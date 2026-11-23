@@ -562,6 +562,7 @@ class BackendClient:
         miner_port: int,
         miner_hotkey: str,
         container_port: int,
+        host_port: int | None = None,
         executor_id: str | None = None,
         rental_in_progress: bool = False,
         gpu_uuids: list[str] | None = None,
@@ -576,7 +577,9 @@ class BackendClient:
             miner_address: Miner IP address
             miner_port: Miner SSH port
             miner_hotkey: Miner hotkey (SS58 address)
-            container_port: Container port to check
+            container_port: The outside port the backend connects to over SSH
+            host_port: The host port the router forwards container_port to (the mapping's internal side,
+                DAH-6946); the backend publishes the test container there. None omits it (same number).
             executor_id: Executor ID (optional)
             rental_in_progress: True if this validator already sees an active customer rental for the
                 executor. Lets the backend skip the container-creating check immediately; the backend
@@ -621,6 +624,9 @@ class BackendClient:
 
         if loopback_plugin is not None:
             json_data["loopback_plugin"] = loopback_plugin
+
+        if host_port is not None:
+            json_data["host_port"] = host_port
 
         if executor_id:
             json_data["executor_id"] = executor_id

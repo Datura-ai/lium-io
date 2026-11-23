@@ -202,6 +202,17 @@ async def test_check_executor_health_sends_loopback_plugin_only_when_given(clien
 
 
 @pytest.mark.asyncio
+async def test_check_executor_health_sends_the_host_port_only_when_given(client):
+    # DAH-6946: the host port a mapped outside port is forwarded to
+    with patch.object(client, "_signed_request", AsyncMock(return_value=None)) as post:
+        await client.check_executor_health("1.2.3.4", 8001, "hotkey", 5892)
+        await client.check_executor_health("1.2.3.4", 8001, "hotkey", 5892, host_port=41002)
+
+    assert "host_port" not in post.await_args_list[0].kwargs["json_data"]
+    assert post.await_args_list[1].kwargs["json_data"]["host_port"] == 41002
+
+
+@pytest.mark.asyncio
 async def test_check_executor_health_sends_the_upload_nonce_only_when_given(client):
     with patch.object(client, "_signed_request", AsyncMock(return_value=None)) as post:
         await client.check_executor_health("1.2.3.4", 8001, "hotkey", 9001)
