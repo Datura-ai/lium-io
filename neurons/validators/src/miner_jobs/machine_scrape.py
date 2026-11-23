@@ -1813,7 +1813,7 @@ def query_sm_guid(umad_path: str, sm_lid: int) -> str:
         os.close(fd)
 
 
-def query_port_sm_guid(port: InfinibandPort, index: int, found: dict) -> None:
+def query_port_sm_guid(port: InfinibandPort, index: int, found: dict[int, str]) -> None:
     """Puts the port's SM GUID in found[index] when the port is active InfiniBand and its SM answers."""
     if port.link_layer.lower() != "infiniband" or not port.state.upper().endswith("ACTIVE"):
         return
@@ -1826,7 +1826,7 @@ def query_port_sm_guid(port: InfinibandPort, index: int, found: dict) -> None:
         pass
 
 
-def join_all(workers: list) -> None:
+def join_all(workers: list[threading.Thread]) -> None:
     for worker in workers:
         worker.join()
 
@@ -1835,8 +1835,8 @@ def fill_sm_guids(ports: list[InfinibandPort]) -> None:
     """Sets sm_guid on every active InfiniBand port whose SM answers within SM_GUID_QUERY_BUDGET_SECONDS."""
     # one thread per port, so a port whose SM never answers cannot keep the others from being asked;
     # module-level targets, not nested defs: the obfuscator renames a call's Name but not a nested def's own name
-    found: dict = {}
-    workers = [
+    found: dict[int, str] = {}
+    workers: list[threading.Thread] = [
         threading.Thread(target=query_port_sm_guid, args=(port, index, found), daemon=True)
         for index, port in enumerate(ports)
     ]
