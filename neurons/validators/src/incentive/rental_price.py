@@ -407,15 +407,18 @@ class RentalPriceIncentive(DefaultIncentive):
             if log_if_cannot_measure:
                 self._log_insufficient_ram_unmeasured(result, "vram or ram missing from the scrape")
             return None
-        vram_gb, ram_gb = round(vram_gb, 1), round(ram_gb, 1)
         if ram_gb * RAM_MEMTOTAL_TOLERANCE >= vram_gb * MIN_RAM_TO_VRAM_RATE:
             return None
         required_ram_gb = round(vram_gb * MIN_RAM_TO_VRAM_RATE / RAM_MEMTOTAL_TOLERANCE, 1)
         if required_ram_gb * RAM_MEMTOTAL_TOLERANCE < vram_gb * MIN_RAM_TO_VRAM_RATE:
             # nearest rounding went below the floor: name the next reading the check above accepts
             required_ram_gb = round(required_ram_gb + 0.1, 1)
+        # rounded only for the report: the check above must use the raw readings
         return InsufficientRam(
-            vram_gb=vram_gb, ram_gb=ram_gb, rate=MIN_RAM_TO_VRAM_RATE, required_ram_gb=required_ram_gb
+            vram_gb=round(vram_gb, 1),
+            ram_gb=round(ram_gb, 1),
+            rate=MIN_RAM_TO_VRAM_RATE,
+            required_ram_gb=required_ram_gb,
         )
 
     def _log_insufficient_ram_unmeasured(self, result: JobResult, cause: str) -> None:

@@ -48,6 +48,8 @@ async def test_with_the_flag_off_the_gate_only_logs_and_the_node_keeps_idle_pay(
         (4, 141, 1500),  # well above
         (2, 32, 31.2),  # 31.2 GB for 64 GB summed VRAM, 0.49x read: the tolerance keeps it
         (2, 32, 32.0),  # exactly half
+        # 15,608 MiB clears 16 GB with the tolerance; rounded to 15.2 GB first, it would not
+        (1, 32, 15608 / 1024),
         # stock 8x flagship at 0.93x keeps idle pay: the reason the floor is half, not all
         (8, 180, 1339.2),
     ],
