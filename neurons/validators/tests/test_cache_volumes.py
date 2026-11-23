@@ -952,27 +952,6 @@ async def test_a_job_cache_over_its_size_is_removed_and_charged_as_a_new_one(doc
     assert bool(affordable) is granted
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("free_gb", "cache_gb", "volume_limit_gb", "granted"),
-    [
-        (600, 150, 400, True),  # within 30% of free disk: created, however little the run volume leaves beside it
-        (400, 200, 20, False),  # over 30% of free disk: refused, though download + volume + 150 GB would fit
-    ],
-)
-async def test_a_new_job_cache_follows_the_30pct_free_disk_share_alone(
-    docker_service, free_gb, cache_gb, volume_limit_gb, granted
-):
-    name = f"job_cache_{cache_gb}gb_0123456789ab"
-    payload = _make_payload(workload_kind=WorkloadKind.FILLER, cache_volumes=[CacheVolume(name=name, target="/cache")])
-    payload.volume_limit_gb = volume_limit_gb
-    ssh_client = DuHostSshClient([], free_gb=free_gb, du_stdout="")
-
-    affordable = await docker_service.select_affordable_cache_volumes(ssh_client, payload, {})
-
-    assert bool(affordable) is granted
-
-
 class RefusingDuHostSshClient(DuHostSshClient):
     """docker refuses the `volume rm` (exit 1)."""
 

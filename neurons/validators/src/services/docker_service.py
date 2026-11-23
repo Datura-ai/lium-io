@@ -6688,10 +6688,7 @@ class DockerService:
             (payload.volume_limit_gb is not None and download_gb > payload.volume_limit_gb)
             or free_gb - download_gb < ENGY_CACHE_MIN_FREE_BESIDE_GB
         )
-        # DAH-6406 (Rustam, 20 Nov): a provider job's cache is created under the share rule alone, like the Lium
-        # caches; the floor of download + run volume + listing margin granted it on small disks it then clamped
-        is_job_cache: bool = any(volume.name.startswith(JOB_CACHE_VOLUME_PREFIX) for volume in payload.cache_volumes)
-        if over_share or (not is_job_cache and free_after_gb <= floor_gb):
+        if over_share or free_after_gb <= floor_gb:
             logger.info(
                 _m(
                     "Node cannot afford the filler cache download; keeping only the volumes it already has",
