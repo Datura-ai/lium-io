@@ -103,9 +103,9 @@ class DefaultIncentive(BaseIncentive):
         """
         report = result.executor_image_report or {}
         status = report.get("status")
-        # the free GPUs of a partly rented split node are scored as an unrented copy, but the node is rented:
-        # it passed the image check, stays listed, and keeps the idle pay for those GPUs too
-        free_node = not result.is_rented and not result.is_split_remainder
+        # free when the image was read, not at the cycle end; the free GPUs of a partly rented split node are scored as an
+        # unrented copy, but the node is rented: it passed the image check, stays listed, and keeps their idle pay too
+        free_node = not report.get("rented_when_read") and not result.is_split_remainder
         if status != "UNOFFICIAL" and not (status == "OUTDATED" and free_node):
             return False
         if not any(

@@ -129,7 +129,7 @@ def test_score_calculator_zeroes_an_outdated_free_node():
 
 
 def test_score_calculator_leaves_an_outdated_rented_node_its_score():
-    report = policy().report(STALE_DIGEST)
+    report = replace(policy().report(STALE_DIGEST), rented_when_read=True)
     scored = make_context(
         state=build_state(gpu_model="NVIDIA H200", executor_image_report=report), collateral_deposited=True
     )
@@ -259,3 +259,39 @@ async def test_the_previous_release_in_its_grace_passes_and_keeps_incentive():
     assert "outdated" not in (warning or "")
     # after the grace the same node is OUTDATED again
     assert policy().report(STALE_DIGEST).status is ImageVerdict.OUTDATED
+
+
+@pytest.mark.asyncio
+async def test_a_rental_ending_after_the_image_was_read_keeps_the_node_its_score():
+    # DAH-6845 review: the outdated reading was taken while rented; the rental ending before the cycle's score must
+    # not turn it into a free-node exclusion, the next cycle reads the image again on a free node
+    context = make_context(
+        config=build_context_config(executor_image_snapshot=policy()),
+        state=build_state(specs=specs(executor_digest=STALE_DIGEST), rented_data=rented_data()),
+    )
+
+    result = await ExecutorImageCheck().run(context)
+    report = result.updates["state"].executor_image_report
+    rental_ended = make_context(
+        state=build_state(gpu_model="NVIDIA H200", executor_image_report=report), collateral_deposited=True
+    )
+    current = make_context(state=build_state(gpu_model="NVIDIA H200"), collateral_deposited=True)
+
+    assert result.passed is True
+    assert report.status is ImageVerdict.OUTDATED and report.rented_when_read is True
+    assert report.as_dict()["rented_when_read"] is True
+    assert calculate_scores(rental_ended, False) == calculate_scores(current, False)
+    assert "outdated" not in (calculate_scores(rental_ended, False)[2] or "")
+
+
+@pytest.mark.asyncio
+async def test_an_outdated_image_read_on_a_free_node_records_it_free():
+    context = make_context(
+        config=build_context_config(executor_image_snapshot=policy()),
+        state=build_state(specs=specs(executor_digest=STALE_DIGEST), rented_data=SimpleNamespace(executors={})),
+    )
+
+    result = await ExecutorImageCheck().run(context)
+
+    assert result.passed is False
+    assert result.updates["state"].executor_image_report.rented_when_read is False

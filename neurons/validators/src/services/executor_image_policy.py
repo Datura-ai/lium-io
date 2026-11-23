@@ -31,6 +31,9 @@ class ExecutorImageReport:
     observed_digest: str | None
     expected_ref: str
     expected_digest: str
+    # DAH-6845: the rental state at the moment the digest was read; an OUTDATED verdict excludes only a node that was
+    # free then, so a rental ending later in the same cycle never judges a reading taken while it ran
+    rented_when_read: bool = False
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -38,6 +41,7 @@ class ExecutorImageReport:
             "observed_digest": self.observed_digest,
             "expected_ref": self.expected_ref,
             "expected_digest": self.expected_digest,
+            "rented_when_read": self.rented_when_read,
         }
 
 

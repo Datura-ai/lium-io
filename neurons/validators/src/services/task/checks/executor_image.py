@@ -100,6 +100,12 @@ class ExecutorImageCheck:
             )
             if published is False and settings.EXECUTOR_IMAGE_UNOFFICIAL_ENFORCE:
                 report = replace(report, status=ImageVerdict.UNOFFICIAL)
+        # DAH-6845: a free node fails and leaves the rent list until it updates; a rented one passes, and keeps its
+        # score too when the image is only OUTDATED (score_calculator, DefaultIncentive), so its renter is untouched.
+        # Judged on the rental state of this reading, carried on the report, not on the state at the end of the cycle
+        rented_executor = rental_of_this_node(ctx)
+        is_rented = rented_executor is not None and len(rented_executor.pods) > 0
+        report = replace(report, rented_when_read=is_rented)
         updated_state = replace(ctx.state, executor_image_report=report)
         what = report.as_dict()
 
@@ -107,10 +113,6 @@ class ExecutorImageCheck:
             event = render_message(Msg.CURRENT, ctx=ctx, check_id=self.check_id, what=what)
             passed = True
         else:
-            # DAH-6845: a free node fails and leaves the rent list until it updates; a rented one passes, and keeps its
-            # score too when the image is only OUTDATED (score_calculator, DefaultIncentive), so its renter is untouched
-            rented_executor = rental_of_this_node(ctx)
-            is_rented = rented_executor is not None and len(rented_executor.pods) > 0
             passed = is_rented
             if not is_rented:
                 impact = "Validation failed - executor unavailable for rent until the image is current"

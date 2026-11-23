@@ -36,7 +36,7 @@ def _rented(status: str) -> JobResult:
     result = failed_idle_result().model_copy(
         update={"job_score": 1.0, "is_rented": True, "gpu_model": "NVIDIA H200", "gpu_count": 8}
     )
-    result.executor_image_report = {**result.executor_image_report, "status": status}
+    result.executor_image_report = {**result.executor_image_report, "status": status, "rented_when_read": True}
     return result
 
 
@@ -62,3 +62,24 @@ async def test_rented_unofficial_executor_keeps_job_result_but_gets_zero_mining_
     assert result.zero_incentive_reasons[0].reason == "outdated_executor_image"
 
 
+
+
+@pytest.mark.asyncio
+async def test_outdated_image_read_while_rented_keeps_its_incentive_when_the_rental_ended_later():
+    # DAH-6845 review: the rental ended between the image reading and the cycle end
+    result = _rented("OUTDATED").model_copy(update={"is_rented": False})
+    incentive = RentalPriceIncentive(IncentiveConfig(), AsyncMock(), {"miner": [result]}, {"NVIDIA H200": 8})
+
+    await incentive._pre_process_job_result("miner", result)
+
+    assert "outdated_executor_image" not in [r.reason for r in result.zero_incentive_reasons]
+
+
+@pytest.mark.asyncio
+async def test_outdated_image_read_on_a_free_node_is_excluded():
+    result = failed_idle_result()
+    incentive = RentalPriceIncentive(IncentiveConfig(), AsyncMock(), {"miner": [result]}, {"NVIDIA H200": 8})
+
+    await incentive._pre_process_job_result("miner", result)
+
+    assert "outdated_executor_image" in [r.reason for r in result.zero_incentive_reasons]

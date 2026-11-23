@@ -135,7 +135,11 @@ async def test_an_outdated_image_on_a_partly_rented_node_keeps_the_idle_pay_of_i
     # DAH-6845: a rented node keeps its rewards on an outdated image, its free split GPUs included
     async def scored(status: str) -> JobResult:
         job = _make_job(gpu_count=8, rented_gpu_count=1)
-        job.executor_image_report = {"status": status, "expected_ref": "daturaai/compute-subnet-executor:latest"}
+        job.executor_image_report = {
+            "status": status,
+            "expected_ref": "daturaai/compute-subnet-executor:latest",
+            "rented_when_read": True,
+        }
         incentive = _build_incentive(job)
         monkeypatch.setattr(incentive, "_calculate_rental_share", AsyncMock(return_value=0.1))
         await incentive.calculate_mining_scores()

@@ -35,11 +35,13 @@ def calculate_scores(
     job_score = 1.0
     actual_score = 1.0
 
-    # Executor image (DAH-2701, DAH-6845): an unofficial build scores 0; an outdated one scores 0 only while free, so
-    # a rented node on an old image keeps its score and rental and leaves the rent list only once the rental ends
+    # Executor image (DAH-2701, DAH-6845): an unofficial build scores 0; an outdated one scores 0 only when the node was
+    # free when its image was read, so a rented node on an old image keeps its score and rental, a rental ending later
+    # in the cycle included, and leaves the rent list on the next cycle that reads it free
     image_report = getattr(ctx.state, "executor_image_report", None)
     if image_report and (
-        image_report.status is ImageVerdict.UNOFFICIAL or (image_report.status is ImageVerdict.OUTDATED and not rented)
+        image_report.status is ImageVerdict.UNOFFICIAL
+        or (image_report.status is ImageVerdict.OUTDATED and not image_report.rented_when_read)
     ):
         actual_score = 0.0
         job_score = 0.0
