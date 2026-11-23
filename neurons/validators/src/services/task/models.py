@@ -137,6 +137,9 @@ class JobResult(BaseModel):
     # DAH-5718: the validator's own SSH session died in the port check; no verdict this cycle (withheld at cycle end),
     # only the findings of the checks that finished are published
     session_lost_in_port_check: bool = Field(default=False, exclude=True)
+    # DAH-3405: the verified-job reset (clear_verified_job_info arguments) of a wave run the rollout window may
+    # withhold; the cycle end sends it only for a result that stands (Validator.withhold_verdicts_for_rollout)
+    held_verified_job_reset: dict[str, Any] | None = Field(default=None, exclude=True)
 
     # Incentive relevant fields
     mining_score: float | None = None                   # Score for mining pool for scoring logic

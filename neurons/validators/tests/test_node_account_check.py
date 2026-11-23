@@ -375,3 +375,69 @@ async def test_a_dropped_session_during_the_account_read_is_reconnected_through_
     assert len(calls) == (1 if drops else 0)
     assert end.node_account_passed is account_passed
     assert end.clear_verified_job_info is (not account_passed and not rented)
+
+
+@pytest.mark.parametrize("in_rollout", [True, False])
+async def test_a_failed_reconnect_sends_its_reset_only_when_the_rollout_does_not_withhold_the_run(
+    in_rollout, monkeypatch
+):
+    """DAH-3405 + DAH-6539, 23 Nov: a recreated executor container dropped the account read and refused the
+    reconnect; the run ended on EXECUTOR_TRANSPORT_UNREACHABLE, which the rollout window withheld at cycle end, but
+    its NODE_ACCOUNT_UNVERIFIED reset had gone out inside the cycle and hid the node. The reset now waits for the
+    cycle end: dropped with a withheld verdict, sent (the node hidden) when the verdict stands."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    from core.validator import Validator
+    from services.executor_rollout import ROLLOUT_FAILURE_REASONS, RolloutWindow
+    from services.task import pipeline as pipeline_module
+    from services.task.pipeline import Pipeline
+    from services.task.result_handler import ResultHandler
+
+    class _Sink:
+        async def emit(self, event):
+            pass
+
+    async def reconnect():
+        raise OSError("connection refused")
+
+    monkeypatch.setattr("services.task.checks.node_account.has_live_rental", lambda ctx: False)
+    first = MagicMock(spec=asyncssh.SSHClientConnection)
+    first.is_closed.return_value = False
+    ctx = _relay_ctx(_DropsTheSession(first)).model_copy(update={"ssh": first})
+    monkeypatch.setattr(pipeline_module, "SSHCommandRunner", lambda conn, max_retries=1: _HostFiles(""))
+    ok, events, end = await Pipeline([NodeAccountCheck()], _Sink(), reconnect=reconnect).run(ctx)
+    last = events[-1]
+    assert not ok and last.reason_code == "EXECUTOR_TRANSPORT_UNREACHABLE"
+
+    # inside the cycle, as TaskService hands a wave run to the result handler
+    redis = MagicMock(clear_verified_job_info=AsyncMock())
+    result = await ResultHandler(redis_service=redis, dry_run=False).handle_result(
+        context=end, miner_info=MagicMock(miner_hotkey=POOL, job_batch_id="batch-1"), executor_info=end.executor,
+        verified_job_info={}, log_text="", success=False, validation_event=last,
+        hold_reset=last.reason_code in ROLLOUT_FAILURE_REASONS,
+    )
+    result.failure_reason_code = last.reason_code
+    redis.clear_verified_job_info.assert_not_awaited()
+
+    # the cycle end
+    window = RolloutWindow(
+        digest="sha256:" + "b" * 64, previous_digest="sha256:" + "a" * 64, started_at=None,
+        opened_job_block=7500 if in_rollout else None, cycles_seen=1, grace_cycles=2,
+    )
+    validator = Validator.__new__(Validator)
+    validator.default_extra = {}
+    validator.redis_service = redis
+    validator.rollout_tracker = MagicMock(record_withheld=AsyncMock())
+    validator.fetch_executor_digest_or_none = AsyncMock(return_value=window.digest)
+    validator.observe_executor_rollout = AsyncMock(return_value=window)
+    standing, withheld = await validator.withhold_verdicts_for_rollout({POOL: [result]}, 7500, "batch-1", window)
+
+    if in_rollout:
+        assert [w.result for w in withheld] == [result]
+        redis.clear_verified_job_info.assert_not_awaited()
+    else:
+        assert standing == {POOL: [result]}
+        redis.clear_verified_job_info.assert_awaited_once()
+        reset = redis.clear_verified_job_info.await_args.kwargs
+        assert reset["executor_id"] == "node-1"
+        assert reset["evidence"]["reason_code"] == "NODE_ACCOUNT_UNVERIFIED"

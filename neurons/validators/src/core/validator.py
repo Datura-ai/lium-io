@@ -1637,6 +1637,8 @@ class Validator:
         )
         standing, withheld_results = withhold_rollout_verdicts(all_job_results, window, job_block)
         await self.record_withheld_verdicts(window, withheld_results, job_batch_id, job_block)
+        # a withheld result's held verified-job reset is dropped with it: it would hide the node like a verdict
+        await self.send_held_verified_job_resets(standing)
         standing, held_for_gpu_reset = withhold_renter_gpu_reset_verdicts(standing)
         standing, session_lost = withhold_session_lost_verdicts(standing)
         rental_changed = []
@@ -1646,6 +1648,24 @@ class Validator:
                 standing, rented_at_start, rented_at_end, self.redis_service, tally.published_early if tally else set()
             )
         return standing, withheld_results + held_for_gpu_reset + session_lost + rental_changed
+
+    async def send_held_verified_job_resets(self, standing: dict[str, list[JobResult]]) -> None:
+        """DAH-3405: send the verified-job reset each standing result held back for the rollout decision."""
+        for results in standing.values():
+            for result in results:
+                if not result.held_verified_job_reset:
+                    continue
+                try:
+                    await self.redis_service.clear_verified_job_info(**result.held_verified_job_reset)
+                except Exception as exc:
+                    logger.error(
+                        _m(
+                            "[rollout-grace] could not send a held verified-job reset",
+                            extra=get_extra_info(
+                                {**self.default_extra, "executor_uuid": result.executor_info.uuid, "error": str(exc)}
+                            ),
+                        ),
+                    )
 
     async def publish_session_lost_findings(
         self,

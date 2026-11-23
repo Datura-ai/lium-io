@@ -252,6 +252,9 @@ class TaskService:
                 log_text = _m(last_event.event, extra=last_event.model_dump())
                 success = False if not ok else last_context.success
 
+                # executor_rollout imports services.task, so it is imported here and not at the top
+                from services.executor_rollout import ROLLOUT_FAILURE_REASONS
+
                 # Handle result using ResultHandler
                 result_handler = ResultHandler(self.redis_service, dry_run=settings.DRY_RUN)
                 result = await result_handler.handle_result(
@@ -262,6 +265,9 @@ class TaskService:
                     log_text=log_text.to_full_string(),
                     success=success,
                     validation_event=last_event,
+                    # DAH-3405: a wave run the rollout window may withhold sends its reset only once the cycle end
+                    # decided the verdict stands; the express lane has no rollout withhold and sends it now
+                    hold_reset=not first_pass and last_event.reason_code in ROLLOUT_FAILURE_REASONS,
                 )
                 result.attestation_digest = attestation_digest
                 result.tee_type = tee_type

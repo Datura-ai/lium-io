@@ -89,6 +89,7 @@ class ResultHandler:
         log_text: str,
         success: bool,
         validation_event: ValidationEvent | None = None,
+        hold_reset: bool = False,
     ) -> JobResult:
         """Handle task result by persisting verification data and building JobResult.
 
@@ -100,6 +101,8 @@ class ResultHandler:
             log_text: Log message for this result
             success: Whether validation succeeded
             validation_event: Structured final validation outcome
+            hold_reset: a verified-job reset is not sent here but returned on the JobResult
+                (held_verified_job_reset), for the cycle end to send once the rollout window decided (DAH-3405)
 
         Returns:
             JobResult containing all validation outcomes
@@ -125,13 +128,15 @@ class ResultHandler:
         logger.info(log_text)
 
         # Persist verification data to Redis (unless in DRY_RUN mode)
+        held_reset = None
         if not self.dry_run:
-            await self._persist_verification_data(
+            held_reset = await self._persist_verification_data(
                 miner_hotkey=miner_info.miner_hotkey,
                 executor_id=executor_info.uuid,
                 verified_job_info=verified_job_info,
                 context=context,
                 success=success,
+                hold_reset=hold_reset,
             )
         else:
             logger.info("DRY_RUN: Skipping Redis persistence")
@@ -297,6 +302,7 @@ class ResultHandler:
             # and cuts the PodStatesReport chunks.
             pod_states=list(context.state.pod_states) or None,
             host_runtime_fault=context.state.host_runtime_fault,
+            held_verified_job_reset=held_reset,
         )
 
     @staticmethod
@@ -371,7 +377,8 @@ class ResultHandler:
         verified_job_info: dict,
         context: Context,
         success: bool,
-    ) -> None:
+        hold_reset: bool = False,
+    ) -> dict | None:
         """Persist verification data to Redis based on validation outcome.
 
         Args:
@@ -380,6 +387,10 @@ class ResultHandler:
             verified_job_info: Previous verification info
             context: Pipeline context with verification state
             success: Whether validation succeeded
+            hold_reset: return a verified-job reset's arguments instead of sending it
+
+        Returns:
+            The held reset's clear_verified_job_info arguments, else None
         """
         if success:
             # On success, update verification data if we have GPU info
@@ -408,7 +419,7 @@ class ResultHandler:
                     "executor_port": context.executor.port,
                     **({"job_batch_id": context.config.job_batch_id} if context.config.job_batch_id else {}),
                 }
-                await self.redis_service.clear_verified_job_info(
+                reset = dict(
                     miner_hotkey=miner_hotkey,
                     executor_id=executor_id,
                     prev_info=verified_job_info,
@@ -417,6 +428,9 @@ class ResultHandler:
                     reanchor_uuids=(context.state.gpu_uuids or '') if context.gpu_reanchor else '',
                     respec=(context.state.gpu_model_count or '') if context.gpu_respec else '',
                 )
+                if hold_reset:
+                    return reset
+                await self.redis_service.clear_verified_job_info(**reset)
             else:
                 # a full set of other cards stays anchored when a later check failed, or it re-anchors every cycle
                 reanchor_uuids = (context.state.gpu_uuids or '') if context.gpu_reanchor else ''
