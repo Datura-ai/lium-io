@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 import asyncssh
 import redis.exceptions
 from core.config import settings
+from services.redis_service import RedisWrites
 
 from ..messages import RentedPodOwnershipMessages as Msg
 from ..messages import render_message
@@ -52,6 +53,9 @@ MAY_BE_REVERTED_NEXT = ("/usr/share", "/var/lib/dpkg")
 # pid or a new one (a pod restarted into it has finished stopping), is a lasting state, not a stop
 MID_REVERT_KEY_PREFIX = "rented_pod_ownership:mid_revert"
 MID_REVERT_TTL_SECONDS = 24 * 3600
+# the marks' one read and one write together: Redis lets a call wait a minute for a pooled connection, and an
+# observe-only check must not spend the validation deadline on it. A candidate not read back in time is SHIFTED
+MID_REVERT_MARKS_BUDGET_SECONDS = 10
 
 
 def read_command(pids: list[int], proc: str = "/proc") -> str:
@@ -139,7 +143,8 @@ class RentedPodOwnershipCheck:
     """
 
     check_id = "host.observe.rented_pod_ownership"
-    replays_after_session_drop = True
+    # it moves the mid-revert marks: a rerun on a fresh session would read its own first-sight mark as a later sight
+    replays_after_session_drop = False
     fatal = False
 
     async def run(self, ctx: Context) -> CheckResult:
@@ -198,12 +203,13 @@ class RentedPodOwnershipCheck:
                 what["runtime_restarted_under_pods"] = restarted
                 # when each flagged runtime started: a notice must date the restart, not the day the check first saw it
                 what["runtime_started_at"] = started_at
-        for pod in pods.values():
-            if pod.get("being_reverted"):
-                if not await self._first_sight_of_mid_revert(ctx, pod):
-                    pod["outside_namespace"] = pod.pop("being_reverted")
-            elif not pod["outside_namespace"]:
-                await self._forget_mid_revert(ctx, pod)
+        candidates = [p for p in pods.values() if p.get("being_reverted")]
+        first_sights = await self._settle_mid_revert_marks(
+            ctx, candidates, [p for p in pods.values() if not p.get("being_reverted") and not p["outside_namespace"]]
+        )
+        for pod in candidates:
+            if pod["container"] not in first_sights:
+                pod["outside_namespace"] = pod.pop("being_reverted")
         shifted = [p for p in pods.values() if p["outside_namespace"]]
         reverting = sorted(p["container"] for p in pods.values() if p.get("being_reverted"))
         if shifted:
@@ -227,28 +233,33 @@ class RentedPodOwnershipCheck:
             what["unread"] = unread
         return self._event(ctx, template, what)
 
-    async def _first_sight_of_mid_revert(self, ctx: Context, pod: dict) -> bool:
-        """True the first read of this container showing the hand-back shape since its last clean read, remembering
-        it; False on any later read (whatever the init pid), or when Redis cannot say (then the shape is reported,
-        not hidden). The TTL only ends marks of containers never read again; each sight renews it."""
-        key = f"{MID_REVERT_KEY_PREFIX}:{ctx.executor.uuid}:{pod['container']}"
-        try:
-            seen = await ctx.services.redis.get(key) is not None
-            # a dry run shares Redis with the live validator: it reads the mark, never sets one
-            if not settings.DRY_RUN:
-                await ctx.services.redis.set(key, "1", ex=MID_REVERT_TTL_SECONDS)
-        except (redis.exceptions.RedisError, OSError):
-            return False
-        return not seen
+    async def _settle_mid_revert_marks(self, ctx: Context, candidates: list[dict], clean: list[dict]) -> set[str]:
+        """The candidates read in the hand-back shape for the first time since their last clean read (any init pid).
+        One MGET and one MULTI/EXEC within MID_REVERT_MARKS_BUDGET_SECONDS: each candidate's mark is set (the TTL only
+        ends marks of containers never read again; each sight renews it) and each clean pod's is cleared, as a clean
+        read ends the stop the mark stood for. When Redis cannot say in time, no candidate is a first sight: the shape
+        is reported, never hidden. A dry run shares Redis with the live validator: it reads the marks, never writes."""
+        if not candidates and (not clean or settings.DRY_RUN):
+            return set()
 
-    async def _forget_mid_revert(self, ctx: Context, pod: dict) -> None:
-        # a clean read ends the stop the mark stood for, so the next hand-back is a new stop
-        if settings.DRY_RUN:
-            return
+        def key(pod: dict) -> str:
+            return f"{MID_REVERT_KEY_PREFIX}:{ctx.executor.uuid}:{pod['container']}"
+
+        async def settle() -> set[str]:
+            seen = await ctx.services.redis.mget([key(p) for p in candidates])
+            if not settings.DRY_RUN:
+                writes = RedisWrites()
+                for pod in candidates:
+                    writes.set(key(pod), "1", ex=MID_REVERT_TTL_SECONDS)
+                for pod in clean:
+                    writes.delete(key(pod))
+                await ctx.services.redis.write_atomically(writes)
+            return {p["container"] for p, mark in zip(candidates, seen) if mark is None}
+
         try:
-            await ctx.services.redis.delete(f"{MID_REVERT_KEY_PREFIX}:{ctx.executor.uuid}:{pod['container']}")
-        except (redis.exceptions.RedisError, OSError):
-            pass  # a mark left behind reads the next hand-back as SHIFTED: reported, never hidden
+            return await asyncio.wait_for(settle(), timeout=MID_REVERT_MARKS_BUDGET_SECONDS)
+        except (redis.exceptions.RedisError, OSError, TimeoutError):
+            return set()
 
     async def _shift_template(self, ctx: Context, shifted: list[dict]):
         """A container restarted long after the host booted was not brought back by a host reboot: say so,

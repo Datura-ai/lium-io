@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import subprocess
 from types import SimpleNamespace
 
+import asyncssh
 import pytest
 from neurons.validators.src.services.task.checks import rented_pod_ownership
 from neurons.validators.src.services.task.checks.rented_pod_ownership import (
@@ -633,3 +635,63 @@ async def test_the_hand_back_shape_is_shifted_when_redis_cannot_say(context_fact
     ctx = _ctx(context_factory, _mid_revert_ssh(), services=build_services(redis=FakeRedis(failing=True)))
     result = await RentedPodOwnershipCheck().run(ctx)
     assert result.event.reason_code == Msg.SHIFTED.reason
+
+
+class _NullSink:
+    async def emit(self, event) -> None:
+        pass
+
+
+def _drops_after_the_ownership_read():
+    """The mid-revert reads come back, then the session drops under the runtime read, as a recreated executor does."""
+    inner = _mid_revert_ssh()
+    closed = []
+
+    async def run(cmd, check=False):
+        if cmd.startswith("ps -eo"):
+            closed.append(True)
+            raise asyncssh.ConnectionLost("SSH connection closed")
+        return await inner.run(cmd, check)
+
+    return SimpleNamespace(run=run, is_closed=lambda: bool(closed))
+
+
+@pytest.mark.asyncio
+async def test_a_session_dropped_after_the_first_sight_is_not_replayed_into_shifted(context_factory):
+    # gateway b5cfb38 #1: the first sight writes the mark; a replay on a fresh session would read that mark and call a
+    # healthy stop SHIFTED in the same run. The check is not replayed: the run keeps the first sight, unread
+    from neurons.validators.src.services.task.pipeline import Pipeline
+
+    services = build_services()
+    reconnects = []
+
+    async def reconnect():
+        reconnects.append(1)
+        return _mid_revert_ssh()
+
+    ctx = _ctx(context_factory, _drops_after_the_ownership_read(), services=services)
+    _, events, _ = await Pipeline([RentedPodOwnershipCheck()], _NullSink(), reconnect=reconnect).run(ctx)
+    assert [e.reason_code for e in events] == [Msg.UNREAD.reason] and reconnects == []
+    # the next cycle still sees the shape: a lasting state
+    assert await _reasons(context_factory, services, [_mid_revert_ssh()]) == [Msg.SHIFTED.reason]
+
+
+class _SlowRedis(FakeRedis):
+    async def mget(self, keys):
+        await asyncio.sleep(3600)
+
+
+@pytest.mark.asyncio
+async def test_a_redis_slower_than_the_budget_leaves_the_hand_back_shifted_in_bounded_time(context_factory, monkeypatch):
+    # gateway b5cfb38 #2: a pool wait of a minute per call must not eat the validation deadline
+    monkeypatch.setattr(rented_pod_ownership, "MID_REVERT_MARKS_BUDGET_SECONDS", 0.05)
+    ctx = _ctx(context_factory, _mid_revert_ssh(), services=build_services(redis=_SlowRedis()))
+    result = await asyncio.wait_for(RentedPodOwnershipCheck().run(ctx), timeout=5)
+    assert result.event.reason_code == Msg.SHIFTED.reason
+
+
+@pytest.mark.asyncio
+async def test_the_marks_of_every_pod_move_in_one_read_and_one_write(context_factory):
+    services = build_services()
+    await RentedPodOwnershipCheck().run(_ctx(context_factory, _mid_revert_ssh(), services=services))
+    assert services.redis.calls == 2
