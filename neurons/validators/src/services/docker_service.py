@@ -15659,14 +15659,7 @@ class DockerService:
             workload_kind=payload.workload_kind,
             request_id=payload.request_id,
             ok=report.ok,
-            # GpusLostOnHost is not on the wire yet: the backend drops the whole frame on an unknown error_code and the
-            # renter's reset hangs until timeout; a separate task adds the wire code and removes this swap after
-            # lium-platform accepts GpusLostOnHost
-            error_code=(
-                GpuResetErrorCode.ResetNotSupported
-                if report.error_code == GpuResetErrorCode.GpusLostOnHost
-                else report.error_code
-            ),
+            error_code=report.error_code,
             container_restarted=report.container_restarted,
             gpus=report.gpus,
             detail=report.detail,
