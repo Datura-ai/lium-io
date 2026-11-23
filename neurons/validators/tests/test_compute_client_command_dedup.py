@@ -88,6 +88,51 @@ class FakeRedis:
             if fnmatch(key, match):
                 yield key
 
+    async def exists(self, key):
+        return int(key in self.values and self.values[key][1] > self.now)
+
+    async def ttl(self, key):
+        if not await self.exists(key):
+            return -2
+        return -1 if self.values[key][1] == float("inf") else int(self.values[key][1] - self.now)
+
+    def pipeline(self, transaction=True):
+        return FakePipeline(self)
+
+
+class FakePipeline:
+    """WATCH/MULTI/EXEC for the dispatch-order cleanup; this fake has no concurrent writer, so a watch never fails
+    (the WatchError path runs on fakeredis in test_compute_client_restart_cut_creates.py)."""
+
+    def __init__(self, redis):
+        self.redis, self.queued = redis, []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def watch(self, *keys):
+        pass
+
+    async def get(self, key):
+        return await self.redis.get(key)
+
+    async def reset(self):
+        self.queued = []
+
+    def multi(self):
+        pass
+
+    def expire(self, key, ttl):
+        self.queued.append((key, ttl))
+
+    async def execute(self):
+        for key, ttl in self.queued:
+            await self.redis.expire(key, ttl)
+        self.queued = []
+
 
 @pytest.fixture
 def client(monkeypatch):

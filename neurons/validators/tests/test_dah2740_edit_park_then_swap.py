@@ -198,6 +198,11 @@ async def test_a_successful_edit_runs_the_same_host_commands(svc, monkeypatch):
     assert ssh.commands.index('/usr/bin/docker volume ls --format "{{.Name}}"') < hung_query
     assert hung_query < len(ssh.commands) - 1 - ssh.commands[::-1].index(_POWER_READ)  # before the last power read
     assert [cmd for cmd in ssh.commands if cmd != HUNG_GPU_QUERY_COMMAND] == [
+        # the pre-run host probe (DAH-3257); no image-label section, the volume is not encrypted; before the park, so
+        # a probe that stops the create leaves the current container as it was
+        prerun_host_probe_command(
+            docker_image=payload.docker_image, image_label=None, with_power=True, miner_hotkey=payload.miner_hotkey
+        ),
         f'/usr/bin/docker ps -a --no-trunc --format "{{{{.Names}}}} {{{{.ID}}}}" --filter name=^{name}$ --filter name=^{name}{EDIT_PARKED_SUFFIX}$ '
         f"--filter name=^kept_unmounted_{payload.pod_id}_",
         # the layer read: renter files under the volume path keep it after the edit
@@ -208,10 +213,6 @@ async def test_a_successful_edit_runs_the_same_host_commands(svc, monkeypatch):
         f"/usr/bin/docker stop -t 10 {parked}",
         # the layer read again on the stopped container, before the replacement exists
         _layer_data_check(f"id-{name}", "/root"),
-        # the pre-run host probe (DAH-3257); no image-label section, the volume is not encrypted
-        prerun_host_probe_command(
-            docker_image=payload.docker_image, image_label=None, with_power=True, miner_hotkey=payload.miner_hotkey
-        ),
         '/usr/bin/docker volume ls --format "{{.Name}}"',
         # the live power floor read twice: beside the volume create, and again right before docker run
         "nvidia-smi --query-gpu=uuid,power.limit,power.default_limit,power.min_limit,power.max_limit"
@@ -1581,7 +1582,7 @@ def test_the_layer_read_skips_only_files_written_in_a_recorded_validator_start(
         f'case "$3" in *UpperDir*) echo "{inspect}"; exit;; *StartedAt*) echo "cid {docker_started}"; exit;; *.Id*) echo cid; exit;; esac\n'
         '[ "$1" = inspect ] && { echo /lium-cipher; exit; }\n'
         # docker diff lists the same file: only the upper-dir read can tell it is startup noise
-        '[ "$1" = diff ] && { printf "C /root\\nA /root/.jupyter\\nA /root/.jupyter/lab.json\\n"; exit; }\n'
+        f'[ "$1" = diff ] && {{ touch {tmp_path}/diffed; printf "C /root\\nA /root/.jupyter\\nA /root/.jupyter/lab.json\\n"; exit; }}\n'
         "exit 2\n"
     )
     docker.chmod(0o755)
@@ -1597,6 +1598,31 @@ def test_the_layer_read_skips_only_files_written_in_a_recorded_validator_start(
     out = subprocess.run(["sh", "-c", command], capture_output=True, text=True).stdout.strip().splitlines()
     assert (out[-1:] != ["drop"]) is kept
     assert (f"upper {host_upper}" in out) is (store not in ("none", "kept"))
+    # a readable upper dir decides alone: docker diff walks the whole layer and holds the container (a DinD pod's
+    # reboot timed out on it every time, 19 Nov)
+    assert (tmp_path / "diffed").exists() is (store in ("none", "kept"))
+
+
+def test_a_readable_upper_dir_without_the_volume_path_drops_without_docker_diff(tmp_path, monkeypatch):
+    import subprocess
+
+    host_upper = "/var/lib/docker/x/diff"
+    proc = tmp_path / "proc"
+    (proc / "1" / "root" / host_upper.lstrip("/") / "etc").mkdir(parents=True)  # the layer changed nothing under /root
+    docker = tmp_path / "docker"
+    docker.write_text(
+        "#!/bin/sh\n"
+        f'case "$3" in *UpperDir*) echo "4242 {host_upper}"; exit;; *StartedAt*) echo "cid 0001-01-01T00:00:00Z"; exit;; esac\n'
+        '[ "$1" = inspect ] && { echo /lium-cipher; exit; }\n'
+        f'[ "$1" = diff ] && {{ touch {tmp_path}/diffed; exit; }}\n'
+        "exit 2\n"
+    )
+    docker.chmod(0o755)
+    monkeypatch.setattr("services.docker_service._VALIDATOR_STARTS_DIR", str(tmp_path / "starts"))
+    command = _layer_data_check("pod_x", "/root").replace("/usr/bin/docker", str(docker)).replace("/proc/", f"{proc}/")
+    out = subprocess.run(["sh", "-c", command], capture_output=True, text=True).stdout.strip().splitlines()
+    assert out[-1:] == ["drop"]
+    assert not (tmp_path / "diffed").exists()
 
 
 @pytest.mark.asyncio
@@ -1729,15 +1755,17 @@ async def test_a_clean_kept_leftover_next_to_the_pod_is_removed_before_parking(s
     result = await _run(svc, payload)
 
     assert isinstance(result, ContainerCreated)
-    removed = ssh.commands.index(f"/usr/bin/docker rm -fv id-{old}")
+    removed = ssh.commands.index(f"nohup /usr/bin/docker rm -fv id-{old} >/dev/null 2>&1 &")
     assert removed < ssh.commands.index(f"/usr/bin/docker rename {_pod_name(payload)} {_kept(payload)}")
     # an already-kept copy is released by docker diff alone, never by the startup-age bound
     assert _layer_data_check(f"id-{old}", "/root", startup_shortcut=False) in ssh.commands
 
 
 @pytest.mark.asyncio
-async def test_a_clean_kept_leftover_docker_will_not_remove_fails_the_edit_before_parking(svc, monkeypatch):
-    # counting it as gone would park another copy under a new name each edit, and they would pile up
+@pytest.mark.parametrize("synchronous_rm_exit", [124, 1], ids=["host-timeout", "refused"])
+async def test_a_clean_kept_leftover_slow_to_remove_never_fails_the_edit(svc, monkeypatch, synchronous_rm_exit):
+    # prod 19 Nov: removing an earlier edit's DinD copy outlasted the command timeout (exit 124) and failed every
+    # reboot; the removal is detached, so the edit parks under a new kept name and goes on
     payload = _edit_payload()
     ssh = _ssh_recording()
     old = f"kept_unmounted_{payload.pod_id}_1700000000"
@@ -1745,18 +1773,19 @@ async def test_a_clean_kept_leftover_docker_will_not_remove_fails_the_edit_befor
     _patch_happy(svc, monkeypatch, ssh)
     side = ssh.run.side_effect
 
-    def _rm_fails(cmd, *args, **kwargs):
+    def _rm_slow(cmd, *args, **kwargs):
         if cmd == f"/usr/bin/docker rm -fv id-{old}":
             ssh.commands.append(cmd)
-            return _ssh_result(exit_status=1, stderr="device or resource busy")
+            return _ssh_result(exit_status=synchronous_rm_exit)
         return side(cmd, *args, **kwargs)
 
-    ssh.run.side_effect = _rm_fails
+    ssh.run.side_effect = _rm_slow
 
     result = await _run(svc, payload)
 
-    assert not isinstance(result, ContainerCreated)
-    assert not any(c.startswith(f"/usr/bin/docker rename {_pod_name(payload)} ") for c in ssh.commands)
+    assert isinstance(result, ContainerCreated)
+    assert f"nohup /usr/bin/docker rm -fv id-{old} >/dev/null 2>&1 &" in ssh.commands
+    assert any(c.startswith(f"/usr/bin/docker rename {_pod_name(payload)} ") for c in ssh.commands)
 
 
 @pytest.mark.parametrize(
@@ -1785,3 +1814,24 @@ def test_the_mount_read_runs_in_a_real_shell(pid, path, out):
     done = subprocess.run(["sh", "-c", command], capture_output=True, text=True)
 
     assert (done.stdout.strip() if done.returncode == 0 else None) == out
+
+
+@pytest.mark.asyncio
+async def test_a_probe_that_may_still_hold_the_session_stops_the_edit_before_it_parks(svc, monkeypatch):
+    """The prerun probe runs before the park: a probe whose channel close is not confirmed (it may still hold the
+    host's only session) fails the edit with the renter's container untouched, so no undo needs that session."""
+    payload = _edit_payload()
+    ssh = _ssh_recording()
+    _patch_happy(svc, monkeypatch, ssh)
+    monkeypatch.setattr(
+        svc, "probe_prerun_host", AsyncMock(side_effect=docker_service.SshSessionMayStillBeTakenError("probe"))
+    )
+    monkeypatch.setattr(svc, "_bring_up_existing_container", AsyncMock())
+
+    result = await _run(svc, payload)
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.failure_step == "prerun_host_probe"
+    assert _docker(ssh.commands, "rename") == []
+    assert _docker(ssh.commands, "stop") == []
+    svc._bring_up_existing_container.assert_not_awaited()

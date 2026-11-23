@@ -9,6 +9,8 @@ jobs:
     environment: dockerhub-push
     env:
       TAG: "dev" 
+      # the staging validator, as the executor's dev image (executor_cd_dev.yml)
+      VALIDATOR_HOTKEY_SS58: "5DHgdomxxHSQf7neJWcagvGhTMKpqvKWwuprEaFF8C653qty"
       TARGET_FILE: "docker-compose.app.dev.yml"
     permissions:
       contents: read
