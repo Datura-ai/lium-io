@@ -243,7 +243,10 @@ try:
         raise RuntimeError("invalid Docker data root")
     os.makedirs(os.path.dirname(lock_path), exist_ok=True)
     with open(lock_path, "a") as lock:
+        # another setup on this host may hold the lock for most of the deadline: a SIGTERM here names the wait
+        step = "the wait for the setup lock"
         fcntl.flock(lock, fcntl.LOCK_EX)
+        step = "start"
         # the backend's health check compares the marker with the plugin's ID and settings but not with
         # the pinned digest, which it does not know: a marker of another build goes before anything
         # below can fail, so both sides see the same fallback, and one of another installation (the

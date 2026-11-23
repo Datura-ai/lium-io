@@ -614,6 +614,24 @@ def test_setup_cut_short_by_the_validators_deadline_says_so_on_stderr(tmp_path: 
     assert "setup cut short by the validator's deadline during docker run --rm" in stderr
     assert not (tmp_path / "probe-ok").exists()
 
+
+def test_setup_cut_short_while_waiting_for_the_setup_lock_names_the_wait(tmp_path: Path) -> None:
+    # Arrange: another setup holds the lock when the validator's `timeout` sends SIGTERM
+    arguments = _setup_arguments(tmp_path, {}, alias="vloopback:v3")
+    with open(tmp_path / "setup.lock", "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        process = subprocess.Popen(arguments, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        time.sleep(1)
+
+        # Act
+        process.send_signal(signal.SIGTERM)
+        _, stderr = process.communicate(timeout=20)
+
+    # Assert: the reason names the lock wait, and no docker command ran
+    assert process.returncode == 1
+    assert "setup cut short by the validator's deadline during the wait for the setup lock" in stderr
+    assert json.loads((tmp_path / "state.json").read_text())["calls"] == []
+
 @pytest.mark.asyncio
 async def test_concurrent_setup_waits_for_the_first_install(tmp_path: Path) -> None:
     # Arrange: two rents reach the same absent plugin while its installation is still running.
