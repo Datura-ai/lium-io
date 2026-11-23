@@ -122,7 +122,7 @@ async def test_a_malformed_configured_origin_breaks_no_other_request(monkeypatch
     monkeypatch.setattr(
         settings,
         "CONFIGURED_MINER_ORIGINS",
-        "miner.example.net:abc, miner.example.net:\u00b2, good.example.net:9000, :1, x:0, y:70000, z:80/path",
+        "miner.example.net:abc, miner.example.net:\u00b2, good.example.net:9000, :1, x:0, y:70000, z:80/path, a@10.0.0.1:80",
     )
     assert settings.configured_miner_origins() == {("good.example.net", 9000)}
 
@@ -152,6 +152,45 @@ def test_a_configured_origin_matches_however_its_host_is_written(monkeypatch, wr
     monkeypatch.setattr(settings, "CONFIGURED_MINER_ORIGINS", written)
     target = yarl.URL(url)
     assert (target.host, target.port) in settings.configured_miner_origins()
+
+
+@pytest.mark.parametrize(
+    "written, url",
+    [
+        ("Miner.Example.NET", "http://miner.example.net:9000/x"),
+        ("[fd00:0:0:0:0:0:0:5]", "http://[fd00::5]:9000/x"),
+        ("[fd00::5]", "http://[fd00::5]:9000/x"),
+        ("fd00::5", "http://[fd00::5]:9000/x"),
+    ],
+)
+def test_the_debug_local_miner_matches_however_its_address_is_written(monkeypatch, written, url):
+    """Stand check 2381-03: MINER_ADDRESS is parsed like a configured origin."""
+    import yarl
+
+    _debug_local_miner(monkeypatch, written, 9000)
+    target = yarl.URL(url)
+    assert (target.host, target.port) in settings.configured_miner_origins()
+
+
+@pytest.mark.asyncio
+async def test_a_userinfo_entry_lets_no_miner_reach_a_private_address(monkeypatch):
+    """Stand check 2381-03: 'x@0.0.0.0:P' is not host:port, so it configures nothing; a miner reporting 0.0.0.0:P is
+    refused and the server there gets no request."""
+    seen = []
+
+    async def handler(request):
+        seen.append(request.path)
+        return web.json_response({"ok": True})
+
+    runner, port = await _serve(handler)
+    try:
+        monkeypatch.setattr(settings, "CONFIGURED_MINER_ORIGINS", f"attacker@0.0.0.0:{port}")
+        assert settings.configured_miner_origins() == set()
+        with pytest.raises(NodeHostError):
+            await _request(f"http://0.0.0.0:{port}/executors")
+        assert seen == []
+    finally:
+        await runner.cleanup()
 
 
 @pytest.mark.asyncio

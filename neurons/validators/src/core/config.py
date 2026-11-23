@@ -40,9 +40,11 @@ def _parse_miner_origins(value: str) -> frozenset[tuple[str, int]]:
         try:
             url = yarl.URL(f"http://{entry}")
             origin = (url.host, url.explicit_port)
+            # nothing but host:port: a path, query, fragment or userinfo ('x@10.0.0.1:80') is a malformed entry
+            bare = url.raw_path in ("", "/") and not (url.query_string or url.fragment or url.user or url.password)
         except ValueError:
-            origin = None
-        if origin and origin[0] and origin[1] and url.raw_path in ("", "/") and not url.query_string and not url.fragment:
+            origin, bare = None, False
+        if origin and origin[0] and origin[1] and bare:
             origins.add(origin)
         else:
             logger.warning("CONFIGURED_MINER_ORIGINS entry %r is not host:port; skipped", entry)
@@ -1124,7 +1126,8 @@ class Settings(BaseSettings):
         """(host, port) of the miners the operator configured: CONFIGURED_MINER_ORIGINS and the debug local miner."""
         origins = set(_parse_miner_origins(self.CONFIGURED_MINER_ORIGINS))
         if self.debug.USE_LOCAL_MINER and self.debug.MINER_ADDRESS and self.debug.MINER_PORT:
-            origins.add((self.debug.MINER_ADDRESS, self.debug.MINER_PORT))
+            # parsed like every configured origin, so it matches however MINER_ADDRESS is written
+            origins |= _parse_miner_origins(f"{self.debug.MINER_ADDRESS}:{self.debug.MINER_PORT}")
         return origins
 
     def get_debug_miner(self) -> dict:
