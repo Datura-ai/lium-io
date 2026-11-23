@@ -83,3 +83,15 @@ async def test_outdated_image_read_on_a_free_node_is_excluded():
     await incentive._pre_process_job_result("miner", result)
 
     assert "outdated_executor_image" in [r.reason for r in result.zero_incentive_reasons]
+
+
+@pytest.mark.asyncio
+async def test_a_rented_outdated_result_stored_before_the_read_time_state_keeps_its_incentive():
+    # DAH-6845 review: a result carried from Redis over a renter's GPU reset was stored without rented_when_read
+    result = _rented("OUTDATED")
+    result.executor_image_report = {k: v for k, v in result.executor_image_report.items() if k != "rented_when_read"}
+    incentive = RentalPriceIncentive(IncentiveConfig(), AsyncMock(), {"miner": [result]}, {"NVIDIA H200": 8})
+
+    await incentive._pre_process_job_result("miner", result)
+
+    assert "outdated_executor_image" not in [r.reason for r in result.zero_incentive_reasons]
