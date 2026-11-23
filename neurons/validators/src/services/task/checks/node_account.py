@@ -125,8 +125,11 @@ class NodeAccountCheck:
             # account's own hotkey needs none
             what["binding_mismatch"] = "claim"
         else:
-            if expected_claim and hotkey == ctx.miner_hotkey and not claim:
-                logger.info(_m("NODE_ACCOUNT_BINDING_UNVERIFIED", extra=get_extra_info({**what, "unread": "claim"})))
+            # a pool-key node is bound to this account only by a claim that matches the one expected: without either
+            # side of that comparison nothing is proven (no refusal either)
+            if hotkey == ctx.miner_hotkey and not (expected_claim and claim):
+                unread = "claim" if expected_claim else "expected_claim"
+                logger.info(_m("NODE_ACCOUNT_BINDING_UNVERIFIED", extra=get_extra_info({**what, "unread": unread})))
                 return False
             return True
         return _refused(ctx, self.check_id, Msg.BINDING_MISMATCH, what, BINDING_PART)

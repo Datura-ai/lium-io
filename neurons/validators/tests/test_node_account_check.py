@@ -396,17 +396,22 @@ async def test_a_dropped_session_during_the_account_read_is_reconnected_through_
 
 
 @pytest.mark.parametrize(
-    "files, hotkeys, proven",
+    "files, hotkeys, claim, proven",
     [
-        (f"hotkey={POOL}\nclaim={CLAIM}\n", ("5Account", POOL), (BINDING_PART,)),  # binding read and proven
-        ("hotkey=5Account\nclaim=\n", ("5Account", POOL), (BINDING_PART,)),  # an own-key node needs no claim
-        ("hotkey=\nclaim=\n", ("5Account", POOL), None),  # no host files: nothing proven
-        (f"hotkey={POOL}\nclaim=\n", ("5Account", POOL), None),  # the claim unread
-        ("hotkey=5Account\n", None, None),  # an IP node naming no account: nothing to prove
+        (f"hotkey={POOL}\nclaim={CLAIM}\n", ("5Account", POOL), CLAIM, (BINDING_PART,)),  # pool node, claims match
+        ("hotkey=5Account\nclaim=\n", ("5Account", POOL), CLAIM, (BINDING_PART,)),  # an own-key node needs no claim
+        ("hotkey=5Account\nclaim=\n", ("5Account", POOL), None, (BINDING_PART,)),  # nor an expected one
+        ("hotkey=\nclaim=\n", ("5Account", POOL), CLAIM, None),  # no host files: nothing proven
+        (f"hotkey={POOL}\nclaim=\n", ("5Account", POOL), CLAIM, None),  # the observed claim missing
+        # the expected claim missing: a pool node's claim is compared with nothing, so nothing is proven
+        (f"hotkey={POOL}\nclaim={CLAIM}\n", ("5Account", POOL), None, None),
+        (f"hotkey={POOL}\nclaim=claim-of-another-account\n", ("5Account", POOL), None, None),
+        (f"hotkey={POOL}\nclaim=\n", ("5Account", POOL), None, None),
+        ("hotkey=5Account\n", None, CLAIM, None),  # an IP node naming no account: nothing to prove
     ],
 )
-async def test_only_a_proven_binding_is_listed(files, hotkeys, proven):
-    result = await NodeAccountCheck().run(_relay_ctx(_HostFiles(files), hotkeys=hotkeys))
+async def test_only_a_proven_binding_is_listed(files, hotkeys, claim, proven):
+    result = await NodeAccountCheck().run(_relay_ctx(_HostFiles(files), hotkeys=hotkeys, claim=claim))
     assert result.passed
     assert result.updates.get("idle_check_passed") == proven
 
@@ -430,6 +435,8 @@ def _lifts(failed: str, passed: tuple[str, ...]) -> bool:
         ({"hotkeys": ("5Account", POOL), "files": "hotkey=5Victim\nclaim=\n", "host_key": True}, {"hotkeys": None, "host_key": True}, False),
         # the converse: a host-key hold, then a cycle without the recorded key and a proven binding
         ({"host_key": "other"}, {"host_key": False, "files": f"hotkey={POOL}\nclaim={CLAIM}\n"}, False),
+        # a pool node's claim mismatch, then a cycle whose miner omits the expected claim: the claim is never compared
+        ({"files": f"hotkey={POOL}\nclaim=claim-of-another-account\n"}, {"files": f"hotkey={POOL}\nclaim=claim-of-another-account\n", "claim": None}, False),
         # the same part proven again lifts it
         ({"hotkeys": ("5Account", POOL), "files": "hotkey=5Victim\nclaim=\n", "host_key": True}, {"files": f"hotkey={POOL}\nclaim={CLAIM}\n", "host_key": True}, True),
         ({"host_key": "other"}, {"host_key": True}, True),
@@ -440,12 +447,12 @@ async def test_a_hold_lifts_only_on_proof_of_the_part_that_failed(fail, later, l
 
     monkeypatch.setattr("services.task.checks.node_account.has_live_rental", lambda ctx: False)
 
-    async def cycle(hotkeys=("5Account", POOL), files="hotkey=\nclaim=\n", host_key=False):
+    async def cycle(hotkeys=("5Account", POOL), files="hotkey=\nclaim=\n", host_key=False, claim=CLAIM):
         monkeypatch.setattr(
             "services.task.checks.node_account.presented_host_key",
             lambda ctx: "ssh-ed25519 AAAAother" if host_key == "other" else "ssh-ed25519 AAAAregistered",
         )
-        ctx = _relay_ctx(_HostFiles(files), hotkeys=hotkeys, address="node.example.test")
+        ctx = _relay_ctx(_HostFiles(files), hotkeys=hotkeys, claim=claim, address="node.example.test")
         ctx.executor.expected_ssh_host_key = "ssh-ed25519 AAAAregistered" if host_key else None
         result = await NodeAccountCheck().run(ctx)
         return updates_with_clear_verified_job_evidence(result, NodeAccountCheck.check_id)
