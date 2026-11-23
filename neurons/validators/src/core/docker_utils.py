@@ -267,6 +267,9 @@ class ContainerDeathDiagnostics:
     error: str | None = None
     started_at: str | None = None
     finished_at: str | None = None
+    # how often dockerd's restart policy brought it back, and that policy: a crash loop under it shows here
+    restart_count: int | None = None
+    restart_policy: str | None = None
     logs_tail: str | None = None
     host_context: dict[str, str] | None = None
     capture_error: str | None = None
@@ -283,6 +286,8 @@ class ContainerDeathDiagnostics:
             "container_error": self.error,
             "container_started_at": self.started_at,
             "container_finished_at": self.finished_at,
+            "container_restart_count": self.restart_count,
+            "container_restart_policy": self.restart_policy,
             "container_logs_tail": self.logs_tail,
             "container_host_context": self.host_context,
             "diagnostics_capture_error": self.capture_error,
@@ -362,9 +367,14 @@ async def collect_container_death_diagnostics(
 
     try:
         inspect_result = await ssh_client.run(
-            f"/usr/bin/docker inspect --format '{{{{json .State}}}}' {quoted_name}"
+            f"/usr/bin/docker inspect --format '{{{{json .State}}}}{{{{println}}}}{{{{.RestartCount}}}} "
+            f"{{{{.HostConfig.RestartPolicy.Name}}}}' {quoted_name}"
         )
-        raw_state = (inspect_result.stdout or "").strip()
+        raw_state, _, restart = (inspect_result.stdout or "").strip().partition("\n")
+        count, _, policy = restart.strip().partition(" ")
+        # the provider controls the host: plain ASCII digits only ("²".isdigit() is True, int() fails)
+        diagnostics.restart_count = int(count) if count.isascii() and count.isdigit() and len(count) <= 10 else None
+        diagnostics.restart_policy = policy.strip() or None
         if raw_state:
             parsed_state = json.loads(raw_state)
             if isinstance(parsed_state, dict):

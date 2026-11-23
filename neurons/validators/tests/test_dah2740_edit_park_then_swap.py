@@ -1677,6 +1677,40 @@ async def test_a_remount_of_a_running_container_records_no_validator_start(svc):
 
 
 @pytest.mark.asyncio
+async def test_a_killed_bootstrap_logs_why_the_container_died(svc, caplog):
+    # pod a5d55eaf (23 Nov): every remount's bootstrap exited 137 because the container kept restarting, and the
+    # warning said only "did not complete cleanly": its State, restart count and log tail are what prove the cause
+    import json
+    import logging
+
+    svc._encrypted_local_volume_name = AsyncMock(return_value="lium-cipher")
+    svc.setup_encrypted_local_volume = AsyncMock()
+    svc.install_open_ssh_server_and_start_ssh_service_with_rental_docker = AsyncMock(return_value=False)
+    state = {"Status": "running", "ExitCode": 1, "OOMKilled": False, "Error": "", "StartedAt": "s", "FinishedAt": "f"}
+
+    async def run(command, *args, **kwargs):
+        if "{{json .State}}" in command:
+            return _ssh_result(stdout=json.dumps(state) + "\n7 unless-stopped\n")
+        if "docker logs" in command:
+            return _ssh_result(stdout="Nested Docker is not available; stopping the pod.\n")
+        return _ssh_result()
+
+    ssh = Mock(run=AsyncMock(side_effect=run))
+    with caplog.at_level(logging.WARNING, logger="services.docker_service"):
+        await svc._restore_mount_and_sshd_after_start(
+            docker_client=Mock(), ssh_client=ssh, container_name="pod_x", local_volume_path="/root",
+            pod_id="x", default_extra={},
+        )
+
+    [record] = [r for r in caplog.records if "did not complete cleanly" in str(r.msg)]
+    extra = record.msg.extra
+    assert (extra["container_exit_code"], extra["container_restart_count"], extra["container_restart_policy"]) == (
+        1, 7, "unless-stopped"
+    )
+    assert "Nested Docker is not available" in extra["container_logs_tail"]
+
+
+@pytest.mark.asyncio
 async def test_each_validator_start_is_kept_next_to_the_earlier_ones(svc, tmp_path, monkeypatch):
     # a second start must not erase the first: the first start's entrypoint files are still in the layer
     import subprocess

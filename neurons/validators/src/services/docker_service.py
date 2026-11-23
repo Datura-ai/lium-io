@@ -13665,11 +13665,14 @@ class DockerService:
                     timeout=30,
                 )
         if not ssh_bootstrap_ok:
+            # a bootstrap killed under us (exit 137) is most often the container itself dying or restarting: its
+            # State, restart count and log tail are the only record of why, the host being the provider's
+            diagnostics = await self._bounded_death_diagnostics(ssh_client, container_name)
             logger.warning(
                 _m(
                     "Docker container started but SSH bootstrap did not complete cleanly",
                     extra=get_extra_info(
-                        {**default_extra, "container_name": container_name}
+                        {**default_extra, "container_name": container_name, **diagnostics.to_log_fields()}
                     ),
                 )
             )
