@@ -65,6 +65,7 @@ from ..availability import ReachSource, ReachTarget
 from ..messages import GpuThermalThrottleMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
+from ..runner import run_to_end
 from .capability import get_filler_only_container
 from .gpu_fault_probe import PROBE_SECONDS, PROBE_TIMEOUT_SECONDS, probe_source
 from .machine_spec_scrape import MachineSpecScrapeCheck, scrape_gpu_details
@@ -316,7 +317,7 @@ class GpuThermalThrottleCheck:
             # the cards when they were read
             return [] if load.done() else readings
         finally:
-            await asyncio.shield(self._stop_load(ctx, load))
+            await run_to_end(self._stop_load(ctx, load))
 
     async def _stop_load(self, ctx: Context, load: asyncio.Task) -> None:
         if not load.done():

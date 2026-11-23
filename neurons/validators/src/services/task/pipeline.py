@@ -695,6 +695,18 @@ def _replays_after_session_drop(step: "Check | ParallelStage") -> bool:
     return all(getattr(chk, "replays_after_session_drop", False) for chk in checks)
 
 
+async def _cancel_until_done(task: asyncio.Future) -> None:
+    """Cancel the step and wait for it to end, cancelling again while it runs: on 3.11 one cancel is swallowed by an
+    asyncio.wait_for (asyncssh's own `run(timeout=)` included) that it reaches as the inner call completes, and the
+    step would go on to its next remote command beside the renter's pod. A step's own cleanup (the remote kill) runs
+    under `runner.run_to_end`, so a repeated cancel never cuts it short."""
+    while not task.done():
+        task.cancel()
+        await asyncio.wait({task}, timeout=RENT_POLL_SECONDS)
+    if not task.cancelled():
+        task.exception()  # retrieved: a step that raised while cancelled is not logged as never awaited
+
+
 class Pipeline:
     def __init__(
         self,
@@ -866,17 +878,14 @@ class Pipeline:
                     break
                 pod = await rent_requested_since_cycle_start(ctx)
                 if pod:
-                    task.cancel()
-                    await asyncio.gather(task, return_exceptions=True)
+                    await _cancel_until_done(task)
                     return [], ctx, pod
             ran_checks, after = await task
             return ran_checks, after, None
         finally:
             # this run cancelled from outside (JOB_TIME_OUT): the step goes with it, and its own cleanup (the remote
             # kill) finishes before the caller closes the SSH session
-            if not task.done():
-                task.cancel()
-                await asyncio.gather(task, return_exceptions=True)
+            await _cancel_until_done(task)
 
     async def run(self, ctx: Context) -> Tuple[bool, list[ValidationEvent], Context]:
         passed, events, end_ctx = await self._run_checks(ctx)

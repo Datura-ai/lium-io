@@ -31,6 +31,7 @@ from services.verifyx_validation_service import (
 
 from ..messages import VerifyXMessages as Msg, render_message, shown
 from ..pipeline import CheckResult, Context
+from ..runner import run_to_end
 from .disk_space import DiskSpaceCheck
 from .rental_probe import has_standing_failure
 from .network_ema import compute_ema
@@ -378,7 +379,7 @@ class VerifyXCheck:
                     **sizing,
                 )
             except asyncio.CancelledError:
-                await asyncio.shield(_kill_or_remember_run(ctx, run_dir))
+                await run_to_end(_kill_or_remember_run(ctx, run_dir))
                 raise
 
         prev_ema = (

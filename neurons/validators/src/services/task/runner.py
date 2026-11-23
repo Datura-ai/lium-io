@@ -2,7 +2,7 @@ import asyncio
 import time
 import uuid
 from datetime import UTC, datetime
-from typing import Optional
+from typing import Awaitable, Optional
 
 import asyncssh
 from pydantic import BaseModel
@@ -51,7 +51,9 @@ class SSHCommandRunner:
             start = datetime.now(UTC)
             t0 = time.perf_counter()
             try:
-                result = await asyncio.wait_for(self.ssh.run(cmd, input=stdin_text), timeout=timeout)
+                # asyncio.timeout, not wait_for: on 3.11 wait_for drops a cancel that lands as the command completes
+                async with asyncio.timeout(timeout):
+                    result = await self.ssh.run(cmd, input=stdin_text)
                 dt = int((time.perf_counter() - t0) * 1000)
                 stdout = str(result.stdout) or ""
                 stderr = str(result.stderr) or ""
@@ -170,6 +172,20 @@ async def run_killed_on_cancel(
     try:
         return await runner.run(wrapped, timeout=seconds, retryable=False, stdin_text=stdin_text)
     except asyncio.CancelledError:
-        # shielded: a second cancel must not stop the kill
-        await asyncio.shield(runner.run(kill, timeout=10, retryable=False))
+        await run_to_end(runner.run(kill, timeout=10, retryable=False))
         raise
+
+
+async def run_to_end(aw: Awaitable) -> None:
+    """Await `aw` (a step's cleanup) to its end through any number of cancels, then re-raise the cancel if one came:
+    the pipeline re-cancels a step until it ends, and the cleanup must still finish before the caller closes the
+    session."""
+    task = asyncio.ensure_future(aw)
+    cancelled = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            cancelled = True
+    if cancelled:
+        raise asyncio.CancelledError()

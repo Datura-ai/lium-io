@@ -35,6 +35,7 @@ from ..messages import NO_OUTBOUND_INTERNET_REMEDIATION, OutboundInternetMessage
 from ..messages import RentalProbeMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
+from ..runner import run_to_end
 from .outbound_internet import EGRESS_PROBE_SCRIPT, parse_egress_probe
 from .rental_owner import rental_of_this_node
 from .ssh_identification import SSH_ID_LINE_MAX, is_ssh2_identification, read_ssh_identification
@@ -1205,17 +1206,7 @@ async def _step_teardown(
     (the first one, or a second) interrupts only this wait, never the settle, and is re-raised once
     the settle is done so the run still ends as cancelled.
     """
-    settle = asyncio.ensure_future(
-        _settle(ctx, outcome, created=created, pod_id=pod_id, log_extra=log_extra)
-    )
-    cancelled = False
-    while not settle.done():
-        try:
-            await asyncio.shield(settle)
-        except asyncio.CancelledError:
-            cancelled = True
-    if cancelled:
-        raise asyncio.CancelledError()
+    await run_to_end(_settle(ctx, outcome, created=created, pod_id=pod_id, log_extra=log_extra))
 
 
 # Passed probes' teardowns still running: the loop keeps only a weak reference to a task.

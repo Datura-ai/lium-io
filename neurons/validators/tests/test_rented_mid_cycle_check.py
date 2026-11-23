@@ -6,6 +6,7 @@ import signal
 import sys
 import time
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -22,7 +23,7 @@ from services.task.checks.verifyx import VerifyXCheck
 from services.task.messages import TenantEnforcementMessages as Msg, render_message
 from services.task.pipeline import CheckResult, Pipeline, ParallelStage
 from services.task.pipeline_factory import PipelineFactory
-from services.task.runner import SSHCommandResult
+from services.task.runner import SSHCommandResult, SSHCommandRunner, run_killed_on_cancel, run_to_end
 
 from clients.compute_client import ComputeClient
 from core.config import settings
@@ -318,9 +319,12 @@ class SlowCleanupStep(HeavyStep):
         try:
             await asyncio.sleep(10)
         except asyncio.CancelledError:
-            await asyncio.sleep(0.05)
-            self.cleaned_up = True
+            await run_to_end(self._clean_up())
             raise
+
+    async def _clean_up(self):
+        await asyncio.sleep(0.05)
+        self.cleaned_up = True
 
 
 @pytest.mark.asyncio
@@ -381,6 +385,121 @@ async def test_an_outside_cancel_is_never_lost_to_a_rent_read_that_completes_in_
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(run, 1.5)
     assert step.proc.returncode == -signal.SIGKILL and not step.finished
+
+
+class LosesTheFirstCancelStep(HeavyStep):
+    """Like a 3.11 wait_for (asyncssh's own `run(timeout=)`) reached as its command completes: the first cancel is
+    lost and the step goes on to its next remote command."""
+
+    def __init__(self, redis: FakeRedis | None = None):
+        super().__init__(redis)
+        self.started = asyncio.Event()
+        self.went_on = False
+
+    async def run(self, ctx):
+        self.started.set()
+        try:
+            if self.redis is not None:
+                mark(self.redis, "pod-new")
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            pass
+        self.went_on = True
+        return await self._next_command(ctx)
+
+    async def _next_command(self, ctx):
+        try:
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
+        self.finished = True
+        return CheckResult(passed=True, event=render_message(Msg.NOT_RENTED, ctx=ctx, check_id=self.check_id, what={}))
+
+
+@pytest.mark.parametrize("staged", [False, True])
+@pytest.mark.asyncio
+async def test_a_rent_stops_a_step_that_lost_the_first_cancel(staged):
+    ctx = make_ctx()
+    step = LosesTheFirstCancelStep(ctx.services.redis)
+
+    ok, events, _ = await asyncio.wait_for(
+        Pipeline([ParallelStage([[step]]) if staged else step], AsyncMock()).run(ctx), 2
+    )
+
+    assert not ok and step.went_on and step.cancelled and not step.finished
+    assert events[-1].reason_code == Msg.RENTED_SINCE_CYCLE_START.reason
+
+
+@pytest.mark.asyncio
+async def test_an_outside_cancel_stops_a_step_that_lost_the_first_cancel():
+    step = LosesTheFirstCancelStep()
+    run = asyncio.ensure_future(Pipeline([step], AsyncMock()).run(make_ctx()))
+    await step.started.wait()
+
+    run.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(run, 2)
+
+    assert step.went_on and step.cancelled and not step.finished
+
+
+class SlowKillRunner:
+    """The probe never ends; the kill takes a moment, during which the pipeline cancels the step again."""
+
+    def __init__(self):
+        self.started = asyncio.Event()
+        self.killed = False
+
+    async def run(self, cmd, **_):
+        if not self.started.is_set():
+            self.started.set()
+            await asyncio.sleep(3600)
+        await asyncio.sleep(0.1)
+        self.killed = True
+        now = datetime.now(UTC)
+        return SSHCommandResult(
+            command=cmd, command_id="k", exit_code=0, stdout="", stderr="", duration_ms=0,
+            started_at=now, finished_at=now, success=True,
+        )
+
+
+@pytest.mark.asyncio
+async def test_a_probes_remote_kill_finishes_through_a_second_cancel():
+    runner = SlowKillRunner()
+    task = asyncio.ensure_future(run_killed_on_cancel(runner, "probe", seconds=60))
+    await runner.started.wait()
+
+    task.cancel()
+    await asyncio.sleep(0.02)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert runner.killed
+
+
+class HeldSSH:
+    def __init__(self):
+        self.result = asyncio.get_running_loop().create_future()
+        self.called = asyncio.Event()
+
+    async def run(self, cmd, input=None):
+        self.called.set()
+        return await self.result
+
+
+@pytest.mark.asyncio
+async def test_a_cancel_that_lands_as_an_ssh_command_completes_is_not_lost():
+    ssh = HeldSSH()
+    task = asyncio.ensure_future(SSHCommandRunner(ssh).run("true"))
+    await ssh.called.wait()
+
+    ssh.result.set_result(SimpleNamespace(exit_status=0, stdout="", stderr=""))
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
 
 
 @pytest.mark.asyncio
