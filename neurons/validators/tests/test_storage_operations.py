@@ -978,6 +978,47 @@ async def test_a_waiter_never_removes_the_files_of_a_launch_that_follows_the_run
 
 
 @pytest.mark.asyncio
+async def test_a_waiter_never_pairs_the_ended_runs_state_with_the_identity_of_the_run_recorded_after_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # review at 1b473b8: the waiter reads EXITED for the old run, then a launch records a new run before the waiter
+    # reads the identity; the cleanup must not take the new run for the one that ended
+    monkeypatch.setattr(storage_operations, "REMOTE_OPERATION_DIRECTORY", tmp_path)
+    files = storage_operations.StorageOperationFiles.for_operation(OPERATION_ID)
+    Path(str(files.lock)).parent.mkdir(parents=True)
+    dead = subprocess.Popen(["true"])
+    dead_start = _start_time(dead.pid)
+    dead.wait()
+    pid, start, spec = tmp_path / f"{OPERATION_ID}.pid", tmp_path / f"{OPERATION_ID}.start", Path(str(files.spec))
+    start.write_text(dead_start + "\n")
+    pid.write_text(f"{dead.pid}\n")
+    local = _local_ssh()
+    incumbent = subprocess.Popen(["sleep", "60"])
+    new_launch = (
+        f"printf '%s\\n' '{{}}' > {spec}; printf '%s\\n' {_start_time(incumbent.pid)} > {start}; "
+        f"printf '%s\\n' {incumbent.pid} > {pid}; "
+    )
+    mark = f"printf '%s' {storage_operations._RUN_MARK}"
+    launched: list[bool] = []
+
+    async def run(command: str, check: bool = False, input: str | None = None) -> SimpleNamespace:
+        if mark in command and not launched:
+            launched.append(True)  # the new launch records its run right after the waiter judged the state
+            command = command.replace(mark, new_launch + mark)
+        return await local.run(command, check, input)
+
+    try:
+        with pytest.raises(storage_operations.StorageOperationLaunchError, match="disappeared"):
+            await storage_operations.wait_for_storage_operation(SimpleNamespace(run=run), files, poll_interval_seconds=0)
+    finally:
+        incumbent.kill()
+    assert launched
+    assert spec.exists()
+    assert pid.read_text() == f"{incumbent.pid}\n"
+    assert start.read_text() == _start_time(incumbent.pid) + "\n"
+
+
+@pytest.mark.asyncio
 async def test_a_launch_held_up_by_another_operation_still_starts_its_runner(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

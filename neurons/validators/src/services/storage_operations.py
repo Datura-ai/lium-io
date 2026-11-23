@@ -505,12 +505,18 @@ async def _observe_operation(
     pid_path = shlex.quote(str(files.pid))
     command = (
         _owned_shell_function(files)
-        + f"if test -s {status_path}; then printf 'STATUS:'; cat {status_path}; "
-        f"elif test -s {pid_path}; then pid=$(cat {pid_path}); "
-        "case \"$pid\" in (*[!0-9]*|'') echo INVALID;; "
+        # the run is read once, before the state, and the state is judged on that read: a launch that records a new
+        # run meanwhile can never pair its identity with the old run's state (a launch writes the start time before
+        # the PID, so a mixed read names no run and its cleanup removes nothing)
+        + f"pid=$(cat {pid_path} 2>/dev/null); start=$(cat {shlex.quote(str(files.start))} 2>/dev/null); "
+        f"if test -s {status_path}; then printf 'STATUS:'; cat {status_path}; "
+        'elif test -n "$pid"; then '
+        "case \"$pid\" in (*[!0-9]*) echo INVALID;; "
         '(*) if owned "$pid" && kill -0 "$pid" 2>/dev/null; then echo RUNNING; else echo EXITED; fi;; esac; '
         "else echo STARTING; fi; "
-        f"printf '%s' {_RUN_MARK}; cat {pid_path} {shlex.quote(str(files.start))} 2>/dev/null"
+        # the same text the cleanup's `$(cat pid start)` reads for this run
+        f"printf '%s' {_RUN_MARK}; "
+        'for value in "$pid" "$start"; do test -z "$value" || printf \'%s\\n\' "$value"; done'
     )
     result = await ssh_client.run(command, check=False)
     state, _, run = (result.stdout or "").partition(_RUN_MARK)
