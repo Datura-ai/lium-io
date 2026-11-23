@@ -33,6 +33,11 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # the staging validator, as the executor's dev image (executor_cd_dev.yml): a non-prod image trusts its own
+      # validator and reads no signed validator message
+      - name: Name the staging validator
+        run: echo '_VALIDATOR_HOTKEY_SS58 = "5DHgdomxxHSQf7neJWcagvGhTMKpqvKWwuprEaFF8C653qty"' > neurons/miners/src/core/config_override.py
+
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
         with:
