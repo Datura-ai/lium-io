@@ -411,6 +411,9 @@ class RentalPriceIncentive(DefaultIncentive):
         if ram_gb * RAM_MEMTOTAL_TOLERANCE >= vram_gb * MIN_RAM_TO_VRAM_RATE:
             return None
         required_ram_gb = round(vram_gb * MIN_RAM_TO_VRAM_RATE / RAM_MEMTOTAL_TOLERANCE, 1)
+        if required_ram_gb * RAM_MEMTOTAL_TOLERANCE < vram_gb * MIN_RAM_TO_VRAM_RATE:
+            # nearest rounding went below the floor: name the next reading the check above accepts
+            required_ram_gb = round(required_ram_gb + 0.1, 1)
         return InsufficientRam(
             vram_gb=vram_gb, ram_gb=ram_gb, rate=MIN_RAM_TO_VRAM_RATE, required_ram_gb=required_ram_gb
         )

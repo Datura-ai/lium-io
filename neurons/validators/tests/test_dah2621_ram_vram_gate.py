@@ -68,3 +68,14 @@ async def test_a_scrape_without_ram_fails_open_and_says_so(enforced, caplog):
 
     assert "insufficient_ram_for_vram" not in _codes(result)
     assert "Cannot measure system RAM against GPU VRAM" in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("vram", [32, 48, 80, 141, 21])
+async def test_the_ram_the_rejection_names_earns_idle_pay(enforced, vram):
+    # 32 GB VRAM: 16/1.05 = 15.238 rounded to nearest named 15.2 GB, which the gate still rejected
+    measured = _incentive()._insufficient_ram(_node(1, vram, 8))
+
+    result = await _incentive().calculate_executor_score(_node(1, vram, measured.required_ram_gb))
+
+    assert "insufficient_ram_for_vram" not in _codes(result)
