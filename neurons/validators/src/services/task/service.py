@@ -99,6 +99,9 @@ class TaskService:
         self.wallet = settings.get_bittensor_wallet()
         # DAH-3019: the start reports run in the background; the set keeps them referenced until done.
         self._start_reports: set[asyncio.Task] = set()
+        # DAH-3405: the wave results holding a verified-job reset for the cycle end; kept here, not only on the
+        # miner's job, so a job that times out before the cycle end still has its resets sent
+        self.results_holding_a_reset: list[JobResult] = []
 
         # Initialize pipeline factory with all required services
         self.pipeline_factory = PipelineFactory(
@@ -269,6 +272,8 @@ class TaskService:
                     # decided the verdict stands; the express lane has no rollout withhold and sends it now
                     hold_reset=not first_pass and last_event.reason_code in ROLLOUT_FAILURE_REASONS,
                 )
+                if result.held_verified_job_reset:
+                    self.results_holding_a_reset.append(result)
                 result.attestation_digest = attestation_digest
                 result.tee_type = tee_type
                 result.gpu_attestation_passed = gpu_attestation_passed

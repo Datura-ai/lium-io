@@ -1924,6 +1924,7 @@ class _NonFatalGpuMemoryFinding:
 
 class _PublishedResult:
     score = 0
+    held_verified_job_reset = None
 
 
 class _CleanScrapeAfterDropout:

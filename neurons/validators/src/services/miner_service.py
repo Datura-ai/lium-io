@@ -77,7 +77,8 @@ from services.docker_service import (
     half_started_stop_retry,
     inflight_creates,
 )
-from services.executor_image_policy import ExpectedImageSnapshot
+from services.default_docker_image_digest_service import fetch_executor_image_digest
+from services.executor_image_policy import ExpectedImageSnapshot, normalize_sha256_digest
 from services.node_host import for_payload_miner, public_host_sock
 from services.redis_service import MACHINE_SPEC_CHANNEL, POD_STATES_CHANNEL, RedisService
 from services.efa_link_probe import measure_and_attach as measure_and_attach_efa
@@ -1357,6 +1358,9 @@ class MinerService:
             early = tally.add(job.get("results") or [])
             if not early or not job.get("miner_coldkey"):
                 return
+            if await self._rollout_window_may_open(tally):
+                # DAH-6951: held for the cycle end, which publishes these only if the rollout withhold lets them stand
+                return
             # recorded before the publish: a node hidden by a partial publish must be re-listable too
             tally.published_early.update(str(result.executor_info.uuid) for result in early)
             await self.publish_machine_specs(
@@ -1379,6 +1383,20 @@ class MinerService:
                 _m("Early publish of unreachable nodes failed", extra=get_extra_info({"error": str(exc)})),
                 exc_info=True,
             )
+
+    @staticmethod
+    async def _rollout_window_may_open(tally: RunningOutageTally) -> bool:
+        """DAH-6951: True when this cycle's end may open an executor rollout window, which withholds an unreachable
+        verdict: the registry digest moved since cycle start (a push mid-cycle), or cannot be read now. Nothing goes
+        early then, as in a cycle that starts inside a window. A seen push holds for the rest of the cycle."""
+        if tally.rollout_digest is None or tally.rollout_began:
+            return tally.rollout_began
+        try:
+            digest = normalize_sha256_digest(await fetch_executor_image_digest())
+        except Exception:
+            digest = None
+        tally.rollout_began = digest is not None and digest != tally.rollout_digest
+        return digest is None or tally.rollout_began
 
     async def publish_machine_specs(
         self,

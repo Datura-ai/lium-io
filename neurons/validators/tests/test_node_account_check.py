@@ -377,14 +377,14 @@ async def test_a_dropped_session_during_the_account_read_is_reconnected_through_
     assert end.clear_verified_job_info is (not account_passed and not rented)
 
 
-@pytest.mark.parametrize("in_rollout", [True, False])
-async def test_a_failed_reconnect_sends_its_reset_only_when_the_rollout_does_not_withhold_the_run(
-    in_rollout, monkeypatch
-):
+@pytest.mark.parametrize("case", ["withheld", "stands", "job_timed_out"])
+async def test_a_failed_reconnect_sends_its_reset_only_when_the_rollout_does_not_withhold_the_run(case, monkeypatch):
     """DAH-3405 + DAH-6539, 23 Nov: a recreated executor container dropped the account read and refused the
     reconnect; the run ended on EXECUTOR_TRANSPORT_UNREACHABLE, which the rollout window withheld at cycle end, but
     its NODE_ACCOUNT_UNVERIFIED reset had gone out inside the cycle and hid the node. The reset now waits for the
-    cycle end: dropped with a withheld verdict, sent (the node hidden) when the verdict stands."""
+    cycle end: dropped with a withheld verdict, sent (the node hidden) when the verdict stands. A miner job that
+    timed out before the cycle end never reaches the withhold: nothing withheld its result, so the reset is sent."""
+    from types import SimpleNamespace
     from unittest.mock import AsyncMock, MagicMock
 
     from core.validator import Validator
@@ -419,24 +419,28 @@ async def test_a_failed_reconnect_sends_its_reset_only_when_the_rollout_does_not
     result.failure_reason_code = last.reason_code
     redis.clear_verified_job_info.assert_not_awaited()
 
-    # the cycle end
+    # the cycle end; TaskService.create_task kept the result for it
     window = RolloutWindow(
         digest="sha256:" + "b" * 64, previous_digest="sha256:" + "a" * 64, started_at=None,
-        opened_job_block=7500 if in_rollout else None, cycles_seen=1, grace_cycles=2,
+        opened_job_block=None if case == "stands" else 7500, cycles_seen=1, grace_cycles=2,
     )
     validator = Validator.__new__(Validator)
     validator.default_extra = {}
     validator.redis_service = redis
+    validator.miner_service = SimpleNamespace(task_service=SimpleNamespace(results_holding_a_reset=[result]))
     validator.rollout_tracker = MagicMock(record_withheld=AsyncMock())
     validator.fetch_executor_digest_or_none = AsyncMock(return_value=window.digest)
     validator.observe_executor_rollout = AsyncMock(return_value=window)
-    standing, withheld = await validator.withhold_verdicts_for_rollout({POOL: [result]}, 7500, "batch-1", window)
+    # the timed-out miner job was cancelled: its results never reach the cycle end
+    cycle = {} if case == "job_timed_out" else {POOL: [result]}
+    standing, withheld = await validator.withhold_verdicts_for_rollout(cycle, 7500, "batch-1", window)
+    assert validator.miner_service.task_service.results_holding_a_reset == []
 
-    if in_rollout:
+    if case == "withheld":
         assert [w.result for w in withheld] == [result]
         redis.clear_verified_job_info.assert_not_awaited()
     else:
-        assert standing == {POOL: [result]}
+        assert standing == cycle and not withheld
         redis.clear_verified_job_info.assert_awaited_once()
         reset = redis.clear_verified_job_info.await_args.kwargs
         assert reset["executor_id"] == "node-1"

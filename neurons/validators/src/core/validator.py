@@ -553,6 +553,7 @@ class Validator:
                         )
                 # DAH-5635: a fresh running share per cycle. None inside an executor rollout window,
                 # where the cycle withholds an unreachable verdict that an early publish would leak.
+                # DAH-6951: a window this cycle's end opens (a push mid-cycle) is caught by the tally's rollout_digest
                 self.miner_service.outage_tally = (
                     None
                     if rollout_window.covers(job_block)
@@ -562,6 +563,7 @@ class Validator:
                             str(executor_id).lower()
                             for executor_id in (rented_executors.executors if rented_executors else {})
                         ),
+                        rollout_digest=rollout_window.digest,
                     )
                 )
                 # every listed rented pod's SSH (any status), probed once while the miners work
@@ -1638,7 +1640,7 @@ class Validator:
         standing, withheld_results = withhold_rollout_verdicts(all_job_results, window, job_block)
         await self.record_withheld_verdicts(window, withheld_results, job_batch_id, job_block)
         # a withheld result's held verified-job reset is dropped with it: it would hide the node like a verdict
-        await self.send_held_verified_job_resets(standing)
+        await self.send_held_verified_job_resets(withheld_results)
         standing, held_for_gpu_reset = withhold_renter_gpu_reset_verdicts(standing)
         standing, session_lost = withhold_session_lost_verdicts(standing)
         rental_changed = []
@@ -1649,23 +1651,29 @@ class Validator:
             )
         return standing, withheld_results + held_for_gpu_reset + session_lost + rental_changed
 
-    async def send_held_verified_job_resets(self, standing: dict[str, list[JobResult]]) -> None:
-        """DAH-3405: send the verified-job reset each standing result held back for the rollout decision."""
-        for results in standing.values():
-            for result in results:
-                if not result.held_verified_job_reset:
-                    continue
-                try:
-                    await self.redis_service.clear_verified_job_info(**result.held_verified_job_reset)
-                except Exception as exc:
-                    logger.error(
-                        _m(
-                            "[rollout-grace] could not send a held verified-job reset",
-                            extra=get_extra_info(
-                                {**self.default_extra, "executor_uuid": result.executor_info.uuid, "error": str(exc)}
-                            ),
+    async def send_held_verified_job_resets(self, withheld_results: list[WithheldVerdict]) -> None:
+        """DAH-3405: send every verified-job reset the cycle's wave runs held back for the rollout decision, except
+        those of the results the rollout window withheld. A result whose miner job timed out before the cycle end
+        never reached the withhold, so nothing withheld it: it stands and its reset is sent."""
+        task_service = self.miner_service.task_service
+        held, task_service.results_holding_a_reset = task_service.results_holding_a_reset, []
+        # by node, not object: a result may be copied on its way to the cycle end
+        withheld = {(w.miner_hotkey, str(w.result.executor_info.uuid)) for w in withheld_results}
+        for result in held:
+            reset = result.held_verified_job_reset
+            if (reset["miner_hotkey"], str(reset["executor_id"])) in withheld:
+                continue
+            try:
+                await self.redis_service.clear_verified_job_info(**reset)
+            except Exception as exc:
+                logger.error(
+                    _m(
+                        "[rollout-grace] could not send a held verified-job reset",
+                        extra=get_extra_info(
+                            {**self.default_extra, "executor_uuid": result.executor_info.uuid, "error": str(exc)}
                         ),
-                    )
+                    ),
+                )
 
     async def publish_session_lost_findings(
         self,

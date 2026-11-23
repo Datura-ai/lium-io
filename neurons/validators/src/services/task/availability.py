@@ -351,8 +351,14 @@ class RunningOutageTally:
     our own outage. A result from another job_batch_id is ignored. The cycle starts a fresh one.
     """
 
-    def __init__(self, job_batch_id: str, rented_executor_ids: frozenset[str] = frozenset()):
+    def __init__(
+        self, job_batch_id: str, rented_executor_ids: frozenset[str] = frozenset(), rollout_digest: str | None = None
+    ):
         self.job_batch_id = job_batch_id
+        # DAH-6951: the executor image digest the rollout tracker knew at cycle start; a registry digest other than
+        # it means a push landed in this cycle and its end opens a rollout window. None: no digest to compare with
+        self.rollout_digest = rollout_digest
+        self.rollout_began = False
         # the backend's rented list at cycle start: a failure is built before the result knows its rentals
         self.rented_executor_ids = rented_executor_ids
         self.checked_count = 0

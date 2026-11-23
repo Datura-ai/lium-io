@@ -204,3 +204,40 @@ async def test_a_partial_finding_forgets_the_remembered_list_unless_it_is_the_ea
 
     assert bool(service.cycle_published_availability) is kept
 
+
+
+OLD, NEW = "sha256:" + "a" * 64, "sha256:" + "b" * 64
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("registry", "published"),
+    [(OLD, True), (NEW, False), (None, False), (RuntimeError("registry down"), False)],
+    ids=["no-push", "push-mid-cycle", "registry-no-answer", "registry-error"],
+)
+async def test_a_push_mid_cycle_holds_the_early_publish_for_the_rollout_withhold(monkeypatch, registry, published):
+    """DAH-6951: a push landing mid-cycle opens a rollout window at this cycle's end, which withholds an unreachable
+    verdict; an early publish would already have hidden the node. Such a node is held for the cycle end, which
+    publishes it only if its verdict stands. With the registry where it was at cycle start, it goes early as before."""
+    from services.executor_rollout import RolloutWindow, withhold_rollout_verdicts
+
+    reads = AsyncMock(side_effect=registry) if isinstance(registry, Exception) else AsyncMock(return_value=registry)
+    monkeypatch.setattr("services.miner_service.fetch_executor_image_digest", reads)
+    candidate = _result([SSH])
+    candidate.failure_reason_code = "EXECUTOR_SSH_UNREACHABLE"
+    service = _service(RunningOutageTally(BATCH, rollout_digest=OLD))
+
+    await service.publish_unreachable_early(_job(_healthy(9) + [candidate]))
+    assert service.publish_machine_specs.await_count == (1 if published else 0)
+
+    if registry == NEW:
+        # the cycle end opens the window and withholds the held node: it is never published this cycle
+        window = RolloutWindow(
+            digest=NEW, previous_digest=OLD, started_at=None, opened_job_block=7500, cycles_seen=1, grace_cycles=2
+        )
+        _, withheld = withhold_rollout_verdicts({"miner-hotkey": [candidate]}, window, 7500)
+        assert [w.result for w in withheld] == [candidate]
+        # a seen push holds the rest of the cycle without asking the registry again
+        await service.publish_unreachable_early(_job([_result([SSH])]))
+        service.publish_machine_specs.assert_not_awaited()
+        reads.assert_awaited_once()

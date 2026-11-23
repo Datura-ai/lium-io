@@ -7,6 +7,7 @@ containers under the validator's SSH sessions, and the cycle read the fleet as 1
 """
 
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import asyncssh
@@ -211,6 +212,7 @@ def _validator_process(tracker: ExecutorRolloutTracker) -> Validator:
     validator_process = Validator.__new__(Validator)
     validator_process.default_extra = {}
     validator_process.rollout_tracker = tracker
+    validator_process.miner_service = _miner_service({})
     return validator_process
 
 
@@ -261,6 +263,7 @@ def _miner_service(published: dict[tuple[str, str], list[dict]]) -> MinerService
     service = MinerService.__new__(MinerService)
     service.cycle_published_availability = published
     service.publish_machine_specs = AsyncMock()
+    service.task_service = SimpleNamespace(results_holding_a_reset=[])
     return service
 
 
