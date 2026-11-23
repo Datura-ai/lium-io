@@ -20,7 +20,7 @@ jobs:
       id-token: write
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Make scripts executable
         run: |
@@ -31,11 +31,11 @@ jobs:
 
       # arm64 is emulated on this x86 runner; the container builder is what can write a multi-arch OCI archive
       # pinned to reviewed commits: these run with id-token: write before the push
-      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
         with:
           # the actions default to mutable tags (binfmt:latest, buildkit:buildx-stable-1); pin the images by digest
           image: docker.io/tonistiigi/binfmt:qemu-v10.2.3@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0
-      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
         with:
           driver-opts: image=moby/buildkit:v0.33.1@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea
 
@@ -49,7 +49,7 @@ jobs:
           echo "IMAGE_NAME=${IMAGE_NAME}" >> $GITHUB_ENV
 
       - name: Log in to Docker Hub (OIDC, no stored token)
-        uses: docker/login-action@v4   # >= 4.5.0 for Docker Hub OIDC
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0 (>= 4.5.0 for Docker Hub OIDC)
         env:
           DOCKERHUB_OIDC_CONNECTIONID: ${{ vars.DOCKERHUB_OIDC_CONNECTIONID }}
           # The exchanged token is the docker password for the rest of the job (default 300 s);
@@ -78,7 +78,7 @@ jobs:
           echo "IMAGE_NAME=${IMAGE_NAME}" >> $GITHUB_ENV
 
       - name: Log in to Docker Hub again for the runner push (OIDC)
-        uses: docker/login-action@v4   # >= 4.5.0 for Docker Hub OIDC
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0 (>= 4.5.0 for Docker Hub OIDC)
         env:
           DOCKERHUB_OIDC_CONNECTIONID: ${{ vars.DOCKERHUB_OIDC_CONNECTIONID }}
           # The exchanged token is the docker password for the rest of the job (default 300 s);
@@ -112,7 +112,7 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       TAG: ${{ github.ref_name }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Add the approved runner digest and the expected compose hash to the release
         run: bash neurons/executor/dstacktee/scripts/release_notes_update.sh "$TAG"
