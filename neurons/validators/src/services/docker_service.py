@@ -151,6 +151,7 @@ from services.gpu_clocks import (
 from services.gpu_reset import RECENT_RENTER_GPU_RESET_SECONDS, GpuResetReport, reset_pod_gpus
 from services.gpu_wedge import cure_wedged_gpus, query_wedged_gpu_uuids
 from services.hung_gpu_reset import HungGpuResult, reset_hung_pod_gpus
+from services.host_memory_guard import TIMEOUT_SECONDS as HOST_MEMORY_GUARD_TIMEOUT_SECONDS
 from services.host_memory_guard import apply_host_memory_guard
 from services.image_flatten import (
     FLATTEN_NO_DISK_RENTER_SENTENCE,
@@ -592,6 +593,8 @@ RENTAL_DISK_SHORT_STEP = "rental_disk_short"
 HOST_READ_PID_MAX_STEP = "host_read_pid_max"
 HOST_READ_RAM_KIB_STEP = "host_read_ram_kib"
 HOST_READ_GPU_COUNT_STEP = "host_read_gpu_count"
+# the host memory guard that ends the host reads; its step only names a channel it may still hold
+HOST_MEMORY_GUARD_STEP = "host_memory_guard"
 # each fail-closed host read, on the validator side: its open, then its command
 _HOST_READ_TIMEOUT_SECONDS = 15
 # DAH-5260: `docker volume rm` of the 1561 GB kimi-k3 cache unlinks ~1.5 TB; ext4 frees ~180 GB/s of
@@ -4109,7 +4112,6 @@ class DockerService:
                     pod_id=pod_id,
                     bridge_hold=bridge_hold,
                 )
-            await apply_host_memory_guard(ssh_client, default_extra)
             return container_id
         finally:
             for lease in flatten_lease:
@@ -5309,8 +5311,7 @@ class DockerService:
     ) -> asyncssh.SSHKnownHosts | None:
         """Single chokepoint for every rental-path SSH host-key policy.
 
-        N3 (CVM attestation gap remediation): with ENABLE_RENTAL_HOSTKEY_FAIL_CLOSED
-        an unexpected error here fails closed — no host-key policy means no rental
+        N3 (CVM attestation gap remediation): an unexpected error here fails closed — no host-key policy means no rental
         SSH — instead of silently falling back to unpinned SSH. Rental-path
         freshness rides the most recent validation-cycle attestation; no nonce is
         minted here by design.
@@ -5323,24 +5324,16 @@ class DockerService:
         except AttestationError:
             raise
         except Exception as exc:
-            if settings.ENABLE_RENTAL_HOSTKEY_FAIL_CLOSED:
-                logger.warning(
-                    _m(
-                        "Unable to prepare known_hosts policy — failing closed (no rental SSH)",
-                        extra=get_extra_info({**log_context, "error": str(exc)}),
-                    )
-                )
-                raise AttestationError(
-                    f"Unable to prepare host-key policy for executor "
-                    f"{executor.address}:{executor.port}; refusing unpinned rental SSH"
-                ) from exc
             logger.warning(
                 _m(
-                    "Unable to prepare known_hosts policy",
+                    "Unable to prepare known_hosts policy — failing closed (no rental SSH)",
                     extra=get_extra_info({**log_context, "error": str(exc)}),
                 )
             )
-            return None
+            raise AttestationError(
+                f"Unable to prepare host-key policy for executor "
+                f"{executor.address}:{executor.port}; refusing unpinned rental SSH"
+            ) from exc
 
     async def _skip_probe_held_ports(self, executor_id: str, available_ports: dict, required_port_count: int) -> dict:
         """The backend's free ports less those a running port check holds, unless too few would be left."""
@@ -10893,6 +10886,19 @@ class DockerService:
                 if ram_kib is not None and payload.gpu_uuids:
                     host_read_step = HOST_READ_GPU_COUNT_STEP
                     gpu_count = await self._read_host_gpu_count(connected_ssh_client)
+                # DAH-6379/6916: host-level MemoryMin before any container of this create starts, so a new pod
+                # cannot starve the host services during its readiness wait. Here it overlaps the Docker connect
+                # and, on this session's serial channel, no other step. Logs what it could not apply; a timed-out
+                # guard frees its channel like the reads, and one whose close is not confirmed stops the create
+                host_read_step = HOST_MEMORY_GUARD_STEP
+                await apply_host_memory_guard(
+                    connected_ssh_client,
+                    default_extra,
+                    run=lambda script: _run_closing_channel_on_timeout(
+                        connected_ssh_client, script, HOST_MEMORY_GUARD_TIMEOUT_SECONDS
+                    ),
+                    reraise=(SshSessionMayStillBeTakenError,),
+                )
                 return pid_max, ram_kib, gpu_count
 
             async def after_host_limits_read(
@@ -15760,24 +15766,13 @@ class DockerService:
                 if inflight_creates.is_cancelled(payload.pod_id):
                     logger.info(_m("Cancelled by its delete: no hung GPU reset", extra=get_extra_info(default_extra)))
                     return None
-                shadow = not settings.HUNG_GPU_RESET_ON_REBOOT_ENABLED
                 result = await reset_hung_pod_gpus(
                     SSHCommandRunner(ssh_client, max_retries=0),
                     list(payload.gpu_uuids),
                     resetting=lambda: self._hold_gpu_reset_pending_mark(payload, default_extra),
-                    shadow=shadow,
                 )
         except Exception as exc:
             logger.warning(_m("Hung GPU check on reboot failed", extra=get_extra_info({**default_extra, "error": repr(exc)})))
-            return None
-        if shadow:
-            if result.hung_uuids:
-                logger.warning(
-                    _m(
-                        "Hung pod GPU found on reboot (shadow: no reset)",
-                        extra=get_extra_info({**default_extra, "hung": result.hung_uuids, "detail": result.detail}),
-                    )
-                )
             return None
         if result.warning is None:
             return None
