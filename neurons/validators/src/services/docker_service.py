@@ -6429,7 +6429,10 @@ class DockerService:
             # not full); the tight-disk sweep evicts it later if the pod's writes need the room. The Engy cache is
             # listed as free disk, so it still gives way until the floor fits too.
             volume_needs_free_gb = rental_needs_free_gb - DPHN_CACHE_LISTING_FLOOR_GB + DPHN_CACHE_FREE_MARGIN_GB
-            engy_volumes: set[str] = {name for name in cache_volumes if name.startswith(ENGY_CACHE_VOLUME_PREFIX)}
+            # a provider job's cache is listed as free disk too (DAH-6406), so it gives way like the Engy cache
+            engy_volumes: set[str] = {
+                name for name in cache_volumes if name.startswith((ENGY_CACHE_VOLUME_PREFIX, JOB_CACHE_VOLUME_PREFIX))
+            }
             if not engy_volumes and free_gb >= volume_needs_free_gb:
                 logger.info(
                     _m(
@@ -6790,10 +6793,11 @@ class DockerService:
         limit_gb: float,
         default_extra: dict,
     ) -> float:
-        """A provider job's cache within its limit is ready (0). One over it is removed so the run starts it
-        empty, and the whole limit is charged like a new cache; if docker cannot remove it, it is kept as is."""
+        """A provider job's cache within its limit is charged what it can still grow by, like a partial Engy cache:
+        the job fills it to the limit. One over it is removed so the run starts it empty, and the whole limit is
+        charged like a new cache; if docker cannot remove it, it is kept as is."""
         if held_gb <= limit_gb:
-            return 0
+            return limit_gb - held_gb
         try:
             result = await ssh_client.run(DockerCommand.volume_remove_strict(volume_name))
         except asyncio.CancelledError:
