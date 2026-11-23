@@ -521,8 +521,10 @@ class PipelineFactory:
           `POST /verify` nor VerifyX can spend the rental check's time (DAH-5933 review).
         - `LocalVerifyCheck` runs alone next: its VerifyX challenge measures the node's network, so nothing else
           of ours may be pulling an image or copying a challenge while it does, and the matmul consumes its answer.
-        - The GPU checks (matmul, fault probe, cached template) follow. `RentedSinceStartCheck` right after the matmul
-          halts a node whose customer pod CapabilityCheck found started during the run, before any later GPU workload.
+        - The GPU checks (matmul, fault probe, cached template) follow. `RentedSinceStartCheck` right after the matmul,
+          and again right after the pinned-memory probe, halts a node whose customer pod either of them found started
+          during the run, before any later GPU workload. Every check that re-reads the rentals mid-run is followed by
+          the halt before the next GPU load.
         - VerifyX runs alone after them, its up to 600 s after the rental check instead of before it.
         - The rental probe, score and finalize follow as today.
         The checks run one after another, as in build_checks; a node that would fail there fails here too. A node
@@ -612,6 +614,9 @@ class PipelineFactory:
                 RentedSinceStartCheck(TenantEnforcementCheck(egress_guard=_RENTAL_EGRESS_GUARD_RENTED)),
                 GpuFaultProbeCheck(),
                 PinnedMemoryProbeCheck(),
+                # the pinned-memory probe's hung copy re-reads the rentals too, and puts a customer pod it finds in the
+                # snapshot: halted here, before the NVLink probe or VerifyX loads the GPUs beside it
+                RentedSinceStartCheck(TenantEnforcementCheck(egress_guard=_RENTAL_EGRESS_GUARD_RENTED)),
                 PostRentalGpuRecheckCheck(),
                 NvlinkFaultCheck(),
                 CachedTemplateVerificationCheck(),

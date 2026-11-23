@@ -10,6 +10,7 @@ and decides exactly as the serial pipeline does.
 from __future__ import annotations
 
 import asyncio
+import inspect
 from dataclasses import replace
 from datetime import UTC, datetime
 
@@ -306,7 +307,7 @@ def test_fast_path_checks_are_the_serial_checks_re_ordered():
     serial_ids = sorted(type(c).__name__ for c in serial)
     fast_ids = sorted(type(c).__name__ for c in flat)
     # the one addition: the rented halt again after each rental re-read, for a pod started during the run
-    assert fast_ids == sorted([*serial_ids, *[RentedSinceStartCheck.__name__] * 2]), "no other check added, none dropped"
+    assert fast_ids == sorted([*serial_ids, *[RentedSinceStartCheck.__name__] * 3]), "no other check added, none dropped"
     assert [type(c) for c in PipelineFactory.build_checks(fast_path=True)] == [type(c) for c in fast]
 
     names = [type(c).__name__ for c in fast]
@@ -331,6 +332,17 @@ def test_fast_path_checks_are_the_serial_checks_re_ordered():
     halts = [i for i, name in enumerate(names) if name == RentedSinceStartCheck.__name__]
     assert names.index(PortCountCheck.__name__) < halts[0] < names.index(LocalVerifyCheck.__name__)
     assert halts[1] == names.index(CapabilityCheck.__name__) + 1
+
+
+def test_every_check_that_finds_a_live_workload_mid_run_is_followed_by_the_rented_halt():
+    # gateway review at 3c91209: the pinned-memory probe's hung copy finds the customer pod and writes it into the
+    # snapshot, but VerifyX ran next with no halt; any check that re-reads the rentals this way must be halted after
+    names = [type(c) for c in PipelineFactory.build_fast_path_checks()]
+    finders = [c for c in names if "lium_workload_live_now(" in inspect.getsource(inspect.getmodule(c))]
+
+    assert CapabilityCheck in finders and len(finders) >= 2
+    for finder in finders:
+        assert names[names.index(finder) + 1] is RentedSinceStartCheck, finder.__name__
 
 
 def _rented(executor_uuid="exe-1", pods=(), fillers=()):
