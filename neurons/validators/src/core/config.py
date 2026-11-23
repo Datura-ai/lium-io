@@ -5,6 +5,7 @@ from enum import Enum
 from typing import TYPE_CHECKING, Literal
 
 import bittensor
+import yarl
 from datura.chain import (
     DEFAULT_ENDPOINT_RETRY_AFTER_SECONDS,
     PUBLIC_NODE_SOURCE,
@@ -32,9 +33,17 @@ def _parse_miner_origins(value: str) -> frozenset[tuple[str, int]]:
         if not entry:
             continue
         host, _, port = entry.rpartition(":")
-        host = host.strip("[]")
-        if host and port.isdigit() and 0 < int(port) < 65536:
-            origins.add((host, int(port)))
+        if ":" in host and not host.startswith("["):
+            entry = f"[{host}]:{port}"  # a bare IPv6 address
+        # parsed as the request URL is (miner_service compares yarl's host and port), so an entry matches however its
+        # host is written (case, IPv6 form) and only an ASCII port in range is one: str.isdigit() also accepts '²'
+        try:
+            url = yarl.URL(f"http://{entry}")
+            origin = (url.host, url.explicit_port)
+        except ValueError:
+            origin = None
+        if origin and origin[0] and origin[1] and url.raw_path in ("", "/") and not url.query_string and not url.fragment:
+            origins.add(origin)
         else:
             logger.warning("CONFIGURED_MINER_ORIGINS entry %r is not host:port; skipped", entry)
     return frozenset(origins)

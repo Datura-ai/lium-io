@@ -119,7 +119,11 @@ async def test_a_miner_the_operator_configured_is_reached_at_its_private_address
 async def test_a_malformed_configured_origin_breaks_no_other_request(monkeypatch):
     """A typo in CONFIGURED_MINER_ORIGINS (a port that is not a number) is skipped: the well-formed entry still counts
     and a request to any public miner still goes out (stand check 2381-03)."""
-    monkeypatch.setattr(settings, "CONFIGURED_MINER_ORIGINS", "miner.example.net:abc, good.example.net:9000, :1, x:0")
+    monkeypatch.setattr(
+        settings,
+        "CONFIGURED_MINER_ORIGINS",
+        "miner.example.net:abc, miner.example.net:\u00b2, good.example.net:9000, :1, x:0, y:70000, z:80/path",
+    )
     assert settings.configured_miner_origins() == {("good.example.net", 9000)}
 
     async def handler(request):
@@ -130,6 +134,24 @@ async def test_a_malformed_configured_origin_breaks_no_other_request(monkeypatch
         assert await _request(f"http://127.0.0.1:{port}/executors") == (200, {"ok": True})
     finally:
         await runner.cleanup()
+
+
+@pytest.mark.parametrize(
+    "written, url",
+    [
+        ("Miner.Example.NET:9000", "http://miner.example.net:9000/x"),
+        ("miner.example.net:9000", "http://MINER.Example.net:9000/x"),
+        ("[0:0::1]:9000", "http://[::1]:9000/x"),
+        ("::1:9000", "http://[::1]:9000/x"),
+    ],
+)
+def test_a_configured_origin_matches_however_its_host_is_written(monkeypatch, written, url):
+    """Stand check 2381-03: the entry is compared in the form the request URL's host takes."""
+    import yarl
+
+    monkeypatch.setattr(settings, "CONFIGURED_MINER_ORIGINS", written)
+    target = yarl.URL(url)
+    assert (target.host, target.port) in settings.configured_miner_origins()
 
 
 @pytest.mark.asyncio
