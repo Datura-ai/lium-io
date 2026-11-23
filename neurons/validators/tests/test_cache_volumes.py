@@ -814,17 +814,18 @@ async def test_an_engy_cache_the_host_refused_to_remove_does_not_keep_the_dolphi
 
 
 @pytest.mark.asyncio
-async def test_a_rental_takes_the_engy_cache_before_an_older_dolphin_cache(docker_service, monkeypatch):
-    # the listing offered the Engy cache as free disk, never the Dolphin one, so the Engy family goes first
+@pytest.mark.parametrize("listed_free", ["engy_cache_hf_1561gb_kimi-k3-1a2b3c4d", "job_cache_200gb_0123456789ab"])
+async def test_a_rental_takes_the_engy_cache_before_an_older_dolphin_cache(docker_service, monkeypatch, listed_free):
+    # the listing offered the Engy and job caches as free disk, never the Dolphin one, so they go first
     class InspectingSshClient(FakeSshClient):
         async def run(self, command: str, *args, **kwargs):
             if "volume inspect" in command:
                 self.commands.append(command)
-                body = f"{_KIMI} 2026-10-22T10:00:00Z\ndphn_cache_hf_x 2026-10-01T10:00:00Z"
+                body = f"{listed_free} 2026-10-22T10:00:00Z\ndphn_cache_hf_x 2026-10-01T10:00:00Z"
                 return SimpleNamespace(exit_status=0, stdout=body, stderr="")
             return await super().run(command, *args, **kwargs)
 
-    ssh_client = InspectingSshClient([_KIMI, "dphn_cache_hf_x", "volume_pod"])
+    ssh_client = InspectingSshClient([listed_free, "dphn_cache_hf_x", "volume_pod"])
     monkeypatch.setattr(docker_service, "get_docker_root_dir", AsyncMock(return_value="/var/lib/docker"))
     monkeypatch.setattr(
         docker_service,
@@ -833,7 +834,7 @@ async def test_a_rental_takes_the_engy_cache_before_an_older_dolphin_cache(docke
     )
 
     assert await docker_service.reclaim_dphn_cache_for_rental(ssh_client, _rental(500), {}) is True
-    assert _removed_volumes(ssh_client) == [_KIMI]
+    assert _removed_volumes(ssh_client) == [listed_free]
 
 
 @pytest.mark.asyncio

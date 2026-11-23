@@ -6430,10 +6430,11 @@ class DockerService:
             # listed as free disk, so it still gives way until the floor fits too.
             volume_needs_free_gb = rental_needs_free_gb - DPHN_CACHE_LISTING_FLOOR_GB + DPHN_CACHE_FREE_MARGIN_GB
             # a provider job's cache is listed as free disk too (DAH-6406), so it gives way like the Engy cache
-            engy_volumes: set[str] = {
-                name for name in cache_volumes if name.startswith((ENGY_CACHE_VOLUME_PREFIX, JOB_CACHE_VOLUME_PREFIX))
+            listed_as_free_prefixes = (ENGY_CACHE_VOLUME_PREFIX, JOB_CACHE_VOLUME_PREFIX)
+            volumes_listed_as_free: set[str] = {
+                name for name in cache_volumes if name.startswith(listed_as_free_prefixes)
             }
-            if not engy_volumes and free_gb >= volume_needs_free_gb:
+            if not volumes_listed_as_free and free_gb >= volume_needs_free_gb:
                 logger.info(
                     _m(
                         "Keeping the Dolphin cache: the customer rental's volume fits beside it",
@@ -6496,8 +6497,8 @@ class DockerService:
                 # the one free-disk reading both the fit and the clamp use, so they never disagree (lio#2219 review)
                 return await self._get_fs_available_bytes(ssh_client, docker_root_dir) / (1024**3)
 
-            async def engy_gone() -> bool:
-                # `volume rm ... || true` exits 0 either way: an Engy cache is gone only once docker no longer lists it
+            async def listed_as_free_gone() -> bool:
+                # `volume rm ... || true` exits 0 either way: a listed-as-free cache is gone only once docker no longer lists it
                 # (or the wipe emptied it), so a failed removal never lets the Dolphin cache stay (lio#2272 review)
                 try:
                     listed = await ssh_client.run('/usr/bin/docker volume ls --format "{{.Name}}"')
@@ -6505,13 +6506,13 @@ class DockerService:
                     raise
                 except Exception:
                     return False
-                return listed.exit_status == 0 and not (set((listed.stdout or "").split()) & engy_volumes) - emptied
+                return listed.exit_status == 0 and not (set((listed.stdout or "").split()) & volumes_listed_as_free) - emptied
 
             async def rental_fits() -> bool:
                 free_now = await free_now_gb()
                 if free_now >= rental_needs_free_gb:
                     return True
-                return free_now >= volume_needs_free_gb and (not engy_volumes or await engy_gone())
+                return free_now >= volume_needs_free_gb and (not volumes_listed_as_free or await listed_as_free_gone())
 
             killed: tuple[str, ...] = tuple(killed_fillers)
 
@@ -6537,7 +6538,7 @@ class DockerService:
                     cache_volumes,
                     remove,
                     rental_fits,
-                    evict_first_prefix=ENGY_CACHE_VOLUME_PREFIX,
+                    evict_first_prefix=listed_as_free_prefixes,
                     volume_remove=volume_remove,
                     keep_image=payload.docker_image,
                 )

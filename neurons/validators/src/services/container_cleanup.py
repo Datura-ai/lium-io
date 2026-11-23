@@ -120,7 +120,7 @@ async def evict_cache_volumes_oldest_first(
     volume_names: list[str],
     run_removal: Callable[[str], Awaitable[object]],
     has_room: Callable[[], Awaitable[bool]],
-    evict_first_prefix: str | None = None,
+    evict_first_prefix: str | tuple[str, ...] | None = None,
     volume_remove: Callable[[str], str] = DockerCommand.volume_remove,
     keep_image: str | None = None,
 ) -> None:
@@ -147,7 +147,7 @@ async def evict_cache_volumes_oldest_first(
     await run_removal(idle_filler_images_removal_command(keep_image))
     if await has_room():
         return
-    # DAH-5260: a rental passes the Engy prefix, the cache its listing offered as free disk
+    # DAH-5260: a rental passes the prefixes of the caches its listing offered as free disk (Engy, provider job)
     ordered: list[str] = sorted(
         volume_names,
         key=lambda name: (
