@@ -19,6 +19,7 @@ from protocol.vc_protocol.compute_requests import (
     FillerRunActiveResponse,
 )
 from services.redis_service import FILLER_REMOVED_BY_VALIDATOR_PREFIX
+from services.upload_nonce import upload_nonce_for_miner
 
 from ...const import (
     FILLER_CONTAINER_PREFIX,
@@ -237,6 +238,8 @@ class RentalVerificationCheck:
                 loopback_plugin=current_loopback_plugin_alias()
                 if settings.LOOPBACK_PLUGIN_V2_ENABLED
                 else LEGACY_LOOPBACK_PLUGIN_ALIAS,
+                # DAH-6606: the backend's upload is dated like this validator's own, so it can be required
+                upload_nonce=upload_nonce_for_miner(miner_hotkey),
                 timeout=int(
                     max(1, min(HEALTH_CHECK_TIMEOUT_SECONDS, task_seconds_left(ctx) - _CLEANUP_RESERVE_SECONDS))
                 ),

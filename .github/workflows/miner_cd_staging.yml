@@ -21,20 +21,28 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+        with:
+          # the action defaults to a mutable BuildKit tag; this job pushes what that builder produces
+          driver-opts: image=moby/buildkit:v0.33.1@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea
 
       - name: Log in to Container registry
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # the staging validator, as the executor's dev image (executor_cd_dev.yml): a non-prod image trusts its own
+      # validator and reads no signed validator message
+      - name: Name the staging validator
+        run: echo '_VALIDATOR_HOTKEY_SS58 = "5DHgdomxxHSQf7neJWcagvGhTMKpqvKWwuprEaFF8C653qty"' > neurons/miners/src/core/config_override.py
+
       - name: Build and push Docker image
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5.4.0
         with:
           context: ./neurons/miners
           build-contexts: |

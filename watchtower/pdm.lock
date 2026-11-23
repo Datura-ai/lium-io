@@ -4,8 +4,8 @@
 [metadata]
 groups = ["default"]
 strategy = ["inherit_metadata"]
-lock_version = "4.5.0"
-content_hash = "sha256:f671e621affcf4d5f652e8ea4154ef59628ddc42fac4658d60019a6e3313cee2"
+lock_version = "4.5.1"
+content_hash = "sha256:d1b2962c9efac07435a6a70aec02c2ac21b5f6eb14f1192316990a81b651aac3"
 
 [[metadata.targets]]
 requires_python = ">=3.11,<3.13"
@@ -364,6 +364,14 @@ files = [
     {file = "colorama-0.4.6-py2.py3-none-any.whl", hash = "sha256:4f1d9991f5acc0ca119f9d443620b77f9d6b33703e51011c16baf57afb285fc6"},
     {file = "colorama-0.4.6.tar.gz", hash = "sha256:08695f5cb7ed6e0531a20572697297273c47b8cae5a63ffc6d6ed5c201be6e44"},
 ]
+
+[[package]]
+name = "datura"
+version = "0.1.2"
+requires_python = "<3.13,>=3.11"
+path = "../datura"
+summary = "Compute subnet shared library"
+groups = ["default"]
 
 [[package]]
 name = "decorator"

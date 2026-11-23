@@ -1,0 +1,50 @@
+{
+  "name": "pinned-actions-required-workflow",
+  "target": "branch",
+  "enforcement": "active",
+  "bypass_actors": [],
+  "conditions": {
+    "ref_name": {
+      "include": [
+        "~DEFAULT_BRANCH"
+      ],
+      "exclude": []
+    },
+    "repository_name": {
+      "include": [
+        "lium-io",
+        "lium"
+      ],
+      "exclude": [],
+      "protected": true
+    }
+  },
+  "rules": [
+    {
+      "type": "workflows",
+      "parameters": {
+        "do_not_enforce_on_create": false,
+        "workflows": [
+          {
+            "path": ".github/workflows/pinned-actions.yml",
+            "repository_id": 823916738,
+            "ref": "refs/heads/main"
+          }
+        ]
+      }
+    },
+    {
+      "type": "required_status_checks",
+      "parameters": {
+        "do_not_enforce_on_create": false,
+        "strict_required_status_checks_policy": true,
+        "required_status_checks": [
+          {
+            "context": "pinned-actions",
+            "integration_id": 15368
+          }
+        ]
+      }
+    }
+  ]
+}

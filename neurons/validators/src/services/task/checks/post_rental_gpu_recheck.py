@@ -10,20 +10,20 @@ clears it. The marker has no expiry (DAH-6355): only a pass ends it.
 
 A card that falls off the bus (GpuModelValidCheck's GPU_DETAILS_MISMATCH) also sets the marker.
 
-A cycle with a filler skips the recheck; after FILLER_SKIP_LIMIT such skips the check removes the
-node's Lium fillers and probes anyway, so a node that always runs a filler cannot skip it for good.
+A cycle with a filler removes the node's Lium fillers and probes at once: the probes would compete with a filler
+for VRAM, and waiting for a cycle without one only delays the passing signal that clears the marker.
 
 GpuLossHoldCheck sets the marker too (source `gpu_loss_hold`) on the first clean read after a GPU dropout. For that
-marker only a pass lets the node list: a failure, a filler skip or a cycle with no verdict fails the node with a
+marker only a pass lets the node list: a failure or a cycle with no verdict (a filler that could not be removed) fails the node with a
 GPU_LOST availability entry (WAITING_AFTER_GPU_LOSS: the backend hides the node, which a failed cycle alone does not
-do while the row is still active) and keeps the marker, where a post-rental recheck lets the node proceed on a skip.
+do while the row is still active) and keeps the marker, where a post-rental recheck lets the node proceed on no verdict.
 """
 
 from __future__ import annotations
 
 import json
 import logging
-from dataclasses import asdict, dataclass, field, fields, replace
+from dataclasses import asdict, dataclass, field, fields
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
@@ -53,9 +53,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 MAX_MARKED_CARDS = 16
-# filler cycles the recheck waits out before it removes the fillers and probes anyway
-FILLER_SKIP_LIMIT = 3
-# GpuLossHoldCheck's marker: a node back from a GPU dropout lists only on a pass, never on a skip or no verdict
+# GpuLossHoldCheck's marker: a node back from a GPU dropout lists only on a pass, never on no verdict
 SOURCE_GPU_LOSS_HOLD = "gpu_loss_hold"
 
 
@@ -73,7 +71,6 @@ class RecheckMarker:
     verdict: str = ""
     flags: list[Any] = field(default_factory=list)
     cards: list[dict[str, str]] = field(default_factory=list)
-    filler_skips: int = 0
     at: str = ""  # when the marker was last written; record_marker sets it
 
     @classmethod
@@ -158,10 +155,7 @@ class PostRentalGpuRecheckCheck:
         what: dict[str, Any] = {"executor_uuid": ctx.executor.uuid, "marker": asdict(marker)}
 
         if get_filler_only_container(ctx):
-            if marker.filler_skips < FILLER_SKIP_LIMIT:
-                # both probes would compete with the filler for VRAM; the marker waits for an idle cycle
-                await record_marker(ctx, replace(marker, filler_skips=marker.filler_skips + 1))
-                return self._not_run(ctx, marker, Msg.FILLER_SKIPPED, what)
+            # both probes would compete with the filler for VRAM
             what["removed_fillers"] = await self._remove_fillers(ctx)
             if not what["removed_fillers"]:
                 # the filler still holds VRAM: a probe OOM here would fail a healthy card
@@ -196,7 +190,7 @@ class PostRentalGpuRecheckCheck:
         )
 
     def _not_run(self, ctx: Context, marker: RecheckMarker, msg, what: dict[str, Any]) -> CheckResult:
-        """No pass this cycle (a filler skip or no verdict): the marker stays. A post-rental recheck lets the node
+        """No pass this cycle (no verdict): the marker stays. A post-rental recheck lets the node
         proceed; a node back from a GPU dropout stays unlisted until the test has passed on every card."""
         if marker.source != SOURCE_GPU_LOSS_HOLD:
             return CheckResult(passed=True, event=render_message(msg, ctx=ctx, check_id=self.check_id, what=what))

@@ -1,9 +1,7 @@
 import ast
 import json
-from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
-from unittest.mock import patch
 
 import pytest
 from neurons.validators.src.protocol.vc_protocol.compute_requests import RentedExecutorsResponse
@@ -23,13 +21,6 @@ from neurons.validators.src.services.task.runner import SSHCommandResult
 from tests.helpers import build_context_config, build_services, build_state, default_executor
 
 PROBE_SOURCE = probe_source()
-
-
-@contextmanager
-def probe_gate(*, enforce_unknown_streak: bool = False):
-    with patch("neurons.validators.src.services.task.checks.gpu_fault_probe.settings") as s:
-        s.GPU_FAULT_PROBE_UNKNOWN_STREAK_ENFORCEMENT_ENABLED = enforce_unknown_streak
-        yield s
 
 
 class FakeRunner:
@@ -113,9 +104,12 @@ def make_ctx(context_factory, runner, *, rented_data=None, first_pass=False):
 
 
 def test_the_fault_enforcement_flag_is_gone():
-    fields = type(module.settings).model_fields
+    from core.config import settings
+
+    fields = type(settings).model_fields
     assert "GPU_FAULT_PROBE_CHECK_ENABLED" not in fields
     assert "GPU_FAULT_PROBE_ENFORCEMENT_ENABLED" not in fields
+    assert "GPU_FAULT_PROBE_UNKNOWN_STREAK_ENFORCEMENT_ENABLED" not in fields
 
 
 @pytest.mark.asyncio
@@ -123,8 +117,7 @@ async def test_first_pass_runs_the_probe(context_factory):
     runner = FakeRunner(probe_stdout("ok"))
     ctx = make_ctx(context_factory, runner, first_pass=True)
 
-    with probe_gate():
-        result = await GpuFaultProbeCheck().run(ctx)
+    result = await GpuFaultProbeCheck().run(ctx)
 
     assert result.event.reason_code == Msg.PROBE_OK.reason
     assert len(runner.calls) == 1
@@ -135,8 +128,7 @@ async def test_probe_source_goes_over_stdin_to_the_executor_interpreter(context_
     runner = FakeRunner(probe_stdout("ok"))
     ctx = make_ctx(context_factory, runner)
 
-    with probe_gate():
-        result = await GpuFaultProbeCheck().run(ctx)
+    result = await GpuFaultProbeCheck().run(ctx)
 
     assert result.passed is True
     assert result.event.reason_code == Msg.PROBE_OK.reason
@@ -158,8 +150,7 @@ async def test_a_fault_fails_the_fatal_check(context_factory):
     stdout = probe_stdout("fault", faults=["gpu 0: gather: 1 of 134217728 elements wrong"])
     ctx = make_ctx(context_factory, FakeRunner(stdout, exit_code=1))
 
-    with probe_gate():
-        result = await GpuFaultProbeCheck().run(ctx)
+    result = await GpuFaultProbeCheck().run(ctx)
 
     assert GpuFaultProbeCheck.fatal is True
     assert result.passed is False
@@ -173,8 +164,7 @@ async def test_nvml_delta_is_a_fault_even_when_every_kernel_passed(context_facto
     stdout = probe_stdout("fault", faults=["gpu 0: uncorrected ECC errors 0 -> 2"])
     ctx = make_ctx(context_factory, FakeRunner(stdout, exit_code=1))
 
-    with probe_gate():
-        result = await GpuFaultProbeCheck().run(ctx)
+    result = await GpuFaultProbeCheck().run(ctx)
 
     assert result.passed is False
     assert result.event.what_we_saw["error"] == "gpu 0: uncorrected ECC errors 0 -> 2"
@@ -188,8 +178,7 @@ async def test_ssh_timeout_is_unknown_not_a_fault(context_factory):
     # like the sibling no-report path
     ctx = make_ctx(context_factory, FakeRunner("", exit_code=-1, error_type="timeout"))
 
-    with probe_gate():
-        result = await GpuFaultProbeCheck().run(ctx)
+    result = await GpuFaultProbeCheck().run(ctx)
 
     assert result.passed is True
     assert result.event.reason_code == Msg.UNKNOWN.reason
@@ -275,8 +264,7 @@ async def test_executor_controlled_report_fields_are_capped_in_the_event(context
     )
     ctx = make_ctx(context_factory, FakeRunner(stdout, exit_code=1))
 
-    with probe_gate():
-        result = await GpuFaultProbeCheck().run(ctx)
+    result = await GpuFaultProbeCheck().run(ctx)
 
     seen = result.event.what_we_saw
     assert len(seen["probe"]["faults"]) == module.MAX_FAULT_LINES
@@ -306,8 +294,7 @@ async def test_a_fault_report_with_non_string_faults_still_fails_the_check(conte
     stdout = probe_stdout("fault", faults=["gpu 0: Xid 79", 7, None, {"x": 1}, True])
     ctx = make_ctx(context_factory, FakeRunner(stdout, exit_code=1))
 
-    with probe_gate():
-        result = await GpuFaultProbeCheck().run(ctx)
+    result = await GpuFaultProbeCheck().run(ctx)
 
     assert result.passed is False
     assert result.event.reason_code == Msg.PROBE_FAILED.reason
@@ -320,8 +307,7 @@ async def test_a_hostile_report_on_the_unknown_path_is_capped_too(context_factor
     stdout = probe_stdout("error", error="E" * 5000, devices=[], faults=[7, None, {"x": 1}])
     ctx = make_ctx(context_factory, FakeRunner(stdout, exit_code=2))
 
-    with probe_gate():
-        result = await GpuFaultProbeCheck().run(ctx)
+    result = await GpuFaultProbeCheck().run(ctx)
 
     assert result.passed is True
     assert result.event.reason_code == Msg.UNKNOWN.reason
@@ -336,8 +322,7 @@ async def test_probe_that_could_not_start_passes_as_unknown(context_factory):
     )
     ctx = make_ctx(context_factory, FakeRunner(stdout, exit_code=2))
 
-    with probe_gate():
-        result = await GpuFaultProbeCheck().run(ctx)
+    result = await GpuFaultProbeCheck().run(ctx)
 
     assert result.passed is True
     assert result.event.reason_code == Msg.UNKNOWN.reason
@@ -351,8 +336,7 @@ async def test_no_report_in_output_passes_as_unknown_with_the_tails(context_fact
         FakeRunner("Traceback ...\n", exit_code=1, stderr="ModuleNotFoundError: ctypes"),
     )
 
-    with probe_gate():
-        result = await GpuFaultProbeCheck().run(ctx)
+    result = await GpuFaultProbeCheck().run(ctx)
 
     assert result.passed is True
     assert result.event.reason_code == Msg.UNKNOWN.reason
@@ -363,8 +347,7 @@ async def test_no_report_in_output_passes_as_unknown_with_the_tails(context_fact
 async def test_malformed_marker_line_is_unknown_not_a_crash(context_factory):
     ctx = make_ctx(context_factory, FakeRunner(PROBE_JSON_MARKER + " [1, 2\n"))
 
-    with probe_gate():
-        result = await GpuFaultProbeCheck().run(ctx)
+    result = await GpuFaultProbeCheck().run(ctx)
 
     assert result.passed is True
     assert result.event.reason_code == Msg.UNKNOWN.reason
@@ -380,8 +363,7 @@ async def test_active_filler_skips_the_probe(context_factory):
     runner = FakeRunner(probe_stdout("ok"))
     ctx = make_ctx(context_factory, runner, rented_data=rented_data)
 
-    with probe_gate():
-        result = await GpuFaultProbeCheck().run(ctx)
+    result = await GpuFaultProbeCheck().run(ctx)
 
     assert result.passed is True
     assert result.event.reason_code == Msg.FILLER_SKIPPED.reason
@@ -724,8 +706,7 @@ async def test_the_recheck_asks_the_probe_to_fail_a_hang_in_the_kernels(context_
     runner = FakeRunner(probe_stdout("ok"))
     ctx = make_ctx(context_factory, runner)
 
-    with probe_gate():
-        await GpuFaultProbeCheck(is_post_rental_recheck=True).run(ctx)
+    await GpuFaultProbeCheck(is_post_rental_recheck=True).run(ctx)
 
     (call,) = runner.calls
     assert " --hang-in-kernels-is-fault; rc=$?" in call["cmd"]

@@ -357,6 +357,10 @@ PYTHON_GPU_DETAILS = [
         "memory_used_mb": 3,
         "graphics_speed": 4,
         "memory_speed": 5,
+        "power_limit": 600,
+        "pcie": 16,
+        "pcie_speed": 8000,
+        "clocks_event_reasons": 0,
     }
 ]
 LIUMD_GPU_DETAILS = [
@@ -370,6 +374,10 @@ LIUMD_GPU_DETAILS = [
         "memory_used_mb": 93,
         "graphics_speed": 94,
         "memory_speed": 95,
+        "power_limit": 420,
+        "pcie": 8,
+        "pcie_speed": 2500,
+        "clocks_event_reasons": 1,
     }
 ]
 PYTHON_SCRAPE = {
@@ -383,8 +391,12 @@ PYTHON_SCRAPE = {
         "utilization": 7,
         "engy_cache_used_gb": 8,
         "containers": 210288,
+        "images": 100,
         "by_container": {"c1": 100},
+        "by_volume": {"v1": 100},
+        "volumes": 200,
     },
+    "gpu_processes": [{"pid": 100, "info": "live", "container_name": "c1"}],
     "docker": {
         "version": "29.10.0",
         "host_cpu_percent": 9,
@@ -404,8 +416,12 @@ LIUMD_SCRAPE = {
         "utilization": 97,
         "engy_cache_used_gb": 98,
         "containers": 210300,
+        "images": 200,
         "by_container": {"c1": 112},
+        "by_volume": {"v1": 112},
+        "volumes": 212,
     },
+    "gpu_processes": [{"pid": 101, "info": "live", "container_name": "c1"}],
     "docker": {
         "version": "29.9.3",
         "host_cpu_percent": 99,
@@ -426,6 +442,122 @@ async def test_specs_are_compared_from_the_post_scrape_snapshot(
     ctx = _ctx(keypair, monkeypatch, verifyx_service, state=state)
 
     record = await _shadow(ctx, FakeLiumd(specs=LIUMD_SCRAPE))
+
+    assert record["specs_agree"] is True
+    assert record["specs_diff"] == []
+
+
+@pytest.mark.asyncio
+async def test_live_host_memory_values_are_not_a_specs_difference(
+    keypair, monkeypatch, verifyx_service
+):
+    python_specs = {
+        **PYTHON_SCRAPE,
+        "host_memory": {"mem_total_kb": 100, "mem_available_kb": 50, "mapped_kb": 10},
+    }
+    liumd_specs = {
+        **LIUMD_SCRAPE,
+        "host_memory": {"mem_total_kb": 100, "mem_available_kb": 40, "mapped_kb": 12},
+    }
+    state = build_state(specs=SPECS, scrape_specs=python_specs)
+    ctx = _ctx(keypair, monkeypatch, verifyx_service, state=state)
+
+    record = await _shadow(ctx, FakeLiumd(specs=liumd_specs))
+
+    assert record["specs_agree"] is True
+    assert record["specs_diff"] == []
+
+
+@pytest.mark.asyncio
+async def test_missing_host_memory_is_still_a_specs_difference(
+    keypair, monkeypatch, verifyx_service
+):
+    python_specs = {**PYTHON_SCRAPE, "host_memory": {"mem_total_kb": 100}}
+    state = build_state(specs=SPECS, scrape_specs=python_specs)
+    ctx = _ctx(keypair, monkeypatch, verifyx_service, state=state)
+
+    record = await _shadow(ctx, FakeLiumd(specs=LIUMD_SCRAPE))
+
+    assert record["specs_agree"] is False
+    assert [diff["path"] for diff in record["specs_diff"]] == ["host_memory"]
+
+
+@pytest.mark.asyncio
+async def test_a_stable_host_memory_value_is_still_compared(
+    keypair, monkeypatch, verifyx_service
+):
+    python_specs = {
+        **PYTHON_SCRAPE,
+        "host_memory": {"mem_total_kb": 100, "mem_available_kb": 50},
+    }
+    liumd_specs = {
+        **LIUMD_SCRAPE,
+        "host_memory": {"mem_total_kb": 90, "mem_available_kb": 40},
+    }
+    state = build_state(specs=SPECS, scrape_specs=python_specs)
+    ctx = _ctx(keypair, monkeypatch, verifyx_service, state=state)
+
+    record = await _shadow(ctx, FakeLiumd(specs=liumd_specs))
+
+    assert record["specs_agree"] is False
+    assert [diff["path"] for diff in record["specs_diff"]] == ["host_memory.mem_total_kb"]
+
+
+@pytest.mark.asyncio
+async def test_live_and_python_timeout_fields_are_not_a_specs_difference(
+    keypair, monkeypatch, verifyx_service
+):
+    python_specs = {
+        **PYTHON_SCRAPE,
+        "egress_ip": "1.1.1.1",
+        "infiniband_ports": [{"state": "active"}],
+        "needrestart_guard": "missing",
+        "needrestart_guard_unguarded": ["sysbox.service"],
+        "needrestart_guard_reason": "a later conf file runs code",
+        "storage_limit_supported": False,
+        "storage_limit_scrape_error": "Test command timed out.",
+        "sysbox_runtime": False,
+        "sysbox_runtime_scrape_error": "Test command timed out.",
+        "interconnect_scrape_error": '"parse: IndexError"',
+    }
+    liumd_specs = {
+        **LIUMD_SCRAPE,
+        "egress_ip": "2.2.2.2",
+        "infiniband_ports": [{"state": "down"}],
+        "needrestart_guard": "present",
+        "needrestart_guard_unguarded": [],
+        "needrestart_guard_reason": "a later conf file runs code",
+        "storage_limit_supported": True,
+        "sysbox_runtime": True,
+        "interconnect_scrape_error": "NVMLError(999)",
+    }
+    state = build_state(specs=SPECS, scrape_specs=python_specs)
+    ctx = _ctx(keypair, monkeypatch, verifyx_service, state=state)
+
+    record = await _shadow(ctx, FakeLiumd(specs=liumd_specs))
+
+    assert record["specs_agree"] is True
+    assert record["specs_diff"] == []
+
+
+@pytest.mark.asyncio
+async def test_a_missing_python_needrestart_guard_does_not_beat_the_node_view(
+    keypair, monkeypatch, verifyx_service
+):
+    python_specs = {
+        **PYTHON_SCRAPE,
+        "needrestart_guard": "missing",
+        "needrestart_guard_unguarded": ["sysbox.service"],
+    }
+    liumd_specs = {
+        **LIUMD_SCRAPE,
+        "needrestart_guard": "present",
+        "needrestart_guard_unguarded": [],
+    }
+    state = build_state(specs=SPECS, scrape_specs=python_specs)
+    ctx = _ctx(keypair, monkeypatch, verifyx_service, state=state)
+
+    record = await _shadow(ctx, FakeLiumd(specs=liumd_specs))
 
     assert record["specs_agree"] is True
     assert record["specs_diff"] == []

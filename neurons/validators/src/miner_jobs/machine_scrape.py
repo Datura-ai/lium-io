@@ -1,6 +1,7 @@
 from ctypes import *
 import sys
 import os
+import difflib
 import glob
 import http.client
 import json
@@ -9,6 +10,7 @@ import shutil
 import socket
 import subprocess
 import threading
+import time
 import psutil
 from functools import wraps
 import hashlib
@@ -693,22 +695,41 @@ FILLER_VOLUME_LABEL_KEY = "io.lium.workload"
 FILLER_VOLUME_LABEL_VALUE = "filler"
 
 
+class DeadlineSocket(socket.socket):
+    # a socket whose every read waits only until the wall-clock `deadline` (time.monotonic()): a reply trickled in
+    # many parts, each inside a per-read timeout, still ends at the deadline
+    deadline = None
+
+    def recv_into(self, *args):
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("the docker read ran out of its time budget")
+        self.settimeout(remaining)
+        return super().recv_into(*args)
+
+
 class UnixSocketHTTPConnection(http.client.HTTPConnection):
-    def __init__(self, socket_path, timeout):
+    def __init__(self, socket_path, timeout, deadline=None):
         super().__init__("localhost", timeout=timeout)
         self.socket_path = socket_path
+        self.deadline = deadline
 
     def connect(self):
-        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        if self.deadline is None:
+            self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        else:
+            self.sock = DeadlineSocket(socket.AF_UNIX, socket.SOCK_STREAM)
+            self.sock.deadline = self.deadline
         self.sock.settimeout(self.timeout)
         self.sock.connect(self.socket_path)
 
 
-def docker_api_get(path):
+def docker_api_get(path, timeout=DOCKER_API_TIMEOUT_SECONDS, deadline=None):
     # read one docker daemon endpoint over its unix socket; the scrape runs inside the privileged
     # executor container, where the host socket is bind-mounted. The CLI reports these sizes as
-    # human strings ("45.08GB"); the API returns exact integers.
-    conn = UnixSocketHTTPConnection(DOCKER_SOCKET_PATH, DOCKER_API_TIMEOUT_SECONDS)
+    # human strings ("45.08GB"); the API returns exact integers. With a `deadline` the whole reply, every part of
+    # its body included, must arrive by then.
+    conn = UnixSocketHTTPConnection(DOCKER_SOCKET_PATH, timeout, deadline)
     try:
         conn.request("GET", path)
         response = conn.getresponse()
@@ -718,6 +739,248 @@ def docker_api_get(path):
         return json.loads(body)
     finally:
         conn.close()
+
+
+# DAH-6379 host memory facts: what the host uses outside the workload containers, swap, hugepages, the mappings
+# outside the containers (where NVIDIA driver memory shows) and the last OOM since boot. Every field the host does not
+# let us read is None with its reason in hm_errors; nothing here fails the scrape.
+HOST_MEMORY_ROOT = "/proc/1/root"  # the host's filesystem: the executor shares the host PID namespace
+WORKLOAD_CONTAINER_PREFIXES = ("pod_", "filler_")
+# one container's memory cgroup on the host: cgroup v2 under systemd or cgroupfs, then v1 (memory controller)
+CONTAINER_MEMORY_CGROUPS = (
+    ("/sys/fs/cgroup/system.slice/docker-{id}.scope", "memory.current"),
+    ("/sys/fs/cgroup/docker/{id}", "memory.current"),
+    ("/sys/fs/cgroup/memory/system.slice/docker-{id}.scope", "memory.usage_in_bytes"),
+    ("/sys/fs/cgroup/memory/docker/{id}", "memory.usage_in_bytes"),
+)
+KMSG_PATH = "/dev/kmsg"
+KMSG_MAX_READS = 200000
+# both workload listings together, out of the scrape's own 300 s budget: past it the listing is unknown, never a timeout
+HOST_MEMORY_INVENTORY_SECONDS = 5
+
+
+def parse_meminfo_kb(text):
+    # /proc/meminfo as {name: kB}; HugePages_* are page counts, not kB, and are returned as is
+    values = {}
+    for line in text.splitlines():
+        name, _, rest = line.partition(":")
+        parts = rest.split()
+        if parts and parts[0].isdigit():
+            values[name.strip()] = int(parts[0])
+    return values
+
+
+def parse_memory_stat_kb(text):
+    # a cgroup's memory.stat (bytes) as {name: kB}
+    values = {}
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[1].isdigit():
+            values[parts[0]] = int(parts[1]) // 1024
+    return values
+
+
+def last_oom_from_kmsg(records, boot_epoch):
+    # ("global" | "memcg", epoch seconds) of the newest OOM kill in /dev/kmsg records ("pri,seq,usec,flags;msg"), or None
+    last = None
+    for record in records:
+        header, _, message = record.partition(";")
+        fields = header.split(",")
+        # facility 0 (kernel) only: a user process can write a look-alike text to /dev/kmsg
+        if not fields[0].isdigit() or int(fields[0]) >> 3 != 0:
+            continue
+        # only the kernel's victim records count: its warnings ("Out of memory and no killable processes...") are no kill
+        if message.startswith("Memory cgroup out of memory: Killed process "):
+            kind = "memcg"
+        elif message.startswith(("Out of memory: Killed process ", "Out of memory (oom_kill_allocating_task): Killed process ")):
+            kind = "global"
+        else:
+            continue
+        if len(fields) >= 3 and fields[2].isdigit():
+            last = (kind, round(boot_epoch + int(fields[2]) / 1e6, 3))
+    return last
+
+
+def read_kmsg_records(path=KMSG_PATH):
+    # every record still in the kernel ring buffer, without blocking at its end; raises unless the scan reached the
+    # end whole, so a partial scan is never read as "the newest kill" (records are oldest first)
+    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    records = []
+    try:
+        for _ in range(KMSG_MAX_READS):
+            try:
+                chunk = os.read(fd, 8192)
+            except BlockingIOError:
+                return records
+            except OSError as exc:
+                if exc.errno == 32:  # EPIPE: a record was overwritten before it was read
+                    raise RuntimeError("a kernel log record was overwritten during the read") from exc
+                raise
+            if not chunk:
+                return records
+            records.append(chunk.decode("utf-8", "replace"))
+        raise RuntimeError(f"the kernel log did not end within {KMSG_MAX_READS} reads")
+    finally:
+        os.close(fd)
+
+
+def container_memory_kb(container_id, host_root=HOST_MEMORY_ROOT):
+    # (memory.current kB, memory.stat {name: kB}, the huge pages its hugetlb.*.current files hold in kB or None when it
+    # has none) of one container's cgroup on the host; raises when none is readable
+    for directory, usage_file in CONTAINER_MEMORY_CGROUPS:
+        base = host_root + directory.format(id=container_id)
+        if os.path.isdir(base):
+            with open(f"{base}/{usage_file}") as usage, open(f"{base}/memory.stat") as stat:
+                current, stats = int(usage.read().strip()) // 1024, parse_memory_stat_kb(stat.read())
+            # usage only: hugetlb.<size>.current, never hugetlb.<size>.rsvd.current (reservations)
+            hugetlb_files = [n for n in os.listdir(base) if n.startswith("hugetlb.") and n.count(".") == 2 and n.endswith(".current")]
+            hugetlb = None
+            for name in hugetlb_files:
+                with open(f"{base}/{name}") as pages:
+                    hugetlb = (hugetlb or 0) + int(pages.read().strip()) // 1024
+            return current, stats, hugetlb
+    raise FileNotFoundError(f"no memory cgroup for container {container_id[:12]}")
+
+
+def list_workload_container_ids(deadline):
+    # the running pod and filler containers as sorted (full id, State.StartedAt), listed now: an older listing misses a
+    # pod started since, and the start time tells a restart of the same container apart (rental_docker_sdk
+    # container_identity). Every docker read shares the wall-clock `deadline` (time.monotonic()); no nested helper,
+    # which the obfuscator does not rename consistently.
+    workloads = []
+    paths = ["/containers/json"]
+    while paths:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("the docker listing ran out of its time budget")
+        path = paths.pop(0)
+        reply = docker_api_get(path, remaining, deadline)
+        if path == "/containers/json":
+            paths = [
+                f"/containers/{container['Id']}/json"
+                for container in reply
+                if any(name.lstrip("/").startswith(WORKLOAD_CONTAINER_PREFIXES) for name in container.get("Names") or [])
+            ]
+        else:
+            started_at = (reply.get("State") or {}).get("StartedAt")
+            if not started_at:
+                raise ValueError(f"docker inspect has no State.StartedAt for {path}")
+            workloads.append((reply["Id"], started_at))
+    if time.monotonic() > deadline:
+        raise TimeoutError("the docker listing ran out of its time budget")
+    return sorted(workloads)
+
+
+def get_host_memory(list_workloads=list_workload_container_ids, host_root=HOST_MEMORY_ROOT, meminfo_path="/proc/meminfo",
+                    vmstat_path="/proc/vmstat", stat_path="/proc/stat", read_kmsg=read_kmsg_records):
+    errors = {}
+    facts = {"hm_errors": errors}
+    # the workloads are listed right before and after the memory reads; a change between them (a container started,
+    # stopped or restarted) nulls the subtraction. Both listings share one short time budget.
+    deadline = time.monotonic() + HOST_MEMORY_INVENTORY_SECONDS
+    try:
+        workloads = list_workloads(deadline)
+    except Exception as exc:
+        workloads = None
+        inventory_error = f"docker inventory failed: {exc!r}"
+    with open(meminfo_path) as meminfo:
+        mem = parse_meminfo_kb(meminfo.read())
+
+    facts["hm_mem_total_kb"] = mem.get("MemTotal")
+    facts["hm_mem_available_kb"] = mem.get("MemAvailable")
+    facts["hm_swap_total_kb"] = mem.get("SwapTotal")
+    facts["hm_swap_used_kb"] = mem["SwapTotal"] - mem["SwapFree"] if "SwapFree" in mem and "SwapTotal" in mem else None
+    facts["hm_shmem_kb"] = mem.get("Shmem")
+    facts["hm_page_cache_kb"] = mem.get("Cached")
+    facts["hm_hugepages_total"] = mem.get("HugePages_Total")
+    facts["hm_hugepages_free"] = mem.get("HugePages_Free")
+    facts["hm_hugepage_size_kb"] = mem.get("Hugepagesize")
+    facts["hm_mapped_kb"] = mem.get("Mapped")
+    for name, key in (("SwapTotal", "hm_swap_total_kb"), ("HugePages_Total", "hm_hugepages_total"), ("Mapped", "hm_mapped_kb")):
+        if name not in mem:
+            errors[key] = f"{name} not in /proc/meminfo"
+
+    # the workload containers' cgroups: memory.current counts their anon, page cache and shmem
+    current = file_ = shmem = file_mapped = 0
+    hugetlb_unaccounted = False
+    unread = []
+    for container_id, _started_at in workloads or []:
+        try:
+            usage, stat, hugetlb_pages = container_memory_kb(container_id, host_root)
+        except Exception as exc:
+            unread.append(f"{container_id[:12]}: {exc!r}")
+            continue
+        current += usage
+        # memory.stat has a hugetlb line only with hugetlb accounting on (cgroup v2 memory_hugetlb_accounting), and pages
+        # faulted before that remount are in hugetlb.*.current but not in it: trusted only when the two agree
+        hugetlb_unaccounted = hugetlb_unaccounted or stat.get("hugetlb") is None or stat["hugetlb"] != hugetlb_pages
+        # v1's usage counts child cgroups, as its total_* stats do (its plain ones are local); v2's are hierarchical
+        # swap cache is in neither the cgroup's file nor the host's Cached (the kernel counts it in the node's file
+        # pages only, the cgroup's in swapcached): both sides leave it in use, nothing to take out
+        file_ += stat.get("total_cache", stat.get("file", 0))
+        shmem += stat.get("total_shmem", stat.get("shmem", 0))
+        file_mapped += stat.get("total_mapped_file", stat.get("file_mapped", 0))
+    if workloads is not None:
+        try:
+            if list_workloads(deadline) != workloads:
+                inventory_error = "the workload containers changed during the memory reads"
+                workloads = None
+        except Exception as exc:
+            inventory_error = f"docker inventory failed: {exc!r}"
+            workloads = None
+    facts["hm_workload_containers"] = None if workloads is None else len(workloads)
+    if workloads is None:
+        errors["hm_workload_containers"] = inventory_error
+    outside_keys = ("hm_outside_workloads_kb", "hm_outside_workloads_no_cache_kb", "hm_mapped_outside_workloads_kb")
+    if workloads is None or unread or not all(n in mem for n in ("MemTotal", "MemFree", "Buffers", "Cached", "Shmem", "Mapped")):
+        for key in outside_keys:
+            facts[key] = None
+            errors[key] = inventory_error if workloads is None else "; ".join(unread) or "a /proc/meminfo field is missing"
+    else:
+        used = mem["MemTotal"] - mem["MemFree"]
+        # all page cache counted as used, then without it (shmem and tmpfs, /dev/shm included, stay counted: not reclaimable)
+        facts["hm_outside_workloads_kb"] = used - current
+        facts["hm_outside_workloads_no_cache_kb"] = (used - mem["Buffers"] - mem["Cached"] + mem["Shmem"]) - (current - file_ + shmem)
+        # mapped pages no workload cgroup owns: an upper bound for NVIDIA driver and other host mappings
+        facts["hm_mapped_outside_workloads_kb"] = mem["Mapped"] - file_mapped
+        # host and cgroup figures are read moments apart: a workload that grew in between leaves a residual below zero
+        if any(facts[key] < 0 for key in outside_keys):
+            for key in outside_keys:
+                facts[key] = None
+                errors[key] = "a workload grew between the host and container reads (negative residual)"
+        # MemTotal - MemFree holds the whole huge page pool: a host-only pool stays host use, and a pod's share is in its
+        # memory.current only under hugetlb accounting; without it a running workload's share is unknown
+        pool = mem.get("Hugetlb", mem.get("HugePages_Total", 0) * mem.get("Hugepagesize", 0))
+        # a pool whose every page is free (Hugetlb is the default pool alone, all of it free) holds no workload's share,
+        # so whatever the accounting it stays host use
+        all_free = all(k in mem for k in ("Hugetlb", "HugePages_Free", "Hugepagesize")) and (
+            mem["Hugetlb"] == mem["HugePages_Free"] * mem["Hugepagesize"]
+        )
+        if pool and not all_free and hugetlb_unaccounted and facts["hm_outside_workloads_kb"] is not None:
+            for key in outside_keys[:2]:
+                facts[key] = None
+                errors[key] = "a huge page pool is reserved and a workload's hugetlb charge is not accounted"
+
+    try:
+        with open(vmstat_path) as vmstat:
+            counters = dict(line.split()[:2] for line in vmstat if len(line.split()) >= 2)
+        facts["hm_oom_kills_since_boot"] = int(counters["oom_kill"])
+    except Exception as exc:
+        facts["hm_oom_kills_since_boot"] = None
+        errors["hm_oom_kills_since_boot"] = repr(exc)
+
+    facts["hm_last_oom_kind"] = facts["hm_last_oom_at"] = None
+    try:
+        with open(stat_path) as stat:
+            boot_epoch = next(int(line.split()[1]) for line in stat if line.startswith("btime "))
+        last = last_oom_from_kmsg(read_kmsg(), boot_epoch)
+        if last:
+            facts["hm_last_oom_kind"], facts["hm_last_oom_at"] = last
+        elif facts["hm_oom_kills_since_boot"]:
+            errors["hm_last_oom_at"] = "OOM kills since boot, none left in the kernel log"
+    except Exception as exc:
+        errors["hm_last_oom_at"] = repr(exc)
+    return facts
 
 
 def get_executor_pid_mode():
@@ -758,7 +1021,8 @@ def needrestart_data_line(line, literal, plain_setting):
     rest = r"\s*(?:=>\s*" + literal + r"\s*)?,?\s*(#.*)?"
     entry = re.fullmatch(r"[ \t]*" + literal + rest, line)
     if entry:
-        return ("entry", entry.group(1).strip("'\""), entry.group(3), False)
+        key = entry.group(1)  # Perl drops one pair of quotes: "'^docker'" is another key than "^docker"
+        return ("entry", key[1:-1] if key[0] in "'\"" else key, entry.group(3), False)
     start = re.match(r"[ \t]*qr([^\w\s])", line)
     if not start:
         return None
@@ -783,40 +1047,78 @@ def needrestart_data_line(line, literal, plain_setting):
     return None
 
 
+# DAH-6804: the boot-time layer reset nvidia_docker_sysbox_setup.sh installs, and the version line it writes first
+SYSBOX_LAYER_RESET_UNIT = "/etc/systemd/system/lium-sysbox-layer-reset.service"
+SYSBOX_LAYER_RESET_VERSION_LINE = re.compile(r"# lium-layer-reset-version=(\d{1,5})")
+
+
+def get_sysbox_layer_reset_version(host_root="/proc/1/root"):
+    # 0 = not installed, 1 = installed before the setup script wrote a version line, N = that version
+    if os.path.samefile(host_root + "/", "/"):  # as get_needrestart_guard
+        raise RuntimeError("no host view: the executor is not in the host PID namespace")
+    try:
+        with open(host_root + SYSBOX_LAYER_RESET_UNIT) as unit_file:
+            first_line = unit_file.readline().rstrip("\n")
+    except FileNotFoundError:
+        return 0
+    match = SYSBOX_LAYER_RESET_VERSION_LINE.fullmatch(first_line)
+    return int(match.group(1)) if match else 1
+
+
 def get_needrestart_guard(host_root="/proc/1/root"):
-    # "present", "partial", "missing" or "no_needrestart", plus the services the host file leaves unguarded.
+    # "present", "partial", "missing" or "no_needrestart", the services the host file leaves unguarded, and why a
+    # "partial" could not prove the guard effective (None when it could read everything).
     # Hosts set up before the setup script wrote the file (16 Nov) have needrestart and no guard. The setup script
     # writes the guard file on hosts without needrestart too, so only the binary or the stock config counts.
+    def unknowable(why):  # a config the scrape cannot prove leaves every service unguarded; `why` names file and line
+        return "partial", list(NEEDRESTART_GUARD_SERVICES), why
+
     if os.path.samefile(host_root + "/", "/"):  # as docker_utils' [ /proc/1/root/ -ef / ]
         raise RuntimeError("no host view: the executor is not in the host PID namespace")
     if not (os.path.exists(host_root + "/usr/sbin/needrestart") or os.path.isfile(host_root + "/etc/needrestart/needrestart.conf")):
-        return "no_needrestart", []
+        return "no_needrestart", [], None
     try:
         with open(host_root + NEEDRESTART_GUARD_FILE) as guard_file:
             text = guard_file.read()
     except FileNotFoundError:
-        return "missing", list(NEEDRESTART_GUARD_SERVICES)
-    zero = ("0", "'0'", '"0"')  # anything else (1, '1', "'0'", an expression) may be true in Perl
-    last_values = {}
-    other_rules = []  # (pattern, value) of every rule that is not one of the five exact keys
-    for line in text.splitlines():
+        return "missing", list(NEEDRESTART_GUARD_SERVICES), None
+    literal = r"""(-?\d+(\.\d+)?|'[^'\\]*'|"[^"\\$@]*")"""
+
+    def perl_false(value):  # a literal Perl reads as false: any numeric zero, '' or '0' (the string "0.0" is true)
+        if re.fullmatch(r"-?\d+(\.\d+)?", value):
+            return float(value) == 0
+        return value[1:-1] in ("", "0") if re.fullmatch(literal, value) else False
+
+    zero = ("0", "'0'", '"0"')  # the guard's own spellings: only these keep a service guarded
+
+    plain_setting = r"[ \t]*\$nrconf\{(\w+)\}\s*=\s*" + literal + r"\s*;\s*(#.*)?"
+    # A reason names a file, a physical line and what is wrong there, never the line itself: a local config line
+    # can hold a secret, and the reason reaches the validator log and the published machine specs.
+    last_values = {}  # service -> (value, where) of its last guard line
+    guard_rules = {}  # Perl key -> (pattern, value, where) of every guard-file rule that is not one of the five keys
+    for number, line in enumerate(text.splitlines(), 1):
         if not line.strip() or line.lstrip().startswith("#"):
             continue
         # only the exact line the setup script writes is understood; any other live Perl (another
         # delimiter, two statements on a line, a map reset) may undo a guard, so it guards nothing
         match = re.fullmatch(r"[ \t]*\$nrconf\{override_rc\}->\{qr\(\^([\w.-]+)\)\}\s*=\s*([^;#]+?)\s*;\s*(#.*)?", line)
+        where = f"{NEEDRESTART_GUARD_FILE} line {number}"
         if not match:
-            return "partial", list(NEEDRESTART_GUARD_SERVICES)
-        last_values[match.group(1)] = match.group(2)  # Perl keeps the last assignment
-        if match.group(1) not in NEEDRESTART_GUARD_SERVICES:
-            other_rules.append(("^" + match.group(1), match.group(2)))
+            return unknowable(f"{where} is not a guard line")
+        # a value may only be literals and numeric operators: anything else (a name, a variable, a brace, a heredoc
+        # that eats the next lines) may set rules the line-by-line bookkeeping below never sees. %, * and / where a
+        # term belongs are a hash, a glob or a match, not arithmetic
+        value = re.sub(literal, "0", match.group(2))
+        if re.search(r"[^\d\s.+*/%()!~?:-]", value) or re.search(r"(^|[^\d)\s])\s*[%*/]", value):
+            return unknowable(f"{where} runs code in its value")
+        if match.group(1) in NEEDRESTART_GUARD_SERVICES:
+            last_values[match.group(1)] = (match.group(2), where)  # Perl keeps the last assignment
+        else:
+            guard_rules[("qr", "^" + match.group(1))] = ("^" + match.group(1), match.group(2), where)
     # needrestart evals needrestart.conf, whose stock loader block then evals conf.d/*.conf in name order. Config
     # is Perl, and code anywhere (a tie on %nrconf, a sub, %nrconf = ()) can undo the guard in ways no text scan
     # rules out, so every file must be data only: literal settings, {/[ structures of qr// and literal entries,
     # and the loader. A later file may only set other keys to literals; anything else leaves it unknowable.
-    unknowable = ("partial", list(NEEDRESTART_GUARD_SERVICES))
-    literal = r"""(-?\d+(\.\d+)?|'[^'\\]*'|"[^"\\$@]*")"""
-    plain_setting = r"[ \t]*\$nrconf\{(\w+)\}\s*=\s*" + literal + r"\s*;\s*(#.*)?"
     loader = [
         "if(-d q(/etc/needrestart/conf.d)) {",
         "foreach my $fn (sort </etc/needrestart/conf.d/*.conf>) {",
@@ -826,35 +1128,96 @@ def get_needrestart_guard(host_root="/proc/1/root"):
         "}",
         "}",
     ]
+
+    def live_lines(conf_text):  # (physical line number, line) of every line that is not blank or a comment
+        return [(n, ln) for n, ln in enumerate(conf_text.splitlines(), 1) if ln.strip() and not ln.lstrip().startswith("#")]
+
     conf_dir = host_root + "/etc/needrestart/conf.d"
     guard_name = os.path.basename(NEEDRESTART_GUARD_FILE)
+    main_path = "/etc/needrestart/needrestart.conf"
     try:
-        with open(host_root + "/etc/needrestart/needrestart.conf") as conf_file:
-            main = [ln for ln in conf_file.read().splitlines() if ln.strip() and not ln.lstrip().startswith("#")]
-    except FileNotFoundError:
-        return unknowable  # no main config, so nothing loads conf.d and the guard file is never read
+        with open(host_root + main_path) as conf_file:
+            main = live_lines(conf_file.read())
+    except FileNotFoundError:  # no main config, so nothing loads conf.d and the guard file is never read
+        return unknowable(f"no {main_path}, so conf.d is never loaded")
     # the stock files differ only in 3.4's log condition and its one computed setting, matched exactly
     old_log = 'print STDERR "$LOGPREF eval $fn\\n" if($nrconf{verbose});'
     stock_code = ["$nrconf{skip_mapfiles} = (-d '/proc/sys/kernel/grsecurity' ? -1 : 0);"]
-    flat = [" ".join(ln.split()).replace(old_log, loader[2]) for ln in main]
+    flat = [" ".join(ln.split()).replace(old_log, loader[2]) for _, ln in main]
     at = next((i for i in range(len(flat)) if flat[i : i + len(loader)] == loader), None)
-    if at is None or at + len(loader) != len(main):
-        return unknowable  # conf.d is not loaded the stock way, or main config code runs after the guard file
-    earlier = [[ln for ln, f in zip(main[:at], flat) if f not in stock_code]]
-    names = sorted(n for n in os.listdir(conf_dir) if n.endswith(".conf") and n != guard_name)
+    if at is None:
+        # a recognisable loader that was changed: anchor on its opener, its conf.d glob or its $LOGPREF log line,
+        # the only loader lines no other Perl block shares (eval/die are generic idioms a site loader also uses),
+        # and name the first line that differs from there on, not only the file
+        # every opener, glob or (below a conf.d line) log line is a candidate start; each is aligned line by line
+        # against the stock loader, inserted and deleted lines allowed, and the one with the most aligned lines wins
+        # (an exact opener in some other block aligns little); ties go to the opener, then the glob. The log line
+        # names no directory, so it is a candidate only when a line just above it still names conf.d
+        conf_d_above = lambda i: any("/etc/needrestart/conf.d" in f for f in flat[max(i - 2, 0) : i])  # noqa: E731
+        # a trailing comment does not stop a line from locating the loader (no loader line holds a #); the alignment
+        # below still compares the lines as written, so a commented loader line is the one named
+        bare = [re.sub(r"\s*#.*$", "", f) for f in flat]
+        candidates = [
+            (i, j) for j in (0, 1, 2) for i, f in enumerate(bare) if f == loader[j] and (j < 2 or conf_d_above(i))
+        ]
+        if not candidates:
+            return unknowable(f"{main_path} has no stock conf.d loader")
+
+        def aligned(i, j):  # window from the candidate's start, two spare lines for inserted ones; its matched runs
+            start = max(i - j, 0)
+            blocks = difflib.SequenceMatcher(None, loader, flat[start : i - j + len(loader) + 2], autojunk=False)
+            return start, blocks.get_matching_blocks()[:-1]
+
+        i, j = min(candidates, key=lambda c: (-sum(m.size for m in aligned(*c)[1]), c[1], c[0]))
+        start, runs = aligned(i, j)
+        if not runs:  # the anchor matched only with its comment stripped and no loader line aligns: it differs
+            return unknowable(f"{main_path} line {main[i][0]} differs from the stock conf.d loader")
+        first = runs[0]
+        if first.a:
+            # the first aligned line is below the opener: the line in the opener's place is the (edited) opener only
+            # if it opens a block (a trailing comment allowed), however much its condition changed; a setting there
+            # means the opener is missing, and the line after it is where the loader starts
+            top = start + first.b - first.a
+            if top >= 0 and re.search(r"\{\s*(#.*)?$", flat[top]):
+                bad = top
+            else:
+                bad = start + first.b if first.a == 1 else max(top + 1, 0)
+        elif start > 0 and bare[start - 1] in loader[1:-2]:
+            # a loader line just above the opener (moved above it, as the glob swapped with the opener): it is where
+            # the loader begins, so it is the first line that differs
+            bad = start - 1
+        else:
+            # the first line after an unbroken aligned run: an inserted line, or the line now in a deleted one's place
+            bad = next(
+                (start + m.b + m.size for m, n in zip(runs, runs[1:]) if (n.a, n.b) != (m.a + m.size, m.b + m.size)),
+                start + runs[-1].b + runs[-1].size,
+            )
+            if bad >= len(flat):
+                return unknowable(f"{main_path} line {main[-1][0]} ends inside the conf.d loader")
+        return unknowable(f"{main_path} line {main[bad][0]} differs from the stock conf.d loader")
+    if at + len(loader) != len(main):
+        return unknowable(f"{main_path} line {main[at + len(loader)][0]} runs code after the conf.d loader")
+    earlier = [(main_path, [line for line, f in zip(main[:at], flat) if f not in stock_code])]
+    # the stock *.conf glob skips dotfiles, so a .backup.conf is never loaded
+    names = sorted(n for n in os.listdir(conf_dir) if n.endswith(".conf") and not n.startswith(".") and n != guard_name)
     for name in names:
-        with open(conf_dir + "/" + name) as conf_file:
-            lines = [ln for ln in conf_file.read().splitlines() if ln.strip() and not ln.lstrip().startswith("#")]
+        path = "/etc/needrestart/conf.d/" + name
+        with open(host_root + path) as conf_file:
+            lines = live_lines(conf_file.read())
         if name < guard_name:
-            earlier.append(lines)
-        elif not all((m := re.fullmatch(plain_setting, ln)) and m.group(1) != "override_rc" for ln in lines):
-            return unknowable
-    for lines in earlier:
+            earlier.append((path, lines))
+            continue
+        for number, ln in lines:
+            if not ((m := re.fullmatch(plain_setting, ln)) and m.group(1) != "override_rc"):
+                return unknowable(f"{path} line {number}, loaded after the guard, is not a literal setting")
+    # Perl keeps the last assignment to a key: files load in name order, the guard file after the earlier ones
+    rules = {}
+    for path, lines in earlier:
         block = None
-        for ln in lines:
+        for number, ln in lines:
             data = needrestart_data_line(ln, literal, plain_setting)
             if data is None:
-                return unknowable
+                return unknowable(f"{path} line {number}, loaded before the guard, is not plain data")
             if data[0] == "open":
                 block = data[1]
             elif data[0] == "close":
@@ -864,20 +1227,48 @@ def get_needrestart_guard(host_root="/proc/1/root"):
                 # The guard file overwrites only the same Perl key: qr(^<service>) with any delimiter stringifies alike,
                 # while the string '^<service>' is another key that stays next to it.
                 if not (data[3] and data[1] in ["^" + s for s in NEEDRESTART_GUARD_SERVICES]):
-                    other_rules.append((data[1], data[2]))
+                    rules[("qr" if data[3] else "str", data[1])] = (data[1], data[2], f"{path} line {number}")
+    rules.update(guard_rules)
+    other_rules = list(rules.values())
+    # A service is unguarded when a rule proves it (a readable pattern that matches its unit, a literal value that is
+    # not 0) or when a rule might (a pattern Python cannot read, a computed value). The reason names the first such
+    # rule only when no proven rule explains every unguarded service.
     unguarded = []
+    unproven = None
     for service in NEEDRESTART_GUARD_SERVICES:
-        overlapping = False
-        for pattern, value in other_rules:
+        proven, unsure, other_zero = False, None, None
+        for pattern, value, where in other_rules:
             if value in zero:
                 continue
             try:
-                overlapping = overlapping or any(re.search(pattern, unit) for unit in NEEDRESTART_GUARD_UNITS[service])
-            except re.error:
-                overlapping = True  # a pattern Python cannot read may still match in Perl
-        if overlapping or last_values.get(service) not in zero:
+                matches = any(re.search(pattern, unit) for unit in NEEDRESTART_GUARD_UNITS[service])
+            except re.error:  # it may still match in Perl
+                unsure = unsure or f"{where} has a rule pattern the scrape cannot evaluate"
+                continue
+            if not matches:
+                continue
+            if value is None or (re.fullmatch(literal, value) and not perl_false(value)):
+                proven = True
+            elif re.fullmatch(literal, value):  # false in Perl too, but not a zero the guard writes
+                other_zero = other_zero or f"{where} sets a zero other than the guard's 0"
+            else:
+                unsure = unsure or f"{where} sets a computed value the scrape cannot evaluate"
+        value, where = last_values.get(service, (None, None))
+        if value is None:
+            proven = True  # no guard line for it
+        elif value not in zero:
+            if re.fullmatch(literal, value) and not perl_false(value):
+                proven = True
+            elif re.fullmatch(literal, value):
+                other_zero = other_zero or f"{where} sets {service} to a zero other than the guard's 0"
+            else:
+                unsure = unsure or f"{where} sets {service} to a computed value the scrape cannot evaluate"
+        unsure = unsure or other_zero
+        if proven or unsure:
             unguarded.append(service)
-    return ("partial" if unguarded else "present"), unguarded
+            if not proven:
+                unproven = unproven or unsure
+    return ("partial" if unguarded else "present"), unguarded, unproven
 
 
 def get_vloopback_volume_bytes(docker_root_dir, filler_only=False, sizes=None):
@@ -1128,8 +1519,6 @@ def get_container_cpu_percents(docker_path: str) -> tuple[float, dict[str, float
 _DOCKER_SIZE_UNITS = {"B": 1, "kB": 10**3, "KB": 10**3, "MB": 10**6, "GB": 10**9, "TB": 10**12, "PB": 10**15}
 
 
-# Top level, not nested in its caller: obfuscator.py renames a nested function's body and leaves its
-# signature, which broke every row (lium-io#2146 review).
 def docker_size_bytes(size_text: str) -> int:
     size_text = size_text.strip()
     number = size_text.rstrip("kKMGTPB")
@@ -2707,6 +3096,12 @@ def get_machine_specs():
         # print(f"Error reading /proc/meminfo; Exc: {exc}", file=sys.stderr)
         data["ram_scrape_error"] = repr(exc)
 
+    # DAH-6379: unreadable fields are None with a reason inside; a whole-block failure is reported, never raised
+    try:
+        data["data_host_memory"] = get_host_memory()
+    except Exception as exc:
+        data["data_host_memory_scrape_error"] = repr(exc)
+
     data["data_hard_disk"] = {}
     try:
         disk_usage = get_host_disk_usage()
@@ -2748,9 +3143,20 @@ def get_machine_specs():
 
     # DAH: hosts set up before 16 Nov lack the needrestart guard; missing key = unknown, never fails
     try:
-        data["data_needrestart_guard"], data["data_needrestart_guard_unguarded"] = get_needrestart_guard()
+        (
+            data["data_needrestart_guard"],
+            data["data_needrestart_guard_unguarded"],
+            data["data_needrestart_guard_reason"],
+        ) = get_needrestart_guard()
     except Exception as exc:
         data["data_needrestart_guard_scrape_error"] = repr(exc)
+
+    # DAH-6804: Sysbox hosts only; missing key = not a Sysbox host or unknown, never fails
+    if data.get("data_sysbox_version"):
+        try:
+            data["data_sysbox_layer_reset_version"] = get_sysbox_layer_reset_version()
+        except Exception as exc:
+            data["data_sysbox_layer_reset_scrape_error"] = repr(exc)
 
     data["data_os"] = ""
     try:

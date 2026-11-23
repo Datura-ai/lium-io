@@ -2592,6 +2592,16 @@ async def test_create_customer_rental_starts_inspector_collector(docker_service,
     ssh_client = _patch_create_container_happy_path(docker_service, monkeypatch)
     lifecycle_spy = AsyncMock()
     monkeypatch.setattr(docker_service, "_run_inspector_collector_lifecycle", lifecycle_spy)
+    memory_guard_spy = AsyncMock(return_value={"set": [], "failed": []})
+    monkeypatch.setattr("services.docker_service.apply_host_memory_guard", memory_guard_spy)
+    guard_calls_at_docker_run: list[int] = []
+    real_docker_run = docker_service._run_rental_docker_create_with_port_retry
+
+    async def docker_run(**kwargs):
+        guard_calls_at_docker_run.append(memory_guard_spy.await_count)
+        return await real_docker_run(**kwargs)
+
+    monkeypatch.setattr(docker_service, "_run_rental_docker_create_with_port_retry", docker_run)
 
     pod_id = str(uuid4())
     payload = ContainerCreateRequest(
@@ -2632,11 +2642,15 @@ async def test_create_customer_rental_starts_inspector_collector(docker_service,
         private_key="encrypted",
     )
 
+    # the host memory guard is on the host before docker run starts the pod, on the create's session
+    assert guard_calls_at_docker_run == [1]
+    assert memory_guard_spy.await_args.args[0] is ssh_client
     # the reply does not wait for the collector or the session close: both come after the return
     lifecycle_spy.assert_not_awaited()
     assert ssh_session.closed is False
     await _drain_create_steps_after_reply(payload)
     lifecycle_spy.assert_awaited_once()
+    memory_guard_spy.assert_awaited_once()
     assert ssh_session.closed is True
     assert lifecycle_spy.await_args.kwargs["action"] == "start"
     assert lifecycle_spy.await_args.kwargs["ssh_client"] is ssh_client
@@ -12082,6 +12096,17 @@ async def test_flatten_sizing_budget_adds_the_neighbours_unwritten_layers(copy, 
     with patch.object(docker_service_module, "flatten_copy_bytes", AsyncMock(return_value=copy)):
         assert await docker_service_module._flatten_sizing_budget(ssh, "sglang", "pod_x") == expected
     assert ssh.run.await_count == (0 if copy is None else 1)
+
+
+@pytest.mark.asyncio
+async def test_an_unreadable_image_size_stops_the_sizing_before_the_volume():
+    # never read as "no copy needed": the grant would take the room the flatten later needs
+    ssh = _node_ssh("")
+    unreadable = AsyncMock(side_effect=image_flatten_module.FlattenSizeUnreadable("size"))
+    with patch.object(docker_service_module, "flatten_copy_bytes", unreadable):
+        with pytest.raises(image_flatten_module.FlattenSizeUnreadable):
+            await docker_service_module._flatten_sizing_budget(ssh, "sglang", "pod_x")
+    ssh.run.assert_not_awaited()
 
 
 def test_others_running_counts_only_the_other_customer_creates_on_the_executor():
