@@ -24,7 +24,9 @@ description: >-
   output, e2e, is true when any package is or when e2e/ itself changed: the e2e stack builds
   every neuron, so it runs whenever one of them could have changed and skips (green, via
   tests-ok) on a PR that touches none. A file under a neuron's own tests/ directory does not select
-  e2e: the stack runs e2e/tests, never those.
+  e2e, and neither does neurons/executor/liumd/: the stack runs e2e/tests and never the vendored
+  binary (the shadow that runs it is off in e2e), while tests/test_liumd_binary_manifest.py checks
+  the pin, so liumd/ also selects validators.
 
 outputs:
   validators:
@@ -54,8 +56,9 @@ runs:
           const SHARED = ['datura/', '.github/'];
           // a change to the wire package also runs the validator's compatibility test against it;
           // a change under dstacktee/ (the measured CVM files and dstack.py) runs the validator's
-          // compose-hash whitelist test (tests/test_tdx_compose_hash_whitelist.py, DAH-3602)
-          const ALSO = { validators: ['lium_protocol/', 'neurons/executor/dstacktee/'] };
+          // compose-hash whitelist test (tests/test_tdx_compose_hash_whitelist.py, DAH-3602);
+          // a re-pin under liumd/ runs the manifest tests (tests/test_liumd_binary_manifest.py)
+          const ALSO = { validators: ['lium_protocol/', 'neurons/executor/dstacktee/', 'neurons/executor/liumd/'] };
           const isDoc = f => /\.md$|(^|\/)\.gitignore$|^docs\//.test(f);
           const touches = (files, pkg, prefix) =>
             files.some(f => f.startsWith(prefix)) || files.some(f => SHARED.some(s => f.startsWith(s)))
@@ -117,8 +120,10 @@ runs:
           }
 
           const rows = [];
-          // the stack never runs a neuron's own tests/, so a change there alone does not select e2e
-          const e2eFiles = files && files.filter(f => !/^neurons\/[^/]+\/tests\//.test(f));
+          // the stack never runs a neuron's own tests/ or the vendored liumd binary, so a change there alone
+          // does not select e2e
+          const notE2E = f => /^neurons\/[^/]+\/tests\//.test(f) || /^neurons\/executor\/liumd\//.test(f);
+          const e2eFiles = files && files.filter(f => !notE2E(f));
           let anyPackage = false;
           for (const [pkg, prefix] of Object.entries(PACKAGES)) {
             const changed = files ? touches(files, pkg, prefix) : true;
