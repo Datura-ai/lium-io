@@ -44,22 +44,24 @@ async def test_probes_run_on_their_own_loop_and_never_on_the_callers():
 
 
 @pytest.mark.asyncio
-async def test_open_probes_stay_within_the_bound_and_queued_ones_still_pass():
-    open_now = peak = 0
-
-    async def slow_answer(_request):
-        nonlocal open_now, peak
-        open_now += 1
-        peak = max(peak, open_now)
-        await asyncio.sleep(0.2)
-        open_now -= 1
+async def test_a_node_whose_probes_hang_never_delays_another_nodes_probes():
+    async def answer(_request):
         return web.Response(text=f"{TOKEN}:1")
 
-    runner, port = await _serve(slow_answer)
+    # accepts and never answers: each probe holds its socket for the whole read budget, like dropped packets
+    silent = await asyncio.start_server(lambda _r, _w: None, "127.0.0.1", 0)
+    silent_port = silent.sockets[0].getsockname()[1]
+    runner, port = await _serve(answer)
+    tester = PortTester()
     try:
-        ok, failed = await PortTester(concurrency=4).test_many("127.0.0.1", [PortPair(1, port)] * 20, TOKEN)
+        hanging = asyncio.create_task(tester.test_many("127.0.0.1", [PortPair(1, silent_port)] * 400, TOKEN))
+        await asyncio.sleep(0.2)
+        started = asyncio.get_running_loop().time()
+        ok, failed = await tester.test_many("127.0.0.1", [PortPair(1, port)] * 50, TOKEN)
+        elapsed = asyncio.get_running_loop().time() - started
+        assert len(ok) == 50 and not failed
+        assert elapsed < 1.5  # the silent node's probes run out at 3 s; nothing here waits for them
+        assert await hanging == ([], [PortPair(1, silent_port)] * 400)
     finally:
+        silent.close()
         await runner.cleanup()
-    assert peak <= 4
-    assert len(ok) == 20 and not failed  # 5 rounds of 0.2 s: a queued probe's budget starts at its slot
-

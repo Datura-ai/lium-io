@@ -16,8 +16,6 @@ logger = logging.getLogger(__name__)
 # connector hands out a socket, so a probe queued behind a full pool burned its budget waiting
 # and was recorded as a dead port without ever putting a packet on the wire
 PROBE_TIMEOUT = aiohttp.ClientTimeout(sock_connect=3, sock_read=3)
-# open probe sockets across every node being verified; a probe waiting for one has not started its budget
-PROBE_CONCURRENCY = 256
 # a node's answer is "<token>:<port>"; reading more than this lets a node grow the validator's memory
 PROBE_BODY_LIMIT = 256
 
@@ -29,8 +27,7 @@ class PortTester:
     reply on it, so Redis replies sat unread and pool checkouts ran past their wait.
     """
 
-    def __init__(self, concurrency: int = PROBE_CONCURRENCY):
-        self._concurrency = concurrency
+    def __init__(self):
         self._loop: asyncio.AbstractEventLoop | None = None
         self._session: aiohttp.ClientSession | None = None  # touched only on the probe loop
         self._start_lock = threading.Lock()
@@ -53,9 +50,9 @@ class PortTester:
 
     async def _probe(self, host: str, port: PortPair, token: str) -> bool:
         if self._session is None:
-            self._session = aiohttp.ClientSession(
-                connector=public_host_connector(limit=self._concurrency, force_close=True)
-            )
+            # no socket bound shared across nodes: one node's dropped probes would hold it for their whole
+            # budget and every other node's probes would queue behind them
+            self._session = aiohttp.ClientSession(connector=public_host_connector(limit=0, force_close=True))
         url = f"http://{host}:{port.external}/"
         expected = f"{token}:{port.internal}"
 
