@@ -71,7 +71,12 @@ class Runner:
             )
         if command.startswith("install -m 0755"):
             self.installed = True
-            return SimpleNamespace(success=True, stdout="", stderr="", exit_status=0)
+            return SimpleNamespace(
+                success=True,
+                stdout=f"{self.download_sha}  /usr/local/bin/liumd\n",
+                stderr="",
+                exit_status=0,
+            )
         raise AssertionError(command)
 
 
@@ -280,3 +285,21 @@ async def test_the_feature_is_off_by_default(monkeypatch):
 
     assert await ensure_liumd_binary(_ctx(runner)) is None
     assert runner.calls == []
+
+
+@pytest.mark.asyncio
+async def test_the_answer_build_refreshes_without_a_version_command(monkeypatch):
+    runner = Runner()
+    fetch, _ = _manifest_fetcher()
+    monkeypatch.setattr(liumd_binary_refresh, "_fetch_manifest", fetch)
+
+    result = await liumd_binary_refresh.refresh_liumd_from_answer(
+        _ctx(runner), "old-build", "x86_64-unknown-linux-gnu", budget_seconds=60
+    )
+
+    assert result.ok is True
+    assert result.changed is True
+    assert not any(c.endswith(" version") for c in runner.calls)
+    install = [c for c in runner.calls if c.startswith("install -m 0755")]
+    assert len(install) == 1
+    assert "sha256sum /usr/local/bin/liumd" in install[0]
