@@ -36,10 +36,17 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # the staging validator, as the executor's dev image (executor_cd_dev.yml): a non-prod image trusts its own
-      # validator and reads no signed validator message
+      # the staging validator, as the executor's dev image (executor_cd_dev.yml), and the staging owner key (staging
+      # only, not on chain) whose signed validator messages the staging image follows
       - name: Name the staging validator
-        run: echo '_VALIDATOR_HOTKEY_SS58 = "5DHgdomxxHSQf7neJWcagvGhTMKpqvKWwuprEaFF8C653qty"' > neurons/miners/src/core/config_override.py
+        env:
+          STAGING_TRUST_OWNER_SS58: "5EeYEmUGfAJeTmVvYSmkpsUmVhiySd2Zch5nyt4tE1HygFX8"
+          STAGING_TRUST_MESSAGE: "lium-validator:5DHgdomxxHSQf7neJWcagvGhTMKpqvKWwuprEaFF8C653qty:1"
+          STAGING_TRUST_SIGNATURE: "0x462f3d57f5307db9dc0d1e820015204e57f5fea61f2a3fa330c0507b7554ce333fdc046406d3a4aaf74599109b25bbb5e842377706d4491ae2f8efad8bd35181"
+        run: |
+          echo '_VALIDATOR_HOTKEY_SS58 = "5DHgdomxxHSQf7neJWcagvGhTMKpqvKWwuprEaFF8C653qty"' > neurons/miners/src/core/config_override.py
+          source scripts/staging_trust_override.sh
+          staging_trust_override neurons/miners/src/core/config_override.py
 
       - name: Build and push Docker image
         uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5.4.0
