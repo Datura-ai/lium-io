@@ -636,8 +636,9 @@ class RentalDockerSdkClient:
         volume takes minutes): it holds the name (409) while inspect answers 404 until the container is
         registered. As long as dockerd keeps the name held, the first create's outcome is still coming,
         so the retry waits for it: adopted once registered, or created here once dockerd released the
-        name because that create failed. A delete of the pod ends the wait (the caller's
-        `_unless_cancelled_by_delete`).
+        name because that create failed. A delete of the pod does not end the wait: leaving would let
+        that container register with nobody to remove it. The caller removes an adopted container its
+        delete overtook, and the spec's `before_create` refuses the create after a delete.
         """
         while True:
             try:

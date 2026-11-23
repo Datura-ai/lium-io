@@ -1364,6 +1364,10 @@ class _SameNameContainerKept(Exception):
     """A re-sent create met the pod's own container already running (or unreadable): it is the renter's, never removed."""
 
 
+class _CreateRefusedAfterDelete(ContainerCreateRefused):
+    """Raised at `containers/create` when this pod's delete has already reported it gone: nothing was created."""
+
+
 class _FillerRefusedForCustomerCreate(ContainerCreateRefused):
     """Raised at a filler's `docker run` while a customer create runs on the same executor."""
 
@@ -2688,6 +2692,14 @@ def _refuse_filler_during_customer_create(payload: ContainerCreateRequest) -> No
         raise _FillerRefusedForCustomerCreate(
             f"a customer create is running on executor {payload.executor_id}; filler {payload.pod_id} not started"
         )
+
+
+def _refuse_create_before_docker(payload: ContainerCreateRequest) -> None:
+    """The run spec's `before_create`, called in the Docker thread right before each `containers/create`."""
+    _refuse_filler_during_customer_create(payload)
+    if inflight_creates.is_cancelled(payload.pod_id, executor_key(payload)):
+        # the resume's create once dockerd freed the name, or a delete since the last checkpoint: make nothing
+        raise _CreateRefusedAfterDelete(f"delete for pod {payload.pod_id} arrived before its container was created")
 
 
 def _refuse_filler_beside_unlisted_pod(payload: ContainerCreateRequest, container_names: Iterable[str]) -> None:
@@ -4605,7 +4617,7 @@ class DockerService:
             entrypoint=custom_options.entrypoint,
             network=RENTAL_NETWORK_NAME,
             labels={LIUM_POD_ID_LABEL: payload.pod_id},
-            before_create=lambda: _refuse_filler_during_customer_create(payload),
+            before_create=lambda: _refuse_create_before_docker(payload),
             # a customer pod created since the cleanup's listing is seen here, before the filler starts
             before_start=(
                 (lambda names: _refuse_filler_beside_unlisted_pod(payload, names))
@@ -11830,49 +11842,45 @@ class DockerService:
                     # again right before the create: a customer create may register while the run
                     # waits for a thread.
                     _refuse_filler_during_customer_create(payload)
-                    # a create retried after a lost answer waits for dockerd's first create, which a delete ends
-                    container_id = await self._unless_cancelled_by_delete(
-                        ssh_client,
-                        payload,
-                        default_extra,
-                        self._run_rental_docker_create_with_port_retry(
-                            docker_client=docker_client,
-                            ssh_client=ssh_client,
-                            run_spec=run_spec,
-                            container_name=container_name,
-                            default_extra=default_extra,
-                            local_volume=local_volume,
-                            log_tag=log_tag,
-                            port_maps=port_maps,
-                            spare_port_pairs=_spare_port_pairs(payload.available_ports, port_maps),
-                            pod_id=payload.pod_id,
-                            remove_port_checks_listed_live=(
-                                None
-                                if probed_port_check_names is None
-                                else lambda: self.wait_for_port_check_containers(
-                                    executor_info=executor_info,
-                                    miner_hotkey=payload.miner_hotkey,
-                                    keypair=keypair,
-                                    private_key=private_key,
-                                    ssh_client=ssh_client,
-                                )
-                            ),
-                            # fillers keep no RepoDigests on a flattened copy, so their image check would be skipped
-                            flatten_reserved_bytes=(
-                                _flatten_reserved_bytes(
-                                    effective_storage_limit_gb, effective_volume_limit_gb, payload.disk_share
-                                )
-                                if payload.workload_kind == WorkloadKind.CUSTOMER_RENTAL
-                                else None
-                            ),
-                            before_flatten_retry=lambda: self._abort_if_cancelled_by_delete(
-                                ssh_client, payload, default_extra, settle_early_probes
-                            ),
-                            flatten_beside_other_create=lambda: customer_creates.others_running(payload),
+                    container_id = await self._run_rental_docker_create_with_port_retry(
+                        docker_client=docker_client,
+                        ssh_client=ssh_client,
+                        run_spec=run_spec,
+                        container_name=container_name,
+                        default_extra=default_extra,
+                        local_volume=local_volume,
+                        log_tag=log_tag,
+                        port_maps=port_maps,
+                        spare_port_pairs=_spare_port_pairs(payload.available_ports, port_maps),
+                        pod_id=payload.pod_id,
+                        remove_port_checks_listed_live=(
+                            None
+                            if probed_port_check_names is None
+                            else lambda: self.wait_for_port_check_containers(
+                                executor_info=executor_info,
+                                miner_hotkey=payload.miner_hotkey,
+                                keypair=keypair,
+                                private_key=private_key,
+                                ssh_client=ssh_client,
+                            )
                         ),
-                        settle_early_probes=settle_early_probes,
+                        # fillers keep no RepoDigests on a flattened copy, so their image check would be skipped
+                        flatten_reserved_bytes=(
+                            _flatten_reserved_bytes(
+                                effective_storage_limit_gb, effective_volume_limit_gb, payload.disk_share
+                            )
+                            if payload.workload_kind == WorkloadKind.CUSTOMER_RENTAL
+                            else None
+                        ),
+                        before_flatten_retry=lambda: self._abort_if_cancelled_by_delete(
+                            ssh_client, payload, default_extra, settle_early_probes
+                        ),
+                        flatten_beside_other_create=lambda: customer_creates.others_running(payload),
                     )
                     edit_swap.replacement_id = container_id
+                    # the run waited for dockerd's outcome, which a delete may have overtaken: the handler
+                    # below removes the container and its volume
+                    await self._abort_if_cancelled_by_delete(ssh_client, payload, default_extra, settle_early_probes)
                     # A customer create that ran while the daemon created this container may have
                     # swept the host before it was listed: remove it by its ID (handler below).
                     _refuse_filler_during_customer_create(payload)
