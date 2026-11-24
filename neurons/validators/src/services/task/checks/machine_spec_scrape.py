@@ -21,6 +21,8 @@ from ..messages import MessageTemplate, render_message
 from ..models import ValidationEvent
 from ..pipeline import CheckResult, Context
 from ..runner import SSHCommandResult
+from .container_download_speed import SPECS_KEY as IN_POD_DOWNLOAD_KEY
+from .container_download_speed import SPECS_MEASURED_AT_KEY as IN_POD_DOWNLOAD_AT_KEY
 from .gpu_loss_hold import GpuLossHoldCheck
 from .rented_gpu_drop import RentedGpuDropCheck, missing_gpus_under_reset
 from .upload_files import UploadFailed, upload_validation_files_to_fresh_remote_dir
@@ -554,6 +556,9 @@ class MachineSpecScrapeCheck:
     ) -> CheckResult:
         specs.pop("port_verify_first_miss", None)
         specs.pop("split_disk", None)
+        # the in-pod download figure is the validator's own reading (ContainerDownloadSpeedCheck), never the node's
+        specs.pop(IN_POD_DOWNLOAD_KEY, None)
+        specs.pop(IN_POD_DOWNLOAD_AT_KEY, None)
         vloopback = specs.pop("vloopback_check", None)
         gpu_info = specs.get("gpu", {}) or {}
         gpu_count = gpu_info.get("count", 0) or 0
@@ -621,12 +626,17 @@ class MachineSpecScrapeCheck:
         *,
         reason: str | None = None,
     ) -> CheckResult:
+        from services.liumd_exec_client import LiumdRefusal
         from services.local_verify_client import LocalVerifyUnavailable
 
         if reason is None:
             if isinstance(answer, LocalVerifyUnavailable):
                 reason = answer.reason or "unavailable"
                 detail = detail or answer.detail
+            elif isinstance(answer, LiumdRefusal):
+                # liumd answered and refused: its own error code and detail say why, not "malformed"
+                reason = answer.error or "refused"
+                detail = detail or answer.detail or f"liumd exit {answer.exit_status}"
             elif answer is None:
                 reason = "no_early_read"
             else:

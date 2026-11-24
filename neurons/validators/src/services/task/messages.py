@@ -1079,6 +1079,31 @@ class SysboxLayerResetMessages:
         impact="Proceed; score not changed",
         remediation=OUTDATED.remediation,
     )
+    REMOVE_PENDING = MessageTemplate(
+        event="Host boot-time layer reset to be removed",
+        reason="SYSBOX_LAYER_RESET_REMOVE_PENDING",
+        severity="info",
+        category="env",
+        impact="Proceed",
+    )
+    REMOVED = MessageTemplate(
+        event="Host boot-time layer reset removed",
+        reason="SYSBOX_LAYER_RESET_REMOVED",
+        severity="info",
+        category="env",
+        impact="Proceed",
+    )
+    REMOVE_FAILED = MessageTemplate(
+        event="Host boot-time layer reset could not be removed",
+        reason="SYSBOX_LAYER_RESET_REMOVE_FAILED",
+        severity="warning",
+        category="env",
+        impact="Proceed; score not changed",
+        remediation=(
+            "Run `sudo bash nvidia_docker_sysbox_setup.sh --remove-layer-reset` from lium-io neurons/executor on the "
+            "host: it removes lium-sysbox-layer-reset.service and Docker's drop-in for it, and restarts nothing."
+        ),
+    )
     UNKNOWN = MessageTemplate(
         event="Host boot-time layer reset not reported",
         reason="SYSBOX_LAYER_RESET_UNKNOWN",
