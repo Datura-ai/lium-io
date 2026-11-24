@@ -561,8 +561,7 @@ class Settings(BaseSettings):
     CONTAINER_DOWNLOAD_SPEED_MIN_MBPS: float = Field(env="CONTAINER_DOWNLOAD_SPEED_MIN_MBPS", default=10.0, gt=0)
     # the same container's upload of 16 MiB to Cloudflare's speed-test sink (what a pod sends: checkpoints, results)
     CONTAINER_UPLOAD_SPEED_MIN_MBPS: float = Field(env="CONTAINER_UPLOAD_SPEED_MIN_MBPS", default=10.0, gt=0)
-    # DAH-6887: off, the upload reading and the fleet comparison for a single bad endpoint are recorded and logged
-    # (`would_fail`) without changing a score; turned on after a day of readings has been reviewed and announced
+    # DAH-6887 rollout switch, off by default
     CONTAINER_SPEED_FLEET_RULE_ENFORCED: bool = Field(env="CONTAINER_SPEED_FLEET_RULE_ENFORCED", default=False)
     CONTAINER_DOWNLOAD_SPEED_INTERVAL_HOURS: float = Field(
         env="CONTAINER_DOWNLOAD_SPEED_INTERVAL_HOURS", default=6.0, gt=0
