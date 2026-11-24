@@ -97,9 +97,9 @@ class FailedContainerErrorCodes(enum.Enum):
     ExecutorUnreachable = "ExecutorUnreachable"
     # DAH-6737: the validator's own step left no container of the pod running: not billed, not a host fault
     PodDownNotHostFault = "PodDownNotHostFault"
-    # 2.23.0: a ContainerDeleteOnNodeLeftRequest reached a host with another boot id; nothing was deleted
+    # 2.18.0: a ContainerDeleteOnNodeLeftRequest reached a host with another boot id; nothing was deleted
     NotTheNodeLeft = "NotTheNodeLeft"
-    # 2.23.0: the create met the pod's name held by another registration's container (for a moved pod, the node-left
+    # 2.18.0: the create met the pod's name held by another registration's container (for a moved pod, the node-left
     # delete's); the backend sends the create once more after that delete is confirmed
     SameNameHeldByNodeLeft = "SameNameHeldByNodeLeft"
 
@@ -334,6 +334,10 @@ class ExecutorSpecRequest(ValidatorMessage):
     # This cycle's DinD test container started on the host and its sshd never answered (a failing container
     # runtime). None from a publisher that predates the field.
     host_runtime_fault: bool | None = None
+    # 2.17.0: the rented pods this cycle's pod checks judged, by pod id, each with the host-side fault codes found on
+    # it (`RENTED_POD_PROC_FUSE_DISCONNECTED`); [] = judged and clean. A pod not listed was not judged. None = no check
+    # judged a pod, or a publisher that predates the field.
+    rented_pod_faults: dict[str, list[str]] | None = pydantic.Field(default=None, max_length=POD_STATES_MAX_ITEMS)
     # When an express recheck outside the cycle started; its `job_batch_id` is still the cycle's. None for a cycle's
     # own report and from a publisher that predates the field.
     check_started_at: datetime | None = None
@@ -472,7 +476,7 @@ class ContainerStopped(PodContainerResponse):
 @VALIDATOR_MESSAGES.register
 class ContainerDeleted(PodContainerResponse):
     message_type: ValidatorMessageType = ValidatorMessageType.ContainerDeleted
-    # 2.23.0: a ContainerDeleteOnNodeLeftRequest's command_id, echoed so the backend can tell which delete this answers;
+    # 2.18.0: a ContainerDeleteOnNodeLeftRequest's command_id, echoed so the backend can tell which delete this answers;
     # empty for any other delete and from older validators
     command_id: str = ""
 
@@ -497,7 +501,7 @@ class SshPubKeyRemoved(PodContainerResponse):
 class FailedContainerRequest(PodContainerResponse):
     message_type: ValidatorMessageType = ValidatorMessageType.FailedRequest
     # the failed request's command_id, echoed for an AddSshPublicKeyRequest, (since lium-io#2028) a
-    # ContainerCreateRequest and (2.23.0) a ContainerDeleteOnNodeLeftRequest; empty otherwise and from older validators
+    # ContainerCreateRequest and (2.18.0) a ContainerDeleteOnNodeLeftRequest; empty otherwise and from older validators
     command_id: str = ""
     error_type: FailedContainerErrorTypes = FailedContainerErrorTypes.ContainerCreationFailed
     error_code: FailedContainerErrorCodes | None = None

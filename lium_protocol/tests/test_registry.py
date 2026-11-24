@@ -47,8 +47,8 @@ def test_a_refused_message_never_carries_the_input_into_the_error() -> None:
 
 @pytest.mark.parametrize("code", ["PodDownNotHostFault", "NotTheNodeLeft", "SameNameHeldByNodeLeft"])
 def test_failed_request_codes_of_every_version_line_parse(code: str) -> None:
-    """2.23.0 carries 2.20.0's PodDownNotHostFault next to its own codes, so the backend that vendors it
-    accepts both validator releases, whichever merges first."""
+    """2.18.0 releases #2352's PodDownNotHostFault together with this line's own codes, so the backend that vendors
+    it accepts both validator changes."""
     message = VALIDATOR_MESSAGES.parse(
         json.dumps({**A_DELETED, "message_type": "FailedRequest", "msg": "x", "error_code": code})
     )

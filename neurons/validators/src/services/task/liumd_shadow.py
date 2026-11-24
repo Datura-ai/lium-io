@@ -36,7 +36,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from datura.requests.validator_requests import MatmulStep, VerifyXStep
-from services.liumd_binary_refresh import refresh_liumd_from_answer
+from services.liumd_binary_refresh import ensure_liumd_binary, refresh_liumd_from_answer
 from services.liumd_exec_client import LiumdExecClient, LiumdRefusal
 from services.local_verify_client import (
     DETAIL_MAX_CHARS,
@@ -202,11 +202,12 @@ async def _facts_only(ctx: Context, client_factory: Callable[[Context, float], A
 
     if not settings.LIUMD_BINARY_REFRESH_ENABLED:
         return answer
-    build_sha = answer.build_sha if isinstance(answer, LocalVerifyAnswer) else ""
-    target = answer.target if isinstance(answer, LocalVerifyAnswer) else ""
-    refresh = await refresh_liumd_from_answer(
-        ctx, build_sha, target, budget_seconds=budget
-    )
+    if isinstance(answer, LocalVerifyAnswer):
+        refresh = await refresh_liumd_from_answer(
+            ctx, answer.build_sha, answer.target, budget_seconds=budget
+        )
+    else:
+        refresh = await ensure_liumd_binary(ctx, budget_seconds=budget)
     if refresh is None:
         return answer
     if refresh.skipped:

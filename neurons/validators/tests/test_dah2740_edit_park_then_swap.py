@@ -1445,7 +1445,7 @@ async def test_the_kept_copy_takes_only_the_parked_layers_own_files_never_its_im
 
     [copy] = _docker(ssh.commands, "cp")
     assert f"{_kept(payload)}:" not in copy  # never `docker cp <parked>:<path>`, the merged rootfs
-    assert "GraphDriver.Data.UpperDir" in copy and "find . -mindepth 1" in copy and "$w -print0" in copy
+    assert ".Data.UpperDir" in copy and "find . -mindepth 1" in copy and "$w -print0" in copy
     assert "tar --null -T - -cf - | /usr/bin/docker cp - " in copy
 
 
@@ -1541,6 +1541,10 @@ def test_the_layer_read_runs_in_a_real_shell(tmp_path, mounts, diff, kept):
         ("containerd", True, None, None),
         # Docker restarted it inside the validator start's window: files since then are the renter's
         ("overlay2", True, ((120, -60),), 60),
+        # a sysbox (DinD) pod on the containerd store: its root is a bind mount, the host's mount table names the overlay
+        ("sysbox", False, ((0, -60),), 0),
+        # the same on Docker 29: its default API omits GraphDriver, so the template naming it exits 1
+        ("sysbox-docker29", False, ((0, -60),), 0),
         ("given", False, ((0, -60),), 0),  # stopped on the containerd store: the upper dir the running read used
         ("none", True, ((0, -60),), 0),  # no upper dir anywhere: docker diff decides, and lists the startup file
         ("kept", True, ((0, -60),), 0),  # a copy already kept: a window never releases it, only docker diff decides
@@ -1562,11 +1566,18 @@ def test_the_layer_read_skips_only_files_written_in_a_recorded_validator_start(
     (upper / "root" / ".jupyter").mkdir(parents=True)
     (upper / "root" / ".jupyter" / "lab.json").write_text("{}")
     (proc / "4242").mkdir()
+    overlay = f"overlay overlay rw,lowerdir=/l1:/l2,upperdir={host_upper},workdir=/w\n"
     (proc / "4242" / "mountinfo").write_text(
         "1 0 0:1 / /proc rw - proc proc rw\n"
-        f"2 0 0:2 / / rw,relatime - overlay overlay rw,lowerdir=/l1:/l2,upperdir={host_upper},workdir=/w\n"
+        + ("2 0 0:2 /rootfs / rw - ext4 /dev/root rw\n" if store.startswith("sysbox") else f"2 0 0:2 / / rw,relatime - {overlay}")
     )
-    inspect = {"overlay2": f"4242 {host_upper}", "containerd": "4242 <no value>"}.get(store, "0 <no value>")
+    # only a running container's rootfs is mounted on the host
+    (proc / "1" / "mountinfo").write_text(
+        f"3 1 0:3 / /var/lib/docker/rootfs/overlayfs/othercid rw - overlay overlay rw,upperdir=/other/diff\n"
+        + (f"4 1 0:4 / /var/lib/docker/rootfs/overlayfs/cid rw,relatime - {overlay}" if store.startswith("sysbox") else "")
+    )
+    pid = "4242" if store in ("overlay2", "containerd", "sysbox", "sysbox-docker29") else "0"
+    upper_dir_reply = {"overlay2": f"echo {host_upper}", "sysbox-docker29": "exit 1"}.get(store, "echo '<no value>'")
     docker_started = (
         "0001-01-01T00:00:00Z"
         if docker_started_ago is None
@@ -1577,7 +1588,8 @@ def test_the_layer_read_skips_only_files_written_in_a_recorded_validator_start(
     docker = tmp_path / "docker"
     docker.write_text(
         "#!/bin/sh\n"
-        f'case "$3" in *UpperDir*) echo "{inspect}"; exit;; *StartedAt*) echo "cid {docker_started}"; exit;; *.Id*) echo cid; exit;; esac\n'
+        f'case "$3" in *UpperDir*) {upper_dir_reply}; exit;; *State.Pid*) echo "{pid} cid"; exit;; '
+        f'*StartedAt*) echo "cid {docker_started}"; exit;; esac\n'
         '[ "$1" = inspect ] && { echo /lium-cipher; exit; }\n'
         # docker diff lists the same file: only the upper-dir read can tell it is startup noise
         f'[ "$1" = diff ] && {{ touch {tmp_path}/diffed; printf "C /root\\nA /root/.jupyter\\nA /root/.jupyter/lab.json\\n"; exit; }}\n'
@@ -1610,7 +1622,8 @@ def test_a_readable_upper_dir_without_the_volume_path_drops_without_docker_diff(
     docker = tmp_path / "docker"
     docker.write_text(
         "#!/bin/sh\n"
-        f'case "$3" in *UpperDir*) echo "4242 {host_upper}"; exit;; *StartedAt*) echo "cid 0001-01-01T00:00:00Z"; exit;; esac\n'
+        f'case "$3" in *UpperDir*) echo "{host_upper}"; exit;; *State.Pid*) echo "4242 cid"; exit;; '
+        '*StartedAt*) echo "cid 0001-01-01T00:00:00Z"; exit;; esac\n'
         '[ "$1" = inspect ] && { echo /lium-cipher; exit; }\n'
         f'[ "$1" = diff ] && {{ touch {tmp_path}/diffed; exit; }}\n'
         "exit 2\n"
@@ -1679,6 +1692,70 @@ async def test_a_remount_of_a_running_container_records_no_validator_start(svc):
 
     svc.setup_encrypted_local_volume.assert_awaited_once()
     assert [c for c in ssh.run.await_args_list if docker_service._VALIDATOR_STARTS_DIR in c.args[0]] == []
+
+
+@pytest.mark.asyncio
+async def test_a_killed_bootstrap_logs_why_the_container_died(svc, caplog):
+    # pod a5d55eaf (23 Nov): every remount's bootstrap exited 137 because the container kept restarting, and the
+    # warning said only "did not complete cleanly": its State and restart count are what prove the cause. The
+    # renter's workload is still running, so its output (which may carry its secrets) is never read into our log
+    import json
+    import logging
+
+    svc._encrypted_local_volume_name = AsyncMock(return_value="lium-cipher")
+    svc.setup_encrypted_local_volume = AsyncMock()
+    svc.install_open_ssh_server_and_start_ssh_service_with_rental_docker = AsyncMock(return_value=False)
+    state = {"Status": "running", "ExitCode": 1, "OOMKilled": False, "Error": "", "StartedAt": "s", "FinishedAt": "f"}
+
+    async def run(command, *args, **kwargs):
+        if "{{json .State}}" in command:
+            return _ssh_result(stdout=json.dumps(state) + "\n7 unless-stopped\n")
+        if "docker logs" in command:
+            return _ssh_result(stdout="RENTER_API_TOKEN=renter-secret\n")
+        return _ssh_result()
+
+    ssh = Mock(run=AsyncMock(side_effect=run))
+    with caplog.at_level(logging.WARNING, logger="services.docker_service"):
+        await svc._restore_mount_and_sshd_after_start(
+            docker_client=Mock(), ssh_client=ssh, container_name="pod_x", local_volume_path="/root",
+            pod_id="x", default_extra={},
+        )
+        await asyncio.gather(*docker_service._BOOTSTRAP_DIAGNOSTICS)
+
+    [record] = [r for r in caplog.records if "did not complete cleanly" in str(r.msg)]
+    extra = record.msg.extra
+    assert (extra["container_exit_code"], extra["container_restart_count"], extra["container_restart_policy"]) == (
+        1, 7, "unless-stopped"
+    )
+    assert extra["container_logs_tail"] is None
+    assert not [c for c in ssh.run.await_args_list if "docker logs" in c.args[0]]
+    assert "renter-secret" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_a_slow_bootstrap_diagnostic_read_does_not_hold_back_the_start(svc):
+    # the remount already took when the bootstrap failed: a hung diagnostic read must not run the caller into its
+    # deadline, which would treat the cut as a failed remount and stop the pod
+    svc._encrypted_local_volume_name = AsyncMock(return_value="lium-cipher")
+    svc.setup_encrypted_local_volume = AsyncMock()
+    svc.install_open_ssh_server_and_start_ssh_service_with_rental_docker = AsyncMock(return_value=False)
+    hung = asyncio.Event()
+
+    async def run(command, *args, **kwargs):
+        if "{{json .State}}" in command:
+            await hung.wait()
+        return _ssh_result()
+
+    ssh = Mock(run=AsyncMock(side_effect=run))
+    try:
+        async with asyncio.timeout(1):
+            await svc._restore_mount_and_sshd_after_start(
+                docker_client=Mock(), ssh_client=ssh, container_name="pod_x", local_volume_path="/root",
+                pod_id="x", default_extra={},
+            )
+    finally:
+        hung.set()
+        await asyncio.gather(*getattr(docker_service, "_BOOTSTRAP_DIAGNOSTICS", ()))
 
 
 @pytest.mark.asyncio

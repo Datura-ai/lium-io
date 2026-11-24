@@ -45,7 +45,7 @@ class BackendMessageType(enum.Enum):
     LockPodGpuClocksRequest = "LockPodGpuClocksRequest"
     # 2.6.0: validate one node now (a provider's "Recheck now")
     RecheckExecutorRequest = "RecheckExecutorRequest"
-    # 2.23.0: delete a moved pod's container on the node it left, only on the host that node booted as
+    # 2.18.0: delete a moved pod's container on the node it left, only on the host that node booted as
     ContainerDeleteOnNodeLeftRequest = "ContainerDeleteOnNodeLeftRequest"
 
 
@@ -207,7 +207,7 @@ class ContainerDeleteRequest(ContainerRequest):
     external_volume: str | None = None
 
 
-# 2.23.0: a validator answers a ContainerDeleteOnNodeLeftRequest within this many seconds of starting it: its wait for
+# 2.18.0: a validator answers a ContainerDeleteOnNodeLeftRequest within this many seconds of starting it: its wait for
 # the pod's creates, the connection and the host command together. The backend keeps a replacement's
 # SameNameHeldByNodeLeft failure held for at least as long after sending the delete, so the answer always finds it.
 NODE_LEFT_DELETE_ANSWER_SECONDS = 1800
@@ -215,7 +215,7 @@ NODE_LEFT_DELETE_ANSWER_SECONDS = 1800
 
 @BACKEND_MESSAGES.register
 class ContainerDeleteOnNodeLeftRequest(ContainerDeleteRequest):
-    """2.23.0: a ContainerDeleteRequest for the node a moved pod left. The node's registration can point at
+    """2.18.0: a ContainerDeleteRequest for the node a moved pod left. The node's registration can point at
     another host by the time it is sent, so the validator deletes only when the host it reaches reports
     `expected_boot_id` (/proc/sys/kernel/random/boot_id) and otherwise answers a FailedContainerRequest with
     `NotTheNodeLeft`. Its own type, not a field: a validator that does not know it refuses the message
