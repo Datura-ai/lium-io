@@ -117,7 +117,7 @@ class Judgement(NamedTuple):
     has_no_verdict: bool
     # the readings the failure rests on: every slow one, or the one cut endpoint the validator reached
     failed: tuple[EndpointReading, ...] = ()
-    # what the fleet comparison would fail while CONTAINER_SPEED_FLEET_RULE_ENFORCED is off (logged, not scored)
+    # what the fleet comparison found (logged)
     would_fail: tuple[EndpointReading, ...] = ()
 
 
@@ -400,9 +400,8 @@ class ContainerDownloadSpeedCheck:
         self, ctx: Context, readings: list[EndpointReading], *, fleet: list[EndpointReading] | None = None
     ) -> Judgement:
         """Slow on every measured download fails. Any other bad endpoint (one slow download, or a slow or failed upload)
-        fails unless the fleet comparison attributes it to the endpoint; while CONTAINER_SPEED_FLEET_RULE_ENFORCED is
-        off that comparison is only recorded (`would_fail`) and the upload decides nothing. `fleet`: the readings the
-        caller judges, the only ones recorded in the fleet window (default: all)."""
+        fails unless the fleet comparison attributes it to the endpoint. `fleet`: the readings the caller judges, the
+        only ones recorded in the fleet window (default: all)."""
         now = time.time()
         enforced = settings.CONTAINER_SPEED_FLEET_RULE_ENFORCED
         await _record_fleet(ctx, readings if fleet is None else fleet, now)
@@ -417,8 +416,7 @@ class ContainerDownloadSpeedCheck:
                 continue
             if r.error in NODE_SIDE_ERRORS and await validator_reaches(dict(ENDPOINTS)[r.endpoint]):
                 return Judgement(is_failing=True, has_no_verdict=False, failed=(r,), would_fail=tuple(bad))
-        # an endpoint left unmeasured (ours, or the endpoint's) and no failure: no verdict. That includes an upload the
-        # receiver answered with an HTTP error, enforced or not: inconclusive, never a pass that ends a streak
+        # an endpoint left unmeasured (ours, or the endpoint's) and no failure: no verdict
         return Judgement(
             is_failing=False,
             has_no_verdict=any(r.mbps is None for r in readings),

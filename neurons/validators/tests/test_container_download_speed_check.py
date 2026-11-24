@@ -438,7 +438,7 @@ async def test_a_uuid_with_any_character_round_trips_through_the_window():
     assert json.loads(fleet.fleet["pypi"][-1][1])[1] == 'odd|uuid"]'
 
 
-async def test_record_only_logs_what_the_fleet_rule_would_fail_and_scores_as_before(caplog):
+async def test_the_fleet_comparison_result_is_logged(caplog):
     cut_up = FAST.replace(UP, line("cf_up", 0, 0.2, 1, "wget: error getting response: Connection reset by peer"))
     for stdout in (PYPI_ONLY_SLOW, cut_up):
         with flags(enforced=False):
@@ -447,16 +447,13 @@ async def test_record_only_logs_what_the_fleet_rule_would_fail_and_scores_as_bef
             caplog.clear()
             with caplog.at_level("INFO"):
                 res = await ContainerDownloadSpeedCheck().run(ctx)
-            # a cut upload measured nothing: no verdict, never OK (it could end a streak)
             expected = Msg.OK if stdout is PYPI_ONLY_SLOW else Msg.UNMEASURED
             assert res.passed and res.event.reason_code == expected.reason
             assert json.loads(next(iter(redis.store.values())))["failures_in_a_row"] == 0
             logged = next(r for r in caplog.records if "CONTAINER_DOWNLOAD_SPEED" in r.getMessage())
             assert logged.msg.extra["would_fail"] == ["pypi" if stdout is PYPI_ONLY_SLOW else "cf_up"]
-            # the readings still go into the window, so the rule can be read before it is enforced
             assert json.loads(fleet.fleet["pypi"][-1][1])[0] == ctx.miner_hotkey
     with flags(enforced=False):
-        # the rule that was already enforced (every download slow) still is
         ctx, _, _ = make_ctx(SLOW)
         res = await ContainerDownloadSpeedCheck().run(ctx)
         assert res.event.reason_code == Msg.SLOW_ONCE.reason

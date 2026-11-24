@@ -549,7 +549,7 @@ async def test_validator_side_fetch_errors_stay_no_verdict():
     assert net == "none"
 
 
-# an upload the receiver refuses (HTTP 429) measured nothing: no verdict, never a pass, enforced or record-only
+# an upload the receiver refuses (HTTP 429) measured nothing: no verdict, never a pass
 @pytest.mark.parametrize("enforced", [True, False])
 async def test_an_upload_the_receiver_refuses_is_no_verdict(enforced):
     refused = RENTALS + line("pypi", CAP_BYTES, 1.0, 0) + line("hf", CAP_BYTES, 1.0, 0)
