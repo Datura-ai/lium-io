@@ -33,6 +33,7 @@ from core.docker_utils import (
     ALPINE_HELPER_IMAGE,
     ContainerDeathDiagnostics,
     DockerCommand,
+    bound_host_port,
     collect_container_death_diagnostics,
     df_available_bytes,
     df_command,
@@ -440,13 +441,6 @@ _LISTENING_PORTS_COMMAND = (
 )
 # docker ps prints a published block as a range: `0.0.0.0:20040-20049->20040-20049/tcp`
 _PUBLISHED_HOST_PORT_RE = re.compile(r":(\d{1,5})(?:-(\d{1,5}))?->[\d-]+/tcp")
-# dockerd's two bind refusals name the host address the bind was for:
-#   `failed to bind host port for 0.0.0.0:9101:172.17.0.2:22/tcp: address already in use`
-#   `failed to bind host port 0.0.0.0:9030/tcp: address already in use`
-#   `Bind for 0.0.0.0:9101 failed: port is already allocated`
-_BOUND_HOST_PORT_RE = re.compile(
-    r"(?:Bind for|failed to bind host port(?: for)?) (?:\[[0-9a-fA-F:.]{0,45}\]|[0-9.]{1,15}):(\d{1,5})(?![0-9])"
-)
 
 
 class RentalPortCollisionError(RuntimeError):
@@ -480,11 +474,7 @@ def port_collision_error_class(exc: BaseException) -> str | None:
 
 def _bound_host_port_from_error(exc: BaseException) -> int | None:
     """The host port dockerd could not bind, read from its refusal text; None when the text has none."""
-    match = _BOUND_HOST_PORT_RE.search(str(exc))
-    if match is None:
-        return None
-    port = int(match.group(1))
-    return port if 0 < port <= 65535 else None
+    return bound_host_port(str(exc))
 
 
 def _spare_port_pairs(
@@ -3203,6 +3193,10 @@ async def recovery_parked(pod_id: str) -> bool | None:
     if await _unmarked_recovery_stop_known(pod_id):
         return True
     return False if _UNMARKED_RECOVERY_STOPS_LOADED else None
+
+
+# failed-bootstrap diagnostics in flight, held so they are not collected before they log
+_BOOTSTRAP_DIAGNOSTICS: set[asyncio.Task] = set()
 
 
 def _retry_recovery_mark_in_background(
@@ -13670,14 +13664,11 @@ class DockerService:
                     timeout=30,
                 )
         if not ssh_bootstrap_ok:
-            logger.warning(
-                _m(
-                    "Docker container started but SSH bootstrap did not complete cleanly",
-                    extra=get_extra_info(
-                        {**default_extra, "container_name": container_name}
-                    ),
-                )
-            )
+            # read off this start's time: the start (and a remount) already took, and a caller's deadline cutting a
+            # slow read would count as a failed start, which stops a remounted pod
+            task = asyncio.create_task(self._log_failed_bootstrap(ssh_client, container_name, default_extra))
+            _BOOTSTRAP_DIAGNOSTICS.add(task)
+            task.add_done_callback(_BOOTSTRAP_DIAGNOSTICS.discard)
         logger.info(
             _m(
                 "Started Docker Container",
@@ -14431,17 +14422,37 @@ class DockerService:
         ]
         return repaired[0] if repaired else None
 
+    async def _log_failed_bootstrap(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        container_name: str,
+        default_extra: dict[str, Any],
+    ) -> None:
+        # a bootstrap killed under us (exit 137) is most often the container itself dying or restarting: its
+        # State and restart count are the only record of why, the host being the provider's. Not its log tail: the
+        # renter's workload keeps running and whatever it prints is the renter's, not the validator log's
+        diagnostics = await self._bounded_death_diagnostics(ssh_client, container_name, read_logs=False)
+        logger.warning(
+            _m(
+                "Docker container started but SSH bootstrap did not complete cleanly",
+                extra=get_extra_info(
+                    {**default_extra, "container_name": container_name, **diagnostics.to_log_fields()}
+                ),
+            )
+        )
+
     async def _bounded_death_diagnostics(
         self,
         ssh_client: asyncssh.SSHClientConnection,
         container_name: str,
+        read_logs: bool = True,
     ) -> ContainerDeathDiagnostics:
         # a hung `docker logs` on the miner's host must not hold back the recovery's verdict or stop;
         # the state read before the hang is kept, so a dead container is not taken for a recovery
         diagnostics = ContainerDeathDiagnostics()
         try:
             return await asyncio.wait_for(
-                collect_container_death_diagnostics(ssh_client, container_name, diagnostics),
+                collect_container_death_diagnostics(ssh_client, container_name, diagnostics, read_logs=read_logs),
                 timeout=_VLOOPBACK_REPAIR_COMMAND_TIMEOUT_SEC,
             )
         except TimeoutError:

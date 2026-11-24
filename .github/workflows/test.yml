@@ -55,11 +55,13 @@ jobs:
       miners: ${{ steps.pkgs.outputs.miners }}
       protocol: ${{ steps.pkgs.outputs.protocol }}
       e2e: ${{ steps.pkgs.outputs.e2e }}
+      shards: ${{ steps.pkgs.outputs.shards }}
       approved: ${{ steps.pkgs.outputs.approved }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - id: pkgs
-        uses: ./.github/actions/changed-packages
+        # $/ runs this repository's action at the running commit (a squash merge keeps it on main; no checkout needed)
+        uses: $/.github/actions/changed-packages
 
   ruff-check:
     # DAH-2972: gate the rule families that are at zero after the dead-code sweep (DAH-2971) so
@@ -77,8 +79,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.11"
       # same pin as lium-platform's CI
@@ -98,15 +100,15 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Set up Python 3.11
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: '3.11'
 
       - name: Install pdm
-        uses: pdm-project/setup-pdm@v4
+        uses: pdm-project/setup-pdm@544d7237314ee09c256785bd360f6b30add38b37 # v4.6
         with:
           cache: true
           cache-dependency-path: neurons/validators/pdm.lock
@@ -145,15 +147,15 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Set up Python 3.11
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: '3.11'
 
       - name: Install pdm
-        uses: pdm-project/setup-pdm@v4
+        uses: pdm-project/setup-pdm@544d7237314ee09c256785bd360f6b30add38b37 # v4.6
         with:
           cache: true
           cache-dependency-path: neurons/executor/pdm.lock
@@ -179,15 +181,15 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Set up Python 3.11
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: '3.11'
 
       - name: Install pdm
-        uses: pdm-project/setup-pdm@v4
+        uses: pdm-project/setup-pdm@544d7237314ee09c256785bd360f6b30add38b37 # v4.6
         with:
           cache: true
           cache-dependency-path: neurons/miners/pdm.lock
@@ -215,10 +217,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Set up Python 3.11
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: '3.11'
 
@@ -254,6 +256,56 @@ jobs:
   # a hard timeout on every step, runs every suite even after a failure, and always leaves e2e/artifacts (timings,
   # summary.md, junit per suite, compose logs, the suites' JSON dumps) — uploaded on every run, and summarised in
   # one sticky PR comment when the run is on a PR. Reproduce: make -C e2e e2e-full.
+  e2e-suites:
+    # Sharded: each shard builds its own stack on its own runner, so the wall time is the slowest shard (rental)
+    # instead of the sum of every suite. Runs beside the package jobs, not after them. e2e-gate (below) is still
+    # the one required check, merges the shards' summaries and fails when either side failed.
+    name: e2e ${{ matrix.shard }}
+    needs: [route]
+    if: ${{ !cancelled() && needs.route.result == 'success' && needs.route.outputs.approved == 'true' && needs.route.outputs.e2e == 'true' && (github.event_name == 'merge_group' || vars.MERGE_QUEUE_ENABLED != 'true') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      # protocol rides with cycle: it is 27 s, a runner of its own would only add a stack build
+      matrix:
+        include:
+          - shard: cycle-protocol
+            suites: cycle protocol
+          - shard: rental
+            suites: rental
+    defaults:
+      run:
+        working-directory: e2e
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        if: contains(fromJSON(needs.route.outputs.shards), matrix.shard)
+      # the gha layer cache (E2E_CACHE, e2e/Makefile) needs a builder that exports cache and the Actions cache URL + token
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+        if: contains(fromJSON(needs.route.outputs.shards), matrix.shard)
+        with:
+          driver-opts: image=moby/buildkit:v0.33.1@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea
+      - uses: crazy-max/ghaction-github-runtime@3cb05d89e1f492524af3d41a1c98c83bc3025124 # v3.1.0
+        if: contains(fromJSON(needs.route.outputs.shards), matrix.shard)
+      - name: build, up, ${{ matrix.suites }}, logs, down — each step under a hard timeout (gate.sh)
+        id: gate
+        if: contains(fromJSON(needs.route.outputs.shards), matrix.shard)
+        timeout-minutes: 55
+        env:
+          E2E_CACHE: gha
+          SUITES: ${{ matrix.suites }}
+        run: ./gate.sh
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        id: artifacts
+        if: always() && contains(fromJSON(needs.route.outputs.shards), matrix.shard)
+        with:
+          name: e2e-${{ matrix.shard }}
+          path: e2e/artifacts
+          retention-days: 14
+          overwrite: true
+
   e2e:
     # e2e-gate is the one required check, so the job never skips: a skipped job does not evaluate its
     # name expression and reports under the raw expression text, and a static-name skip would report the
@@ -263,25 +315,19 @@ jobs:
     # it on approval; the merge-group run executes the gate for the queued tree, and is green only when
     # the gate ran (or no package changed), never when route failed.
     name: ${{ (needs.route.result == 'skipped' || (github.event_name == 'pull_request_review' && needs.route.result == 'success' && needs.route.outputs.approved != 'true')) && 'e2e-gate (not a gating review)' || 'e2e-gate' }}
-    # e2e-gate is the one required check, so it also fails when route, ruff-check or a package test job failed:
-    # a red unit test cannot merge on a green e2e
-    needs: [route, validators, executor, miners, ruff-check, protocol]
+    # e2e-gate is the one required check, so it also fails when route, ruff-check, a package test job or the
+    # e2e shards failed: a red unit test cannot merge on a green e2e, and a skipped gate is never green.
+    needs: [route, validators, executor, miners, ruff-check, protocol, e2e-suites]
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 5
     permissions:
-      contents: read
+      actions: read          # the shards' artifacts
       pull-requests: write   # the sticky result comment (skipped on fork PRs, where the token is read-only)
-    env:
-      RUN: ${{ needs.route.outputs.e2e }}
-    defaults:
-      run:
-        working-directory: e2e
     steps:
-      - name: route, ruff-check and the package test jobs passed
+      - name: route, ruff-check, the package tests and the e2e shards passed
         if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
-        working-directory: ${{ github.workspace }}
-        run: echo "::error::a package test job or ruff failed (see tests-ok)" && exit 1
+        run: echo "::error::a package test job, ruff or an e2e shard failed (see tests-ok)" && exit 1
       - name: a gating run must route
         # route skips only a review that cannot gate; when it was supposed to run and did not, fail closed
         if: >-
@@ -289,54 +335,63 @@ jobs:
           && (github.event_name != 'pull_request_review'
           || (github.event.review.state == 'approved'
           && contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR", "CONTRIBUTOR"]'), github.event.review.author_association)))
-        working-directory: ${{ github.workspace }}
         run: echo "::error::route did not succeed (needs.route.result=${{ needs.route.result }})" && exit 1
       - name: a merge-group entry must have a route approval
         if: github.event_name == 'merge_group' && needs.route.outputs.approved != 'true'
-        working-directory: ${{ github.workspace }}
         run: echo "::error::route did not approve the merge-group tree" && exit 1
+      - name: the shards ran when the gate was expected
+        if: needs.route.outputs.approved == 'true' && needs.route.outputs.e2e == 'true' && (github.event_name == 'merge_group' || vars.MERGE_QUEUE_ENABLED != 'true') && needs.e2e-suites.result != 'success'
+        run: echo "::error::the e2e shards did not run (e2e-suites=${{ needs.e2e-suites.result }})" && exit 1
       - name: not a gating review
         if: needs.route.result == 'skipped'
-        working-directory: ${{ github.workspace }}
         run: echo "this review cannot gate the tree; the last e2e-gate result stands"
       # With the queue off the PR check is the real gate: a green here would let an approved head merge
       # before the approval run reports, so fail closed instead.
       - name: not approved yet
         if: needs.route.result == 'success' && github.event_name != 'merge_group' && needs.route.outputs.approved != 'true'
-        working-directory: ${{ github.workspace }}
         run: echo "the approval rule blocks the merge; e2e-gate reports after a review approves" && [ "${{ vars.MERGE_QUEUE_ENABLED }}" = "true" ]
       - name: deferred to the merge queue
         if: github.event_name != 'merge_group' && needs.route.outputs.approved == 'true' && vars.MERGE_QUEUE_ENABLED == 'true'
-        working-directory: ${{ github.workspace }}
         run: echo "e2e gate runs in the merge queue for this tree"
-      - uses: actions/checkout@v4
-        if: needs.route.outputs.approved == 'true' && (github.event_name == 'merge_group' || vars.MERGE_QUEUE_ENABLED != 'true') && env.RUN == 'true'
-      # the gha layer cache (E2E_CACHE, e2e/Makefile) needs a builder that exports cache and the Actions cache URL + token
-      - uses: docker/setup-buildx-action@v3
-        if: needs.route.outputs.approved == 'true' && (github.event_name == 'merge_group' || vars.MERGE_QUEUE_ENABLED != 'true') && env.RUN == 'true'
-      - uses: crazy-max/ghaction-github-runtime@v3
-        if: needs.route.outputs.approved == 'true' && (github.event_name == 'merge_group' || vars.MERGE_QUEUE_ENABLED != 'true') && env.RUN == 'true'
-      - name: build, up, every suite, logs, down — each step under a hard timeout (gate.sh)
-        if: needs.route.outputs.approved == 'true' && (github.event_name == 'merge_group' || vars.MERGE_QUEUE_ENABLED != 'true') && env.RUN == 'true'
-        id: gate
-        timeout-minutes: 55
-        env:
-          E2E_CACHE: gha
-        run: ./gate.sh
-      - uses: actions/upload-artifact@v4
-        id: artifacts
-        if: always() && needs.route.outputs.approved == 'true' && (github.event_name == 'merge_group' || vars.MERGE_QUEUE_ENABLED != 'true') && env.RUN == 'true'
-        with:
-          name: e2e-gate-${{ github.event.pull_request.number || github.run_id }}-${{ github.run_attempt }}
-          path: e2e/artifacts
-          retention-days: 14
-      - name: result on the PR
-        if: always() && needs.route.outputs.approved == 'true' && (github.event_name == 'merge_group' || vars.MERGE_QUEUE_ENABLED != 'true') && env.RUN == 'true' && github.event.pull_request && github.event.pull_request.head.repo.full_name == github.repository
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        if: always() && needs.e2e-suites.result != 'skipped'
         continue-on-error: true
-        uses: actions/github-script@v7
+        with:
+          pattern: e2e-*
+          path: e2e/artifacts/shards
+      - name: one summary from the shards
+        if: always() && needs.e2e-suites.result != 'skipped'
         env:
-          OUTCOME: ${{ steps.gate.outcome }}
-          ARTIFACT_URL: ${{ steps.artifacts.outputs.artifact-url }}
+          SHARDS_RESULT: ${{ needs.e2e-suites.result }}
+          EXPECTED: ${{ needs.route.outputs.shards }}
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib, sys
+          root, out = pathlib.Path('e2e/artifacts/shards'), pathlib.Path('e2e/artifacts/summary.md')
+          expected = json.loads(os.environ.get('EXPECTED') or '[]')
+          out.parent.mkdir(parents=True, exist_ok=True)
+          blocks, present = [], {}
+          for d in sorted(p for p in root.glob('*') if p.is_dir()):
+              md = d / 'summary.md'
+              body = md.read_text().strip() if md.exists() else '**e2e gate: FAIL**: no summary written'
+              first, _, rest = body.partition('\n')
+              present[d.name.removeprefix('e2e-')] = 'PASS' in first
+              t = d / 'timings.txt'
+              suites = [l.split('\t')[0].removeprefix('test-') for l in t.read_text().splitlines() if l.startswith('test-')] if t.exists() else []
+              blocks.append(f"### {' + '.join(suites) or d.name}\n\n{rest.strip()}\n")
+          ok = sorted(present) == sorted(expected) and all(present.values()) and os.environ.get('SHARDS_RESULT') == 'success'
+          out.write_text(('**e2e gate: PASS**' if ok else '**e2e gate: FAIL**') + '\n\n' + '\n'.join(blocks))
+          print(out.read_text())
+          if not ok:
+              print(f"::error::e2e shards: expected {expected}, reported {sorted(present)}")
+              sys.exit(1)
+          PY
+      - name: result on the PR
+        if: always() && needs.e2e-suites.result != 'skipped' && github.event.pull_request && github.event.pull_request.head.repo.full_name == github.repository
+        continue-on-error: true
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
+        env:
+          OUTCOME: ${{ needs.e2e-suites.result }}
         with:
           script: |
             const fs = require('fs');
@@ -344,14 +399,14 @@ jobs:
             const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
             const summary = fs.existsSync('e2e/artifacts/summary.md')
               ? fs.readFileSync('e2e/artifacts/summary.md', 'utf8')
-              : `**e2e gate: FAIL** — no summary written: the gate did not finish (outcome ${process.env.OUTCOME}: it failed before its first step, or the 55-minute step limit killed it mid-run); see the run log.`;
+              : `**e2e gate: FAIL** — no summary written: the shards did not finish (${process.env.OUTCOME}); see the run log.`;
             const body = [
               marker,
-              `### e2e gate · ${context.payload.pull_request.head.sha.slice(0, 8)} · [run](${runUrl})${process.env.ARTIFACT_URL ? ` · [artifacts](${process.env.ARTIFACT_URL})` : ''}`,
+              `### e2e gate · ${context.payload.pull_request.head.sha.slice(0, 8)} · [run](${runUrl}) · [artifacts](${runUrl}#artifacts)`,
               '',
               summary.trim(),
               '',
-              `<sub>Compose stack: the PR's executor + miner + validator services on one runner, no chain, no GPU (e2e/README.md). Reproduce: \`make -C e2e e2e-full\`; on a GPU box: \`E2E_GPU=1 make -C e2e e2e-full\`.</sub>`,
+              `<sub>Compose stack: the PR's executor + miner + validator services on one runner per shard, no chain, no GPU (e2e/README.md). Reproduce: \`make -C e2e e2e-full\`; on a GPU box: \`E2E_GPU=1 make -C e2e e2e-full\`.</sub>`,
             ].join('\n');
             // every page: on a PR with more than 100 comments a single page would miss the marker and post a second comment
             const comments = await github.paginate(github.rest.issues.listComments, { ...context.repo, issue_number: context.issue.number, per_page: 100 });

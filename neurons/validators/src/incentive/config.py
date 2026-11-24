@@ -170,7 +170,7 @@ RENTAL_PRICES_PER_HOUR.update({
 MAX_UNRENTED_GPUS_BY_TYPE: dict[str, dict[int, int]] = {
     "B300": {1: 4, 8: 32},
     "B200": {1: 10, 8: 64},
-    "H200": {1: 10, 8: 64},
+    "H200": {1: 5, 8: 32},
     "H100": {1: 10, 8: 64},
     "RTX 4090": {1: 10, 8: 64},
     "A100": {1: 10, 8: 40},

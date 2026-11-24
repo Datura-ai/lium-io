@@ -1677,6 +1677,70 @@ async def test_a_remount_of_a_running_container_records_no_validator_start(svc):
 
 
 @pytest.mark.asyncio
+async def test_a_killed_bootstrap_logs_why_the_container_died(svc, caplog):
+    # pod a5d55eaf (23 Nov): every remount's bootstrap exited 137 because the container kept restarting, and the
+    # warning said only "did not complete cleanly": its State and restart count are what prove the cause. The
+    # renter's workload is still running, so its output (which may carry its secrets) is never read into our log
+    import json
+    import logging
+
+    svc._encrypted_local_volume_name = AsyncMock(return_value="lium-cipher")
+    svc.setup_encrypted_local_volume = AsyncMock()
+    svc.install_open_ssh_server_and_start_ssh_service_with_rental_docker = AsyncMock(return_value=False)
+    state = {"Status": "running", "ExitCode": 1, "OOMKilled": False, "Error": "", "StartedAt": "s", "FinishedAt": "f"}
+
+    async def run(command, *args, **kwargs):
+        if "{{json .State}}" in command:
+            return _ssh_result(stdout=json.dumps(state) + "\n7 unless-stopped\n")
+        if "docker logs" in command:
+            return _ssh_result(stdout="RENTER_API_TOKEN=renter-secret\n")
+        return _ssh_result()
+
+    ssh = Mock(run=AsyncMock(side_effect=run))
+    with caplog.at_level(logging.WARNING, logger="services.docker_service"):
+        await svc._restore_mount_and_sshd_after_start(
+            docker_client=Mock(), ssh_client=ssh, container_name="pod_x", local_volume_path="/root",
+            pod_id="x", default_extra={},
+        )
+        await asyncio.gather(*docker_service._BOOTSTRAP_DIAGNOSTICS)
+
+    [record] = [r for r in caplog.records if "did not complete cleanly" in str(r.msg)]
+    extra = record.msg.extra
+    assert (extra["container_exit_code"], extra["container_restart_count"], extra["container_restart_policy"]) == (
+        1, 7, "unless-stopped"
+    )
+    assert extra["container_logs_tail"] is None
+    assert not [c for c in ssh.run.await_args_list if "docker logs" in c.args[0]]
+    assert "renter-secret" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_a_slow_bootstrap_diagnostic_read_does_not_hold_back_the_start(svc):
+    # the remount already took when the bootstrap failed: a hung diagnostic read must not run the caller into its
+    # deadline, which would treat the cut as a failed remount and stop the pod
+    svc._encrypted_local_volume_name = AsyncMock(return_value="lium-cipher")
+    svc.setup_encrypted_local_volume = AsyncMock()
+    svc.install_open_ssh_server_and_start_ssh_service_with_rental_docker = AsyncMock(return_value=False)
+    hung = asyncio.Event()
+
+    async def run(command, *args, **kwargs):
+        if "{{json .State}}" in command:
+            await hung.wait()
+        return _ssh_result()
+
+    ssh = Mock(run=AsyncMock(side_effect=run))
+    try:
+        async with asyncio.timeout(1):
+            await svc._restore_mount_and_sshd_after_start(
+                docker_client=Mock(), ssh_client=ssh, container_name="pod_x", local_volume_path="/root",
+                pod_id="x", default_extra={},
+            )
+    finally:
+        hung.set()
+        await asyncio.gather(*getattr(docker_service, "_BOOTSTRAP_DIAGNOSTICS", ()))
+
+
+@pytest.mark.asyncio
 async def test_each_validator_start_is_kept_next_to_the_earlier_ones(svc, tmp_path, monkeypatch):
     # a second start must not erase the first: the first start's entrypoint files are still in the layer
     import subprocess

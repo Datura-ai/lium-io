@@ -125,6 +125,8 @@ ORIGINAL_KEYS = {
     # DAH-5059: kB per container name (writable layer + its anonymous volumes) and per volume name
     'hard_disk_by_container': "by_container",
     'hard_disk_by_volume': "by_volume",
+    # DAH-6981: containers with a volume no read could size this scrape (their size is unknown, not partial)
+    'hard_disk_unsized_containers': "unsized_containers",
     'data_os': "os",
     'data_kernel': "kernel",
     'kernel_scrape_error': "kernel_scrape_error",
@@ -369,6 +371,7 @@ class FileEncryptService:
             'hard_disk_engy_cache_used_gb': "",
             'hard_disk_by_container': "",
             'hard_disk_by_volume': "",
+            'hard_disk_unsized_containers': "",
             'data_os': "",
             'data_kernel': "",
             'kernel_scrape_error': "",

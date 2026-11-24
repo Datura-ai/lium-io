@@ -48,12 +48,17 @@ jobs:
       # the hotkey the dev executor build trusts too (executor_cd_dev.yml).
       STAGING_ENDPOINT_URL: https://staging.lium.io/api/watchtower/digest
       STAGING_VALIDATOR_HOTKEY: "5DHgdomxxHSQf7neJWcagvGhTMKpqvKWwuprEaFF8C653qty"
+      # the staging owner key (staging only, not on chain) and the message it signed: the staging image follows
+      # validator messages that key signs (scripts/staging_trust_override.sh)
+      STAGING_TRUST_OWNER_SS58: "5EeYEmUGfAJeTmVvYSmkpsUmVhiySd2Zch5nyt4tE1HygFX8"
+      STAGING_TRUST_MESSAGE: "lium-validator:5DHgdomxxHSQf7neJWcagvGhTMKpqvKWwuprEaFF8C653qty:1"
+      STAGING_TRUST_SIGNATURE: "0x462f3d57f5307db9dc0d1e820015204e57f5fea61f2a3fa330c0507b7554ce333fdc046406d3a4aaf74599109b25bbb5e842377706d4491ae2f8efad8bd35181"
       # One OCI index for x86 and ARM (GB300, GB10) hosts, as the executor (executor_cd_prod.yml):
       # docker_build.sh writes it to an OCI archive and the push steps copy it with skopeo.
       PLATFORMS: "linux/amd64,linux/arm64"
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Resolve the tag and check it against watchtower/pyproject.toml
         id: tag
@@ -83,11 +88,11 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       # pinned to reviewed commits: these run with id-token: write before the push
-      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
         with:
           # the actions default to mutable tags (binfmt:latest, buildkit:buildx-stable-1); pin the images by digest
           image: docker.io/tonistiigi/binfmt:qemu-v10.2.3@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0
-      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
         with:
           driver-opts: image=moby/buildkit:v0.33.1@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea
 
@@ -98,6 +103,10 @@ jobs:
       - name: Build the prod image
         env:
           DEPLOY_ENV: prod
+          # prod never follows the staging owner key: the job-level values are blanked for this build
+          STAGING_TRUST_OWNER_SS58: ""
+          STAGING_TRUST_MESSAGE: ""
+          STAGING_TRUST_SIGNATURE: ""
           OCI_ARCHIVE: /tmp/lium-watchtower-prod.oci.tar
           TAG: ${{ steps.tag.outputs.tag }}
         run: |
@@ -117,7 +126,7 @@ jobs:
           bash ./docker_build.sh
 
       - name: Log in to Docker Hub (OIDC, no stored token)
-        uses: docker/login-action@v4   # >= 4.5.0 for Docker Hub OIDC
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0 (>= 4.5.0 for Docker Hub OIDC)
         env:
           DOCKERHUB_OIDC_CONNECTIONID: ${{ vars.DOCKERHUB_OIDC_CONNECTIONID }}
           # The exchanged token is the docker password for the rest of the job (default 300 s);

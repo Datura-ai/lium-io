@@ -1646,3 +1646,14 @@ def test_fetch_json_reads_a_reply_and_refuses_one_over_the_cap():
             trust_service.fetch_json(url)
     finally:
         stop()
+
+def test_trust_a_staging_build_follows_only_its_own_owner_key_and_never_reads_the_chain(tmp_path, monkeypatch):
+    staging = Keypair.create_from_uri("//WatchtowerTrustStagingOwner")
+    _chain(monkeypatch, Mock(side_effect=AssertionError("chain read")))
+    trust = ValidatorTrust(image_message=_image(tmp_path, _message(OWNER, NEW_VALIDATOR, 8)),
+                           owner=staging.ss58_address, read_chain=False, message=_message(staging, OLD_VALIDATOR, 1))
+    trust.load()
+    assert trust.report()["validator"] == OLD_VALIDATOR.ss58_address
+    assert trust.offer(_message(OWNER, NEW_VALIDATOR, 2)) is False
+    assert trust.refresh_owner() is False and trust.owner == staging.ss58_address
+    assert trust.offer(_message(staging, NEW_VALIDATOR, 2)) is True

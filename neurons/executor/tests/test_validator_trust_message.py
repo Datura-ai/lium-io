@@ -403,3 +403,40 @@ def test_the_image_copy_is_signed_by_the_release_time_owner_coldkey():
 
     shipped = trust_service._signed(json.loads(trust_service.IMAGE_MESSAGE_PATH.read_text()))
     assert verify_trust_message(shipped, RELEASE_SUBNET_OWNER_COLDKEY).revision == 1
+
+
+@pytest.fixture(scope="module")
+def staging_owner():
+    return Keypair.create_from_uri("//LiumTrustStagingOwner")
+
+
+def test_a_staging_build_follows_only_its_own_owner_key_and_never_reads_the_chain(
+    tmp_path, monkeypatch, owner, staging_owner, old_validator, new_validator
+):
+    monkeypatch.setattr(trust_service, "read_subnet_owner_coldkey", MagicMock(side_effect=AssertionError("chain read")))
+    image = _image(tmp_path, _signed(owner, old_validator, 9))   # the release image copy is never taken in staging
+    start = _signed(staging_owner, old_validator, 1)
+    trust = ValidatorTrust(
+        state_dir=tmp_path, image_message=image, owner=staging_owner.ss58_address, read_chain=False, message=start
+    )
+    trust.load()
+    assert trust.report()["validator"] == old_validator.ss58_address and trust.report()["revision"] == 1
+    assert not trust.offer(_signed(owner, new_validator, 2))   # the release owner's message is not the staging owner's
+    assert asyncio.run(trust.refresh_owner()) is False and trust.owner == staging_owner.ss58_address
+    assert trust.offer(_signed(staging_owner, new_validator, 2))
+    asyncio.run(trust.save())
+    # a restart keeps the staging message; a state file naming another owner and signer cannot move the fixed owner
+    state = json.loads((tmp_path / STATE_FILE).read_text())
+    (tmp_path / STATE_FILE).write_text(json.dumps({**state, "owner": owner.ss58_address}))
+    again = ValidatorTrust(
+        state_dir=tmp_path, image_message=image, owner=staging_owner.ss58_address, read_chain=False, message=start
+    )
+    again.load()
+    assert again.report()["validator"] == new_validator.ss58_address and again.owner == staging_owner.ss58_address
+    forged = {"owner": owner.ss58_address, "signer": owner.ss58_address, "message": _signed(owner, old_validator, 5)._asdict()}
+    (tmp_path / STATE_FILE).write_text(json.dumps(forged))
+    third = ValidatorTrust(
+        state_dir=tmp_path, image_message=image, owner=staging_owner.ss58_address, read_chain=False, message=start
+    )
+    third.load()
+    assert third.report()["revision"] == 1   # the release-signed kept message is refused; the build's own message holds
