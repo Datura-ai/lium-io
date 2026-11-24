@@ -9,7 +9,7 @@ description: >-
   merged PR already ran its jobs, so main re-runs only the packages it changed (DAH-5201). Any other
   event (workflow_dispatch, a push whose before-commit is unknown) has no diff and selects every package. Documentation never selects a package: *.md and .gitignore files
   wherever they sit, and the root docs/ tree, are dropped from the file list before routing
-  (isDoc; lium_protocol/changes/*.md is not documentation: those fragments are what
+  (isDoc; nothing under lium_protocol/changes/ is documentation: those fragments are what
   scripts/check_version.py reads, so they select protocol), so a PR that only edits neurons/validators/README.md runs no tests and tests-ok still
   reports green — the tests exercise code, and none of those files is code. (A docs/ directory
   inside a package, e.g. neurons/executor/dstacktee/docs/, is not dropped: it is part of that
@@ -57,8 +57,8 @@ runs:
           // a change under dstacktee/ (the measured CVM files and dstack.py) runs the validator's
           // compose-hash whitelist test (tests/test_tdx_compose_hash_whitelist.py, DAH-3602)
           const ALSO = { validators: ['lium_protocol/', 'neurons/executor/dstacktee/'] };
-          // a change fragment is the protocol package's input (scripts/check_version.py), not documentation
-          const isDoc = f => !/^lium_protocol\/changes\/[^/]+\.md$/.test(f) && /\.md$|(^|\/)\.gitignore$|^docs\//.test(f);
+          // nothing under changes/ is documentation: scripts/check_version.py reads it, and refuses a misplaced file
+          const isDoc = f => !/^lium_protocol\/changes\//.test(f) && /\.md$|(^|\/)\.gitignore$|^docs\//.test(f);
           const touches = (files, pkg, prefix) =>
             files.some(f => f.startsWith(prefix)) || files.some(f => SHARED.some(s => f.startsWith(s)))
             || files.some(f => (ALSO[pkg] || []).some(s => f.startsWith(s)));

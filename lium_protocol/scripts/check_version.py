@@ -9,8 +9,9 @@ queue too, so each PR is judged on its own diff; locally pass `$(git merge-base 
 3. a release PR leaves a fragment that is on its base (a feature merged after the release was cut: its change would
    ship under the release's tag without its bump),
 4. a PR edits a fragment that is already on its base, or adds one `release.py` cannot read (it would stop the
-   release later), or
-5. the wire changes and no fragment is added under lium_protocol/changes/. The wire is the committed schema snapshot
+   release later) or does not read (a file in a subfolder of changes/),
+5. a release PR changes the wire (a change shipped under the release's tag with no fragment of its own), or
+6. the wire changes and no fragment is added under lium_protocol/changes/. The wire is the committed schema snapshot
    (CI holds it equal to the models: `python -m lium_protocol.schema --check`) but its protocol_version line, so a
    comment or a docstring that is not in the schema needs no fragment.
 A release PR is one that deletes at least one fragment: `scripts/release.py` does that, nothing else does.
@@ -20,7 +21,7 @@ import re
 import subprocess
 import sys
 
-from release import BUMPS, bumped, parse_fragment  # scripts/release.py: one fragment format, one bump rule
+from release import BUMPS, Fragment, bumped, parse_fragment  # scripts/release.py: one fragment format, one bump rule
 
 WIRE = "lium_protocol/lium_protocol/snapshots/"
 CHANGES = "lium_protocol/changes/"
@@ -37,11 +38,16 @@ def version(ref: str) -> str:
     return re.search(r'^PROTOCOL_VERSION = "([^"]+)"$', git("show", f"{ref}:{INIT}"), re.MULTILINE).group(1)
 
 
+def is_fragment(path: str) -> bool:
+    # release.py reads only changes/*.md, so a file in a subfolder is not a fragment
+    return path.startswith(CHANGES) and "/" not in path[len(CHANGES):] and path.endswith(".md")
+
+
 def fragments(ref: str) -> set[str]:
-    return {p for p in git("ls-tree", "-r", "--name-only", "--full-name", ref, "--", f":(top){CHANGES}").splitlines() if p.endswith(".md")}
+    return {p for p in git("ls-tree", "-r", "--name-only", "--full-name", ref, "--", f":(top){CHANGES}").splitlines() if is_fragment(p)}
 
 
-def _fragment(ref: str, path: str):
+def parse_fragment_at_ref(ref: str, path: str) -> Fragment | str:
     """the parsed fragment at ref, or the error text release.py would stop on"""
     try:
         return parse_fragment(git("show", f"{ref}:{path}"), path)
@@ -51,19 +57,21 @@ def _fragment(ref: str, path: str):
 
 def problems(base: str) -> list[str]:
     status = [line.split("\t") for line in git("diff", "--name-status", "--no-renames", base, "HEAD").splitlines()]
-    is_release = any(s == "D" and p.startswith(CHANGES) for s, p, *_ in status)
-    new_fragments = [p for s, p, *_ in status if s == "A" and p.startswith(CHANGES) and p.endswith(".md")]
+    is_release = any(s == "D" and is_fragment(p) for s, p, *_ in status)
+    new_fragments = [p for s, p, *_ in status if s == "A" and is_fragment(p)]
     found = []
     for s, p, *_ in status:
-        if s not in ("A", "D") and p.startswith(CHANGES) and p.endswith(".md"):
+        if s != "D" and p.startswith(CHANGES) and not is_fragment(p):
+            found.append(f"{p} is not a fragment release.py reads: put it directly under {CHANGES} as <name>.md")
+        elif s not in ("A", "D") and is_fragment(p):
             found.append(f"{p} is a fragment already on the base: add a new fragment instead of editing it")
     for p in new_fragments:
-        parsed = _fragment("HEAD", p)
+        parsed = parse_fragment_at_ref("HEAD", p)
         if isinstance(parsed, str):
             found.append(parsed)
     old, new = version(base), version("HEAD")
     if is_release:
-        parsed_base = [_fragment(base, p) for p in sorted(fragments(base))]
+        parsed_base = [parse_fragment_at_ref(base, p) for p in sorted(fragments(base))]
         base_bumps = [f.bump for f in parsed_base if not isinstance(f, str)]
         due = bumped(old, max(base_bumps, key=BUMPS.index)) if base_bumps else None
         if new != due:
@@ -86,7 +94,12 @@ def problems(base: str) -> list[str]:
     diff = git("diff", "-U0", "-M", base, "HEAD", "--", f":(top){WIRE}").splitlines()
     changed = [x for x in diff if x.startswith(("+", "-")) and not x.startswith(("+++", "---"))]
     wire = [x for x in changed if not NOT_WIRE.match(x[1:])]
-    if wire and not new_fragments:
+    if wire and is_release:
+        found.append(
+            f"a release PR changed the wire ({wire[0][:80]!r}…): ship the change in its own PR with a fragment, "
+            "then release it"
+        )
+    elif wire and not new_fragments:
         found.append(
             f"the wire changed ({wire[0][:80]!r}…) without a fragment: add lium_protocol/changes/<name>.md "
             "(first line `minor` or `major`, then one changelog line)"

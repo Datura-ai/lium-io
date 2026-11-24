@@ -217,3 +217,23 @@ def test_a_release_with_a_bigger_bump_than_its_fragments_fails(repo: Path) -> No
     path.write_text(path.read_text().replace(PROTOCOL_VERSION, f"{MAJOR + 1}.0.0"))
     result = check(repo)
     assert result.returncode == 1 and f"must set PROTOCOL_VERSION to {next_minor()}" in result.stdout, result.stdout
+
+
+def test_a_release_that_also_changes_the_wire_fails(repo: Path) -> None:
+    """taiberium on lium-io#2376: a breaking change added to a release PR would ship under the release's tag"""
+    fragment(repo, "new-field", "minor")
+    commit(repo, "feature")
+    assert release(repo).returncode == 0
+    change_wire(repo)
+    fragment(repo, "breaking", "major")
+    result = check(repo)
+    assert result.returncode == 1 and "a release PR changed the wire" in result.stdout, result.stdout
+
+
+def test_a_fragment_in_a_subfolder_fails(repo: Path) -> None:
+    """taiberium on lium-io#2376: release.py reads only changes/*.md"""
+    change_wire(repo)
+    (repo / "lium_protocol/changes/topic").mkdir(parents=True)
+    (repo / "lium_protocol/changes/topic/x.md").write_text("minor\na change.\n")
+    result = check(repo)
+    assert result.returncode == 1 and "topic/x.md is not a fragment release.py reads" in result.stdout, result.stdout
