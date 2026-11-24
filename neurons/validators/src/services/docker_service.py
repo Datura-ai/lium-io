@@ -2987,6 +2987,15 @@ def _half_started_stop_slot(executor_info: ExecutorSSHInfo, pod_id: str) -> str:
     return f"{executor_info.uuid}:{pod_id}"
 
 
+# job_batch_id -> the cycle's one read of the executors with a pending half-started stop (the last few cycles: the
+# wave and the express lane's runs overlap)
+_HALF_STARTED_STOP_EXECUTORS_READS: dict[str, asyncio.Future] = {}
+_HALF_STARTED_STOP_EXECUTORS_READS_KEPT = 4
+# this process's one backfill of the pending set from the indexes (records an earlier release wrote without a set
+# entry); redone only after a failure
+_HALF_STARTED_STOP_BACKFILL: asyncio.Future | None = None
+
+
 def _half_started_stop_field(pod_id: str, container_id: str) -> str:
     """One record (and one background retry) per container: a start of another container of the pod neither ends nor
     replaces it."""
@@ -13239,10 +13248,10 @@ class DockerService:
         container_name, identity, recorded_at, plaintext_path = recorded
         slot = _half_started_stop_slot(executor_info, pod_id)
         try:
-            # one write: a lost reply leaves the field either set and indexed or absent, never a record the check misses
+            # one MULTI/EXEC with its pending-set entry: both or neither, never a record the check misses
             await asyncio.wait_for(
-                self.redis_service.hset(
-                    f"{HALF_STARTED_STOP_INDEX_PREFIX}{executor_info.uuid}",
+                self.redis_service.mark_half_started_stop(
+                    executor_info.uuid,
                     _half_started_stop_field(pod_id, identity.partition("@")[0]),
                     json.dumps(
                         {
@@ -13269,8 +13278,8 @@ class DockerService:
         slot = _half_started_stop_slot(executor_info, pod_id)
         try:
             await asyncio.wait_for(
-                self.redis_service.hdel(
-                    f"{HALF_STARTED_STOP_INDEX_PREFIX}{executor_info.uuid}", _half_started_stop_field(pod_id, container_id)
+                self.redis_service.forget_half_started_stop(
+                    executor_info.uuid, _half_started_stop_field(pod_id, container_id)
                 ),
                 timeout=_STOPPED_BY_RECOVERY_MARK_TIMEOUT_SEC,
             )
@@ -13495,13 +13504,59 @@ class DockerService:
         await self._forget_half_started_stop(executor_info, pod_id, recorded_id, extra)
         return True
 
+    async def _half_started_stop_executors(self, job_batch_id: str | None) -> frozenset[str] | None:
+        """The executors with a pending half-started stop, read once per cycle (job_batch_id) for all of its node
+        checks; None (every node reads its own index) until this process has backfilled the set, which this starts.
+        Per process, not a stored marker: a record an earlier release wrote (no set entry) before this process started,
+        rollback included, is in the set before the set is trusted."""
+        global _HALF_STARTED_STOP_BACKFILL
+        backfill = _HALF_STARTED_STOP_BACKFILL
+        if backfill is None or (backfill.done() and (backfill.cancelled() or backfill.exception() is not None)):
+            backfill = _HALF_STARTED_STOP_BACKFILL = asyncio.ensure_future(
+                self.redis_service.backfill_half_started_stop_executors()
+            )
+        if not backfill.done():
+            return None
+        read = _HALF_STARTED_STOP_EXECUTORS_READS.get(job_batch_id) if job_batch_id else None
+        if read is None:
+            read = asyncio.ensure_future(
+                asyncio.wait_for(
+                    self.redis_service.half_started_stop_executors(), timeout=_STOPPED_BY_RECOVERY_MARK_TIMEOUT_SEC
+                )
+            )
+            if job_batch_id:
+                _HALF_STARTED_STOP_EXECUTORS_READS[job_batch_id] = read
+                while len(_HALF_STARTED_STOP_EXECUTORS_READS) > _HALF_STARTED_STOP_EXECUTORS_READS_KEPT:
+                    _HALF_STARTED_STOP_EXECUTORS_READS.pop(next(iter(_HALF_STARTED_STOP_EXECUTORS_READS)))
+
+                def drop_failed(done: asyncio.Future) -> None:
+                    # a failed read is not kept for the cycle: the next node check reads again
+                    if (done.cancelled() or done.exception() is not None) and (
+                        _HALF_STARTED_STOP_EXECUTORS_READS.get(job_batch_id) is done
+                    ):
+                        _HALF_STARTED_STOP_EXECUTORS_READS.pop(job_batch_id)
+
+                read.add_done_callback(drop_failed)
+        # shielded: one node check's deadline does not cancel the read the cycle's other checks share
+        return await asyncio.shield(read)
+
     async def retry_pending_half_started_stops(
         self, *, executor_info: ExecutorSSHInfo, private_key: str | None, default_extra: dict[str, Any]
     ) -> None:
         """Retry every pending stop on this executor, whatever the node's current rental: a pod deleted or reassigned
         since its failed start is no longer listed, but its old run may still write without its mount."""
+        flagged = await self._half_started_stop_executors(default_extra.get("job_batch_id"))
+        if flagged is not None and executor_info.uuid not in flagged:
+            return
         index = f"{HALF_STARTED_STOP_INDEX_PREFIX}{executor_info.uuid}"
         pending = await asyncio.wait_for(self.redis_service.hgetall(index), timeout=_STOPPED_BY_RECOVERY_MARK_TIMEOUT_SEC)
+        if flagged is not None and not pending:
+            # a stale entry (its last record dropped while the backfill added it): one read, then it is gone
+            await asyncio.wait_for(
+                self.redis_service.forget_half_started_stop(executor_info.uuid, None),
+                timeout=_STOPPED_BY_RECOVERY_MARK_TIMEOUT_SEC,
+            )
+            return
         # all at once, each under its own pod lock: one slow stop cannot use up the check's budget for the others
         fields = [member.decode() if isinstance(member, bytes) else str(member) for member in pending or {}]
         await asyncio.gather(
