@@ -1866,9 +1866,16 @@ async def _remove_kept_containers(ssh_client: asyncssh.SSHClientConnection, cont
         if len(fields) == 2 and fields[0].startswith(prefix)
     ]
     if ids:
-        removed = await _run_with_host_timeout(
-            ssh_client, f"/usr/bin/docker rm -fv {' '.join(map(shlex.quote, ids))}", _PARK_COMMAND_TIMEOUT_SECONDS
-        )
+        rm = f"/usr/bin/docker rm -fv {' '.join(map(shlex.quote, ids))}"
+        removed = await _run_with_host_timeout(ssh_client, rm, _PARK_COMMAND_TIMEOUT_SECONDS)
+        if removed.exit_status != 0:
+            # a parked container whose exit event dockerd lost (an edit's direct kill cut off by this delete) fails
+            # `rm -f` forever: kill its init and shim directly and try once more, as container_cleanup does (DAH-2991)
+            for container_id in ids:
+                await _run_with_host_timeout(
+                    ssh_client, DockerCommand.kill_container_processes(container_id), _PARK_COMMAND_TIMEOUT_SECONDS
+                )
+            removed = await _run_with_host_timeout(ssh_client, rm, _PARK_COMMAND_TIMEOUT_SECONDS)
         if removed.exit_status != 0:
             raise KeptContainersNotRemoved(f"docker rm exited {removed.exit_status}: {(removed.stderr or '').strip()}")
     return ids
