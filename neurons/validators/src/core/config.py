@@ -333,7 +333,8 @@ class Settings(BaseSettings):
     VALIDATOR_LIUMD_SHADOW: bool = Field(env="VALIDATOR_LIUMD_SHADOW", default=False)
     # Use the full machine-scrape document returned by the same early `liumd run` instead of
     # running the Python machine scrape. Off: Python remains authoritative and the early run is
-    # only compared in the shadow.
+    # only compared in the shadow. On: a liumd document that cannot be read (unavailable, empty,
+    # malformed or timed out) falls back to the Python scrape for that node.
     VALIDATOR_LIUMD_SPECS: bool = Field(env="VALIDATOR_LIUMD_SPECS", default=False)
     # Prod repair path: fetch the liumd manifest from lium-io main and replace a missing/stale
     # /usr/local/bin/liumd only after the manifest sha256 matches.
