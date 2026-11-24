@@ -234,7 +234,9 @@ class RentalProbeCheck:
     renter holds it, and re-reads the node's idleness from the backend and this validator's pending-pod
     marks under the lock, not from the cycle-start snapshot; the lock is released as soon as the
     create returns. Anything the probe cannot read (backend, Redis) makes it skip or reach no verdict;
-    it never penalises on missing data alone.
+    it never penalises on missing data alone. A node with no passed probe on record is the exception:
+    a cycle without a verdict leaves it unlisted (RENTAL_PROBE_NOT_YET_PROVEN, score 0, nothing cleared),
+    so a node is first listed by a probe that passed, never by a skip.
 
     An idle node running a Lium filler is probed too, beside the filler rather than in its place:
     create_container is told `beside_fillers`, so it
@@ -371,8 +373,9 @@ class RentalProbeCheck:
         with the lock held; every refusal after the lock was taken releases it first.
         """
         # the last probe's failed step, standing until a probe passes; None when there is none or
-        # Redis could not be read (then this cycle behaves as if there were none, and logs why)
-        standing = await _standing_failure(ctx)
+        # Redis could not be read (then this cycle behaves as if there were none, and logs why). A node
+        # no probe has passed on yet stands the same way: it is first listed by a pass, not by a skip.
+        standing = await _standing_failure(ctx) or await _never_passed(ctx)
 
         skip_reason, skip_what = await _skip_reason(ctx, standing)
         if skip_reason == "rented":
@@ -504,6 +507,18 @@ class RentalProbeCheck:
     def _carried(self, ctx: Context, standing: _Failure, *, no_verdict: str) -> CheckResult:
         """This cycle reached no verdict of its own and the last probe failed: fail the node again with
         that step (review). `no_verdict` is what this cycle would otherwise have reported."""
+        if standing is _NEVER_PASSED:
+            # nothing failed, so nothing is recorded or cleared: the node waits unlisted for its first pass
+            return CheckResult(
+                passed=False,
+                event=render_message(
+                    Msg.NOT_YET_PROVEN,
+                    ctx=ctx,
+                    check_id=self.check_id,
+                    what={"executor_uuid": ctx.executor.uuid, "no_verdict_this_cycle": no_verdict},
+                ),
+                updates={"score": 0.0, "job_score": 0.0},
+            )
         what: dict[str, Any] = {
             "executor_uuid": ctx.executor.uuid,
             "failed_step": standing.step,
@@ -757,6 +772,22 @@ async def _clear_last_ok(ctx: Context) -> None:
 class _Failure:
     step: str
     create_step: str | None = None
+
+
+# The standing state of a node with no passed probe on record (DAH-7044): a node is first listed by a
+# probe that passed, not by cycles that reached no verdict. Never written to Redis; the first pass's
+# stamp ends it.
+_NEVER_PASSED = _Failure("never_passed")
+
+
+async def _never_passed(ctx: Context) -> _Failure | None:
+    try:
+        last_ok = await _last_ok_at(ctx)
+    except Exception:
+        # unreadable: decided as if a pass were on record, like every other unreadable input
+        _read_failed(ctx, "its interval stamp in Redis")
+        return None
+    return _NEVER_PASSED if last_ok is None else None
 
 
 async def _standing_failure(ctx: Context) -> _Failure | None:

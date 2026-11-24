@@ -154,10 +154,14 @@ class FakeCreateLock:
         self.redis.create_lock_events.append("released")
 
 
+# a node with a pass on record, due for its next probe (the usual idle node); None: no pass on record
+_DUE = object()
+
+
 class FakeRedis:
     def __init__(
         self,
-        last_ok: float | None = None,
+        last_ok: float | None | object = _DUE,
         *,
         renting=False,
         broken: bool = False,
@@ -166,8 +170,11 @@ class FakeRedis:
         create_lock_broken: bool = False,
     ):
         self.store: dict[str, str] = {}
+        if last_ok is _DUE:
+            last_ok = time.time() - 7 * 3600
         if last_ok is not None:
             self.store[f"rental_probe_ok:{EXECUTOR.uuid}"] = str(last_ok)
+        self._stamp_before = self.store.get(f"rental_probe_ok:{EXECUTOR.uuid}")
         if failed_step is not None:
             self.store[f"rental_probe_failed:{EXECUTOR.uuid}"] = f"{failed_step}:"
         self.removed_pending: list[tuple[str, str, str]] = []
@@ -223,7 +230,9 @@ class FakeRedis:
         self.removed_pending.append((miner_hotkey, executor_id, pod_id))
 
     def stamped(self) -> bool:
-        return f"rental_probe_ok:{EXECUTOR.uuid}" in self.store
+        # stamped by this probe: the pass on record a test starts with does not count
+        stamp = self.store.get(f"rental_probe_ok:{EXECUTOR.uuid}")
+        return stamp is not None and stamp != self._stamp_before
 
     def standing_failure(self) -> str | None:
         raw = self.store.get(f"rental_probe_failed:{EXECUTOR.uuid}")
@@ -1878,3 +1887,67 @@ async def test_the_teardown_wait_never_outlasts_the_job():
     assert asyncio.get_running_loop().time() - started < 1
     assert not task.done()
     task.cancel()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "make_ctx, late, no_verdict",
+    [
+        (
+            lambda redis: make_probe_context(redis=redis, images=()),
+            0,
+            "inconclusive: no default renter image for this GPU and driver",
+        ),
+        (
+            lambda redis: make_probe_context(redis=redis, image_present=False),
+            0,
+            "skipped: default renter image is not pulled on the node",
+        ),
+        (lambda redis: make_probe_context(redis=redis), 650, "skipped: too little cycle time left"),
+    ],
+)
+async def test_a_node_no_probe_has_passed_on_is_not_listed_by_a_cycle_without_a_verdict(
+    make_ctx, late, no_verdict
+):
+    """Regression: a node no probe had passed on was listed with score 1.0 through cycles that reached
+    no verdict, and renters' pods then failed at create. A node is first listed by a probe that passed."""
+    redis = FakeRedis(last_ok=None)
+    ctx, docker, _ = make_ctx(redis)
+    ctx = ctx.model_copy(update={"started_at_monotonic": time.monotonic() - late})
+    with probe_settings():
+        result = await RentalProbeCheck().run(ctx)
+    assert result.passed is False and result.event.reason_code == Msg.NOT_YET_PROVEN.reason
+    assert result.event.what_we_saw["no_verdict_this_cycle"] == no_verdict
+    # nothing failed: the score is held at 0, the verified job is not cleared, no failure is recorded
+    assert result.updates == {"score": 0.0, "job_score": 0.0}
+    assert redis.standing_failure() is None and not redis.stamped()
+    assert docker.create_calls == []
+
+
+@pytest.mark.asyncio
+async def test_a_node_with_a_pass_on_record_keeps_a_cycle_without_a_verdict_unpenalised():
+    ctx, _, _ = make_probe_context(redis=FakeRedis(last_ok=time.time() - 7 * 3600), images=())
+    with probe_settings():
+        result = await RentalProbeCheck().run(ctx)
+    assert result.passed is True and result.event.reason_code == Msg.INCONCLUSIVE.reason
+
+
+@pytest.mark.asyncio
+async def test_a_node_no_probe_has_passed_on_is_listed_by_its_first_pass():
+    redis = FakeRedis(last_ok=None)
+    ctx, _, _ = make_probe_context(redis=redis, images=())
+    with probe_settings():
+        assert (await RentalProbeCheck().run(ctx)).passed is False
+    ctx, _, _ = make_probe_context(redis=redis)
+    with probe_settings(), renter_path():
+        result = await RentalProbeCheck().run(ctx)
+    assert result.passed is True and result.event.reason_code == Msg.PROBE_OK.reason
+    assert redis.stamped()
+
+
+@pytest.mark.asyncio
+async def test_a_rented_node_no_probe_has_passed_on_is_left_alone():
+    ctx, _, _ = make_probe_context(redis=FakeRedis(last_ok=None), rented=rented_data(pods=1))
+    with probe_settings():
+        result = await RentalProbeCheck().run(ctx)
+    assert result.passed is True and result.updates == {}

@@ -2710,6 +2710,17 @@ class RentalProbeMessages:
         category="runtime",
         impact="Score set to 0 and the verified job cleared until a probe passes; the node is probed again next cycle while it stays idle",
     )
+    NOT_YET_PROVEN = MessageTemplate(
+        event="Not listed yet: no rental probe has passed on this node",
+        reason="RENTAL_PROBE_NOT_YET_PROVEN",
+        severity="warning",
+        category="runtime",
+        impact="Score set to 0 until a rental probe passes; the probe runs on the node while it is idle",
+        remediation=(
+            "Keep the node idle with the default renter image for its GPU and driver pulled; "
+            "it is listed after the first rental probe that passes."
+        ),
+    )
     INCONCLUSIVE = MessageTemplate(
         event="Rental probe could not reach a verdict",
         reason="RENTAL_PROBE_INCONCLUSIVE",
