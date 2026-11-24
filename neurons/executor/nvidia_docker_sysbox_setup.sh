@@ -23,7 +23,7 @@ SYSBOX_VERSION="0.7.1"
 # DAH-6804: the boot-time layer reset's version, written into its unit; the validator reinstalls it (--install-layer-reset)
 # on Sysbox hosts whose unit is missing or older. Bump it whenever shift_sysbox_layers_back_at_boot's output changes.
 # 1 is reserved for units written before this marker.
-LAYER_RESET_VERSION=3
+LAYER_RESET_VERSION=4
 # nestybox publishes amd64 and arm64 .debs; arm64 is for GB300 / Grace hosts (check_arch refuses the rest)
 case "$(uname -m)" in
     aarch64|arm64) SYSBOX_ARCH=arm64; SYSBOX_SHA="04ca894ae0b53f0fa54eaacc173ce40363c9a95ea5450f773716a84ef650a69b" ;;
@@ -500,10 +500,78 @@ def shift_batch(paths, base):
     return n
 
 
+def started_at(d, cid):
+    # when Docker last started the container; None when unreadable (then no walk is resumed)
+    try:
+        return json.load(open(f"{d}/containers/{cid}/config.v2.json"))["State"]["StartedAt"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def resume_point(cursor, key):
+    # how far an earlier, cut-off run walked this layer: (entries done, the last of them), or (0, None) to walk it whole.
+    # Only a pod started since can change its layer (Docker is down while this runs): a new StartedAt drops the point
+    try:
+        saved = json.load(open(cursor))
+        if key["started"] and all(saved[k] == v for k, v in key.items()):
+            return saved["n"], saved["last"]
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    return 0, None
+
+
+def save_point(cursor, key, n, last):
+    # written after its batch is done, so it never claims more than was shifted; a torn file reads as no point
+    tmp = cursor + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump({**key, "n": n, "last": last}, f)
+    os.replace(tmp, cursor)
+
+
+def unreadable(e):
+    if e.errno != errno.ENAMETOOLONG:
+        raise e
+    print(f"skipped ...{(e.filename or '')[-80:]}: {e.strerror}", file=sys.stderr, flush=True)
+
+
+def walk(top):
+    # every entry under top, a directory before its contents. One open directory per level, read entry by entry:
+    # memory stays at the depth, however many entries a directory holds, and no recursion (os.walk before Python 3.12
+    # recursed once per level). Unchanged directories list in the same order, which resume_point relies on
+    dirs = []
+
+    def enter(path):
+        try:
+            dirs.append(os.scandir(path))
+        except OSError as e:
+            unreadable(e)
+
+    enter(top)
+    try:
+        while dirs:
+            try:
+                entry = next(dirs[-1], None)
+            except OSError as e:
+                unreadable(e)
+                entry = None
+            if entry is None:
+                dirs.pop().close()
+                continue
+            yield entry.path
+            if entry.is_dir(follow_symlinks=False):
+                enter(entry.path)
+    finally:
+        for it in dirs:
+            it.close()
+
+
 def main():
     # a running pod's layer is shifted on purpose: only act while Docker is down, before it starts any pod
     if docker_running() and not DRY:
         sys.exit("Docker is running; not touching any layer")
+    if "--replay-only" in sys.argv:
+        replay_journal()  # offline recovery of the journal --remove-layer-reset kept
+        return
     if os.path.exists(STARTED) and not DRY:
         print("Docker already ran this boot (its pods may still run under live-restore); nothing to reset", flush=True)
         return
@@ -549,41 +617,36 @@ def main():
             continue
         base = (bu, pod_base(top.st_gid, gids) or gids[0] + (bu - uids[0]))
         n = 0
-        batch = []
-
-        def unreadable(e):
-            if e.errno != errno.ENAMETOOLONG:
-                raise e
-            print(f"skipped ...{(e.filename or '')[-80:]}: {e.strerror}", file=sys.stderr, flush=True)
-
-        # one open directory per level, read entry by entry: memory stays at the depth plus one batch, however many
-        # entries a directory holds, and no recursion (os.walk before Python 3.12 recursed once per level)
-        dirs = []
-
-        def enter(path):
-            try:
-                dirs.append(os.scandir(path))
-            except OSError as e:
-                unreadable(e)
-
-        enter(upper)
-        while dirs:
-            try:
-                entry = next(dirs[-1], None)
-            except OSError as e:
-                unreadable(e)
-                entry = None
-            if entry is None:
-                dirs.pop().close()
-                continue
-            batch.append(entry.path)
-            if len(batch) >= BATCH:
-                n += shift_batch(batch, base)
-                batch = []
-            if entry.is_dir(follow_symlinks=False):
-                enter(entry.path)
+        # a layer whose walk outlasts the unit's start timeout resumes where the last boot stopped, not from its start
+        cursor = f"{os.path.dirname(JOURNAL)}/walk-{cid}.json"
+        key = {"upper": upper, "started": started_at(d, cid)}
+        skip, last = resume_point(cursor, key)
+        while True:
+            seen, batch, same = 0, [], True
+            entries = walk(upper)
+            for path in entries:
+                seen += 1
+                if seen < skip:
+                    continue  # listed only: shifted by an earlier run
+                if seen == skip:
+                    same = path == last
+                    if not same:
+                        break
+                    continue
+                batch.append(path)
+                if len(batch) >= BATCH:
+                    n += shift_batch(batch, base)
+                    batch = []
+                    if key["started"] and not DRY:
+                        save_point(cursor, key, seen, path)
+            entries.close()
+            if same and seen >= skip:
+                break
+            skip, last = 0, None  # the layer is not the one the point was saved on: walk it whole
         batch.append(upper)  # last: its owner marks the layer done, so a cut-off run is redone next boot
         n += shift_batch(batch, base)
+        if not DRY and os.path.exists(cursor):
+            os.remove(cursor)
         print(f"{'would shift' if DRY else 'shifted'} {n} entries of {cid[:12]} back from {bu}", flush=True)
 
 
@@ -642,6 +705,12 @@ remove_layer_reset() {
     rm -f "$(host_path /etc/systemd/system/docker.service.d/lium-sysbox-layer-reset.conf)" || return 1
     if [ -z "${SYSBOX_SETUP_HOST_ROOT:-}" ] && [ -e "$unit" ]; then
         systemctl disable lium-sysbox-layer-reset.service >/dev/null 2>&1 || return 1
+    fi
+    if [ -e "$(host_path /var/lib/lium-sysbox-layer-reset/pending.jsonl)" ]; then
+        # a cut-off reset left setuid bits and capabilities only the program restores: it stays, and so does the unit
+        # file (disabled, it never runs; the scrape keeps reporting it, so the validator retries) until a --replay-only
+        [ -n "${SYSBOX_SETUP_HOST_ROOT:-}" ] || systemctl daemon-reload
+        return 3
     fi
     rm -f "$unit" "$(host_path /usr/local/sbin/lium-sysbox-layer-reset)" || return 1
     [ -n "${SYSBOX_SETUP_HOST_ROOT:-}" ] || systemctl daemon-reload
@@ -1483,8 +1552,14 @@ case "${1:-}" in
         # DAH-7052: what the validator runs on hosts with the layer reset when its rollout is set to remove. One result
         # line, like --install-layer-reset; never stops or restarts Docker, never runs the reset.
         if [ "$(id -u)" != 0 ]; then echo "layer_reset_skipped not_root"
-        elif remove_layer_reset >/dev/null 2>&1; then echo "layer_reset_removed"
-        else echo "layer_reset_failed remove"; fi
+        else
+            remove_layer_reset >/dev/null 2>&1
+            case $? in
+                0) echo "layer_reset_removed" ;;
+                3) echo "layer_reset_failed recovery_needed" ;;
+                *) echo "layer_reset_failed remove" ;;
+            esac
+        fi
         exit 0
         ;;
     -h|--help)

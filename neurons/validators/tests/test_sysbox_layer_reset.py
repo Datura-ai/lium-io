@@ -299,7 +299,14 @@ async def test_remove_waits_for_an_idle_host_and_skips_dry_run(context_factory, 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "stdout", ["layer_reset_failed remove\n", "layer_reset_skipped not_root\n", "layer_reset_failed nsenter_failed\n", ""]
+    "stdout",
+    [
+        "layer_reset_failed remove\n",
+        "layer_reset_failed recovery_needed\n",
+        "layer_reset_skipped not_root\n",
+        "layer_reset_failed nsenter_failed\n",
+        "",
+    ],
 )
 async def test_a_remove_that_does_not_work_warns_and_keeps_the_score(context_factory, mode, stdout):
     mode("remove")

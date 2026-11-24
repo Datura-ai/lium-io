@@ -217,6 +217,28 @@ def test_a_failed_disable_still_leaves_docker_independent_of_the_reset(tmp_path)
     assert (tmp_path / "etc/systemd/system/lium-sysbox-layer-reset.service").exists()
 
 
+def test_remove_with_a_pending_journal_keeps_the_program_that_replays_it(tmp_path):
+    # a reset cut off after a chown left setuid bits only the program restores
+    assert _install_on_a_live_host(tmp_path, enable_fails=False).returncode == 0
+    journal = tmp_path / "var/lib/lium-sysbox-layer-reset/pending.jsonl"
+    journal.parent.mkdir(parents=True)
+    journal.write_text(json.dumps({"p": "/x", "m": 0o4755, "c": None}) + "\n")
+    (tmp_path / "systemctl.log").unlink()
+
+    result = _remove_on_a_live_host(tmp_path)
+
+    assert result.returncode == 3
+    assert not (tmp_path / "etc/systemd/system/docker.service.d/lium-sysbox-layer-reset.conf").exists()
+    assert (tmp_path / "usr/local/sbin/lium-sysbox-layer-reset").exists()
+    assert (tmp_path / "etc/systemd/system/lium-sysbox-layer-reset.service").exists()  # scraped, so the validator retries
+    assert (tmp_path / "systemctl.log").read_text() == "disable lium-sysbox-layer-reset.service\ndaemon-reload\n"
+    assert journal.exists()
+
+
+def test_remove_layer_reset_mode_reports_recovery_needed():
+    assert '3) echo "layer_reset_failed recovery_needed" ;;' in open(SCRIPT).read()
+
+
 def test_remove_on_a_host_without_the_reset_is_a_no_op(tmp_path):
     result = _remove_on_a_live_host(tmp_path)
     assert result.returncode == 0, result.stderr
@@ -423,6 +445,7 @@ def _fake_fs(tmp_path):
         O_RDONLY=os.O_RDONLY,
         sync=lambda: None,
         remove=os.remove,
+        replace=os.replace,
         lstat=lambda p: SimpleNamespace(st_uid=fs.owners[p], st_gid=fs.owners[p], st_mode=fs.modes[p]),
         lchown=lchown,
         chmod=lambda p, m: fs.modes.__setitem__(p, stat.S_IFMT(fs.modes[p]) | m),
@@ -840,3 +863,78 @@ def test_the_reset_waits_for_the_disk_dockers_data_root_is_on(tmp_path, data_roo
     quoted = re.search(r'^RequiresMountsFor="((?:[^"\\]|\\.)*)"$', unit, re.M).group(1)
     assert re.sub(r"\\(.)", r"\1", quoted).replace("%%", "%") == expected
     assert unit.index("RequiresMountsFor=") < unit.index("[Service]")
+
+
+def test_replay_only_restores_a_kept_journal_and_shifts_no_layer(tmp_path, monkeypatch):
+    reset, fs = _fake_fs(tmp_path)
+    sudo = str(fs.upper / "sudo")
+    fs.modes[sudo] = stat.S_IFREG | 0o755
+    os.makedirs(os.path.dirname(reset["JOURNAL"]), exist_ok=True)
+    with open(reset["JOURNAL"], "w") as f:
+        f.write(json.dumps({"p": sudo, "m": 0o4755, "c": None}) + "\n")
+    os.makedirs(os.path.dirname(reset["STARTED"]), exist_ok=True)
+    open(reset["STARTED"], "w").close()  # Docker ran this boot (stopped for the recovery)
+    owners = dict(fs.owners)
+    monkeypatch.setattr(sys, "argv", ["lium-sysbox-layer-reset", "--replay-only"])
+    reset["main"]()
+    assert stat.S_IMODE(fs.modes[sudo]) == 0o4755
+    assert not os.path.exists(reset["JOURNAL"])
+    assert fs.owners == owners
+
+
+def _started(tmp_path, when):
+    (tmp_path / "var/lib/docker/containers" / ("a" * 64) / "config.v2.json").write_text(
+        json.dumps({"State": {"StartedAt": when}}))
+
+
+def _cut_at(reset, n):
+    real, calls = reset["os"].lchown, []
+
+    def lchown(*a):
+        if len(calls) == n:
+            raise InterruptedError()  # the unit's start timeout
+        calls.append(a[0])
+        return real(*a)
+
+    reset["os"].lchown = lchown
+    with pytest.raises(InterruptedError):
+        reset["main"]()
+    reset["os"].lchown = real
+
+
+def _lstats(reset):
+    seen, real = [], reset["os"].lstat
+    reset["os"].lstat = lambda p: (seen.append(p), real(p))[1]
+    return seen
+
+
+def test_a_walk_cut_off_by_the_timeout_resumes_where_it_stopped(tmp_path):
+    reset, fs = _fake_fs(tmp_path)
+    reset["BATCH"] = 1
+    _started(tmp_path, "2026-11-24T10:00:00Z")
+    _cut_at(reset, 3)
+    seen = _lstats(reset)
+    reset["main"]()
+    entries = [p for p in fs.modes if p != str(fs.upper)]
+    assert len([p for p in seen if p != str(fs.upper)]) == len(entries) - 3  # the 3 done ones are not visited again
+    assert fs.owners == {p: 1000 if p.endswith("renterfile") else 0 for p in fs.modes}
+    assert not list(Path(reset["JOURNAL"]).parent.glob("walk-*"))
+
+
+@pytest.mark.parametrize("change", ["pod_started", "listing_changed", "no_start_time"])
+def test_a_layer_that_may_have_changed_since_the_cut_off_is_walked_whole(tmp_path, change):
+    reset, fs = _fake_fs(tmp_path)
+    reset["BATCH"] = 1
+    _started(tmp_path, "2026-11-24T10:00:00Z")
+    _cut_at(reset, 3)
+    if change == "pod_started":
+        _started(tmp_path, "2026-11-24T10:20:00Z")  # Docker ran the pod after the timeout
+    elif change == "listing_changed":
+        point = next(Path(reset["JOURNAL"]).parent.glob("walk-*"))
+        point.write_text(json.dumps({**json.loads(point.read_text()), "last": "/elsewhere"}))
+    else:
+        (tmp_path / "var/lib/docker/containers" / ("a" * 64) / "config.v2.json").unlink()
+    seen = _lstats(reset)
+    reset["main"]()
+    assert set(fs.modes) <= set(seen)
+    assert fs.owners == {p: 1000 if p.endswith("renterfile") else 0 for p in fs.modes}
