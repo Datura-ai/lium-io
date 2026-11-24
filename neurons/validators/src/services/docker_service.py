@@ -8670,6 +8670,11 @@ class DockerService:
         host_probe: VolumeHostProbe | None = None,
         labels: dict[str, str] | None = None,
     ):
+        if limit is not None and limit > _FRESH_SIZING_MAX_VOLUME_GB:
+            raise ValueError(
+                f"New local volume size {limit} GB exceeds the "
+                f"{_FRESH_SIZING_MAX_VOLUME_GB} GB limit"
+            )
         requested_timeout = timeout
         _quote_safe_docker_volume_name(
             local_volume,

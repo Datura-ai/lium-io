@@ -122,7 +122,7 @@ async def test_probe_volume_host_lets_a_session_that_may_stay_taken_stop_the_cre
 # ---------------------------------------------------------------------------
 
 
-async def _create_volume(docker_service, ssh_client, probe):
+async def _create_volume(docker_service, ssh_client, probe, *, limit=40, sparse=False):
     docker_service.stream_log = AsyncMock()
     docker_client = docker_service.rental_docker_client_factory.client
     await docker_service.create_local_volume(
@@ -132,11 +132,48 @@ async def _create_volume(docker_service, ssh_client, probe):
         log_tag="tag",
         log_text="Creating docker volume volume_test",
         log_extra={},
-        limit=40,
+        limit=limit,
         timeout=10,
+        sparse=sparse,
         host_probe=probe,
     )
     return docker_client.created_volumes
+
+
+_OVERSIZED_VOLUME_GB = docker_service_module._FRESH_SIZING_MAX_VOLUME_GB + 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sparse", [False, True])
+async def test_create_local_volume_rejects_a_size_above_the_ext4_file_limit_before_any_host_command(
+    docker_service, sparse
+):
+    # Arrange: legacy and fallback sizing pass the requested size through unchanged
+    ssh_client = Mock(run=AsyncMock())
+
+    # Act
+    with pytest.raises(ValueError, match=f"{_OVERSIZED_VOLUME_GB} GB exceeds the 16383 GB limit"):
+        await _create_volume(docker_service, ssh_client, None, limit=_OVERSIZED_VOLUME_GB, sparse=sparse)
+
+    # Assert: no root probe, plugin install or enable, volume call or success log
+    ssh_client.run.assert_not_called()
+    docker_service.stream_log.assert_not_called()
+    assert docker_service.rental_docker_client_factory.client.created_volumes == []
+
+
+@pytest.mark.asyncio
+async def test_create_local_volume_at_the_ext4_file_limit_creates_the_volume(docker_service, monkeypatch):
+    # Arrange
+    monkeypatch.setattr(settings, "LOOPBACK_PLUGIN_V2_ENABLED", False)
+    probe = VolumeHostProbe("/var/lib/docker", None, [], loopback_plugin_enabled=True)
+
+    # Act
+    created = await _create_volume(
+        docker_service, _plugin_host(old_state="true"), probe, limit=_OVERSIZED_VOLUME_GB - 1
+    )
+
+    # Assert
+    assert created[0]["driver_opts"]["size"] == f"{_OVERSIZED_VOLUME_GB - 1}g"
 
 
 @pytest.mark.asyncio
@@ -802,3 +839,22 @@ async def test_plugin_setup_runs_under_the_probed_budget_only_for_the_generation
     assert setup_commands[0].startswith(f"timeout -k 5 {budget} ")
     # the script measures its probe against the same deadline
     assert shlex.split(shlex.split(setup_commands[0])[-1])[9] == budget
+
+
+@pytest.mark.asyncio
+async def test_create_container_with_an_oversized_new_volume_fails_without_launching(svc, monkeypatch):
+    # Arrange: the real create_local_volume behind the stubbed deploy flow
+    ssh_client = _deploy_ssh_client()
+    _patch_happy(svc, monkeypatch, ssh_client)
+    monkeypatch.setattr(
+        svc, "resolve_volume_sizing", AsyncMock(return_value=Mock(volume_limit_gb=_OVERSIZED_VOLUME_GB, storage_limit_gb=1))
+    )
+    monkeypatch.setattr(svc, "create_local_volume", DockerService.create_local_volume.__get__(svc))
+
+    # Act
+    result = await _run_create_container(svc, _deploy_payload(volume_limit_gb=_OVERSIZED_VOLUME_GB))
+
+    # Assert: the failure reaches the backend and no container starts
+    assert result.__class__.__name__ == "FailedContainerRequest"
+    assert f"{_OVERSIZED_VOLUME_GB} GB exceeds the 16383 GB limit" in result.detail
+    svc._run_rental_docker_create_with_port_retry.assert_not_called()
