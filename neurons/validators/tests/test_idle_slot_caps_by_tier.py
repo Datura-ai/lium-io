@@ -144,3 +144,24 @@ async def test_idle_h200_nodes_over_the_halved_caps_share_the_capped_pay():
     rented = jobs["miner_rented"][0]
     assert rented.eligible_for_rental_share is False
     assert rented.unrented_cap_multiplier is None
+
+
+@pytest.mark.asyncio
+async def test_idle_h200_spot_nodes_over_the_halved_cap_share_the_capped_spot_pay():
+    """Five idle 8-card Spot H200 nodes exceed the halved cap in their own Spot pool."""
+    jobs = {}
+    for i in range(5):
+        job = _make_pcc_job(f"h200-spot-8x-{i}", H200, 8)
+        job.is_spot = True
+        job.is_on_spot_pay_list = True
+        job.has_lium_filler = True
+        job.filler_revenue_per_gpu_hour = 10.0
+        jobs[f"miner_spot_{i}"] = [job]
+
+    incentive = await _run_with_production_config(jobs)
+
+    assert incentive.spot_count_by_bucket[("H200", 8)] == 40
+    for i in range(5):
+        result = jobs[f"miner_spot_{i}"][0]
+        assert result.spot_cap == 32
+        assert result.spot_cap_multiplier == pytest.approx(32 / 40)
