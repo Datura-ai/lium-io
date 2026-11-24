@@ -1107,8 +1107,7 @@ async def reset_pod_gpus(
                     if attempt:
                         # the flag reports the last start: an earlier recovery start does not count (review 4447075986)
                         report.ok, report.container_restarted = False, False
-                        # a reset that ran is not a refused one: the code says what went wrong (DAH-6741)
-                        report.error_code = report.error_code or GpuResetErrorCode.ContainerNotRestarted
+                        # no error_code: the backend reads ok false with every GPU reset as the container not restarting
                         notes.append(f"the container did not start again: {exc}")
     if fabric_manager_problem:
         report.ok = False

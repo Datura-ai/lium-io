@@ -1335,7 +1335,7 @@ async def test_the_container_is_started_even_when_the_reset_raises():
 async def test_a_failed_start_is_reported():
     report, _ = await _reset(FakeHost(), start=AsyncMock(side_effect=RuntimeError("no start")))
     assert not report.ok and not report.container_restarted and "did not start" in report.detail
-    assert report.error_code == GpuResetErrorCode.ContainerNotRestarted and [g.result for g in report.gpus] == ["reset"] * 2
+    assert report.error_code is None and [g.result for g in report.gpus] == ["reset"] * 2
 
 
 @pytest.mark.asyncio
