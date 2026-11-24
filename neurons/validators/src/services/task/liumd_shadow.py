@@ -334,6 +334,7 @@ def evaluate_evidence(
     *,
     spread_fail_ms: int | None = None,
     wall_clock_min_ms: int | None = None,
+    claimed_model: str | None = None,
 ) -> dict[str, Any]:
     """The validator's own verdict on the executor's evidence document: hard mismatches against the
     claim, duplicate cards, and the liumd timing floors. Defensive: junk reads as no evidence."""
@@ -407,6 +408,12 @@ def evaluate_evidence(
         add("duplicate_pci")
     for card in cards:
         sources = _as_dict(card.get("sources"))
+        nvml = _as_dict(sources.get("nvml"))
+        if nvml:
+            if not _as_dict(sources.get("proc")):
+                add("proc_source_missing")
+            if not _as_dict(sources.get("sysfs")):
+                add("sysfs_source_missing")
         for name, fields in EVIDENCE_SOURCE_FIELDS.items():
             source = _as_dict(sources.get(name))
             for field in fields:
@@ -416,6 +423,13 @@ def evaluate_evidence(
         vendor = _as_text(_as_dict(sources.get("sysfs")).get("vendor"))
         if vendor is not None and vendor.lower() != EVIDENCE_SYSFS_VENDOR:
             add("sysfs_vendor_mismatch")
+        model = _as_text(card.get("model"))
+        if (
+            claimed_model
+            and model
+            and model.lower() != claimed_model.strip().lower()
+        ):
+            add("claimed_model_mismatch")
     if spread is not None and spread_fail_ms is not None and spread > spread_fail_ms:
         add("spread_over_limit")
     # No timing sample (a single-card matmul) means the wall-clock floor has nothing to judge.
@@ -460,6 +474,7 @@ def _evidence_record(
             _claimed_gpu_count(ctx),
             spread_fail_ms=settings.VALIDATOR_LIUMD_EVIDENCE_SPREAD_MS,
             wall_clock_min_ms=settings.VALIDATOR_LIUMD_EVIDENCE_WALL_CLOCK_MIN_MS,
+            claimed_model=_as_text(ctx.state.gpu_model),
         )
     except Exception:  # noqa: BLE001 — malformed evidence never reaches the node's result
         return None

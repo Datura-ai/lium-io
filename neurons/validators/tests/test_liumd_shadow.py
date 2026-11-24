@@ -1366,6 +1366,25 @@ def test_a_source_that_disagrees_with_the_card_is_a_reason():
     assert "proc_model_mismatch" in judged["reasons"] and judged["would_fail"] is True
 
 
+def test_a_missing_proc_or_sysfs_source_is_a_reason():
+    card = _evidence_card()
+    card["sources"]["proc"] = None
+    card["sources"]["sysfs"] = None
+
+    judged = evaluate_evidence(_evidence(card), 1)
+
+    assert "proc_source_missing" in judged["reasons"]
+    assert "sysfs_source_missing" in judged["reasons"]
+    assert judged["would_fail"] is True
+
+
+def test_a_card_model_that_differs_from_the_claim_is_a_reason():
+    judged = evaluate_evidence(_evidence(_evidence_card()), 1, claimed_model="NVIDIA H100")
+
+    assert "claimed_model_mismatch" in judged["reasons"]
+    assert judged["would_fail"] is True
+
+
 def test_a_first_result_spread_over_the_configured_limit_is_a_reason():
     cards = [
         _evidence_card(0, first=1_000),
