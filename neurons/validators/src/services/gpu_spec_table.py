@@ -124,8 +124,8 @@ GPU_VRAM_SIZES_MB: dict[str, list[int]] = {
     "NVIDIA A100-SXM4-40GB": [40960],  # 40 GB; observed: 40960
     "NVIDIA A800 80GB PCIe": [81920],  # 80 GB
     "NVIDIA A10 Tensor Core GPU": [24576],  # 24 GB
-    # Only 8 GB is a factory SKU; 40/64 GB come from the community driver unlock.
-    "NVIDIA CMP 170HX": [8192, 40960, 65536],  # 8/40/64 GB multi-variant
+    # Only 8 GB is a factory SKU; 40/64/80 GB come from the community driver unlock.
+    "NVIDIA CMP 170HX": [8192, 40960, 65536, 81920],  # 8/40/64/80 GB multi-variant
     # Ampere pro
     "NVIDIA RTX A6000": [49152],  # 48 GB; observed: 49140
     "NVIDIA RTX A5000": [24576],  # 24 GB; observed: 24564
@@ -193,6 +193,9 @@ MODDED_VRAM_MODELS: dict[str, tuple[str, int]] = {
     RTX_4090_48GB: ("NVIDIA GeForce RTX 4090", 49152),  # 48 GB; observed: 49140
     "NVIDIA GeForce RTX 4080 32GB": ("NVIDIA GeForce RTX 4080", 32768),  # 32 GB
     "NVIDIA GeForce RTX 4080 SUPER 32GB": ("NVIDIA GeForce RTX 4080 SUPER", 32768),  # 32 GB
+    "NVIDIA GeForce RTX 4090 D 48GB": ("NVIDIA GeForce RTX 4090 D", 49152),  # 48 GB
+    "NVIDIA GeForce RTX 3080 20GB": ("NVIDIA GeForce RTX 3080", 20480),  # 20 GB
+    "NVIDIA GeForce RTX 2080 Ti 22GB": ("NVIDIA GeForce RTX 2080 Ti", 22528),  # 22 GB
 }
 for _modded, (_base, _size_mb) in MODDED_VRAM_MODELS.items():
     GPU_VRAM_SIZES_MB[_modded] = [_size_mb]

@@ -48,6 +48,7 @@ def test_reason_enum_pins_the_stable_code_contract():
         "rented_sysbox_not_confirmed",
         "disk_limited_remainder",
         "port_check_deferred_remainder",
+        "insufficient_ram_for_vram",
     }
 
 

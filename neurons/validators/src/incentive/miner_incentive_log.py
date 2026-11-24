@@ -11,6 +11,7 @@ HOW A NODE PICKS A POOL:
                                                           mining score is zeroed, e.g. Sysbox
                                                           not confirmed; reason below)
   idle AND model in program AND price ok AND disk >= 1.5x VRAM
+       AND RAM >= half of VRAM (when that gate is enforced)
        AND (not full-8x OR NCU/split/attested-CVM offered) AND power cap appliable
                                AND capacity?            -> unrented pool (earns)
   otherwise                                            -> 0 incentive (reason below)
@@ -28,6 +29,7 @@ WHAT THIS CATALOG HOLDS — every `MinerLogLine` the miner-facing log block
      GPU model not in the unrented program (earns only when rented),
      price above the market soft limit (lower the price to earn),
      total disk below 1.5x total GPU VRAM (add disk to earn),
+     system RAM below half of total GPU VRAM, when enforced (add RAM to earn),
      8x H200/B200/B300 with no NCU profiling, GPU splitting or passed TDX
        attestation (offer any of the three to earn),
      container that cannot apply a GPU power cap (give it CAP_SYS_ADMIN to earn),
@@ -83,6 +85,7 @@ if TYPE_CHECKING:
     from incentive.rental_price import (
         DiskLimitedRemainder,
         InsufficientDisk,
+        InsufficientRam,
         MissingFull8xCapability,
         PortLimitedRemainder,
         PowerCapIncapable,
@@ -111,6 +114,7 @@ class ZeroIncentiveReason(StrEnum):
     NO_UNRENTED_CAPACITY_FOR_GPU_COUNT = "no_unrented_capacity_for_gpu_count"
     NVIDIA_DRIVER_BELOW_MINIMUM = "nvidia_driver_below_minimum"
     INSUFFICIENT_DISK_FOR_VRAM = "insufficient_disk_for_vram"
+    INSUFFICIENT_RAM_FOR_VRAM = "insufficient_ram_for_vram"
     SYSBOX_NOT_ENABLED = "sysbox_not_enabled"
     FULL_8X_WITHOUT_NCU_OR_SPLIT = "flagship_without_ncu_or_split"  # wire code, append-only: consumers key on it (DAH-5197 keeps the value)
     CANNOT_APPLY_GPU_POWER_CAP = "cannot_apply_gpu_power_cap"
@@ -404,6 +408,28 @@ class MinerLogLine(BaseModel):
                 "total_disk_gb": measured.disk_gb,
                 "min_disk_to_vram_rate": measured.rate,
                 "required_disk_gb": required_disk_gb,
+            },
+        )
+
+    @staticmethod
+    def no_payout_because_insufficient_ram_for_vram(
+        result: JobResult, measured: InsufficientRam
+    ) -> MinerLogLine:
+        required_ram_gb: float = measured.required_ram_gb
+        return MinerLogLine._no_payout(
+            result,
+            reason=ZeroIncentiveReason.INSUFFICIENT_RAM_FOR_VRAM,
+            message=(
+                f"No unrented incentive: this executor has {measured.ram_gb} GB of RAM but "
+                f"{measured.vram_gb} GB of GPU VRAM. An idle executor needs system RAM of at least "
+                f"{measured.rate}x its GPU VRAM to earn the unrented incentive. Give it at least "
+                f"{required_ram_gb} GB of RAM, or rent it out to earn."
+            ),
+            extra_fields={
+                "total_vram_gb": measured.vram_gb,
+                "total_ram_gb": measured.ram_gb,
+                "min_ram_to_vram_rate": measured.rate,
+                "required_ram_gb": required_ram_gb,
             },
         )
 

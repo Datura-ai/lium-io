@@ -19,10 +19,12 @@ from payload_models.payloads import MinerJobRequestPayload
 from protocol.vc_protocol.compute_requests import NetworkEMA, RentedExecutorsResponse
 from protocol.vc_protocol.validator_requests import ValidationEvent
 from services.attestation_service import HostPolicyResult
+from services.liumd_binary_refresh import LiumdRefresh
 from services.liumd_exec_client import LiumdRefusal
 from services.local_verify_client import (
     DETAIL_MAX_CHARS,
     SCHEMA,
+    LocalVerifyAnswer,
     LocalVerifyUnavailable,
     parse_answer,
 )
@@ -448,6 +450,122 @@ async def test_specs_are_compared_from_the_post_scrape_snapshot(
 
 
 @pytest.mark.asyncio
+async def test_live_host_memory_values_are_not_a_specs_difference(
+    keypair, monkeypatch, verifyx_service
+):
+    python_specs = {
+        **PYTHON_SCRAPE,
+        "host_memory": {"mem_total_kb": 100, "mem_available_kb": 50, "mapped_kb": 10},
+    }
+    liumd_specs = {
+        **LIUMD_SCRAPE,
+        "host_memory": {"mem_total_kb": 100, "mem_available_kb": 40, "mapped_kb": 12},
+    }
+    state = build_state(specs=SPECS, scrape_specs=python_specs)
+    ctx = _ctx(keypair, monkeypatch, verifyx_service, state=state)
+
+    record = await _shadow(ctx, FakeLiumd(specs=liumd_specs))
+
+    assert record["specs_agree"] is True
+    assert record["specs_diff"] == []
+
+
+@pytest.mark.asyncio
+async def test_missing_host_memory_is_still_a_specs_difference(
+    keypair, monkeypatch, verifyx_service
+):
+    python_specs = {**PYTHON_SCRAPE, "host_memory": {"mem_total_kb": 100}}
+    state = build_state(specs=SPECS, scrape_specs=python_specs)
+    ctx = _ctx(keypair, monkeypatch, verifyx_service, state=state)
+
+    record = await _shadow(ctx, FakeLiumd(specs=LIUMD_SCRAPE))
+
+    assert record["specs_agree"] is False
+    assert [diff["path"] for diff in record["specs_diff"]] == ["host_memory"]
+
+
+@pytest.mark.asyncio
+async def test_a_stable_host_memory_value_is_still_compared(
+    keypair, monkeypatch, verifyx_service
+):
+    python_specs = {
+        **PYTHON_SCRAPE,
+        "host_memory": {"mem_total_kb": 100, "mem_available_kb": 50},
+    }
+    liumd_specs = {
+        **LIUMD_SCRAPE,
+        "host_memory": {"mem_total_kb": 90, "mem_available_kb": 40},
+    }
+    state = build_state(specs=SPECS, scrape_specs=python_specs)
+    ctx = _ctx(keypair, monkeypatch, verifyx_service, state=state)
+
+    record = await _shadow(ctx, FakeLiumd(specs=liumd_specs))
+
+    assert record["specs_agree"] is False
+    assert [diff["path"] for diff in record["specs_diff"]] == ["host_memory.mem_total_kb"]
+
+
+@pytest.mark.asyncio
+async def test_live_and_python_timeout_fields_are_not_a_specs_difference(
+    keypair, monkeypatch, verifyx_service
+):
+    python_specs = {
+        **PYTHON_SCRAPE,
+        "egress_ip": "1.1.1.1",
+        "infiniband_ports": [{"state": "active"}],
+        "needrestart_guard": "missing",
+        "needrestart_guard_unguarded": ["sysbox.service"],
+        "needrestart_guard_reason": "a later conf file runs code",
+        "storage_limit_supported": False,
+        "storage_limit_scrape_error": "Test command timed out.",
+        "sysbox_runtime": False,
+        "sysbox_runtime_scrape_error": "Test command timed out.",
+        "interconnect_scrape_error": '"parse: IndexError"',
+    }
+    liumd_specs = {
+        **LIUMD_SCRAPE,
+        "egress_ip": "2.2.2.2",
+        "infiniband_ports": [{"state": "down"}],
+        "needrestart_guard": "present",
+        "needrestart_guard_unguarded": [],
+        "needrestart_guard_reason": "a later conf file runs code",
+        "storage_limit_supported": True,
+        "sysbox_runtime": True,
+        "interconnect_scrape_error": "NVMLError(999)",
+    }
+    state = build_state(specs=SPECS, scrape_specs=python_specs)
+    ctx = _ctx(keypair, monkeypatch, verifyx_service, state=state)
+
+    record = await _shadow(ctx, FakeLiumd(specs=liumd_specs))
+
+    assert record["specs_agree"] is True
+    assert record["specs_diff"] == []
+
+
+@pytest.mark.asyncio
+async def test_a_missing_python_needrestart_guard_does_not_beat_the_node_view(
+    keypair, monkeypatch, verifyx_service
+):
+    python_specs = {
+        **PYTHON_SCRAPE,
+        "needrestart_guard": "missing",
+        "needrestart_guard_unguarded": ["sysbox.service"],
+    }
+    liumd_specs = {
+        **LIUMD_SCRAPE,
+        "needrestart_guard": "present",
+        "needrestart_guard_unguarded": [],
+    }
+    state = build_state(specs=SPECS, scrape_specs=python_specs)
+    ctx = _ctx(keypair, monkeypatch, verifyx_service, state=state)
+
+    record = await _shadow(ctx, FakeLiumd(specs=liumd_specs))
+
+    assert record["specs_agree"] is True
+    assert record["specs_diff"] == []
+
+
+@pytest.mark.asyncio
 async def test_specs_agree_is_none_without_the_python_snapshot(
     keypair, monkeypatch, verifyx_service
 ):
@@ -572,6 +690,79 @@ async def test_a_failed_post_scrape_read_is_logged_unavailable(
     record = await _shadow(ctx, FakeLiumd())
 
     assert (record["outcome"], record["reason"]) == ("unavailable", "transport")
+
+
+@pytest.mark.asyncio
+async def test_a_skipped_repair_keeps_the_stale_answer(keypair, monkeypatch, verifyx_service):
+    monkeypatch.setattr(settings, "LIUMD_BINARY_REFRESH_ENABLED", True)
+    monkeypatch.setattr(settings, "VALIDATOR_LIUMD_SPECS", True)
+    repair = AsyncMock(
+        return_value=LiumdRefresh(False, "old-build", "download failed", skipped=True)
+    )
+    monkeypatch.setattr(liumd_shadow, "refresh_liumd_from_answer", repair)
+    ctx = _ctx(keypair, monkeypatch, verifyx_service)
+    early = FakeLiumd()
+
+    answer = await liumd_shadow._facts_only(ctx, early.factory)
+
+    assert isinstance(answer, LocalVerifyAnswer)
+    repair.assert_awaited_once()
+    assert len(early.intents) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_failed_repair_under_specs_mode_does_not_use_the_stale_answer(
+    keypair, monkeypatch, verifyx_service
+):
+    monkeypatch.setattr(settings, "LIUMD_BINARY_REFRESH_ENABLED", True)
+    monkeypatch.setattr(settings, "VALIDATOR_LIUMD_SPECS", True)
+    repair = AsyncMock(
+        return_value=LiumdRefresh(False, None, "no task budget for the liumd download")
+    )
+    monkeypatch.setattr(liumd_shadow, "refresh_liumd_from_answer", repair)
+    ctx = _ctx(keypair, monkeypatch, verifyx_service)
+    early = FakeLiumd()
+
+    answer = await liumd_shadow._facts_only(ctx, early.factory)
+
+    assert isinstance(answer, LocalVerifyUnavailable)
+    assert answer.reason == "binary_refresh_failed"
+    repair.assert_awaited_once()
+    assert len(early.intents) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_changed_repair_reruns_the_read(keypair, monkeypatch, verifyx_service):
+    monkeypatch.setattr(settings, "LIUMD_BINARY_REFRESH_ENABLED", True)
+    repair = AsyncMock(return_value=LiumdRefresh(True, "new-build", changed=True))
+    monkeypatch.setattr(liumd_shadow, "refresh_liumd_from_answer", repair)
+    ctx = _ctx(keypair, monkeypatch, verifyx_service)
+    early = FakeLiumd()
+
+    answer = await liumd_shadow._facts_only(ctx, early.factory)
+
+    assert isinstance(answer, LocalVerifyAnswer)
+    assert len(early.intents) == 2
+
+
+@pytest.mark.asyncio
+async def test_a_read_without_a_build_checks_the_installed_binary(
+    keypair, monkeypatch, verifyx_service
+):
+    monkeypatch.setattr(settings, "LIUMD_BINARY_REFRESH_ENABLED", True)
+    check = AsyncMock(return_value=None)
+    monkeypatch.setattr(liumd_shadow, "ensure_liumd_binary", check)
+    repair = AsyncMock()
+    monkeypatch.setattr(liumd_shadow, "refresh_liumd_from_answer", repair)
+    ctx = _ctx(keypair, monkeypatch, verifyx_service)
+    early = FakeLiumd(result=LocalVerifyUnavailable("transport", "closed"))
+
+    answer = await liumd_shadow._facts_only(ctx, early.factory)
+
+    assert isinstance(answer, LocalVerifyUnavailable)
+    check.assert_awaited_once()
+    repair.assert_not_awaited()
+    assert len(early.intents) == 1
 
 
 @pytest.mark.asyncio

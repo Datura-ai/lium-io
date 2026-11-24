@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import copy
 import json
 import logging
@@ -11,7 +12,6 @@ from typing import Any, Literal
 
 from services.file_encrypt_service import ORIGINAL_KEYS
 from services.gpu_spec_table import classify_gpu_model, list_sxm_on_pcie_adapter_as_pcie
-from services.liumd_binary_refresh import DEFAULT_REFRESH_BUDGET_SECONDS, ensure_liumd_binary
 
 from core.config import settings
 from core.utils import _m, get_extra_info
@@ -23,7 +23,6 @@ from ..pipeline import CheckResult, Context
 from ..runner import SSHCommandResult
 from .gpu_loss_hold import GpuLossHoldCheck
 from .rented_gpu_drop import RentedGpuDropCheck, missing_gpus_under_reset
-from .task_time import task_seconds_left
 from .upload_files import UploadFailed, upload_validation_files_to_fresh_remote_dir
 
 logger = logging.getLogger(__name__)
@@ -35,8 +34,12 @@ logger = logging.getLogger(__name__)
 # per-executor timeout. The upload gets one attempt for exactly that reason.
 STDIN_FAILURE_RETRY_WINDOW_MS = 120_000
 FALLBACK_UPLOAD_ATTEMPTS = 1
-# The scrape's own worst case from above; the liumd refresh must not eat the time this needs.
-SCRAPE_BUDGET_SECONDS = 720
+
+# Specs mode reads liumd first, then falls back to the Python scrape when liumd cannot produce a
+# usable document. The read is capped so the fallback still fits inside the machine-scrape timeout.
+LIUMD_SPECS_READ_TIMEOUT_SECONDS = 180
+LIUMD_SPECS_FALLBACK_RESERVE_SECONDS = 90
+LIUMD_SPECS_MIN_READ_SECONDS = 5.0
 
 # The scrape says only two things on stdout: a Fernet token when it worked, and a JSON object
 # with an "error" key when it ran but had nothing to report. Every Fernet token is base64url of
@@ -386,6 +389,33 @@ def _binary_command(remote_dir: str, script_filename: str) -> str:
     return f"chmod +x {script_path} && {script_path}"
 
 
+async def scrape_gpu_details(ctx: Context, timeout: int) -> list[dict[str, Any]]:
+    """A fresh scrape's gpu_details, normalised as MachineSpecScrapeCheck stores them; [] when no payload decrypted.
+
+    DAH-6469: GpuThermalThrottleCheck reads the cards under its own load with it. It writes nothing to ctx.state, so
+    the checks after it keep the cycle's own scrape."""
+    if ctx.config.machine_scrape_source:
+        command, stdin_text = f"{shlex.quote(ctx.executor.python_path)} -I -", ctx.config.machine_scrape_source
+    elif ctx.state.remote_dir and ctx.config.machine_scrape_filename:
+        command, stdin_text = _binary_command(ctx.state.remote_dir, ctx.config.machine_scrape_filename), None
+    else:
+        return []
+    scrape_run = await ctx.runner.run(command, timeout=timeout, retryable=False, stdin_text=stdin_text)
+    if not scrape_run.success:
+        return []
+    try:
+        specs = _deobfuscate(json.loads(_decrypt_payload(ctx, scrape_run.stdout)), ctx.config.obfuscation_keys)
+    except Exception:  # noqa: BLE001 - no token this validator can read: no reading
+        return []
+    gpu_info = specs.get("gpu") if isinstance(specs, dict) else None
+    details = gpu_info.get("details") if isinstance(gpu_info, dict) else None
+    if not isinstance(details, list):
+        return []
+    return list_sxm_on_pcie_adapter_as_pcie(
+        specs, _normalize_gpu_details([detail for detail in details if isinstance(detail, dict)])
+    )
+
+
 class MachineSpecScrapeCheck:
     """Run the obfuscated scrape script and unpack the executor's hardware profile.
 
@@ -403,71 +433,69 @@ class MachineSpecScrapeCheck:
 
     async def run(self, ctx: Context) -> CheckResult:
         liumd_specs = settings.VALIDATOR_LIUMD_SPECS and not settings.DRY_RUN
-        if settings.VALIDATOR_LIUMD_SHADOW or liumd_specs:
-            refresh = await ensure_liumd_binary(
-                ctx,
-                budget_seconds=min(
-                    DEFAULT_REFRESH_BUDGET_SECONDS, task_seconds_left(ctx) - SCRAPE_BUDGET_SECONDS
-                ),
-            )
-            if refresh is not None and refresh.skipped:
-                logger.warning(
-                    _m(
-                        "liumd binary refresh skipped; using the local binary",
-                        extra=get_extra_info({**ctx.default_extra, "detail": refresh.detail[:300]}),
-                    )
-                )
-            elif refresh is not None and not refresh.ok:
-                if liumd_specs:
-                    return self._fail_liumd(
-                        ctx,
-                        None,
-                        f"liumd binary refresh failed: {refresh.detail}",
-                        reason="binary_refresh_failed",
-                    )
-                logger.warning(
-                    _m(
-                        "liumd binary refresh failed; shadow continues",
-                        extra=get_extra_info({**ctx.default_extra, "detail": refresh.detail[:300]}),
-                    )
-                )
-            elif refresh is not None and refresh.changed:
-                logger.info(
-                    _m(
-                        "liumd binary refreshed",
-                        extra=get_extra_info({**ctx.default_extra, "build_sha": refresh.build_sha}),
-                    )
-                )
-            elif refresh is not None and refresh.detail:
-                logger.warning(
-                    _m(
-                        "liumd binary refresh degraded; using the local binary",
-                        extra=get_extra_info({**ctx.default_extra, "detail": refresh.detail[:300]}),
-                    )
-                )
-        if liumd_specs:
-            return await self._scrape_with_liumd(ctx)
-
         timeout = ctx.config.machine_scrape_timeout or self.DEFAULT_TIMEOUT
+
+        if liumd_specs:
+            result, fallback_reason = await self._scrape_with_liumd(ctx, timeout)
+            if result.passed or fallback_reason is None:
+                return result
+            detail = str(result.event.what_we_saw.get("detail") or "")[:300]
+            logger.warning(
+                _m(
+                    "liumd machine specs unavailable; using the Python scrape",
+                    extra=get_extra_info(
+                        {**ctx.default_extra, "liumd_reason": fallback_reason, "detail": detail}
+                    ),
+                )
+            )
+            if ctx.config.machine_scrape_source:
+                fallback = await self._scrape_from_source(ctx, timeout, start_shadow=False)
+            else:
+                fallback = await self._scrape_uploaded_binary(ctx, timeout, start_shadow=False)
+            fallback.event.what_we_saw["liumd_fallback_reason"] = fallback_reason
+            if detail:
+                fallback.event.what_we_saw["liumd_fallback_detail"] = detail
+            return fallback
 
         if ctx.config.machine_scrape_source:
             return await self._scrape_from_source(ctx, timeout, start_shadow=True)
         return await self._scrape_uploaded_binary(ctx, timeout, start_shadow=True)
 
-    async def _scrape_with_liumd(self, ctx: Context) -> CheckResult:
-        """Use the full machine-scrape document from the same early `liumd run`."""
+    async def _scrape_with_liumd(
+        self, ctx: Context, timeout: int
+    ) -> tuple[CheckResult, str | None]:
+        """Use the liumd machine-scrape document, or report why the Python fallback must run."""
         from services.local_verify_client import LocalVerifyAnswer
 
         from ..liumd_shadow import start_facts_after_scrape
 
         task = start_facts_after_scrape(ctx)
         if task is None:
-            return self._fail_liumd(ctx, None, "no early liumd read")
-        answer = await task
+            result = self._fail_liumd(ctx, None, "no early liumd read")
+            return result, self._liumd_reason(result)
+        budget = max(
+            LIUMD_SPECS_MIN_READ_SECONDS,
+            min(
+                float(timeout) - LIUMD_SPECS_FALLBACK_RESERVE_SECONDS,
+                LIUMD_SPECS_READ_TIMEOUT_SECONDS,
+            ),
+        )
+        try:
+            answer = await asyncio.wait_for(task, timeout=budget)
+        except TimeoutError:
+            result = self._fail_liumd(ctx, None, "liumd read timed out", reason="timeout")
+            return result, "timeout"
+        except Exception as exc:  # a shadow bug must not fail the scrape
+            result = self._fail_liumd(
+                ctx, None, f"{type(exc).__name__}: {exc}"[:300], reason="error"
+            )
+            return result, "error"
         if not isinstance(answer, LocalVerifyAnswer):
-            return self._fail_liumd(ctx, answer)
+            result = self._fail_liumd(ctx, answer)
+            return result, self._liumd_reason(result)
         if not answer.specs:
-            return self._fail_liumd(ctx, answer, "empty liumd specs")
+            result = self._fail_liumd(ctx, answer, "empty liumd specs")
+            return result, self._liumd_reason(result)
 
         specs = _normalize_liumd_document(answer.specs)
         gpu_info = specs.get("gpu")
@@ -475,10 +503,15 @@ class MachineSpecScrapeCheck:
         if not isinstance(gpu_info, dict) or not isinstance(raw_gpu_details, list) or not all(
             isinstance(detail, dict) for detail in raw_gpu_details
         ):
-            return self._fail_liumd(ctx, answer, "malformed liumd specs")
+            result = self._fail_liumd(ctx, answer, "malformed liumd specs")
+            return result, self._liumd_reason(result)
         if not raw_gpu_details:
-            return await self._fail_without_gpus(ctx, answer, specs)
-        return self._result_from_specs(ctx, specs, delivery="liumd", task=task, snapshot=False)
+            return await self._fail_without_gpus(ctx, answer, specs), None
+        return self._result_from_specs(ctx, specs, delivery="liumd", task=task, snapshot=False), None
+
+    @staticmethod
+    def _liumd_reason(result: CheckResult) -> str:
+        return str(result.event.what_we_saw.get("liumd_reason") or "unavailable")
 
     async def _fail_without_gpus(
         self, ctx: Context, answer: Any, specs: dict[str, Any]
