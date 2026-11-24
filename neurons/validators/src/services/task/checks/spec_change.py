@@ -11,7 +11,7 @@ class SpecChangeCheck:
     """Reset verification when the GPU model:count tuple changes between runs.
 
     The same cards under another name are reset once, then verified as they are now. A full set of other cards
-    of another model never verifies under this executor id: that machine is added as a new node.
+    of another model never verifies under this executor id: the node's own cards (or machine) must be back.
     """
 
     check_id = "gpu.validate.spec_change"

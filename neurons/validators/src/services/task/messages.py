@@ -779,7 +779,11 @@ class SpecChangeMessages:
         severity="warning",
         category="env",
         impact="Node stays unverified; score set to 0",
-        remediation="Put this node's GPUs back, or add the machine as a new node.",
+        remediation=(
+            "Restore this node's original GPUs or point it back to its original machine. To register another machine "
+            "at the same IP and port, first free that address by updating the existing node's address or deleting "
+            "the existing node. A rented node cannot be deleted."
+        ),
     )
     SPEC_UNCHANGED = MessageTemplate(
         event="GPU inventory stable",

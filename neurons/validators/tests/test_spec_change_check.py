@@ -89,6 +89,12 @@ async def test_other_cards_of_another_model_stay_unverified(verified_spec, new_s
     # the record keeps the node's model and cards, so the next cycle fails the same way
     assert not result.updates.get("gpu_respec")
     assert not result.updates.get("gpu_reanchor")
+    # the portal refuses a second node on the same IP and port, so the remediation must not say "add a new node"
+    assert result.event.remediation == (
+        "Restore this node's original GPUs or point it back to its original machine. To register another machine at "
+        "the same IP and port, first free that address by updating the existing node's address or deleting the "
+        "existing node. A rented node cannot be deleted."
+    )
 
 
 @pytest.mark.asyncio
