@@ -557,3 +557,25 @@ async def test_apply_tells_a_host_refusal_from_our_own_error(failure, expected, 
         ssh, [GpuPowerLimit(gpu_uuid="GPU-a", watts=200)], redis, POD_ID, "executor-1"
     )
     assert result is expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("action", "reads"), [("cap", gpl.POWER_LIMIT_READBACK_ATTEMPTS), ("restore", 1), ("raise", 1)]
+)
+async def test_only_a_cap_rereads_an_unreadable_readback(action, reads, monkeypatch):
+    # lio#2094 review 6035971914: filler deletion and customer creation wait on a restore or raise, so a transient
+    # unreadable readback there must not cost the retries a cap's HOST_REFUSED verdict needs.
+    monkeypatch.setattr(gpl, "POWER_LIMIT_READBACK_RETRY_SECONDS", 0)
+    commands = []
+
+    async def run(command, **_kwargs):
+        commands.append(command)
+        return FakeRun(exit_status=9) if "--query-gpu=power.limit" in command else FakeRun()
+
+    ssh = AsyncMock(run=AsyncMock(side_effect=run))
+
+    outcome = await gpl._set_and_log_power_limit(ssh, action, "executor-1", "GPU-a", 400, 200, None)
+
+    assert outcome.failure is not None
+    assert sum("--query-gpu=power.limit" in command for command in commands) == reads

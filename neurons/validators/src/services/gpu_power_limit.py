@@ -412,6 +412,7 @@ async def _set_power_limit(
     ssh: asyncssh.SSHClientConnection,
     uuid: str,
     watts: int,
+    readback_attempts: int = 1,
 ) -> PowerLimitSetOutcome:
     """Set one GPU's power limit and VERIFY it stuck. nvidia-smi can report success while the limit
     silently reverts (persistence mode off, driver unloads) — only the readback proves the cap exists.
@@ -430,7 +431,7 @@ async def _set_power_limit(
             persistence_enabled=None,
             host_refused=True,
         )
-    for attempt in range(POWER_LIMIT_READBACK_ATTEMPTS):
+    for attempt in range(readback_attempts):
         if attempt:
             await asyncio.sleep(POWER_LIMIT_READBACK_RETRY_SECONDS)
         try:
@@ -476,7 +477,10 @@ async def _set_and_log_power_limit(
     # _set_alone logs it as failed. A refusal of the best-effort -pm 1 is not one: that step logs it
     # and the set goes on.
     await _enable_persistence_mode(ssh, gpu_uuid, log_extra)
-    set_outcome = await _set_power_limit(ssh, gpu_uuid, watts_after)
+    # Only a cap's unread readback can become HOST_REFUSED, so only a cap re-reads before that verdict. A restore or
+    # raise reads once: filler deletion and customer creation wait on it, inside the backend's terminal wait
+    readback_attempts = POWER_LIMIT_READBACK_ATTEMPTS if action == "cap" else 1
+    set_outcome = await _set_power_limit(ssh, gpu_uuid, watts_after, readback_attempts)
     failure = set_outcome.failure
     status = "ok" if failure is None else "failed"
     message = f"gpu power limit {action} {status}: executor={executor_id} gpu={gpu_uuid} watts {watts_before} -> {watts_after}"
