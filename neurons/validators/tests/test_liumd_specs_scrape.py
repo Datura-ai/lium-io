@@ -129,7 +129,6 @@ async def test_an_unusable_liumd_document_falls_back_to_the_python_scrape(
     assert result.passed is True
     assert result.event.reason_code == Msg.SCRAPE_OK.reason
     assert result.event.what_we_saw["delivery"] == "stdin"
-    assert result.event.what_we_saw["liumd_delivery"] == "liumd"
     assert result.event.what_we_saw["liumd_fallback_reason"] == reason
     state = result.updates["state"]
     assert state.specs["gpu"]["count"] == 1

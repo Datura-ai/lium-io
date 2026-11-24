@@ -452,12 +452,7 @@ class MachineSpecScrapeCheck:
                 fallback = await self._scrape_from_source(ctx, timeout, start_shadow=False)
             else:
                 fallback = await self._scrape_uploaded_binary(ctx, timeout, start_shadow=False)
-            fallback.event.what_we_saw.update(
-                {
-                    "liumd_delivery": "liumd",
-                    "liumd_fallback_reason": fallback_reason,
-                }
-            )
+            fallback.event.what_we_saw["liumd_fallback_reason"] = fallback_reason
             if detail:
                 fallback.event.what_we_saw["liumd_fallback_detail"] = detail
             return fallback
