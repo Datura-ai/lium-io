@@ -60,6 +60,11 @@ _package_fallback_probes: dict[tuple[str, str], int] = {}
 # margin for scoring, publishing and cleanup; with less than MIN_COLD_RETRY_SECONDS of that it is skipped.
 MIN_COLD_RETRY_SECONDS = 240
 COLD_RETRY_MARGIN_SECONDS = 60
+# DAH-5933: the first sample gets the task's time less COLD_RETRY_MARGIN_SECONDS for scoring, publishing and cleanup,
+# so a slow VerifyX (up to its 600 s cap) cannot run past the task. With less than MIN_COLD_RETRY_SECONDS for VerifyX
+# itself the cycle reports VERIFYX_NO_TASK_TIME, which carries like RENTAL_CHECK_NO_TASK_TIME: the validator's budget,
+# not the node, decided it. No extra reserve for the rental probe: it needs 360 s after the GPU checks, so a smaller
+# reserve never lets it run and only cuts VerifyX runs that would pass (review at 1749a1d).
 # cap on the rental-state re-read before the retry; a slower answer counts as unknown (busy)
 RENTAL_STATE_TIMEOUT_SECONDS = 30
 # during the retry only the per-executor pending-pod marker is re-read, every interval; the backend's
@@ -246,6 +251,17 @@ class VerifyXCheck:
     replays_after_session_drop = False
     fatal = True
 
+    def _no_task_time(self, ctx: Context, what: dict) -> CheckResult:
+        return CheckResult(
+            passed=False,
+            event=render_message(
+                Msg.NO_TASK_TIME,
+                ctx=ctx,
+                check_id=self.check_id,
+                what={**what, "seconds_needed": MIN_COLD_RETRY_SECONDS},
+            ),
+        )
+
     def _extract_errors(self, result) -> str | list | None:
         """Extract errors from result with clear priority: data.errors > result.error."""
         if result.data and result.data.get("errors"):
@@ -253,7 +269,6 @@ class VerifyXCheck:
         return result.error
 
     async def run(self, ctx: Context) -> CheckResult:
-        verifyx_service = ctx.services.verifyx
         specs = ctx.state.specs
         if not specs:
             event = render_message(
@@ -363,13 +378,14 @@ class VerifyXCheck:
             result = local.verifyx
             transport = "local_verify"
         else:
-            result = await verifyx_service.validate_verifyx_and_process_job(
-                shell=ctx.services.shell,
-                executor_info=ctx.executor,
-                default_extra=ctx.default_extra,
-                machine_spec=specs,
-                **sizing,
-            )
+            budget = task_seconds_left(ctx) - COLD_RETRY_MARGIN_SECONDS
+            if budget < MIN_COLD_RETRY_SECONDS:
+                return self._no_task_time(ctx, {"seconds_left": max(0, int(budget))})
+            # the preflight shares this budget, so even a full one bounds the whole call; the service still caps
+            # the remote run at VERIFYX_COMMAND_TIMEOUT_SECONDS after the preflight
+            result = await _verifyx_within(ctx, specs, sizing, budget)
+            if result is None:
+                return self._no_task_time(ctx, {"cut_off_after_seconds": int(budget)})
 
         prev_ema = (
             ctx.state.rented_data.network_ema.get(ctx.executor.uuid)
@@ -1026,6 +1042,36 @@ def hold_verifyx_ema(ctx: Context, specs: dict[str, Any]) -> dict[str, Any]:
         else:
             held[key] = previous
     return {**specs, "network": held}
+
+
+async def _verifyx_within(ctx: Context, specs: dict, sizing: dict, budget: float):
+    """DAH-5933: the first sample cut at `budget`; None when the cut came first. A cut-off run, or one whose SSH
+    call failed, is killed on the host as the cold retry's is, or kept for the next run to reap."""
+    verifyx_service = ctx.services.verifyx
+    run_dir = f".verifyx-{secrets.token_hex(8)}"
+    result = None
+    try:
+        result = await asyncio.wait_for(
+            verifyx_service.validate_verifyx_and_process_job(
+                shell=ctx.services.shell,
+                executor_info=ctx.executor,
+                default_extra=ctx.default_extra,
+                machine_spec=specs,
+                run_dir=run_dir,
+                # the remote deadline is this one, so a run whose cleanup cannot connect stops with it (review F-24)
+                deadline_monotonic=time.monotonic() + budget,
+                **sizing,
+            ),
+            timeout=budget,
+        )
+    except TimeoutError:
+        pass
+    finally:
+        if (result is None or (result.diagnostics or {}).get("transport_error") is not None) and not (
+            await verifyx_service.kill_remote_verifyx(ctx.services.shell, run_dir, ctx.default_extra)
+        ):
+            await _remember_stale_run(ctx, run_dir)
+    return result
 
 
 async def _remember_stale_run(ctx: Context, run_dir: str) -> None:

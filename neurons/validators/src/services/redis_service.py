@@ -395,6 +395,11 @@ def last_scored_result_key(miner_hotkey: str, executor_id: str) -> str:
     return f"{LAST_SCORED_RESULT_PREFIX}:{miner_hotkey}:{executor_id}"
 
 
+def last_scored_result_vouch_key(miner_hotkey: str, executor_id: str) -> str:
+    """The job block of the last cycle that kept the node's last scored result eligible (DAH-5933)."""
+    return f"{LAST_SCORED_RESULT_PREFIX}_vouch:{miner_hotkey}:{executor_id}"
+
+
 def _verified_job_field(miner_hotkey: str, executor_id: str) -> str:
     """The verified record is per (miner hotkey, executor id): an executor id is unique only per hotkey, so a
     hotkey that lists another's executor id writes, resets and marks only its own record."""
@@ -899,6 +904,15 @@ class RedisService:
         if not keys:
             return []
         return await self.redis.mget(keys)
+
+    async def read_and_take(self, key: str, taken_key: str) -> tuple:
+        """`key` and `taken_key` read in one MULTI that also deletes `taken_key`: a value read is never read again."""
+        async with self.redis.pipeline(transaction=True) as pipe:
+            pipe.get(key)
+            pipe.get(taken_key)
+            pipe.delete(taken_key)
+            value, taken, _ = await pipe.execute()
+        return value, taken
 
     async def delete(self, key: str):
         """Remove a key from Redis."""

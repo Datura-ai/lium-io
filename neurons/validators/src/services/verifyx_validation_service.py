@@ -7,6 +7,7 @@ import os
 import logging
 import re
 import shlex
+import time
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Dict, NamedTuple, Optional, Tuple, List
@@ -67,6 +68,10 @@ class VerifyXFailureClass(str, Enum):
     EMPTY_RESPONSE = "EMPTY_RESPONSE"
     CIPHER_REJECTED = "CIPHER_REJECTED"
     UNKNOWN = "UNKNOWN"
+
+
+# printed to stderr by the bounded run's wrapper once its deadline has passed on the host
+VERIFYX_DEADLINE_MARKER = "lium-verifyx-deadline-reached"
 
 
 class SSHCapture(NamedTuple):
@@ -239,6 +244,24 @@ class NetworkGateTally:
 NETWORK_GATE_TALLY = NetworkGateTally()
 
 
+# DAH-5933: `timeout -k 10 SECONDS CMD...` for a host without it: the watchdog leads its own process group, which
+# kill_remote_verifyx kills by the recorded PID; at the deadline TERM to the group, then KILL after 10 s.
+_PYTHON_WATCHDOG = (
+    "import os,signal,subprocess,sys\n"
+    "os.setpgid(0,0)\n"
+    "p=subprocess.Popen(sys.argv[2:])\n"
+    "try:\n sys.exit(p.wait(float(sys.argv[1])))\n"
+    "except subprocess.TimeoutExpired:\n pass\n"
+    "signal.signal(signal.SIGTERM,signal.SIG_IGN)\n"
+    # the marker is best effort: a closed SSH reader (EPIPE) must never stop the kill below
+    f"try:\n os.write(2,{(VERIFYX_DEADLINE_MARKER + chr(10)).encode()!r})\nexcept OSError:\n pass\n"
+    "os.killpg(0,signal.SIGTERM)\n"
+    "try:\n p.wait(10)\n"
+    "except subprocess.TimeoutExpired:\n os.killpg(0,signal.SIGKILL)\n"
+    "sys.exit(124)\n"
+)
+
+
 class VerifyXValidationService:
     def __init__(self):
         self.lib_name = LIB_PATH
@@ -386,7 +409,11 @@ class VerifyXValidationService:
         machine_spec: dict,
         challenge_config_overrides: dict | None = None,
         run_dir: str | None = None,
+        deadline_monotonic: float | None = None,
     ):
+        """`deadline_monotonic` (time.monotonic()) bounds a run the validator cuts off: the remote run gets what is
+        left of it after the checksum and the challenge, under a watchdog of its own, and None comes back without a
+        launch once nothing is left (DAH-5933 review)."""
         # The SSH transport: library checksum over the shell → prepare_verifyx_challenge → one
         # remote `verifyx_executor.py` run → evaluate_verifyx_capture. The local transport
         # (checks/local_verify.py) calls the same prepare/evaluate around `POST /verify`.
@@ -477,11 +504,35 @@ class VerifyXValidationService:
                 machine_spec, default_extra, challenge_config_overrides, lib_name=lib_name
             )
 
-            command = self._verifyx_command(executor_info, challenge, lib_name, run_dir)
+            seconds = VERIFYX_COMMAND_TIMEOUT_SECONDS
+            cut = None
+            if deadline_monotonic is not None:
+                remaining = deadline_monotonic - time.monotonic()
+                left = int(remaining)
+                if left <= 0:
+                    return None
+                # The caller's own wait, on this clock, cuts the run at the deadline and kills it
+                # (checks/verifyx.py `_verifyx_within`); the host's watchdog is only the backstop for a kill that never
+                # lands, so it fires after that cut and the kill's own timeout. A run that returns before the cut is
+                # judged as any run: the host's clock never decides a cut (review at ea74f37). Never past the fixed
+                # command cap, which a budget near it would otherwise exceed by the kill's timeout.
+                seconds = min(seconds, left + VERIFYX_KILL_TIMEOUT_SECONDS)
+                # cut only at the deadline, and only when the budget cannot afford the full command and the kill: a
+                # budget that can keeps the uncut 600 s wait, so a run answering before the deadline is always judged
+                # (review r4656251199)
+                cut = remaining if remaining < VERIFYX_COMMAND_TIMEOUT_SECONDS + VERIFYX_KILL_TIMEOUT_SECONDS else None
+            command = self._verifyx_command(
+                executor_info, challenge, lib_name, run_dir, deadline_monotonic is not None, seconds
+            )
 
             logger.info(_m("VerifyX Python Script Command", extra=get_extra_info(challenge.log_extra)))
 
-            ssh_capture = await self._run_ssh_command(shell, command)
+            try:
+                ssh_capture = await asyncio.wait_for(self._run_ssh_command(shell, command), cut)
+            except TimeoutError:
+                return None  # cut, as by the caller's wait: the caller kills the run
+            if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+                return None  # answered past the deadline (a watchdog the cap fired near it): the caller's cut, not a verdict
             return self.evaluate_verifyx_capture(challenge, ssh_capture, default_extra)
 
         except Exception as e:
@@ -620,7 +671,13 @@ class VerifyXValidationService:
         return None
 
     def _verifyx_command(
-        self, executor_info, challenge: "VerifyXChallenge", lib_name: str, run_dir: str | None = None
+        self,
+        executor_info,
+        challenge: "VerifyXChallenge",
+        lib_name: str,
+        run_dir: str | None = None,
+        python_watchdog: bool = False,
+        seconds: int = VERIFYX_COMMAND_TIMEOUT_SECONDS,
     ) -> str:
         command = (
             f"{shlex.quote(executor_info.python_path)} {shlex.quote(executor_info.root_dir + '/src/verifyx_executor.py')} "
@@ -631,14 +688,22 @@ class VerifyXValidationService:
         # A run the validator may cut off: its own scratch dir (cwd, so the disk-test file lands in
         # it on the same filesystem) and its PID on record, for kill_remote_verifyx.
         d = shlex.quote(run_dir)
-        return (
-            # a remote deadline of its own: the run cannot outlive its budget even if the kill never lands;
+        if python_watchdog:
+            # DAH-5933 review F-29/F-32: the bounded first sample runs under the executor's own Python watchdog, the
+            # backstop that stops it after the validator's own cut if that cut's kill never landed. Its marker,
+            # written right before its kill, is a diagnostic in the stderr tail only: nothing decides on it.
+            start = (
+                f"mkdir {d} && cd {d} || exit 1; "
+                f"{shlex.quote(executor_info.python_path)} -c {shlex.quote(_PYTHON_WATCHDOG)} {int(seconds)} {command} & "
+            )
+        else:
             # a host whose `timeout` lacks -k (busybox) skips the retry, so the first sample stands
-            f"timeout -k 1 1 true 2>/dev/null || {{ echo 'no timeout -k' >&2; exit 1; }}; "
-            f"mkdir {d} && cd {d} || exit 1; "
-            f"timeout -k 10 {VERIFYX_COMMAND_TIMEOUT_SECONDS} {command} & echo $! > pid; wait $!; rc=$?; "
-            f"cd .. && rm -rf {d}; exit $rc"
-        )
+            start = (
+                f"timeout -k 1 1 true 2>/dev/null || {{ echo 'no timeout -k' >&2; exit 1; }}; "
+                f"mkdir {d} && cd {d} || exit 1; timeout -k 10 {int(seconds)} {command} & "
+            )
+        # a remote deadline of its own: the run cannot outlive its budget even if the kill never lands
+        return f"{start}echo $! > pid; wait $!; rc=$?; cd .. && rm -rf {d}; exit $rc"
 
     async def kill_remote_verifyx(self, shell, run_dir: str, default_extra: dict) -> bool:
         """Kill a VerifyX run started with `run_dir` and cut off by the validator; True once it is gone.

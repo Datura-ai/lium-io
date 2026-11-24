@@ -2367,6 +2367,8 @@ class MinerService:
                             executor_image_snapshot=executor_image_snapshot,
                             attestation_nonce=attestation_nonce,
                             first_pass=first_pass,
+                            # DAH-5933 review: an express recheck's wait ends before JOB_TIME_OUT; the checks budget against it
+                            deadline_monotonic=None if job_timeout is None else job_started_at + job_timeout,
                         ),
                         timeout=timeout,
                     )

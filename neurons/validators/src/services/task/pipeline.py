@@ -290,6 +290,8 @@ class Context(BaseModel):
     # time.monotonic() at the executor task's start; a best-effort step budgets against
     # the executor task's timeout from here.
     started_at_monotonic: float = Field(default_factory=time.monotonic)
+    # an express recheck's own deadline (time.monotonic()), when it cancels the task before its timeout does
+    deadline_monotonic: float | None = None
     executor: ExecutorSSHInfo
     miner_hotkey: str
     miner_coldkey: str | None = None
@@ -327,6 +329,8 @@ class Context(BaseModel):
     contract_version: str | None = None
     is_rental_succeed: bool = False
     rented: bool = False
+    # the rental snapshot whose listed pods the rented halt judged all closed: a later halt judges only a fresher read
+    rentals_judged_closed: RentedExecutorsResponse | None = None
     renting_in_progress: bool = False
     ssh_pub_keys: list[str] | None = None
     port_count: int = 0
