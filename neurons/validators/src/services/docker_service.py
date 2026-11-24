@@ -14998,9 +14998,9 @@ class DockerService:
     async def _reset_leftover_clock_locks_before_create(
         self, ssh_client, payload: ContainerCreateRequest, default_extra: dict
     ) -> None:
-        """DAH-4663: a GPU whose clock lock outlived its pod (teardown -rgc failed) is reset before anyone starts
-        on it. A GPU with a lock record that still cannot be reset fails the create (its record stays for the next
-        try); anything else here is best-effort and never blocks the rental."""
+        """DAH-4663: a GPU whose clock lock outlived its pod (teardown -rgc failed), or that someone else locked, is
+        reset before anyone starts on it. A GPU that still cannot be reset fails the create (a record stays for the
+        next try); anything else here is best-effort and never blocks the rental."""
         # DAH-4663 (review): after a renter's clock lock in flight on this pod (a reboot), so its -lgc never lands
         # after this reset dropped its record. Only around this step, so a delete still cancels the create at once.
         async with pod_gpu_operation_locks.hold(
@@ -15026,8 +15026,8 @@ class DockerService:
                 )
                 return
         if still_locked:
-            # never hand a renter the previous renter's locked clocks
-            raise RuntimeError(f"GPU clocks a previous rental locked could not be reset: {', '.join(still_locked)}")
+            # never hand a renter locked clocks, whoever locked them
+            raise RuntimeError(f"GPU clocks could not be reset to default: {', '.join(still_locked)}")
 
     async def delete_container(
         self,
