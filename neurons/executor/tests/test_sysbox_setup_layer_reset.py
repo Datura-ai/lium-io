@@ -619,6 +619,23 @@ def test_a_reset_cut_off_between_chown_and_restore_gets_the_setuid_bit_and_capab
     assert not os.path.exists(reset["JOURNAL"])
 
 
+
+def test_a_journaled_path_replaced_by_a_link_to_a_host_file_is_left_untouched(tmp_path):
+    reset, fs = _fake_fs(tmp_path)
+    sudo, host = fs.upper / "sudo", tmp_path / "etc/sudoers"
+    host.parent.mkdir(parents=True, exist_ok=True)
+    host.write_text("")
+    host.chmod(0o440)
+    os.makedirs(os.path.dirname(reset["JOURNAL"]), exist_ok=True)
+    with open(reset["JOURNAL"], "w") as f:
+        f.write(json.dumps({"p": str(sudo), "m": 0o4777, "c": ""}) + "\n")
+    sudo.unlink()
+    sudo.symlink_to(host)  # a pod swapped the journaled file for a link while Docker ran after a failed reset
+    reset["os"].chmod = lambda *a: pytest.fail("chmod through a replaced path")
+    reset["replay_journal"]()
+    assert stat.S_IMODE(host.stat().st_mode) == 0o440
+    assert not os.path.exists(reset["JOURNAL"])
+
 def test_named_acl_entries_are_shifted_back_also_when_the_owner_already_matches(tmp_path):
     reset, fs = _fake_fs(tmp_path)
     renter, etc = str(fs.upper / "renterfile"), str(fs.upper / "etc")

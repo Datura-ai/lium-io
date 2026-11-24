@@ -430,7 +430,12 @@ def journal(entries):
 
 
 def restore(e):
-    os.chmod(e["p"], e["m"])
+    p = e["p"]
+    # Docker may have run since the journal was written: never follow a path a pod replaced with a link
+    if os.path.realpath(p) != p or stat.S_ISLNK(os.lstat(p).st_mode):
+        print(f"skipped ...{p[-80:]}: replaced since journaled", file=sys.stderr, flush=True)
+        return
+    os.chmod(p, e["m"])
     if e["c"]:
         os.setxattr(e["p"], "security.capability", bytes.fromhex(e["c"]), follow_symlinks=False)
 
