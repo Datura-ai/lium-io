@@ -561,9 +561,9 @@ async def test_a_slow_dockerd_keeps_the_park_within_one_wait(svc, monkeypatch):
 
     result = await _run(svc, payload)
 
-    # the direct kill comes first, then reads that each end by the one 30 s budget; none starts past it
-    # (the last entry is the park's own final read before it decides whether to rename back: past the budget, 1 s)
-    assert host_timeouts == [30, 30, 18, 6, 1]
+    # the direct kill comes first, then reads that each end by the one 30 s budget; none starts past it, the park's
+    # own final read included (past the budget the container counts as unreadable and stays parked for the restore)
+    assert host_timeouts == [30, 30, 18, 6]
     # the rename back is a write: cut short after dockerd applied it, the restore would remove the renter's pod
     assert rename_back_timeouts == [60]
     assert isinstance(result, FailedContainerRequest) and result.failure_step == "park_current_container"

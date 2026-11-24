@@ -2183,10 +2183,18 @@ class _EditSwap:
             # after a destructive `docker rm -fv`. If even the rename back fails, parked_name
             # stays set so __aexit__ tries the full restore once more. The kill can still land after
             # the wait, so rename back only while Docker still says it runs; a stopped or unreadable
-            # container stays parked for __aexit__ to restore.
-            left = _seconds_left(self._kill_deadline) if self._kill_deadline is not None else None
-            running = await self._run(f"/usr/bin/docker inspect -f '{{{{.State.Running}}}}' {shlex.quote(parked)}", left)
-            if running.exit_status == 0 and (running.stdout or "").strip() == "true":
+            # container stays parked for __aexit__ to restore. Past the kill wait's budget no read starts: the
+            # container counts as unreadable, so the park ends inside the budget a cancelling delete waits for.
+            deadline = self._kill_deadline
+            running = (
+                None
+                if deadline is not None and time.monotonic() >= deadline
+                else await self._run(
+                    f"/usr/bin/docker inspect -f '{{{{.State.Running}}}}' {shlex.quote(parked)}",
+                    _seconds_left(deadline) if deadline is not None else None,
+                )
+            )
+            if running is not None and running.exit_status == 0 and (running.stdout or "").strip() == "true":
                 # a write keeps the full timeout: cut short after dockerd applied it, the restore would remove the pod
                 renamed_back = await self._run(
                     f"/usr/bin/docker rename {shlex.quote(parked)} {shlex.quote(self.container_name)}"
