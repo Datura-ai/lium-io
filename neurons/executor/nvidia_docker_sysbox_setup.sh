@@ -429,10 +429,11 @@ def journal(entries):
         os.close(d)
 
 
-def restore(e):
+def restore(e, root, real_root):
     p = e["p"]
-    # Docker may have run since the journal was written: never follow a path a pod replaced with a link
-    if os.path.realpath(p) != p or stat.S_ISLNK(os.lstat(p).st_mode):
+    # Docker may have run since the journal was written: never follow a path a pod replaced with a link; the data
+    # root itself may sit behind one, so the path is compared below the resolved root
+    if os.path.realpath(p) != os.path.join(real_root, os.path.relpath(p, root)) or stat.S_ISLNK(os.lstat(p).st_mode):
         print(f"skipped ...{p[-80:]}: replaced since journaled", file=sys.stderr, flush=True)
         return
     os.chmod(p, e["m"])
@@ -446,13 +447,15 @@ def replay_journal():
         lines = open(JOURNAL).read().splitlines()
     except FileNotFoundError:
         return
+    root = data_root()
+    real_root = os.path.realpath(root)
     for line in lines:
         try:
             e = json.loads(line)
         except ValueError:
             continue  # torn while written: its batch had not reached any chown yet
         try:
-            restore(e)
+            restore(e, root, real_root)
         except FileNotFoundError:
             pass  # gone with its container
         # any other error fails the unit with the journal kept, so Docker stays down and the next boot retries

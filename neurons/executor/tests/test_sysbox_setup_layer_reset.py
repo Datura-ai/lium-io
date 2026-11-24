@@ -636,6 +636,21 @@ def test_a_journaled_path_replaced_by_a_link_to_a_host_file_is_left_untouched(tm
     assert stat.S_IMODE(host.stat().st_mode) == 0o440
     assert not os.path.exists(reset["JOURNAL"])
 
+
+def test_a_journal_under_a_data_root_behind_a_link_is_replayed(tmp_path):
+    reset, fs = _fake_fs(tmp_path)
+    sudo = str(fs.upper / "sudo")
+    fs.modes[sudo] = stat.S_IFREG | 0o755  # stripped by the chown before the cut-off
+    os.makedirs(os.path.dirname(reset["JOURNAL"]), exist_ok=True)
+    with open(reset["JOURNAL"], "w") as f:
+        f.write(json.dumps({"p": sudo, "m": 0o4755, "c": ""}) + "\n")
+    (tmp_path / "data").mkdir()
+    shutil.move(str(tmp_path / "var/lib/docker"), str(tmp_path / "data/docker"))
+    (tmp_path / "var/lib/docker").symlink_to(tmp_path / "data/docker")  # Docker's data-root is a link to another disk
+    reset["replay_journal"]()
+    assert stat.S_IMODE(fs.modes[sudo]) == 0o4755
+    assert not os.path.exists(reset["JOURNAL"])
+
 def test_named_acl_entries_are_shifted_back_also_when_the_owner_already_matches(tmp_path):
     reset, fs = _fake_fs(tmp_path)
     renter, etc = str(fs.upper / "renterfile"), str(fs.upper / "etc")
