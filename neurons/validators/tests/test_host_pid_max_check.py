@@ -124,4 +124,15 @@ def test_every_pipeline_reads_it_after_the_non_fatal_checks(build):
     names = _names(build())
     at = names.index("HostPidMaxCheck")
     assert at > names.index("RentedGpuDropCheck") and at > names.index("GpuLossHoldCheck")
-    assert names[at + 1] == "GpuCountCheck"
+    if "TenantEnforcementCheck" in names:  # the rented halt: a rental already on the node is judged before it
+        assert at < names.index("TenantEnforcementCheck")
+
+
+@pytest.mark.parametrize("build", [PipelineFactory.build_checks, PipelineFactory.build_fast_path_checks])
+def test_the_stale_container_cleanup_runs_before_it(build):
+    """A halt here on an idle node must not skip the cleanup: a container whose rental ended would stay running on
+    the host, GPU processes and all, for every cycle the host keeps the unusable setting."""
+    names = _names(build())
+    at = names.index("HostPidMaxCheck")
+    assert at > names.index("StaleContainerCleanupCheck")
+    assert at > names.index("ProviderSideLoadCheck")
