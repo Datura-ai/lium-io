@@ -88,11 +88,14 @@ def end_on_validator_deadline(*_):
     print("setup cut short by the validator's deadline during " + step, file=sys.stderr, flush=True)
     sys.exit(1)
 
+def without_credentials(url):
+    # user info ends at the URL's last "@" (a password may hold "@" or "/" unencoded); the query (a signed URL's
+    # signature or token) is a credential too
+    return "://" + re.split(r"[?#]", url.group(1).rpartition("@")[2], maxsplit=1)[0]
+
 def stderr_of(result):
-    # docker's own message on one line, each URL cut to scheme, host and path: its user info and its query
-    # (a signed URL's signature or token) are credentials
-    text = re.sub(r"://(?:[^/\s@]+@)?([^\s?#\"']*)[?#][^\s\"']*", r"://\1", result.stderr or "")
-    text = re.sub(r"://[^/\s@]+@", "://", text).strip()[-300:]
+    # docker's own message on one line, each URL cut to scheme, host and path
+    text = re.sub(r"://([^\s\"']*)", without_credentials, result.stderr or "").strip()[-300:]
     return ": " + " ".join(text.split()) if text else ""
 
 signal.signal(signal.SIGTERM, end_on_validator_deadline)
