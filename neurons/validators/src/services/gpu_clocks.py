@@ -45,8 +45,8 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 CLOCK_LOCK_KEY_PREFIX = "gpu_clock_lock:"
-# its own budget, after the -rgc batch in the same call: the host kills a stalled -rac/-rmc, so it never costs the
-# -rgc results (review)
+# its own budget, after the -rgc batch in the same call: the host kills a stalled -rac/-rmc (half each), so it never
+# costs the -rgc results (review)
 APP_MEM_CLOCK_RESET_TIMEOUT_SECONDS = 30
 # the -rgc batch's budget, then the -rac/-rmc one, with a margin: the call answers before the runner gives up
 _RESET_CALL_TIMEOUT_SECONDS = _QUERY_TIMEOUT_SECONDS + APP_MEM_CLOCK_RESET_TIMEOUT_SECONDS + 10
@@ -137,8 +137,10 @@ def _reset_app_and_memory_clocks(uuids: list[str]) -> str:
     the same SSH call (one round trip on the create's path), so a stalled reset never costs the -rgc results and none
     outlives the call: each nvidia-smi is the direct child of its own SIGKILL timeout (half the budget, -rac then
     -rmc), because uutils timeout (Ubuntu 26.04) signals only its direct child, so one timeout around the batch left
-    the background resets running (lio#2362 merge queue). The batch's own timeout stays as its cap. Not TERM then -k:
-    an nvidia-smi ignoring TERM keeps changing clocks after the handoff (review). Each reset echoes
+    the background resets running (lio#2362 merge queue). No timeout wraps the batch: GNU timeout gives each inner
+    timeout its own process group, so an outer kill ended only the shell and the call returned while the -rmc runs
+    were still alive (lio#2362 review). `wait` returns only once every reset has exited, at most the budget. Not
+    TERM then -k: an nvidia-smi ignoring TERM keeps changing clocks after the handoff (review). Each reset echoes
     "<uuid> <flag> <exit>", 137 when killed."""
     per_reset = f"{APP_MEM_CLOCK_RESET_TIMEOUT_SECONDS / 2:g}"
     resets = " ".join(
@@ -149,7 +151,7 @@ def _reset_app_and_memory_clocks(uuids: list[str]) -> str:
         + " ) &"
         for u in uuids
     ) + " wait"
-    return f"timeout -s KILL {APP_MEM_CLOCK_RESET_TIMEOUT_SECONDS} sh -c {shlex.quote(resets)}"
+    return f"sh -c {shlex.quote(resets)}"
 
 
 def _log_app_and_memory_resets(lines: list[list[str]], uuids: list[str]) -> None:
