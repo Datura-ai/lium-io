@@ -858,8 +858,12 @@ class RentalPriceIncentive(DefaultIncentive):
             merged.set_incentive_split(merged.incentive or 0.0, free.incentive or 0.0)
             merged.incentive_logs.extend(free.incentive_logs)
             # DAH-2340 reasons ride a separate list — the unrented portion's zero reasons would
-            # otherwise never reach the backend.
-            merged.zero_incentive_reasons.extend(free.zero_incentive_reasons)
+            # otherwise never reach the backend. A both-pools exclusion is node-wide and each
+            # portion records it, so the node carries each code once.
+            merged_reason_codes: set[str] = {reason.reason for reason in merged.zero_incentive_reasons}
+            merged.zero_incentive_reasons.extend(
+                reason for reason in free.zero_incentive_reasons if reason.reason not in merged_reason_codes
+            )
             # Drop by identity: two portions of one executor can compare equal as pydantic models.
             portions.sibling_results[:] = [
                 result for result in portions.sibling_results if result is not free
