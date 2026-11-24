@@ -1981,7 +1981,6 @@ async def test_a_fillers_own_workload_passes(
         ("daturaai/pearl-miner", ""),  # the scrape could not read it, or liumd does not report it
         ("daturaai/pearl-miner", None),
         (None, "/opt/other/gpu-app"),  # no record and no running image reported
-        ("ghcr.io/hanlinai/engy-golden-serve", "/opt/other/gpu-app"),  # a workload with no allowlist
     ],
 )
 @pytest.mark.asyncio
@@ -2275,9 +2274,18 @@ async def test_inline_python_that_is_not_the_workloads_own_child_is_foreign(cont
     assert result.passed is False
 
 
+@pytest.mark.parametrize(
+    "repository, cmdline",
+    [
+        ("daturaai/dlph", "/opt/dolphinpod/dolphinpod-worker start"),  # retired: no Lium workload runs on it
+        ("ghcr.io/hanlinai/engy-golden-serve", "/opt/other/gpu-app"),  # its serving name is not recorded yet
+    ],
+)
 @pytest.mark.asyncio
-async def test_any_gpu_process_in_a_filler_on_the_retired_dolphin_image_is_foreign(context_factory):
-    ctx, _ = await _filler_process_ctx(context_factory, "/opt/dolphinpod/dolphinpod-worker start", "daturaai/dlph")
+async def test_any_gpu_process_in_a_filler_on_an_image_without_process_names_is_foreign(
+    context_factory, repository, cmdline
+):
+    ctx, _ = await _filler_process_ctx(context_factory, cmdline, repository)
 
     result = await GpuUsageCheck().run(ctx)
 

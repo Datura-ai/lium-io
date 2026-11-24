@@ -903,20 +903,16 @@ def test_the_idle_filler_removal_keeps_the_rented_image_under_any_docker_hub_pre
     assert "reference=daturaai/dlph " in command
 
 
-# Filler images with no established GPU process names: the Engy image's serving engine is installed by
-# the workload at run time.
-_FILLER_IMAGES_WITHOUT_PROCESS_NAMES = {"ghcr.io/hanlinai/engy-golden-serve"}
-# Images no Lium workload runs on any more: every GPU process in them is foreign.
-_RETIRED_FILLER_IMAGES = {"daturaai/dlph"}
+# Images whose every GPU process is foreign: no Lium workload runs on dlph any more, and Engy's serving
+# executable is chosen by the deployment slot, not fixed by the image.
+_FILLER_IMAGES_WITHOUT_PROCESS_NAMES = {"daturaai/dlph", "ghcr.io/hanlinai/engy-golden-serve"}
 
 
-def test_every_filler_image_has_its_gpu_process_names_apart_from_the_known_gaps():
-    from services.task.checks.gpu_usage import FILLER_PROCESS_ALLOWLISTS
-
+def test_every_filler_image_is_judged_by_its_gpu_process_names():
     assert set(FILLER_IMAGE_REPOSITORIES) <= set(FILLER_WORKLOADS)
-    assert set(FILLER_PROCESS_ALLOWLISTS) == set(FILLER_WORKLOADS) - _FILLER_IMAGES_WITHOUT_PROCESS_NAMES
-    assert {repository for repository, workload in FILLER_PROCESS_ALLOWLISTS.items() if not workload.process_names} == (
-        _RETIRED_FILLER_IMAGES
+    assert all(workload.process_names is not None for workload in FILLER_WORKLOADS.values())
+    assert {repository for repository, workload in FILLER_WORKLOADS.items() if not workload.process_names} == (
+        _FILLER_IMAGES_WITHOUT_PROCESS_NAMES
     )
 
 

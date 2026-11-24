@@ -80,30 +80,32 @@ REMOVE_CACHE_SWEEP_CONTAINER = f"/usr/bin/docker rm -f {CACHE_SWEEP_CONTAINER_NA
 MULTIPROCESSING_CHILD = "multiprocessing-child"
 
 # Every image repository a filler is started from: its workload, the executable names its GPU
-# processes run as (None until they are established), and whether the reclaims below remove it idle.
+# processes run as (any other GPU process in it is foreign), and whether the reclaims below remove it idle.
 @dataclass(frozen=True)
 class FillerWorkload:
     strategy: str
-    process_names: tuple[str, ...] | None
-    removed_when_idle: bool = True
+    process_names: tuple[str, ...]
+    image_removed_when_idle: bool = True
 
 
 FILLER_WORKLOADS: dict[str, FillerWorkload] = {
-    # the workload installs its serving engine at run time: the image fixes no process name
-    "ghcr.io/hanlinai/engy-golden-serve": FillerWorkload("ENGY_TEE", None),
+    # the image's supervisor runs whatever executable a deployment slot claims, so the image fixes no
+    # serving name: every GPU process is foreign until the started filler records its serving executable.
+    # Engy starts are paused (none since 19 Nov); a restart needs that record first or its fillers fail here.
+    "ghcr.io/hanlinai/engy-golden-serve": FillerWorkload("ENGY_TEE", ()),
     # the worker downloads its inference engine at run time; the engine has been vLLM and sonar, and the engine
     # starts GPU children through multiprocessing's spawn start method (sonar's P2P probe at engine start)
     "daturaai/dolphin": FillerWorkload("DPHN", ("dolphinpod", "sonar", "vllm", MULTIPROCESSING_CHILD)),
     # the first Dolphin image, no longer started: no GPU process of a Lium workload runs in it
     "daturaai/dlph": FillerWorkload("DPHN", ()),
     # small and has no cache volume, so a reclaim gains nothing from removing it
-    "daturaai/pearl-miner": FillerWorkload("PEARL", ("peakminer",), removed_when_idle=False),
+    "daturaai/pearl-miner": FillerWorkload("PEARL", ("peakminer",), image_removed_when_idle=False),
 }
 
 # The images of the fillers whose caches the reclaims below give back (Engy's alone is ~32 GB). No
 # `-f`: dockerd refuses an image any container still uses, running or stopped, so a live filler keeps it.
 FILLER_IMAGE_REPOSITORIES = tuple(
-    repository for repository, workload in FILLER_WORKLOADS.items() if workload.removed_when_idle
+    repository for repository, workload in FILLER_WORKLOADS.items() if workload.image_removed_when_idle
 )
 
 

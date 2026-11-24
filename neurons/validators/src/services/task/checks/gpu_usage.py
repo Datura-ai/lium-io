@@ -27,7 +27,7 @@ from services.const import (
     RENTAL_CLOSE_CLOCK_SKEW_MINUTES,
     RENTAL_TEARDOWN_GRACE_MINUTES,
 )
-from services.container_cleanup import image_repository
+from services.container_cleanup import FILLER_WORKLOADS, MULTIPROCESSING_CHILD, FillerWorkload, image_repository
 from services.gpu_reset import renter_gpu_resets
 from services.redis_service import (
     EDIT_PARKED_CONTAINER_PREFIX,
@@ -46,7 +46,6 @@ from services.gpu_wedge import (
     matches_wedge_utilization,
     query_wedged_gpu_uuids,
 )
-from services.container_cleanup import FILLER_WORKLOADS, MULTIPROCESSING_CHILD, FillerWorkload
 
 from ..messages import GpuUsageMessages as Msg
 from ..messages import render_message
@@ -55,15 +54,9 @@ from .rental_owner import rental_of_this_node
 
 logger = logging.getLogger(__name__)
 
-# The filler workloads whose GPU processes are known, by the image repository the validator started
-# the filler from (FILLER_WORKLOADS names every filler image). A name matches the start of the
-# executable's basename, or of the script or module an interpreter runs, or the part before "::" of
-# a renamed process title (vLLM's engine child shows as "VLLM::EngineCore").
-FILLER_PROCESS_ALLOWLISTS: dict[str, FillerWorkload] = {
-    repository: workload
-    for repository, workload in FILLER_WORKLOADS.items()
-    if workload.process_names is not None
-}
+# A filler's GPU process names (FILLER_WORKLOADS, by the image repository the validator started the
+# filler from) match the start of the executable's basename, or of the script or module an interpreter
+# runs, or the part before "::" of a renamed process title (vLLM's engine child shows as "VLLM::EngineCore").
 _INTERPRETER = re.compile(r"python[0-9.]*")
 # interpreter options that take the next argument as their value (`-W ignore`, `-X faulthandler`)
 _INTERPRETER_OPTIONS_WITH_VALUE = {"-W", "-X", "--check-hash-based-pycs"}
@@ -613,7 +606,7 @@ async def _foreign_processes_in_fillers(
                 recorded,
                 live,
             )
-        if workload := FILLER_PROCESS_ALLOWLISTS.get(recorded or live or ""):
+        if workload := FILLER_WORKLOADS.get(recorded or live or ""):
             workloads[name] = workload
     foreign: list[tuple[str, str]] = []
     for process in gpu_processes:
