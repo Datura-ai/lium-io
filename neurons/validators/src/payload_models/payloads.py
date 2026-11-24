@@ -199,7 +199,7 @@ class MinerJobEnryptedFiles(BaseModel):
     # deliver it over stdin needs no upload and one that cannot still has the binary.
     machine_scrape_source: str
     # DAH-5899: file_encrypt_service.ScrapeBinaryBuild; None when the binary is already in tmp_directory
-    binary_build: Any = None
+    machine_scrape_binary_build: Any = None
     # score_file_name: str
 
 

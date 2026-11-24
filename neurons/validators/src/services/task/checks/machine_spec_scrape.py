@@ -643,14 +643,14 @@ class MachineSpecScrapeCheck:
         # DAH-5899: the cycle builds its binary only now, once for every node that needs it; the build counts
         # against the task's time, and a retry whose scrape would no longer fit keeps the stdin verdict
         # (upload up to UPLOAD_TIMEOUT, then the scrape's own timeout)
-        if ctx.config.machine_scrape_binary is None:
+        if ctx.config.machine_scrape_binary_build is None:
             return True
         retry_seconds = timeout + UPLOAD_TIMEOUT
         wait_seconds = task_seconds_left(ctx) - retry_seconds
         if wait_seconds <= 0:
             return False
         try:
-            await ctx.config.machine_scrape_binary.ensure(wait_seconds)
+            await ctx.config.machine_scrape_binary_build.ensure(wait_seconds)
         except Exception as exc:
             logger.error(
                 _m("[scrape] binary not ready; keeping the stdin result", extra=get_extra_info(

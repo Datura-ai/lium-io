@@ -1,4 +1,5 @@
 import asyncio
+import gc
 import sys
 from pathlib import Path
 
@@ -102,7 +103,7 @@ def test_preparing_a_cycle_builds_nothing(job_files_root, monkeypatch):
 
     assert files.machine_scrape_source
     assert list(Path(files.tmp_directory).iterdir()) == []
-    assert isinstance(files.binary_build, ScrapeBinaryBuild)
+    assert isinstance(files.machine_scrape_binary_build, ScrapeBinaryBuild)
     # an empty earlier directory holds nothing anyone reads; one with a binary waits for the next build
     assert not (job_files_root / "cycle-empty").exists()
     assert (job_files_root / "cycle-built").exists()
@@ -138,8 +139,8 @@ async def test_a_build_that_fails_after_every_waiter_left_is_logged_not_unretrie
         lambda *_: [sys.executable, "-c", "import time; time.sleep(0.3); raise SystemExit(7)"],
     )
     build = ScrapeBinaryBuild(directory, "tmpabc", "print(1)", lambda: ())
-    handler_calls = []
-    asyncio.get_running_loop().set_exception_handler(lambda _loop, context: handler_calls.append(context))
+    unhandled_exception_reports = []
+    asyncio.get_running_loop().set_exception_handler(lambda _loop, context: unhandled_exception_reports.append(context))
 
     with pytest.raises(TimeoutError):
         await build.ensure(0.01)
@@ -147,8 +148,7 @@ async def test_a_build_that_fails_after_every_waiter_left_is_logged_not_unretrie
     await asyncio.wait({task})
     del task
     build._build = None
-    import gc
     gc.collect()
 
-    assert handler_calls == []
+    assert unhandled_exception_reports == []
     assert "scrape binary build failed" in caplog.text and "exited 7" in caplog.text

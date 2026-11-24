@@ -526,7 +526,7 @@ class FileEncryptService:
 
     def prepare_cycle_job_files(self, keep_directories: Callable[[], Iterable[str]]) -> MinerJobEnryptedFiles:
         """DAH-5899: this cycle's keys and obfuscated source, with the frozen scrape left unbuilt. A normal cycle
-        delivers the source over stdin and never needs the binary; `binary_build` freezes it on the first failed
+        delivers the source over stdin and never needs the binary; `machine_scrape_binary_build` freezes it on the first failed
         stdin scrape. Earlier cycles' directories go only once that build is done (empty ones go now)."""
         # first: a failed obfuscator run leaves the earlier cycles' directories as they are
         scrape = self._obfuscated_scrape()
@@ -547,7 +547,7 @@ class FileEncryptService:
             tmp_directory=str(directory),
             machine_scrape_file_name=file_name,
             machine_scrape_source=scrape.source,
-            binary_build=ScrapeBinaryBuild(directory, file_name, scrape.source, keep_directories),
+            machine_scrape_binary_build=ScrapeBinaryBuild(directory, file_name, scrape.source, keep_directories),
         )
 
     def _obfuscated_scrape(self) -> ObfuscatedScrape:

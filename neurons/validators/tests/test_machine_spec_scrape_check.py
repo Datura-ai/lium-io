@@ -941,10 +941,10 @@ class FakeBinaryBuild:
             raise self.error
 
 
-def _stdin_failure_ctx(context_factory, runner, ssh_client, binary_build):
+def _stdin_scrape_ctx(context_factory, runner, ssh_client, binary_build):
     return context_factory(
         services=build_services(ssh=DummySSHService(decrypted_data=RAW_SPECS)),
-        config=build_context_config(machine_scrape_source="print('scrape')", machine_scrape_binary=binary_build),
+        config=build_context_config(machine_scrape_source="print('scrape')", machine_scrape_binary_build=binary_build),
         state=build_state(upload_local_dir="/local/validator/files"),
         runner=runner,
         ssh=ssh_client,
@@ -957,7 +957,7 @@ async def test_a_scrape_that_passes_over_stdin_never_builds_the_binary(context_f
     # DAH-5899: a normal cycle delivers the source and must not freeze the binary
     binary_build = FakeBinaryBuild()
     runner = DummySSHCommandRunner(result=make_command_result(success=True, stdout=FERNET_TOKEN))
-    ctx = _stdin_failure_ctx(context_factory, runner, DummySSHClient(), binary_build)
+    ctx = _stdin_scrape_ctx(context_factory, runner, DummySSHClient(), binary_build)
 
     result = await MachineSpecScrapeCheck().run(ctx)
 
@@ -975,7 +975,7 @@ async def test_a_failed_stdin_scrape_builds_the_binary_before_its_upload_retry(c
         ]
     )
     ssh_client = DummySSHClient()
-    ctx = _stdin_failure_ctx(context_factory, runner, ssh_client, binary_build)
+    ctx = _stdin_scrape_ctx(context_factory, runner, ssh_client, binary_build)
 
     result = await MachineSpecScrapeCheck().run(ctx)
 
@@ -995,7 +995,7 @@ async def test_the_build_wait_leaves_time_for_the_upload_and_the_scrape(context_
         result=make_command_result(success=False, exit_code=1, stderr="no psutil", duration_ms=1600)
     )
     ssh_client = DummySSHClient()
-    ctx = _stdin_failure_ctx(context_factory, runner, ssh_client, binary_build)
+    ctx = _stdin_scrape_ctx(context_factory, runner, ssh_client, binary_build)
 
     result = await MachineSpecScrapeCheck().run(ctx)
 
@@ -1015,7 +1015,7 @@ async def test_a_retry_that_no_longer_fits_after_the_build_keeps_the_stdin_verdi
         result=make_command_result(success=False, exit_code=1, stderr="no psutil", duration_ms=1600)
     )
     ssh_client = DummySSHClient()
-    ctx = _stdin_failure_ctx(context_factory, runner, ssh_client, FakeBinaryBuild())
+    ctx = _stdin_scrape_ctx(context_factory, runner, ssh_client, FakeBinaryBuild())
 
     result = await MachineSpecScrapeCheck().run(ctx)
 
@@ -1031,7 +1031,7 @@ async def test_a_failed_build_keeps_the_stdin_verdict(context_factory):
         result=make_command_result(success=False, exit_code=1, stderr="no psutil", duration_ms=1600)
     )
     ssh_client = DummySSHClient()
-    ctx = _stdin_failure_ctx(context_factory, runner, ssh_client, FakeBinaryBuild(RuntimeError("exit 1")))
+    ctx = _stdin_scrape_ctx(context_factory, runner, ssh_client, FakeBinaryBuild(RuntimeError("exit 1")))
 
     result = await MachineSpecScrapeCheck().run(ctx)
 
