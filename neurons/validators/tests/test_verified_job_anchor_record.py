@@ -11,9 +11,12 @@ import pytest
 from fakeredis import FakeServer
 from fakeredis.aioredis import FakeRedis
 
+from neurons.validators.src.services.task.checks.gpu_attestation_identity import GpuAttestationIdentityCheck
 from neurons.validators.src.services.task.checks.gpu_fingerprint import GpuFingerprintCheck
 from neurons.validators.src.services.task.checks.spec_change import SpecChangeCheck
-from neurons.validators.src.services.task.pipeline import Pipeline
+from neurons.validators.src.services.task.messages import GpuAttestationIdentityMessages, render_message
+from neurons.validators.src.services.task.pipeline import CheckResult, Pipeline
+from neurons.validators.src.services.task.pipeline_factory import PipelineFactory
 from neurons.validators.src.services.task.result_handler import ResultHandler
 from services.redis_service import VERIFIED_JOB_COUNT_KEY, RedisService
 
@@ -38,16 +41,45 @@ async def _record(service: RedisService) -> dict:
     return json.loads(await service.redis.hget(VERIFIED_JOB_COUNT_KEY, f"hk:{EXECUTOR}"))
 
 
+class _AttestationFails:
+    """GpuAttestationIdentityCheck failing fatally (enforced, or a CC VBIOS below the minimum) with no reset."""
+
+    check_id = GpuAttestationIdentityCheck.check_id
+    fatal = True
+
+    async def run(self, ctx):
+        event = render_message(GpuAttestationIdentityMessages.MISMATCH, ctx=ctx, check_id=self.check_id, what={})
+        return CheckResult(passed=False, event=event, fatal=True)
+
+
 async def _cycle(
-    service, handler, context_factory, *, uuids: str, later_check_fails: bool = False, model: str = "A100"
+    service,
+    handler,
+    context_factory,
+    *,
+    uuids: str,
+    later_check_fails: bool = False,
+    model: str = "A100",
+    attestation_fails: bool = False,
+    ends_after_fingerprint: bool = False,
 ):
     """One validation cycle as the service runs it: record from Redis, the two GPU-set checks through the real
-    Pipeline, the outcome persisted by the ResultHandler."""
+    Pipeline, the outcome persisted by the ResultHandler. `attestation_fails` adds a fatally failing attestation
+    check where the production pipeline runs it relative to the two."""
     verified = await service.get_verified_job_info("hk", EXECUTOR)
     ctx = context_factory(
         state=build_state(gpu_uuids=uuids, gpu_model_count=f"{model}:{len(uuids.split(','))}"), verified=verified
     )
-    ok, events, ctx = await Pipeline([GpuFingerprintCheck(), SpecChangeCheck()], _Sink()).run(ctx)
+    checks = [GpuFingerprintCheck(), SpecChangeCheck()]
+    if attestation_fails:
+        order = [type(c) for c in PipelineFactory.build_checks()]
+        checks.insert(
+            1 if order.index(GpuAttestationIdentityCheck) < order.index(SpecChangeCheck) else 2, _AttestationFails()
+        )
+    if ends_after_fingerprint:
+        # the run ends before the spec change decision, whatever ends it
+        checks = [GpuFingerprintCheck(), _AttestationFails()]
+    ok, events, ctx = await Pipeline(checks, _Sink()).run(ctx)
     await handler._persist_verification_data(
         miner_hotkey="hk", executor_id=EXECUTOR, verified_job_info=verified, context=ctx,
         success=ok and not later_check_fails,
@@ -101,20 +133,89 @@ async def test_a_re_anchor_is_kept_when_a_later_check_fails_the_cycle(context_fa
 
 
 @pytest.mark.asyncio
-async def test_a_node_on_another_gpu_model_is_reset_once_then_verified_as_it_is_now(context_factory):
-    """Regression: the reset kept the old model:count, so a node moved onto another model failed every cycle."""
+async def test_the_same_cards_under_another_model_name_are_reset_once_then_verified_as_they_are_now(context_factory):
+    """Regression (DAH-6295): the reset kept the old model:count, so renamed cards failed every cycle."""
     service = _redis_service()
     service.publish = AsyncMock()
     handler = ResultHandler(redis_service=service, dry_run=False)
     await _cycle(service, handler, context_factory, uuids="gpu-001,gpu-002", model="B300 PC")
 
-    ok, _, record = await _cycle(service, handler, context_factory, uuids="gpu-003,gpu-004", model="B300 AC")
+    ok, _, record = await _cycle(service, handler, context_factory, uuids="gpu-001,gpu-002", model="B300 AC")
     assert ok is False and record["spec"] == "B300 AC:2" and record["count"] == 0
     assert service.publish.await_count == 1
 
-    ok, _, record = await _cycle(service, handler, context_factory, uuids="gpu-003,gpu-004", model="B300 AC")
+    ok, _, record = await _cycle(service, handler, context_factory, uuids="gpu-001,gpu-002", model="B300 AC")
     assert ok is True and record["spec"] == "B300 AC:2" and record["count"] == 1
 
     # a change back is reset again: every model change still costs a fresh audit
-    ok, _, record = await _cycle(service, handler, context_factory, uuids="gpu-003,gpu-004", model="B300 PC")
+    ok, _, record = await _cycle(service, handler, context_factory, uuids="gpu-001,gpu-002", model="B300 PC")
     assert ok is False and record["spec"] == "B300 PC:2" and record["count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_other_cards_of_another_model_never_verify_under_the_node(context_factory):
+    """Another machine behind the node (a full set of other cards, another model) fails every cycle: the record
+    keeps the node's model and cards, so it is never verified, listed or billed as the other model under this id."""
+    service = _redis_service()
+    service.publish = AsyncMock()
+    handler = ResultHandler(redis_service=service, dry_run=False)
+    await _cycle(service, handler, context_factory, uuids="gpu-001,gpu-002", model="H100")
+
+    for cycle in (1, 2, 3):
+        ok, _, record = await _cycle(service, handler, context_factory, uuids="gpu-003,gpu-004", model="B300")
+        assert ok is False
+        assert record["spec"] == "H100:2" and record["uuids"] == "gpu-001,gpu-002" and record["count"] == 0
+        assert service.publish.await_count == cycle
+
+    # the node's own cards back: verified again
+    ok, _, record = await _cycle(service, handler, context_factory, uuids="gpu-001,gpu-002", model="H100")
+    assert ok is True and record["spec"] == "H100:2" and record["count"] == 1
+
+
+@pytest.mark.parametrize(
+    "build",
+    [PipelineFactory.build_checks, PipelineFactory.build_dry_run_checks, PipelineFactory.build_fast_path_checks],
+)
+def test_the_spec_change_check_runs_right_after_the_fingerprint_check(build):
+    """DAH-7001 review: no check may fail the cycle between the fingerprint's re-anchor and the spec change decision."""
+    kinds = [type(check) for check in build()]
+    assert kinds.index(SpecChangeCheck) == kinds.index(GpuFingerprintCheck) + 1
+
+
+@pytest.mark.asyncio
+async def test_other_cards_of_another_model_stay_unverified_when_the_attestation_check_also_fails(context_factory):
+    """DAH-7001 review: with the attestation check between the two, its fatal fail stopped the run before the spec
+    change decision, the re-anchor onto the other cards was saved, and the next cycle took the model change for a
+    rename (same cards) and verified the other model under the node."""
+    service = _redis_service()
+    service.publish = AsyncMock()
+    handler = ResultHandler(redis_service=service, dry_run=False)
+    await _cycle(service, handler, context_factory, uuids="gpu-001,gpu-002", model="H100")
+
+    for _ in range(3):
+        ok, _, record = await _cycle(
+            service, handler, context_factory, uuids="gpu-003,gpu-004", model="B300", attestation_fails=True
+        )
+        assert ok is False and record["spec"] == "H100:2" and record["uuids"] == "gpu-001,gpu-002"
+    ok, _, record = await _cycle(service, handler, context_factory, uuids="gpu-003,gpu-004", model="B300")
+    assert ok is False and record["spec"] == "H100:2" and record["uuids"] == "gpu-001,gpu-002"
+
+
+@pytest.mark.asyncio
+async def test_other_cards_of_another_model_stay_unverified_when_the_run_ends_before_the_spec_change_decision(
+    context_factory,
+):
+    """DAH-7001 review: the re-anchor onto other cards of another model was saved by any run that ended between the
+    fingerprint check and the spec change decision; the next cycle then verified the other model under the node."""
+    service = _redis_service()
+    service.publish = AsyncMock()
+    handler = ResultHandler(redis_service=service, dry_run=False)
+    await _cycle(service, handler, context_factory, uuids="gpu-001,gpu-002", model="H100")
+
+    ok, _, record = await _cycle(
+        service, handler, context_factory, uuids="gpu-003,gpu-004", model="B300", ends_after_fingerprint=True
+    )
+    assert ok is False and record["spec"] == "H100:2" and record["uuids"] == "gpu-001,gpu-002"
+    for _ in range(2):
+        ok, _, record = await _cycle(service, handler, context_factory, uuids="gpu-003,gpu-004", model="B300")
+        assert ok is False and record["spec"] == "H100:2" and record["uuids"] == "gpu-001,gpu-002"

@@ -751,25 +751,34 @@ async def test_a_session_lost_in_the_port_check_is_retried_not_a_failed_first_pa
 
 
 @pytest.mark.asyncio
-async def test_a_run_stopped_by_a_renters_create_is_deferred_not_published_as_failed(monkeypatch, wallet, caplog):
-    """A renter's create since cycle start stops the run with no verdict: nothing is published, it is not a
-    failed first pass, and it is retried as a deferral, as the wave holds it."""
+@pytest.mark.parametrize("check", ["rental", "verifyx", "rented", "created"])
+async def test_a_rental_probe_the_task_had_no_time_for_is_no_failed_first_pass(monkeypatch, wallet, check):
+    """DAH-5933: the validator's budget left the rental probe (or VerifyX) no time, or the backend found the node
+    rented during the check (review 4656859541): the scored cycle has no verdict for it, so nothing is published, the
+    node is not validated, and it is asked again as a deferral until MAX_ATTEMPTS leaves it to the cycle."""
+    from services.task.messages import RentalVerificationMessages, TenantEnforcementMessages, VerifyXMessages
+
+    no_time_reason = {
+        "rental": RentalVerificationMessages.NO_TASK_TIME.reason,
+        "verifyx": VerifyXMessages.NO_TASK_TIME.reason,
+        "rented": RentalVerificationMessages.RENTED_SINCE_THE_SNAPSHOT.reason,
+        # DAH-5750: a renter's create the run stopped for is deferred the same way
+        "created": TenantEnforcementMessages.RENTED_SINCE_CYCLE_START.reason,
+    }[check]
+
     new_node = str(uuid4())
     harness = _Harness(monkeypatch, {"miner-a": [_portal_executor(new_node)]}, [_Neuron("miner-a")])
 
-    def stopped(payload, executor_id):
+    def no_time(payload, executor_id):
         result = _job_result(executor_id, score=0.0)
-        result.failure_reason_code = "RENTED_SINCE_CYCLE_START"
+        result.failure_reason_code = no_time_reason
         return {"miner_hotkey": "miner-a", "miner_coldkey": "c", "results": [result]}
 
-    harness.job_for = stopped
-    with caplog.at_level(logging.INFO):
-        assert await harness.tick_and_settle() == 1
-
+    harness.job_for = no_time
+    assert await harness.tick_and_settle() == 1
     harness.miner_service.publish_machine_specs.assert_not_awaited()
-    assert not [r for r in caplog.records if r.getMessage() == EXPRESS_FAILED_EVENT]
     pending = harness.lane._pending[new_node]
-    assert pending.failed_runs == 0 and pending.not_before > 0
+    assert (pending.failed_runs, pending.attempts) == (0, 1) and pending.not_before > 0
     assert await harness.redis_service.get_validated_executors() == set()
 
 

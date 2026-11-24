@@ -36,7 +36,7 @@ from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from services.executor_image_policy import ExpectedImageSnapshot
 from services.miner_service import EXPRESS_LANE, MinerService
 from services.redis_service import EXPRESS_REDIS_SLOT
-from services.task.messages import TenantEnforcementMessages
+from services.task.messages import CYCLE_END_READ_REASONS, RENTED_AFTER_START_REASONS
 from services.task_service import JobResult
 
 from core.config import settings
@@ -68,11 +68,12 @@ FIRST_PASS_FAILED = "first pass failed"
 FIRST_PASS_FAILED_RETRY_SECONDS = 60
 FIRST_PASS_MAX_RUNS = 3
 SESSION_LOST_IN_PORT_CHECK = "the validator's SSH session closed during the port check"
-RENTED_SINCE_CYCLE_START = TenantEnforcementMessages.RENTED_SINCE_CYCLE_START.reason
 # A lost session is the validator's, not the node's, so it spends none of MAX_ATTEMPTS (which the
 # miner's snapshot misses may already have used). Its own bound keeps a node whose session always
 # drops from staying queued, and hidden from the wave, for good: ~20 min at RETRY_SECONDS.
 SESSION_LOST_MAX_RUNS = 10
+NO_TASK_TIME_FOR_THE_RENTAL_PROBE = "the task had no time left for the rental probe or VerifyX"
+RENTED_DURING_THE_CHECK = "the backend found the node rented during the check"
 # Self-hosted miners' executor lists: how often, how many miners at once, and the longest a miner
 # that keeps not answering is skipped (one miss skips one interval, doubling per further miss).
 # Each ask is bounded by REST_EXECUTOR_LIST_TIMEOUT (miner_service).
@@ -690,9 +691,12 @@ class ExpressLane:
                         await self._end_recheck(pending)
             self._defer(pending, SESSION_LOST_IN_PORT_CHECK)
             return
-        if result.failure_reason_code == RENTED_SINCE_CYCLE_START:
-            # a renter's create stopped the run: no verdict, as the wave holds it; retried as a deferral
-            self._defer(pending, RENTED_SINCE_CYCLE_START)
+        if result.failure_reason_code in CYCLE_END_READ_REASONS:
+            # DAH-5933: a result the scored cycle holds for its cycle-end rented read (a budget stop, a rental the
+            # backend found during the check, a renter's create since cycle start) has no verdict: no failed first
+            # pass goes out; asked again within MAX_ATTEMPTS, then the cycle carries or withholds it
+            rented = result.failure_reason_code in RENTED_AFTER_START_REASONS
+            self._defer(pending, RENTED_DURING_THE_CHECK if rented else NO_TASK_TIME_FOR_THE_RENTAL_PROBE)
             return
         passed = result.score > 0 or result.job_score > 0
         should_run_first_pass_again = (

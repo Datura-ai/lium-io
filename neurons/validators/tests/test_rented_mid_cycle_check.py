@@ -453,7 +453,9 @@ async def test_the_run_ended_by_a_new_pod_gets_no_verdict_this_cycle():
 def test_rechecked_right_before_the_gpu_and_network_tests(fast_path):
     names = [type(check).__name__ for check in PipelineFactory.build_checks(fast_path=fast_path)]
     before = [names[i + 1] for i, name in enumerate(names) if name == "RentedMidCycleCheck"]
-    assert before == ["LocalVerifyCheck", "ParallelStage" if fast_path else "CapabilityCheck"]
+    # serial: the rental check (no GPU load) sits between the halt and LocalVerify/VerifyX
+    expected = ["LocalVerifyCheck", "CapabilityCheck", "VerifyXCheck"] if fast_path else ["RentalVerificationCheck", "CapabilityCheck"]
+    assert before == expected
     assert names.index("TenantEnforcementCheck") < names.index("RentedMidCycleCheck")
 
 
@@ -466,9 +468,7 @@ class BlockingVerifyX:
         self.started = asyncio.Event()
         self.kill_remote_verifyx = AsyncMock(return_value=True)
 
-    async def validate_verifyx_and_process_job(self, *, run_dir=None, deadline_optional=False, **_):
-        # the first sample falls back to the old run on a host without `timeout -k`
-        assert deadline_optional
+    async def validate_verifyx_and_process_job(self, *, run_dir=None, **_):
         self.run_dir = run_dir
         self.started.set()
         await asyncio.sleep(3600)
@@ -638,7 +638,7 @@ def test_a_hold_for_a_create_mid_cycle_keeps_no_miner_active():
 
 
 @pytest.mark.asyncio
-async def test_the_port_check_container_removal_is_bounded_on_a_stuck_docker_daemon():
+async def test_the_port_check_container_removal_is_bounded_on_a_stuck_docker_daemon(caplog):
     import asyncssh
 
     from services.executor_connectivity.container_runner import CLEANUP_TIMEOUT_SECONDS, ContainerRunner
@@ -650,9 +650,13 @@ async def test_the_port_check_container_removal_is_bounded_on_a_stuck_docker_dae
             seen.update(kwargs)
             raise asyncssh.TimeoutError(None, None, None, None, None, None, None, None)
 
-    await ContainerRunner().cleanup(StuckDocker(), "nc-test")
+    with caplog.at_level("WARNING", logger="services.executor_connectivity.container_runner"):
+        await ContainerRunner().cleanup(StuckDocker(), "nc-test")
 
     assert seen == {"timeout": CLEANUP_TIMEOUT_SECONDS}
+    # the leftover container is logged by name, never dropped silently
+    [record] = [r for r in caplog.records if "removal timed out" in r.getMessage()]
+    assert record.levelname == "WARNING" and record.msg.extra == {"container_name": "nc-test"}
 
 
 def test_pid_tagged_names_its_parts():

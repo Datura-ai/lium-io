@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 
+from services.gpu_spec_table import H100_PCIE, H100_SXM
 from services.redis_service import GPU_ANCHOR_KEY
 
 from ..messages import GpuFingerprintMessages as Msg, render_message
@@ -21,6 +22,22 @@ def full_set_changed(anchor: list[str], current: list[str]) -> bool:
     other physical GPUs on a reboot). Not a fault, rented or idle: GpuFingerprintCheck re-anchors the node to the
     new set and verifies it the same cycle, and GpuLossHoldCheck holds nothing for it. Fewer cards is a dropout."""
     return bool(anchor) and len(current) == len(anchor) and set(current) != set(anchor)
+
+
+# DAH-6546: the same GPU under two datacenter names, one explicit pair as the backend's GPU-set move treats it
+# (executor_gpu.py _swap_model); never a broad grouping, which could let a node swap to a weaker GPU without a reset
+_SAME_MODEL = {H100_SXM: H100_PCIE, "NVIDIA B300 SXM6 PC": "NVIDIA B300 SXM6 AC"}
+
+
+def as_listed(spec: str) -> str:
+    # DAH-5677: an H100 SXM-on-PCIe-adapter node verified before as "H100 80GB HBM3:N" is listed as "H100 PCIe:N" now
+    model, sep, count = spec.rpartition(":")
+    return f"{_SAME_MODEL[model]}{sep}{count}" if model in _SAME_MODEL else spec
+
+
+def listed_model(spec: str) -> str:
+    # the model only: a rented dropout respecs the record's count but keeps every anchored UUID (DAH-7001)
+    return as_listed(spec).rpartition(":")[0]
 
 
 def split_uuids(csv: str) -> list[str]:
@@ -48,7 +65,9 @@ class GpuFingerprintCheck:
     except on a full set change.
 
     A full set of other cards (`full_set_changed`: as many cards as anchored, other UUIDs) is not a fault in
-    either mode: the check passes, `gpu_reanchor` makes the new set the anchor, and nothing is reset. The same
+    either mode: the check passes, `gpu_reanchor` makes the new set the anchor, and nothing is reset. Only cards
+    of the record's model (as listed) are re-anchored; other cards of another model pass here unanchored and
+    SpecChangeCheck fails them. The same
     GPU UUIDs listed by two nodes at once is judged by DuplicateExecutorCheck, not here.
 
     Any other difference (cards missing, or a card count that changed) is fatal with a verification reset and
@@ -90,6 +109,18 @@ class GpuFingerprintCheck:
         seen = {"duplicate_uuid": True} if duplicated else {}
 
         if full_set_changed(anchor, current):
+            prev_spec = verified.get("spec") or ""
+            current_spec = ctx.state.gpu_model_count or ""
+            if prev_spec and current_spec and listed_model(prev_spec) != listed_model(current_spec):
+                # other cards of another model are another machine: never anchored under this node, whatever ends
+                # the run; SpecChangeCheck fails it (DAH-7001)
+                event = render_message(
+                    Msg.UUID_OK,
+                    ctx=ctx,
+                    check_id=self.check_id,
+                    what={"gpu_uuids": current_uuids, "previous": prev_uuids, "reanchored": False, **seen},
+                )
+                return CheckResult(passed=True, event=event)
             # not a fault (owner decision, 29 Oct): anchor the new set and verify it now, rented or idle
             logger.info("GPU set of executor %s changed in full; re-anchored: %s", ctx.executor.uuid, current_uuids)
             event = render_message(

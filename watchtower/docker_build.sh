@@ -84,6 +84,9 @@ if [ "$DEPLOY_ENV" != "prod" ]; then
 WATCHTOWER_ENDPOINT_URL = "$WATCHTOWER_ENDPOINT_URL"
 WATCHTOWER_VALIDATOR_HOTKEY = "$WATCHTOWER_VALIDATOR_HOTKEY"
 EOF
+    # the staging owner key whose signed messages this build follows (unset = message trust stays off)
+    source "$SCRIPT_DIR/../scripts/staging_trust_override.sh"
+    staging_trust_override "$CONFIG_OVERRIDE"
 
     log_info "config_override.py written to $CONFIG_OVERRIDE"
 else

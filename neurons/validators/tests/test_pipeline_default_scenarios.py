@@ -244,13 +244,14 @@ class VerifyXResult:
             "network": {"download_speed": 10000},
         }
         self.error = None
+        self.diagnostics = None
 
 
 class DummyVerifyXService:
     """Mock VerifyX validation service."""
 
     async def validate_verifyx_and_process_job(
-        self, *, shell, executor_info, default_extra, machine_spec, run_dir=None, **_
+        self, *, shell, executor_info, default_extra, machine_spec, run_dir=None, deadline_monotonic=None
     ):
         return VerifyXResult()
 

@@ -42,6 +42,11 @@ busy judgeable reading without a thermal slowdown bit; a load that ended before 
 nothing, and a cycle with less time left than the whole sequence skips it. No reading leaves the hold, and the TTL
 stays the fallback. A dry run writes nothing; a Redis that cannot be read is no hold.
 
+The event names the cause from the driver's own reason bits, never "heat" for a slowdown the driver does not call
+thermal: HW_SLOWDOWN (0x8) is also raised by a power brake from the power supply (0x80 then says so) or a power
+spike, so 0x8 alone is "a hardware slowdown" whose fix may be power delivery, not fans. The block decision is the
+same for every cause: a busy card under half its clock gives the renter a fraction of its speed either way.
+
 A GPU whose clocks a renter locked (DAH-4663, a ``gpu_clock_lock:<uuid>`` record in Redis) is spared only the
 low-clock finding: the lock holds its clock down on purpose, but a thermal or hardware slowdown is still judged.
 The record is read only when a GPU was flagged.
@@ -53,6 +58,7 @@ import asyncio
 import json
 import logging
 import shlex
+from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Any
 
@@ -63,7 +69,7 @@ from core.utils import _m, get_extra_info
 
 from ..availability import ReachSource, ReachTarget
 from ..messages import GpuThermalThrottleMessages as Msg
-from ..messages import render_message
+from ..messages import MessageTemplate, render_message
 from ..pipeline import CheckResult, Context
 from ..runner import run_to_end
 from .capability import get_filler_only_container
@@ -80,6 +86,7 @@ CLOCKS_EVENT_REASON_SW_POWER_CAP = 0x4
 CLOCKS_EVENT_REASON_HW_SLOWDOWN = 0x8
 CLOCKS_EVENT_REASON_SW_THERMAL_SLOWDOWN = 0x20
 CLOCKS_EVENT_REASON_HW_THERMAL_SLOWDOWN = 0x40
+CLOCKS_EVENT_REASON_HW_POWER_BRAKE_SLOWDOWN = 0x80
 
 THERMAL_REASON_NAMES = {
     CLOCKS_EVENT_REASON_HW_SLOWDOWN: "hw_slowdown",
@@ -93,6 +100,37 @@ MIN_UTILIZATION_PCT = 80
 MIN_CLOCK_RATIO = 0.5
 # A power limit at least this share of the card's default counts as the default (not lowered on purpose).
 POWER_CAP_DEFAULT_RATIO = 0.98
+# Each cause judge_gpu can name: its words in the event title, and what the provider should check. A card can
+# report several causes at once, so no text rules out another cause's fix.
+CAUSES: dict[str, tuple[str, str]] = {
+    "thermal": (
+        "overheating",
+        "The driver reports a thermal slowdown: the core or the memory is too hot (nvidia-smi shows no memory "
+        "temperature on many GDDR6X cards, so a normal core temperature does not rule it out). Fix the cooling: "
+        "fans, thermal pads, airflow, datacenter temperature.",
+    ),
+    "power_brake": (
+        "a power brake",
+        "The driver reports a hardware power brake: the power supply or the board asked the card to slow down. "
+        "Check the power supply, the GPU power cables and the PDU.",
+    ),
+    "hw_slowdown": (
+        "a hardware slowdown",
+        "The driver reports a hardware slowdown without saying why: heat, a power brake from the power supply, or "
+        "a power spike. Check `Clocks Event Reasons` (`Clocks Throttle Reasons` on older drivers) in `nvidia-smi -q -d PERFORMANCE`, then the power supply and "
+        "cables as well as the cooling.",
+    ),
+    "power_cap": (
+        "its power cap",
+        "The card is held by its power cap although its power limit is at the default: the board or the power "
+        "supply cannot deliver the power. Check the power supply and the GPU power cables.",
+    ),
+    "low_clock": (
+        "an unreported cause",
+        "The driver reports no slowdown reason for the low clock. Check `nvidia-smi -q -d PERFORMANCE,CLOCK` for "
+        "application clocks or a clock lock set on the host.",
+    ),
+}
 THERMAL_HOLD_KEY_PREFIX = "gpu_thermal_hold"
 THERMAL_HOLD_SECONDS = 7 * 24 * 3600
 # DAH-6469: the validator's own load on a held node's cards: dense FMA work (the probe's --heat-seconds) after the
@@ -161,6 +199,15 @@ def judge_gpu(detail: dict[str, Any]) -> dict[str, Any] | None:
 
     if not thermal_reasons and not low_clock:
         return None
+    causes = []
+    if reasons is not None and reasons & (CLOCKS_EVENT_REASON_SW_THERMAL_SLOWDOWN | CLOCKS_EVENT_REASON_HW_THERMAL_SLOWDOWN):
+        causes.append("thermal")
+    if reasons is not None and reasons & CLOCKS_EVENT_REASON_HW_POWER_BRAKE_SLOWDOWN:
+        causes.append("power_brake")
+    if not causes and thermal_reasons:  # HW_SLOWDOWN alone: the driver did not say which
+        causes.append("hw_slowdown")
+    if not causes:
+        causes.append("power_cap" if power_capped else "low_clock")
     return {
         "uuid": detail.get("uuid"),
         "name": detail.get("name"),
@@ -171,6 +218,7 @@ def judge_gpu(detail: dict[str, Any]) -> dict[str, Any] | None:
         "clock_ratio": round(clock_ratio, 3) if clock_ratio is not None else None,
         "clocks_event_reasons": hex(reasons) if reasons is not None else None,
         "reasons": thermal_reasons + (["clock_below_half_of_max"] if low_clock else []),
+        "causes": causes,
         # Hard evidence of a heat fault: half the clock gone AND the driver says why.
         "collapsed": bool(thermal_reasons)
         and clock_ratio is not None
@@ -194,6 +242,20 @@ def _judgeable_busy(detail: dict[str, Any]) -> bool:
         and _to_number(detail.get("graphics_speed")) is not None
         and bool(_to_number(detail.get("max_graphics_speed")))
         and _to_number(detail.get("clocks_event_reasons")) is not None
+    )
+
+
+def _naming_causes(template: MessageTemplate, findings: list[dict[str, Any]], title: str) -> MessageTemplate:
+    """The template with its title and remediation naming the causes the driver reported for these GPUs.
+
+    No findings (a held node whose collapse was in an earlier cycle) keeps the template's neutral words."""
+    causes = list(dict.fromkeys(cause for finding in findings for cause in finding["causes"]))
+    if not causes:
+        return template
+    return replace(
+        template,
+        event=f"{title} {' and '.join(CAUSES[cause][0] for cause in causes)}",
+        remediation=" ".join(CAUSES[cause][1] for cause in causes) + " " + (template.remediation or ""),
     )
 
 
@@ -265,19 +327,24 @@ class GpuThermalThrottleCheck:
                 what.update(held_from_rental=True, held_gpu_uuids=held, held_since=since)
             if load_probe is not None:
                 what["load_probe"] = load_probe
-            event = render_message(Msg.COLLAPSED, ctx=ctx, check_id=self.check_id, what=what)
+            event = render_message(
+                _naming_causes(Msg.COLLAPSED, collapsed, "GPU clock collapsed by"),
+                ctx=ctx,
+                check_id=self.check_id,
+                what=what,
+            )
             return CheckResult(
                 passed=False,
                 event=event,
                 updates={
                     "score": 0.0,
                     "job_score": 0.0,
-                    "score_warning": " WARNING: a busy GPU is thermally throttled below half its clock",
+                    "score_warning": " WARNING: a busy GPU is held below half its clock",
                 },
             )
         if throttled:
             event = render_message(
-                Msg.THROTTLED,
+                _naming_causes(Msg.THROTTLED, throttled, "GPU throttled under load by"),
                 ctx=ctx,
                 check_id=self.check_id,
                 what={"gpus": throttled, "throttled_count": len(throttled)},

@@ -10,7 +10,7 @@ from typing import Any, Optional
 
 from datura.requests.miner_requests import ExecutorSSHInfo
 from payload_models.payloads import MinerJobRequestPayload
-from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
+from protocol.vc_protocol.compute_requests import RentedExecutor, RentedExecutorsResponse
 from protocol.vc_protocol.validator_requests import ResetVerifiedJobReason, ValidationEvent
 from services.gpu_spec_table import (
     classify_gpu_model,
@@ -23,6 +23,7 @@ from core.config import settings
 from core.utils import _m, get_extra_info
 from incentive.config import BASE_GPU_MAP
 
+from .checks.rental_owner import rental_of_this_node
 from .checks.verifyx import hold_verifyx_ema, verifyx_ema_hold_reason
 from .event_report_fit import fit_event_report
 from .models import JobResult
@@ -58,7 +59,11 @@ def _canonicalize_published_gpu_names(specs: dict) -> dict:
 
 def pods_rented_gpu_count(rented_data: RentedExecutorsResponse | None, executor_uuid: str) -> int | None:
     """GPUs the node's rented pods hold, or None when a pod does not report its count."""
-    rented_executor = rented_data.executors.get(executor_uuid) if rented_data else None
+    return rental_gpu_count(rented_data.executors.get(executor_uuid) if rented_data else None)
+
+
+def rental_gpu_count(rented_executor: RentedExecutor | None) -> int | None:
+    """GPUs one rental record's pods hold, or None when it has no pod or a pod does not report its count."""
     if not rented_executor or not rented_executor.pods:
         return None
     pod_gpu_counts: list[int | None] = [pod.gpu_count for pod in rented_executor.pods]
@@ -277,6 +282,7 @@ class ResultHandler:
             ssh_pub_keys=context.ssh_pub_keys,
             is_rented=context.rented,
             rented_gpu_count=self._get_rented_gpu_count(context),
+            rental_pod_ids=self._get_rental_pod_ids(context),
             is_spot=is_spot,
             is_on_spot_pay_list=is_on_spot_pay_list,
             is_new_rentals_paused=is_new_rentals_paused,
@@ -297,6 +303,7 @@ class ResultHandler:
             # and cuts the PodStatesReport chunks.
             pod_states=list(context.state.pod_states) or None,
             host_runtime_fault=context.state.host_runtime_fault,
+            rented_pod_faults=context.state.rented_pod_faults,
         )
 
     @staticmethod
@@ -340,6 +347,17 @@ class ResultHandler:
         if not context.rented:
             return None
         return pods_rented_gpu_count(context.state.rented_data, context.executor.uuid)
+
+    @staticmethod
+    def _get_rental_pod_ids(context: Context) -> list[str] | None:
+        """The snapshot's rental of this node as the verdict read it: [] idle, its pod ids rented, None when the two
+        disagree or the rental lists no pod."""
+        rental = rental_of_this_node(context)
+        if not context.rented:
+            return [] if rental is None else None
+        if rental is None or not rental.pods:
+            return None
+        return sorted(str(pod.pod_id) for pod in rental.pods)
 
     @staticmethod
     def _get_rental_created_at(context: Context) -> datetime | None:

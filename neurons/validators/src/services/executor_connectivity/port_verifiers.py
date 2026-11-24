@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 import aiohttp
 from asyncssh import SSHClientConnection
 
+from core.docker_utils import bound_host_port
 from core.utils import _m, get_extra_info
 from services.const import MIN_PORT_COUNT
 from services.executor_connectivity.container_runner import ContainerRunner
@@ -502,9 +503,9 @@ class SemiBatchVerifier:
     verified if every chunk fails to start, letting the caller fall through.
     """
 
-    # docker refuses the whole `run` when a single published port is already allocated, so the
-    # chunk size is the blast radius of one busy port (DAH-2527: idle fillers take the same low
-    # ports this tier probes). Ten matches the sequential tier's cap.
+    # docker refuses the whole `run` when a single published port is already allocated (DAH-2527: idle
+    # fillers take the same low ports this tier probes); a refusal naming the port republishes the chunk
+    # without it, any other start failure fails the chunk. Ten matches the sequential tier's cap.
     CHUNK_SIZE = 10
     # a healthy chunk answers in under 10 s (prod p90 9 s); a host too loaded to start a container
     # took 6.5 min and pushed rented B300s past the job deadline (20 Oct), so a stalled chunk fails
@@ -584,8 +585,9 @@ class SemiBatchVerifier:
         token = uuid.uuid4().hex
         container_name = f"port_test_pub_{token[:8]}"
         script = NetcatScript.batch(ports, token, 0)
-        # external differs from internal when the miner advertises port_mappings
-        publish_flags = " ".join(f"-p {port.external}:{port.internal}" for port in ports)
+        # -p is HOST:CONTAINER; with port_mappings the router forwards external to the host's internal
+        # port, where rental pods bind too, so the host side is internal like the other tiers
+        publish_flags = " ".join(f"-p {port.internal}:{port.internal}" for port in ports)
 
         # any error below must not escape: an exception here would zero the whole
         # verification (fatal PortCountCheck) instead of falling through to the
@@ -603,7 +605,14 @@ class SemiBatchVerifier:
                         extra=get_extra_info(log_ctx),
                     )
                 )
-                return [], ports
+                # docker refuses the whole run for one host port another container holds (a rental started
+                # after selection): that port fails, the rest of the chunk is published again without it
+                busy = bound_host_port(str(start_result.status))
+                rest = [port for port in ports if port.internal != busy]
+                if busy is None or not rest or len(rest) == len(ports):
+                    return [], ports
+                ok, bad = await self._verify_chunk(rest, ssh_client=ssh_client, host=host, log_ctx=log_ctx)
+                return ok, [*bad, *(port for port in ports if port.internal == busy)]
 
             started = True
             async with aiohttp.ClientSession(connector=public_host_connector(limit=0)) as session:
