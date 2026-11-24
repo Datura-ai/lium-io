@@ -378,6 +378,8 @@ class Context(BaseModel):
     # False once GpuKernelCountCheck finds a kernel list shorter than the reported count; the
     # check is non-fatal on a live rental, so the score gate lives in calculate_scores.
     gpu_kernel_count_passed: bool = True
+    # set with it when the finding is a reported card the create step cannot attach (every card listed)
+    gpu_kernel_unattachable: bool = False
     # False once a card is below its reported GPU model (DAH-6241); non-fatal on a live rental, so the score
     # gate lives in calculate_scores.
     gpu_model_passed: bool = True

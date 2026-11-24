@@ -2,6 +2,8 @@ from unittest.mock import AsyncMock
 
 import pytest
 from neurons.validators.src.services.nvidia_devices import (
+    HOST_PID1_ROOT,
+    HOST_PROC_GPU_INFO_CMD,
     MissingRentedGpuError,
     _query_gpu_nodes_for_uuids,
     _query_shared_nodes,
@@ -148,3 +150,27 @@ def test_shared_nodes_keep_nvswitch_nodes_on_a_host_with_nvswitch(tmp_path):
     nodes = _shared_nodes_on_fake_host(tmp_path, switch_pci_addresses=["0000:05:00.0"])
 
     assert nodes == ["/dev/nvidiactl", "/dev/nvidia-uvm", "/dev/nvidia-nvswitchctl", "/dev/nvidia-nvswitch0"]
+
+
+def test_the_minor_lookup_reads_through_pid_1_and_uses_the_container_path_only_when_that_lists_nothing(tmp_path):
+    # DAH-7076: after a reset the executor's own bind of the card points at the deleted entry
+    import subprocess
+
+    gpus = "/proc/driver/nvidia/gpus"
+    host, container = tmp_path / "host", tmp_path / "container"
+    cmd = HOST_PROC_GPU_INFO_CMD.replace(HOST_PID1_ROOT + gpus, str(host)).replace(gpus, str(container))
+    assert HOST_PID1_ROOT not in cmd and gpus not in cmd  # both paths were redirected
+
+    def card(root, bus, uuid, minor):
+        (root / bus).mkdir(parents=True)
+        (root / bus / "information").write_text(f"Model: X\nGPU UUID: {uuid}\nDevice Minor: {minor}\n")
+
+    def run():
+        res = subprocess.run(["sh", "-c", cmd], capture_output=True, text=True, check=False)
+        return res.returncode, res.stdout
+
+    card(container, "0000:01:00.0", "GPU-aaa", 0)  # the container's stale view lists one card
+    assert run() == (0, "GPU-aaa, 0\n")
+    card(host, "0000:01:00.0", "GPU-aaa", 0)
+    card(host, "0000:02:00.0", "GPU-bbb", 1)
+    assert run() == (0, "GPU-aaa, 0\nGPU-bbb, 1\n")

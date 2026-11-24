@@ -312,7 +312,7 @@ async def _query_gpu_nodes_for_uuids(
     except RuntimeError as exc:
         errors.append(str(exc))
         uuid_to_minor = {}
-    # An empty map is the real signal, not the exception: PROC_GPU_INFO_CMD swallows an
+    # An empty map is the real signal, not the exception: HOST_PROC_GPU_INFO_CMD swallows an
     # unreadable procfs (unexpanded glob, `|| continue`, stderr discarded) and exits 0, so an
     # honest host with no readable procfs would otherwise log identically to a spoof.
     proc_unreadable = not uuid_to_minor
@@ -397,6 +397,14 @@ KERNEL_GPU_VIEW_SEPARATOR = "--kernel-gpu-uuids--"
 # container's own root or is not readable.
 HOST_PID1_ROOT = "/proc/1/root"
 HOST_PID1_MOUNTINFO = "/proc/1/mountinfo"
+# DAH-7076: the UUID-to-minor lookup the create step attaches by. The executor's own binds under
+# /proc/driver/nvidia/gpus are made when it starts; a GPU reset re-creates the card's host entry and
+# the bind keeps pointing at the deleted one until the executor restarts. Through PID 1's root a
+# pid:host executor reads the host's entries; where the PID namespace is not shared the same path is
+# the container's own view, as before. The container path runs only when that path lists nothing.
+HOST_PROC_GPU_INFO_CMD = (
+    f"{{ {_proc_gpu_info_cmd(HOST_PID1_ROOT)}; }} | grep . || {{ {PROC_GPU_INFO_CMD}; }}"
+)
 
 
 def kernel_gpu_view_cmd(*, host_view: bool = False) -> str:
@@ -577,7 +585,7 @@ async def query_gpu_minor_map_from_proc(
 ) -> dict[str, int]:
     if host_probe is not None and host_probe.gpu_minor_map_stdout is not None:
         return _parse_uuid_minor_csv(host_probe.gpu_minor_map_stdout)
-    res = await ssh.run(PROC_GPU_INFO_CMD)
+    res = await ssh.run(HOST_PROC_GPU_INFO_CMD)
     if res.exit_status != 0:
         raise RuntimeError(
             "NVIDIA /proc GPU minor query failed on executor: "

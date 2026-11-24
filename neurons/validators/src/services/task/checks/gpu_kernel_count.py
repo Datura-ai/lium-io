@@ -295,7 +295,8 @@ class GpuKernelCountCheck:
                 passed=False,
                 event=event,
                 fatal=not has_live_rental(ctx),
-                updates={"gpu_kernel_count_passed": False},
+                updates={"gpu_kernel_count_passed": False}
+                | ({"gpu_kernel_unattachable": True} if verdict == "unattachable" else {}),
             )
         return CheckResult(passed=True, event=event)
 

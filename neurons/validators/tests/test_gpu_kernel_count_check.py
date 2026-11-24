@@ -22,7 +22,7 @@ from services.nvidia_devices import (
     KERNEL_GPU_FS_SEPARATOR,
     KERNEL_GPU_VIEW_CMD,
     KERNEL_GPU_VIEW_SEPARATOR,
-    PROC_GPU_INFO_CMD,
+    HOST_PROC_GPU_INFO_CMD,
 )
 
 from neurons.validators.src.services.task.availability import (
@@ -91,7 +91,7 @@ def _ctx(
     specs = {"gpu": {"count": len(reported) if count is None else count}}
 
     async def run(command, *args, **kwargs):
-        if command == PROC_GPU_INFO_CMD and attachable is not None:
+        if command == HOST_PROC_GPU_INFO_CMD and attachable is not None:
             rows = "\n".join(f"{gpu_uuid}, {i}" for i, gpu_uuid in enumerate(attachable))
             return SimpleNamespace(exit_status=0, stdout=rows, stderr="")
         if command != HOST_KERNEL_GPU_VIEW_CMD:
@@ -834,3 +834,29 @@ async def test_an_unattachable_card_still_fails_when_the_host_list_covers_every_
     assert result.passed is False
     assert result.event.reason_code == Msg.UNATTACHABLE.reason
     assert result.event.what_we_saw["unattachable_uuids"] == [REAL[3]]
+
+
+@pytest.mark.asyncio
+async def test_a_stale_bind_after_a_gpu_reset_with_every_card_on_the_host_passes(context_factory, check_enabled):
+    # DAH-7076, node fc1b5612: a renter reset re-created the card's host entry, the executor's own bind
+    # went stale (a foreign mount), and the lookup through PID 1's root still finds every card
+    ctx = _behind_a_foreign_mount(
+        _ctx(context_factory, reported=REAL[:4], kernel=None, host=_host_stdout(REAL[:4]), attachable=REAL[:4])
+    )
+
+    result = await GpuKernelCountCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.what_we_saw["kernel_verdict"] == "match_host_view"
+    # the stale bind is still reported as found
+    assert result.event.what_we_saw["kernel_gpu_foreign_mounts"] == ctx.state.kernel_gpu_foreign_mounts
+    assert "gpu_kernel_count_passed" not in result.updates
+
+
+@pytest.mark.asyncio
+async def test_an_unattachable_card_marks_its_own_score_flag(context_factory, check_enabled):
+    ctx = _behind_a_foreign_mount(_ctx(context_factory, reported=REAL[:4], kernel=None, attachable=REAL[:3]))
+
+    result = await GpuKernelCountCheck().run(ctx)
+
+    assert result.updates == {"gpu_kernel_count_passed": False, "gpu_kernel_unattachable": True}
