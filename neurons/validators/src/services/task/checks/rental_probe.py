@@ -265,8 +265,8 @@ class RentalProbeCheck:
                 ),
                 updates={"score": 0.0, "job_score": 0.0},
             )
-        if result.passed and ctx.state.allcards_skipped_for_standing_probe_failure:
-            # the all-cards work proof did not judge the node this cycle: it relists after the next cycle runs it
+        if result.passed and ctx.state.allcards_not_proven:
+            # the all-cards work proof did not prove every card this cycle: it relists after a cycle that does
             return CheckResult(
                 passed=False,
                 event=render_message(

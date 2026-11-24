@@ -51,6 +51,7 @@ from services.verifyx_validation_service import SSHCapture
 from core.config import settings
 from core.utils import _m, get_extra_info
 
+from .checks import local_verify
 from .checks.capability import CapabilityCheck
 from .checks.local_verify import _step_reason
 from .checks.machine_spec_scrape import normalize_liumd_specs
@@ -301,8 +302,9 @@ async def _compare(
 ) -> dict[str, Any]:
     today = today_verdicts(ok, events)
     steps = {name: _today_fields(step) for name, step in today.items()}
-    if settings.MATMUL_ALLCARDS_CHECK_ENABLED:
-        steps["matmul"]["liumd_reason"] = "allcards_ssh"
+    matmul_ssh_reason = local_verify._matmul_ssh_reason()
+    if matmul_ssh_reason:
+        steps["matmul"]["liumd_reason"] = matmul_ssh_reason
     # A pod or filler started after the cycle's snapshot is not seen below, so a listed executor
     # is meant to be reserved and non-rentable. `all` can include rentable nodes, so GPU steps are
     # refused with `all` until the rental-overlap guard exists.
@@ -311,13 +313,12 @@ async def _compare(
         return _skipped("not_reserved", steps=steps)
     if _workload_on_node(ctx, today):
         return _skipped("workload", steps=steps)
-    # All-cards enforcement can reject a card before today's matmul; the shadow's one ordinary
-    # matmul is not comparable (checks/local_verify.py `allcards_ssh`).
-    allcards = settings.MATMUL_ALLCARDS_CHECK_ENABLED
+    # The all-cards proof can reject a card before today's matmul, so the shadow's one ordinary
+    # matmul is not comparable while the matmul stays on SSH (checks/local_verify.py `allcards_ssh`).
     ask_matmul = (
         settings.LIUMD_SHADOW_GPU_STEPS_ENABLED
         and today["matmul"].verdict in RAN
-        and not allcards
+        and not matmul_ssh_reason
     )
     # On a never-measured executor today's check may re-measure a cold sample below the gate
     # (DAH-2959) and pass on the second; the shadow's one sample is not comparable.

@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 from neurons.validators.src.protocol.vc_protocol.compute_requests import RentedExecutorsResponse
+from neurons.validators.src.services.matrix_validation_service import AllCardsProbe
 from neurons.validators.src.services.task.checks import (
     GpuFaultProbeCheck,
     GpuModelValidCheck,
@@ -42,9 +43,10 @@ class FakeValidation:
 def _all_cards(*reasons, over_wall_clock=False):
     per_card = [{"card_index": i, "ok": not r, "reason": r} for i, r in enumerate(reasons)]
     passed = not any(reasons) and not over_wall_clock
-    return SimpleNamespace(
+    return AllCardsProbe(
         passed=passed,
         failure_reason="" if passed else "1/2 card(s) failed device work-proof",
+        elapsed_seconds=1.0,
         over_wall_clock=over_wall_clock,
         per_card=per_card,
     )
@@ -211,14 +213,17 @@ async def test_no_all_cards_matmul_is_inconclusive_on_a_multi_card_node(
 @pytest.mark.parametrize(
     "all_cards",
     [
-        _all_cards("timeout", "timeout"),
-        _all_cards("ssh_error: channel closed", ""),
-        _all_cards("ssh_error: channel closed", "timeout"),
+        # the connection to the whole node was lost: every card's run raised an SSH error
+        _all_cards("ssh_error: connection lost", "ssh_error: connection lost"),
         _all_cards("", "", over_wall_clock=True),
         # review (17 Nov): a multi-card claim the probe could not run (no card details or size, our own cipher
-        # failed) ran no card, so it says nothing about them: inconclusive as before, whatever the flags
-        SimpleNamespace(
-            passed=False, failure_reason="not probed: no card details", over_wall_clock=False, per_card=[]
+        # failed) ran no card, so it says nothing about them: inconclusive as before
+        AllCardsProbe(
+            passed=False,
+            failure_reason="not probed: no card details",
+            elapsed_seconds=0.0,
+            over_wall_clock=False,
+            per_card=[],
         ),
     ],
 )
@@ -234,14 +239,49 @@ async def test_an_all_cards_matmul_lost_to_ssh_or_time_is_inconclusive(context_f
 
 @pytest.mark.asyncio
 async def test_a_card_that_times_out_again_on_the_retry_fails_the_recheck(context_factory):
-    # lio#2305: the probe retries a run with a timeout once; a card that times out again is a verdict here, whatever
-    # the MATMUL_ALLCARDS flags say (the recheck always runs the probe)
+    # lio#2305: the probe retries a run with a timeout once; a card that times out again is a verdict here
     all_cards = _all_cards("", "timeout_after_retry")
     ctx = _idle_ctx(context_factory, FakeRunner(probe_stdout("ok")), FakeValidation(all_cards))
 
     result = await PostRentalGpuRecheckCheck().run(ctx)
 
     assert result.passed is False and result.event.reason_code == Msg.FAILED.reason
+    assert KEY in ctx.services.redis.store
+
+
+@pytest.mark.parametrize(
+    "all_cards",
+    [
+        # a run that ended without an exit status: the channel answered, so it is the card's verdict
+        _all_cards("exit_status=None", "exit_status=None"),
+        # one card's channel failed while the other answered: not a lost connection to the node
+        _all_cards("ssh_error: channel closed", ""),
+        _all_cards("ssh_error: channel closed", "timeout_after_retry"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_run_without_a_status_or_one_lost_channel_fails_the_recheck(context_factory, all_cards):
+    ctx = _idle_ctx(context_factory, FakeRunner(probe_stdout("ok")), FakeValidation(all_cards))
+
+    result = await PostRentalGpuRecheckCheck().run(ctx)
+
+    assert result.passed is False and result.event.reason_code == Msg.FAILED.reason
+    assert KEY in ctx.services.redis.store
+
+
+@pytest.mark.asyncio
+async def test_a_node_rented_at_the_cycle_snapshot_is_not_probed_this_cycle(context_factory):
+    """The A6000 case (DAH-6978): the rental ended mid-cycle and its workload still loaded the cards. The cards prove
+    themselves in the first idle cycle; this one is inconclusive and the marker stays."""
+    validation = FakeValidation(_all_cards("timeout_after_retry", "timeout_after_retry"))
+    ctx = _idle_ctx(context_factory, FakeRunner(probe_stdout("ok")), validation)
+    ctx = ctx.model_copy(update={"state": build_state(specs={"gpu": {"count": 2}}, rented_data=_live_rental())})
+
+    result = await PostRentalGpuRecheckCheck().run(ctx)
+
+    assert validation.calls == 0
+    assert result.passed and result.event.reason_code == Msg.INCONCLUSIVE.reason
+    assert result.event.what_we_saw["skipped"] == "rented_at_snapshot"
     assert KEY in ctx.services.redis.store
 
 

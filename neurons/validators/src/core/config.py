@@ -393,13 +393,6 @@ class Settings(BaseSettings):
     # The scrape mounts a size-limited vloopback volume the way a rental does and reports the verdict in
     # its SCRAPE_OK event. Kill switch: off, the scrape skips the test (baked in by FileEncryptService).
     VLOOPBACK_SCRAPE_CHECK_ENABLED: bool = Field(env="VLOOPBACK_SCRAPE_CHECK_ENABLED", default=True)
-    # Item 3 — run the GPU work-proof on every claimed card concurrently (own challenge per card,
-    # sized from the registry SKU) and time the aggregate on the validator, so a count lie either
-    # fails device selection or serialises past a wide wall-clock threshold.
-    # Off by default until enforcement is on in prod: a validator on the public image pulls each release at once,
-    # so a true default would enforce there before the shadow step. It never runs beside a renter. Details: DAH-6576.
-    MATMUL_ALLCARDS_CHECK_ENABLED: bool = Field(env="MATMUL_ALLCARDS_CHECK_ENABLED", default=False)
-    MATMUL_ALLCARDS_ENFORCEMENT_ENABLED: bool = Field(env="MATMUL_ALLCARDS_ENFORCEMENT_ENABLED", default=False)
     # Item 2b — send the advertised CPU-core count in the rental-verification health check so the
     # host's Docker daemon creates the probe with `--cpus=<advertised>` and rejects a count that
     # exceeds the machine's physical cores (a signal the lscpu wrapper cannot forge, since dockerd

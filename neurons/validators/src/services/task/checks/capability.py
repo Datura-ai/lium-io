@@ -48,6 +48,14 @@ GPU_MODEL_VERDICT_KEY = "gpu_model_verdict:{miner_hotkey}:{executor_uuid}"
 GPU_MODEL_VERDICT_TTL_SECONDS = 7 * 24 * 60 * 60
 GPU_MODEL_NO_VERDICT_TTL_SECONDS = 24 * 60 * 60
 
+# The last full all-cards work proof that passed: its expiry is the key's own TTL, so only a pass sets or extends it
+# (a skip, a busy card or a lost connection never does). A node with no live pass is not offered on a deferral.
+ALLCARDS_PASS_KEY = "allcards_pass:{miner_hotkey}:{executor_uuid}"
+ALLCARDS_PASS_VALID_SECONDS = 24 * 60 * 60
+# A deferral this node already had: the next idle cycle's run is its one retry, and a second deferral fails it.
+ALLCARDS_DEFERRED_KEY = "allcards_deferred:{miner_hotkey}:{executor_uuid}"
+ALLCARDS_DEFERRED_TTL_SECONDS = 7 * 24 * 60 * 60
+
 
 class CapabilityCheck:
     """Run the containerised GPU capability probe (nvidia-smi in Docker).
@@ -123,29 +131,26 @@ class CapabilityCheck:
         # liumd phase 1: LocalVerifyCheck already ran this challenge through `POST /verify` and
         # judged it with evaluate_matmul_output — the same function the SSH path ends in. Only a
         # PASSING local result is consumed; anything else runs over SSH exactly as before.
-        allcards_deferred = False
+        allcards_skip = None
         local = getattr(ctx.state, "local_verify", None)
         transport = "ssh"
         if local is not None and local.matmul is not None:
             result = local.matmul
             transport = "local_verify"
         else:
-            # A standing rental-probe failure: the all-cards run (up to minutes on a large node) would leave the
-            # probe, the only check that clears it, too little cycle time to ever run (review). The single-card
-            # run still proves card 0, and RentalProbeCheck does not pass this cycle, so every card proves
-            # itself before the node relists, as with VerifyX. In shadow the run decides nothing, so it is only skipped.
-            allcards_deferred = settings.MATMUL_ALLCARDS_CHECK_ENABLED and await has_standing_failure(ctx)
+            allcards_skip = await _allcards_skip_reason(ctx)
             try:
                 result = await validation_service.validate_gpu_model_and_process_job(
                     ssh_client=ctx.ssh,
                     executor_info=ctx.executor,
                     default_extra=ctx.default_extra,
                     machine_spec=specs,
-                    **({"probe_all_cards": False} if allcards_deferred else {}),
+                    **({"probe_all_cards": False} if allcards_skip else {}),
                     **sizing,
                 )
             except Exception as exc:
                 failure_reason = str(exc)
+        allcards = await judge_all_cards(ctx, specs, result, allcards_skip)
 
         # Shadow line: the speed this run measured next to the reported model. Log only.
         log_matmul_speed(specs, result, transport=transport, default_extra=ctx.default_extra)
@@ -173,6 +178,8 @@ class CapabilityCheck:
             what: dict = {"metrics": result.metrics, "transport": transport, **logged}
             if sizing:
                 what["first_pass_vram_budget_mb"] = sizing["vram_budget_mb"]
+            if allcards is not None:
+                what["allcards"] = allcards.as_dict()
             event = render_message(
                 Msg.VERIFY_OK,
                 ctx=ctx,
@@ -185,8 +192,8 @@ class CapabilityCheck:
             state_changes: dict = {}
             if result.metrics is not None:
                 state_changes["gpu_metrics"] = result.metrics
-            if allcards_deferred and allcards_enforced():
-                state_changes["allcards_skipped_for_standing_probe_failure"] = True
+            if allcards is not None and not allcards.listed:
+                state_changes["allcards_not_proven"] = True
             updates: dict = {"state": replace(ctx.state, **state_changes)} if state_changes else {}
             return CheckResult(passed=True, event=event, updates=updates)
 
@@ -204,6 +211,12 @@ class CapabilityCheck:
             }
         elif failure_reason:
             failure_details = {"error": failure_reason}
+
+        if allcards is not None and allcards.outcome == ALLCARDS_DEFERRED:
+            # the run failed on cards that were not the node's to give this cycle: no verdict on them yet
+            return _allcards_deferred_result(ctx, self.check_id, allcards, failure_details)
+        if allcards is not None:
+            failure_details["allcards"] = allcards.as_dict()
 
         if _probe_gave_no_answer(result):
             lium_workload = await lium_workload_live_now(ctx)
@@ -236,6 +249,155 @@ class CapabilityCheck:
         return CheckResult(passed=False, event=event)
 
 
+ALLCARDS_PASSED = "passed"
+ALLCARDS_FAILED = "failed"
+ALLCARDS_DEFERRED = "deferred"
+
+
+@dataclass(frozen=True)
+class AllCardsVerdict:
+    """This cycle's all-cards work-proof verdict on a multi-card node.
+
+    `deferred`: the cards gave no verdict this cycle (`reason` says why); `listed` is whether the node may still be
+    offered this cycle, which only a live last pass and no earlier deferral allow.
+    """
+
+    outcome: Literal["passed", "failed", "deferred"]
+    reason: str = ""
+    listed: bool = True
+    snapshot: RentedExecutorsResponse | None = None
+
+    def as_dict(self) -> dict:
+        return {"outcome": self.outcome, "reason": self.reason, "listed": self.listed}
+
+
+async def _allcards_skip_reason(ctx: Context) -> str | None:
+    """Why the all-cards run does not start this cycle, or None when it does.
+
+    `rented_at_snapshot`: the cycle snapshot lists a rental of this node, so its cards may still be loaded by it even
+    when the rental ended mid-cycle; the cards prove themselves in the first idle cycle, before the node is offered.
+    `standing_probe_failure`: the all-cards run (up to minutes on a large node) would leave the rental probe, the only
+    check that clears the failure, too little cycle time to ever run. Either way the single-card run still proves
+    card 0 and the node is not offered this cycle.
+    """
+    rental = rental_of_this_node(ctx)
+    if rental is not None and rental.pods:
+        return "rented_at_snapshot"
+    if await has_standing_failure(ctx):
+        return "standing_probe_failure"
+    return None
+
+
+async def judge_all_cards(
+    ctx: Context, specs: dict, result: ValidationResult | None, skip_reason: str | None
+) -> AllCardsVerdict | None:
+    """The all-cards verdict of this cycle, or None on a single-card node or a run that failed before the proof.
+
+    A card that gave no answer is not proven this cycle only when the backend has a Lium workload (rental, filler,
+    default job) assigned to that very card now; a workload on other cards says nothing about it. A wrong answer
+    is never waived, nor is a run over the wall clock with every card answering. A lost connection to the whole
+    node defers too. A deferral is bounded: one retry in the next idle cycle, and the node is offered meanwhile
+    only on a live last pass.
+    """
+    gpu_count = (specs.get("gpu") or {}).get("count") or 0
+    if gpu_count <= 1:
+        return None
+    if skip_reason:
+        return AllCardsVerdict(ALLCARDS_DEFERRED, skip_reason, listed=False)
+    probe = getattr(result, "all_cards", None) if result is not None else None
+    if probe is None:
+        # a success without the proof (the local transport) proves card 0 only
+        return AllCardsVerdict(ALLCARDS_DEFERRED, "not_run", listed=False) if result is not None and result.success else None
+    if probe.passed:
+        await record_all_cards_pass(ctx)
+        return AllCardsVerdict(ALLCARDS_PASSED)
+    unanswered = probe.unanswered_cards
+    if probe.wrong_answer or not unanswered:
+        return AllCardsVerdict(ALLCARDS_FAILED, probe.failure_reason)
+    snapshot = None
+    if probe.connection_lost:
+        reason = "connection_lost"
+    else:
+        assigned, snapshot = await _lium_workload_gpu_uuids(ctx)
+        details = (specs.get("gpu") or {}).get("details") or []
+        card_uuids = [
+            ((details[i].get("uuid") or "") if i < len(details) else "").strip().lower() for i in unanswered
+        ]
+        if not all(uuid and uuid in assigned for uuid in card_uuids):
+            return AllCardsVerdict(ALLCARDS_FAILED, probe.failure_reason)
+        reason = "lium_workload"
+    if await _redis_flag(ctx, ALLCARDS_DEFERRED_KEY, default=False):
+        return AllCardsVerdict(ALLCARDS_FAILED, f"{probe.failure_reason}; deferred last time too")
+    await _redis_set(ctx, ALLCARDS_DEFERRED_KEY, ALLCARDS_DEFERRED_TTL_SECONDS)
+    listed = await _redis_flag(ctx, ALLCARDS_PASS_KEY, default=False)
+    return AllCardsVerdict(ALLCARDS_DEFERRED, reason, listed=listed, snapshot=snapshot)
+
+
+async def record_all_cards_pass(ctx: Context) -> None:
+    """Every card passed the full all-cards proof: a fresh pass, and any deferral is spent."""
+    await _redis_set(ctx, ALLCARDS_PASS_KEY, ALLCARDS_PASS_VALID_SECONDS)
+    if settings.DRY_RUN:
+        return
+    try:
+        await ctx.services.redis.delete(_allcards_key(ctx, ALLCARDS_DEFERRED_KEY))
+    except Exception as exc:  # noqa: BLE001 — the next deferral then fails a node that has passed: fail closed
+        logger.warning(_m("All-cards deferral clear failed", extra=get_extra_info({**ctx.default_extra, "error": str(exc)})))
+
+
+def _allcards_key(ctx: Context, template: str) -> str:
+    return template.format(miner_hotkey=ctx.miner_hotkey, executor_uuid=ctx.executor.uuid)
+
+
+async def _redis_flag(ctx: Context, template: str, *, default: bool) -> bool:
+    try:
+        return await ctx.services.redis.get(_allcards_key(ctx, template)) is not None
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(_m("All-cards state read failed", extra=get_extra_info({**ctx.default_extra, "error": str(exc)})))
+        return default
+
+
+async def _redis_set(ctx: Context, template: str, ttl_seconds: int) -> None:
+    if settings.DRY_RUN:
+        return
+    try:
+        await ctx.services.redis.set(_allcards_key(ctx, template), datetime.now().isoformat(), ex=ttl_seconds)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(_m("All-cards state write failed", extra=get_extra_info({**ctx.default_extra, "error": str(exc)})))
+
+
+async def _lium_workload_gpu_uuids(ctx: Context) -> tuple[set[str], RentedExecutorsResponse | None]:
+    """The GPU UUIDs the backend has a Lium workload assigned to on this node right now (lower case), and the fresh
+    snapshot they came from. Only the backend's assignment counts, never the node's word; no answer is no card."""
+    try:
+        fresh = await ctx.services.backend.get_rented_executors_now()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Rented-executors re-read failed; the all-cards verdict stands: %s", exc)
+        return set(), None
+    if fresh is None:
+        return set(), None
+    uuids: list[str] = []
+    if not uuid_listed_under_another_miner(ctx, fresh):
+        uuids += fresh.get_filler_gpu_uuids(ctx.executor.uuid)
+    rental = rental_of_this_node(ctx, rented_data=fresh)
+    for pod in rental.pods if rental else []:
+        uuids += pod.gpu_uuids or []
+    return {u.strip().lower() for u in uuids if u}, fresh
+
+
+def _allcards_deferred_result(
+    ctx: Context, check_id: str, allcards: AllCardsVerdict, failure_details: dict
+) -> CheckResult:
+    template = Msg.RENTED_SKIPPED if allcards.reason == "lium_workload" else Msg.ALLCARDS_DEFERRED
+    event = render_message(
+        template, ctx=ctx, check_id=check_id, what={"allcards": allcards.as_dict(), "probe": failure_details}
+    )
+    state_changes: dict = {"allcards_not_proven": not allcards.listed}
+    if allcards.snapshot is not None:
+        # later checks in the cycle see the workload this verdict saw
+        state_changes["rented_data"] = allcards.snapshot
+    return CheckResult(passed=True, event=event, updates={"state": replace(ctx.state, **state_changes)})
+
+
 # What the probe answers when it never reached the UUID step: the wrapper prints "UUID:  None"
 # after a failed cudaMalloc, and the service reports that as a mismatch against 'None'.
 _NO_UUID = frozenset({"", "none", "null"})
@@ -250,7 +412,7 @@ def _probe_gave_no_answer(result: ValidationResult | None) -> bool:
     """
     if result is None:
         return False
-    if result.timed_out or result.all_cards_no_answer:
+    if result.timed_out:
         return True
     if not (result.error_message or "").startswith(UUID_MISMATCH_ERROR_PREFIX):
         return False
@@ -526,12 +688,7 @@ async def _read_gpu_model_verdict(ctx: Context) -> tuple[bool, list[GpuModelMism
         if raw is None:
             return False, [], set(), True
         stored = json.loads(raw)
-        # a work-proof failure stored under enforcement stops failing the node the moment either flag is off
-        mismatches = [
-            m
-            for m in (GpuModelMismatch(**m) for m in stored.get("mismatches") or [])
-            if m.kind != WORK_PROOF_FAILED or allcards_enforced()
-        ]
+        mismatches = [GpuModelMismatch(**m) for m in stored.get("mismatches") or []]
         measured_ok = {int(i) for i in stored.get("measured_ok") or []}
     except Exception as exc:
         logger.warning(_m("GPU model verdict read failed", extra=get_extra_info({**ctx.default_extra, "error": str(exc)})))
@@ -616,16 +773,11 @@ def _sample_error_kind(result: ValidationResult) -> str:
 
 
 def _filler_sample_failed_card(sample: dict) -> bool:
-    """A filler sample whose pinned card gave no answer or a wrong one, under all-cards enforcement.
+    """A filler sample whose pinned card gave no answer or a wrong one.
 
     `no_memory` and `timeout` stay a record only. Rationale: DAH-6576.
     """
-    return allcards_enforced() and sample.get("error_kind") in ("no_answer", "wrong_answer")
-
-
-def allcards_enforced() -> bool:
-    """The all-cards work proof runs and fails nodes: enforcement means nothing while the check itself is off."""
-    return settings.MATMUL_ALLCARDS_CHECK_ENABLED and settings.MATMUL_ALLCARDS_ENFORCEMENT_ENABLED
+    return sample.get("error_kind") in ("no_answer", "wrong_answer")
 
 
 def get_filler_only_container(ctx: Context) -> str | None:

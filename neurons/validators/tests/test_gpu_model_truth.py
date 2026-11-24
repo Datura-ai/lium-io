@@ -679,8 +679,6 @@ def test_a_bare_nvidia_h100_with_the_sxm_sm_count_passes_as_the_pcie_card():
 async def test_a_carried_work_proof_failure_clears_on_a_right_answer_with_no_numbers(context_factory, monkeypatch):
     """Review (17 Nov): a filler-sample work-proof failure on card 1, the filler then removed. The normal path's pinned
     remeasure of card 1 gets a right answer without numbers: that clears the failure, as the filler sample does."""
-    monkeypatch.setattr(capability.settings, "MATMUL_ALLCARDS_CHECK_ENABLED", True)
-    monkeypatch.setattr(capability.settings, "MATMUL_ALLCARDS_ENFORCEMENT_ENABLED", True)
     redis = FakeRedis()
     failed = capability.work_proof_failed(_two_card_specs(), 1)
     redis.store[_verdict_key()] = json.dumps({"mismatches": [failed.as_dict()]})

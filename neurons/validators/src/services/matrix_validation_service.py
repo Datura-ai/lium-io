@@ -11,7 +11,6 @@ from dataclasses import dataclass
 
 import asyncssh
 
-from core.config import settings
 from core.utils import _m, get_extra_info
 from services.gpu_spec_table import name_reported_by_driver, matmul_probe_vram_mb
 
@@ -198,8 +197,9 @@ class ValidationResult:
     # DAH-6241: card index -> the sealed metrics the all-cards probe read off that card alone
     # (None when the probe did not run); device 0's own are in `metrics`.
     card_metrics: dict[int, dict] | None = None
-    # The all-cards work-proof failed with no card answering at all (see AllCardsProbe.no_card_answered).
-    all_cards_no_answer: bool = False
+    # The all-cards work-proof this run made (None: one card, or not asked for); CapabilityCheck judges a failed one
+    # card by card (checks/capability.py `judge_all_cards`).
+    all_cards: "AllCardsProbe | None" = None
 
     def __bool__(self) -> bool:
         """Allow using ValidationResult in boolean context for backward compatibility."""
@@ -223,12 +223,20 @@ class AllCardsProbe:
     per_card: list[dict]
 
     @property
-    def no_card_answered(self) -> bool:
-        """True when NO card answered (every card timed out, lost its channel or gave no answer); only then may
-        CapabilityCheck apply its live-workload waiver. A wrong answer never qualifies. Rationale: DAH-6576."""
-        return bool(self.per_card) and all(
-            not c.get("ok") and c.get("reason") != "wrong_answer" for c in self.per_card
-        )
+    def wrong_answer(self) -> bool:
+        """A card answered its challenge wrong: never waived or deferred."""
+        return any(c.get("reason") == "wrong_answer" for c in self.per_card)
+
+    @property
+    def unanswered_cards(self) -> list[int]:
+        """The cards that failed without a wrong answer (no answer, a timeout, a lost channel, no exit status)."""
+        return [c["card_index"] for c in self.per_card if not c.get("ok") and c.get("reason") != "wrong_answer"]
+
+    @property
+    def connection_lost(self) -> bool:
+        """The SSH connection to the whole node was lost: every card's run raised an SSH error. A run that ended
+        without an exit status is not this: the channel answered, so it says something about the card."""
+        return bool(self.per_card) and all((c.get("reason") or "").startswith("ssh_error") for c in self.per_card)
 
 
 def _not_probed(reason: str) -> AllCardsProbe:
@@ -387,7 +395,7 @@ class ValidationService:
             "over_wall_clock": over_wall_clock,
             "per_card": per_card,
             "passed": passed,
-            "enforced": settings.MATMUL_ALLCARDS_ENFORCEMENT_ENABLED,
+            "enforced": True,
         }
         log = logger.info if passed else logger.warning
         log(_m("All-cards GPU work-proof", extra=get_extra_info(log_extra)))
@@ -823,26 +831,21 @@ class ValidationService:
         # The SSH transport of the capability matmul: prepare_matmul_challenge → one remote
         # `decrypt_challenge.py` run → evaluate_matmul_output. The local transport (checks/
         # local_verify.py) calls the same two functions around `POST /verify`.
-        # DAH-2671 item 3: all-claimed-cards work-proof. Shadow (MATMUL_ALLCARDS_CHECK_ENABLED
-        # without enforcement) logs timing + per-card outcome and NEVER changes the returned result;
-        # enforcement fails any claimed card without its own right answer, and the aggregate
-        # wall-clock. Only a single-card host skips it (probe returns None): the single-card run
-        # below is that card's proof. A filler-node sample runs beside the filler, so it pins one
-        # card per sample instead (checks/capability.py, enforced there).
+        # DAH-2671 item 3: all-claimed-cards work-proof. It fails any claimed card without its own
+        # right answer, and the aggregate wall-clock; the caller judges a failed probe card by card
+        # (`ValidationResult.all_cards`). Only a single-card host skips it (probe returns None): the
+        # single-card run below is that card's proof. A filler-node sample runs beside the filler, so
+        # it pins one card per sample instead (checks/capability.py).
         all_cards = None
-        if settings.MATMUL_ALLCARDS_CHECK_ENABLED and probe_all_cards:
+        if probe_all_cards:
             all_cards = await self.probe_all_claimed_cards(
                 ssh_client, executor_info, default_extra, machine_spec
             )
-            if (
-                settings.MATMUL_ALLCARDS_ENFORCEMENT_ENABLED
-                and all_cards is not None
-                and not all_cards.passed
-            ):
+            if all_cards is not None and not all_cards.passed:
                 return ValidationResult(
                     success=False,
                     error_message=f"All-cards GPU work-proof failed: {all_cards.failure_reason}",
-                    all_cards_no_answer=all_cards.no_card_answered,
+                    all_cards=all_cards,
                 )
 
         # Per-call verifier object: its key MUST survive the SSH round-trip so we can
@@ -943,6 +946,7 @@ class ValidationService:
             judged.elapsed_seconds = run_seconds
             judged.elapsed_source = ELAPSED_SOURCE_VALIDATOR
             if all_cards is not None:
+                judged.all_cards = all_cards
                 judged.card_metrics = {
                     outcome["card_index"]: outcome["metrics"]
                     for outcome in all_cards.per_card
