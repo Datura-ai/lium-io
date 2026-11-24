@@ -235,8 +235,9 @@ class RentalProbeCheck:
     marks under the lock, not from the cycle-start snapshot; the lock is released as soon as the
     create returns. Anything the probe cannot read (backend, Redis) makes it skip or reach no verdict;
     it never penalises on missing data alone. A node with no passed probe on record is the exception:
-    a cycle without a verdict leaves it unlisted (RENTAL_PROBE_NOT_YET_PROVEN, score 0, nothing cleared),
-    so a node is first listed by a probe that passed, never by a skip.
+    a cycle without a verdict hides it (RENTAL_PROBE_NOT_YET_PROVEN, score 0, nothing cleared), so a node
+    is first listed by a probe that passed, never by a skip. A record that cannot be read scores nothing
+    and leaves the listing as stored (RENTAL_PROBE_PROOF_UNREADABLE).
 
     An idle node running a Lium filler is probed too, beside the filler rather than in its place:
     create_container is told `beside_fillers`, so it
@@ -374,7 +375,8 @@ class RentalProbeCheck:
         """
         # the last probe's failed step, standing until a probe passes; None when there is none or
         # Redis could not be read (then this cycle behaves as if there were none, and logs why). A node
-        # no probe has passed on yet stands the same way: it is first listed by a pass, not by a skip.
+        # no probe has passed on yet stands the same way: it is first listed by a pass, not by a skip;
+        # so does one whose pass record cannot be read (an unknown record is not a pass).
         standing = await _standing_failure(ctx) or await _never_passed(ctx)
 
         skip_reason, skip_what = await _skip_reason(ctx, standing)
@@ -507,12 +509,15 @@ class RentalProbeCheck:
     def _carried(self, ctx: Context, standing: _Failure, *, no_verdict: str) -> CheckResult:
         """This cycle reached no verdict of its own and the last probe failed: fail the node again with
         that step (review). `no_verdict` is what this cycle would otherwise have reported."""
-        if standing is _NEVER_PASSED:
-            # nothing failed, so nothing is recorded or cleared: the node waits unlisted for its first pass
+        if standing is _NEVER_PASSED or standing is _PROOF_UNREADABLE:
+            # nothing failed, so nothing is recorded or cleared. Never passed: the reason hides the node
+            # (REASONS_THAT_HIDE_AT_ONCE) until its first pass. Unreadable: no score, and the backend keeps
+            # the node's stored listing state (REASONS_THAT_KEEP_STORED), so an unproven node is not listed
+            # by it and a proven one is not hidden by a Redis read failure.
             return CheckResult(
                 passed=False,
                 event=render_message(
-                    Msg.NOT_YET_PROVEN,
+                    Msg.NOT_YET_PROVEN if standing is _NEVER_PASSED else Msg.PROOF_UNREADABLE,
                     ctx=ctx,
                     check_id=self.check_id,
                     what={"executor_uuid": ctx.executor.uuid, "no_verdict_this_cycle": no_verdict},
@@ -778,15 +783,16 @@ class _Failure:
 # probe that passed, not by cycles that reached no verdict. Never written to Redis; the first pass's
 # stamp ends it.
 _NEVER_PASSED = _Failure("never_passed")
+# The stamp could not be read: whether a pass is on record is unknown, so the node is not scored on it.
+_PROOF_UNREADABLE = _Failure("proof_unreadable")
 
 
 async def _never_passed(ctx: Context) -> _Failure | None:
     try:
         last_ok = await _last_ok_at(ctx)
     except Exception:
-        # unreadable: decided as if a pass were on record, like every other unreadable input
         _read_failed(ctx, "its interval stamp in Redis")
-        return None
+        return _PROOF_UNREADABLE
     return _NEVER_PASSED if last_ok is None else None
 
 

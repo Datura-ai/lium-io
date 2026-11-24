@@ -26,6 +26,7 @@ from neurons.validators.src.services.task.checks.rental_probe import (
     RentalProbeCheck,
 )
 from neurons.validators.src.services.task.messages import RentalProbeMessages as Msg
+from neurons.validators.src.services.task.availability import run_availability_errors
 from neurons.validators.src.services.task.pipeline import (
     Pipeline,
     updates_with_clear_verified_job_evidence,
@@ -1405,8 +1406,22 @@ async def test_unreadable_state_rents_nothing():
     ctx, docker, _ = make_probe_context(redis=FakeRedis(broken=True))
     with probe_settings(), renter_path():
         result = await RentalProbeCheck().run(ctx)
-    assert result.event.reason_code == Msg.SKIPPED.reason
-    assert result.event.what_we_saw["reason"] == "interval state unreadable"
+    assert result.event.reason_code == Msg.PROOF_UNREADABLE.reason
+    assert result.event.what_we_saw["no_verdict_this_cycle"] == "skipped: interval state unreadable"
+    assert docker.create_calls == []
+
+
+@pytest.mark.asyncio
+async def test_an_unreadable_pass_record_neither_scores_nor_lists_the_node():
+    """Regression (DAH-7044 review): an unreadable pass record was decided as if a pass were on record,
+    so the cycle skipped with a pass and a node no probe had passed on could be scored and listed."""
+    ctx, docker, _ = make_probe_context(redis=FakeRedis(broken=True))
+    with probe_settings():
+        result = await RentalProbeCheck().run(ctx)
+    assert result.passed is False and result.event.reason_code == Msg.PROOF_UNREADABLE.reason
+    assert result.updates == {"score": 0.0, "job_score": 0.0}
+    # the backend keeps the stored listing state: no hide of a proven node, no listing of an unproven one
+    assert run_availability_errors(False, [result.event]) is None
     assert docker.create_calls == []
 
 
@@ -1922,6 +1937,10 @@ async def test_a_node_no_probe_has_passed_on_is_not_listed_by_a_cycle_without_a_
     assert result.updates == {"score": 0.0, "job_score": 0.0}
     assert redis.standing_failure() is None and not redis.stamped()
     assert docker.create_calls == []
+    # hidden at once (DAH-7044 review): a zero score alone leaves a node the backend holds listed
+    errors = run_availability_errors(False, [result.event])
+    assert [e["reason_code"] for e in errors] == ["VERIFICATION_FAILED"]
+    assert errors[0]["what_we_saw"]["failed_reason"] == Msg.NOT_YET_PROVEN.reason
 
 
 @pytest.mark.asyncio

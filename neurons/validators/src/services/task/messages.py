@@ -2721,6 +2721,14 @@ class RentalProbeMessages:
             "it is listed after the first rental probe that passes."
         ),
     )
+    PROOF_UNREADABLE = MessageTemplate(
+        event="Rental probe record could not be read",
+        reason="RENTAL_PROBE_PROOF_UNREADABLE",
+        severity="warning",
+        category="runtime",
+        impact="No score this cycle; the listing stays as the last cycle that could read the record left it",
+        remediation="Nothing to do on the node; the record is read again next cycle.",
+    )
     INCONCLUSIVE = MessageTemplate(
         event="Rental probe could not reach a verdict",
         reason="RENTAL_PROBE_INCONCLUSIVE",
