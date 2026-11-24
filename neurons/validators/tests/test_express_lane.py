@@ -751,6 +751,36 @@ async def test_a_session_lost_in_the_port_check_is_retried_not_a_failed_first_pa
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("check", ["rental", "verifyx", "rented"])
+async def test_a_rental_probe_the_task_had_no_time_for_is_no_failed_first_pass(monkeypatch, wallet, check):
+    """DAH-5933: the validator's budget left the rental probe (or VerifyX) no time, or the backend found the node
+    rented during the check (review 4656859541): the scored cycle has no verdict for it, so nothing is published, the
+    node is not validated, and it is asked again as a deferral until MAX_ATTEMPTS leaves it to the cycle."""
+    from services.task.messages import RentalVerificationMessages, VerifyXMessages
+
+    no_time_reason = {
+        "rental": RentalVerificationMessages.NO_TASK_TIME.reason,
+        "verifyx": VerifyXMessages.NO_TASK_TIME.reason,
+        "rented": RentalVerificationMessages.RENTED_SINCE_THE_SNAPSHOT.reason,
+    }[check]
+
+    new_node = str(uuid4())
+    harness = _Harness(monkeypatch, {"miner-a": [_portal_executor(new_node)]}, [_Neuron("miner-a")])
+
+    def no_time(payload, executor_id):
+        result = _job_result(executor_id, score=0.0)
+        result.failure_reason_code = no_time_reason
+        return {"miner_hotkey": "miner-a", "miner_coldkey": "c", "results": [result]}
+
+    harness.job_for = no_time
+    assert await harness.tick_and_settle() == 1
+    harness.miner_service.publish_machine_specs.assert_not_awaited()
+    pending = harness.lane._pending[new_node]
+    assert (pending.failed_runs, pending.attempts) == (0, 1) and pending.not_before > 0
+    assert await harness.redis_service.get_validated_executors() == set()
+
+
+@pytest.mark.asyncio
 async def test_a_session_lost_after_snapshot_misses_used_max_attempts_keeps_the_node_queued(
     monkeypatch, wallet
 ):

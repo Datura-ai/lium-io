@@ -259,13 +259,42 @@ def build_rented_executor_not_listed_event(
     )
 
 
-def build_executor_unreachable_by_miner_event(*, executor_uuid: str, miner_hotkey: str) -> ValidationEvent:
+# The executor's answer to an upload signed more than UPLOAD_NONCE_MAX_AGE_SECONDS (600) away from its own clock.
+STALE_UPLOAD_NONCE = "Stale upload nonce"
+
+
+def build_executor_unreachable_by_miner_event(
+    *, executor_uuid: str, miner_hotkey: str, refusal: str | None = None
+) -> ValidationEvent:
     """An unrented node the miner lists for this validator and could not reach this wave.
 
     The miner's answer carries the node's id in ``known_executor_ids`` and not in ``executors``:
     it tried to install the validator's key and the node did not take it. Without this event the
     wave writes nothing and the node only "stops reporting". The miner sends no address for it.
+
+    ``refusal`` is the node's own answer when it did answer and turned the key down
+    (``refused_executors``): the node is reachable, so the event names the answer, and for a stale
+    nonce the node's clock (22 Nov: 14 refusals were read as "could not reach"). Same
+    code and score: the node still took no key.
     """
+    if refusal is not None:
+        if STALE_UPLOAD_NONCE in refusal:
+            remediation = (
+                "The node's clock is more than 10 minutes off, so it reads the validator's signed request as "
+                "stale. Turn on time sync on the machine (`timedatectl set-ntp true`, or chrony/ntpd) and check "
+                "that `timedatectl status` shows the clock synchronized."
+            )
+        else:
+            remediation = "Check the executor's log for why it refused the /upload_ssh_key request."
+        return build_availability_event(
+            code=AvailabilityErrorCode.EXECUTOR_UNREACHABLE_BY_MINER,
+            reach_source=ReachSource.MINER,
+            reach_target=ReachTarget.EXECUTOR_API,
+            event_text="Miner reached this node, but the node refused the validator's key",
+            impact="Score 0 for this cycle; the node is hidden from the market until a cycle installs the key.",
+            remediation=remediation,
+            what_we_saw={"executor_uuid": executor_uuid, "miner_hotkey": miner_hotkey, "node_answer": refusal},
+        )
     return build_availability_event(
         code=AvailabilityErrorCode.EXECUTOR_UNREACHABLE_BY_MINER,
         reach_source=ReachSource.MINER,

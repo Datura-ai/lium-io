@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import copy
 import json
 import logging
@@ -34,6 +35,12 @@ logger = logging.getLogger(__name__)
 # per-executor timeout. The upload gets one attempt for exactly that reason.
 STDIN_FAILURE_RETRY_WINDOW_MS = 120_000
 FALLBACK_UPLOAD_ATTEMPTS = 1
+
+# Specs mode reads liumd first, then falls back to the Python scrape when liumd cannot produce a
+# usable document. The read is capped so the fallback still fits inside the machine-scrape timeout.
+LIUMD_SPECS_READ_TIMEOUT_SECONDS = 180
+LIUMD_SPECS_FALLBACK_RESERVE_SECONDS = 90
+LIUMD_SPECS_MIN_READ_SECONDS = 5.0
 
 # The scrape says only two things on stdout: a Fernet token when it worked, and a JSON object
 # with an "error" key when it ran but had nothing to report. Every Fernet token is base64url of
@@ -427,29 +434,69 @@ class MachineSpecScrapeCheck:
 
     async def run(self, ctx: Context) -> CheckResult:
         liumd_specs = settings.VALIDATOR_LIUMD_SPECS and not settings.DRY_RUN
-        if liumd_specs:
-            return await self._scrape_with_liumd(ctx)
-
         timeout = ctx.config.machine_scrape_timeout or self.DEFAULT_TIMEOUT
+
+        if liumd_specs:
+            result, fallback_reason = await self._scrape_with_liumd(ctx, timeout)
+            if result.passed or fallback_reason is None:
+                return result
+            detail = str(result.event.what_we_saw.get("detail") or "")[:300]
+            logger.warning(
+                _m(
+                    "liumd machine specs unavailable; using the Python scrape",
+                    extra=get_extra_info(
+                        {**ctx.default_extra, "liumd_reason": fallback_reason, "detail": detail}
+                    ),
+                )
+            )
+            if ctx.config.machine_scrape_source:
+                fallback = await self._scrape_from_source(ctx, timeout, start_shadow=False)
+            else:
+                fallback = await self._scrape_uploaded_binary(ctx, timeout, start_shadow=False)
+            fallback.event.what_we_saw["liumd_fallback_reason"] = fallback_reason
+            if detail:
+                fallback.event.what_we_saw["liumd_fallback_detail"] = detail
+            return fallback
 
         if ctx.config.machine_scrape_source:
             return await self._scrape_from_source(ctx, timeout, start_shadow=True)
         return await self._scrape_uploaded_binary(ctx, timeout, start_shadow=True)
 
-    async def _scrape_with_liumd(self, ctx: Context) -> CheckResult:
-        """Use the full machine-scrape document from the same early `liumd run`."""
+    async def _scrape_with_liumd(
+        self, ctx: Context, timeout: int
+    ) -> tuple[CheckResult, str | None]:
+        """Use the liumd machine-scrape document, or report why the Python fallback must run."""
         from services.local_verify_client import LocalVerifyAnswer
 
         from ..liumd_shadow import start_facts_after_scrape
 
         task = start_facts_after_scrape(ctx)
         if task is None:
-            return self._fail_liumd(ctx, None, "no early liumd read")
-        answer = await task
+            result = self._fail_liumd(ctx, None, "no early liumd read")
+            return result, self._liumd_reason(result)
+        budget = max(
+            LIUMD_SPECS_MIN_READ_SECONDS,
+            min(
+                float(timeout) - LIUMD_SPECS_FALLBACK_RESERVE_SECONDS,
+                LIUMD_SPECS_READ_TIMEOUT_SECONDS,
+            ),
+        )
+        try:
+            answer = await asyncio.wait_for(task, timeout=budget)
+        except TimeoutError:
+            result = self._fail_liumd(ctx, None, "liumd read timed out", reason="timeout")
+            return result, "timeout"
+        except Exception as exc:  # a shadow bug must not fail the scrape
+            result = self._fail_liumd(
+                ctx, None, f"{type(exc).__name__}: {exc}"[:300], reason="error"
+            )
+            return result, "error"
         if not isinstance(answer, LocalVerifyAnswer):
-            return self._fail_liumd(ctx, answer)
+            result = self._fail_liumd(ctx, answer)
+            return result, self._liumd_reason(result)
         if not answer.specs:
-            return self._fail_liumd(ctx, answer, "empty liumd specs")
+            result = self._fail_liumd(ctx, answer, "empty liumd specs")
+            return result, self._liumd_reason(result)
 
         specs = _normalize_liumd_document(answer.specs)
         gpu_info = specs.get("gpu")
@@ -457,10 +504,15 @@ class MachineSpecScrapeCheck:
         if not isinstance(gpu_info, dict) or not isinstance(raw_gpu_details, list) or not all(
             isinstance(detail, dict) for detail in raw_gpu_details
         ):
-            return self._fail_liumd(ctx, answer, "malformed liumd specs")
+            result = self._fail_liumd(ctx, answer, "malformed liumd specs")
+            return result, self._liumd_reason(result)
         if not raw_gpu_details:
-            return await self._fail_without_gpus(ctx, answer, specs)
-        return self._result_from_specs(ctx, specs, delivery="liumd", task=task, snapshot=False)
+            return await self._fail_without_gpus(ctx, answer, specs), None
+        return self._result_from_specs(ctx, specs, delivery="liumd", task=task, snapshot=False), None
+
+    @staticmethod
+    def _liumd_reason(result: CheckResult) -> str:
+        return str(result.event.what_we_saw.get("liumd_reason") or "unavailable")
 
     async def _fail_without_gpus(
         self, ctx: Context, answer: Any, specs: dict[str, Any]

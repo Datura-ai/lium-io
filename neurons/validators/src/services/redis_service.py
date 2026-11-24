@@ -93,6 +93,9 @@ STOPPED_BY_RECOVERY_STOPPED = "stopped"
 # so no record exists that the node check cannot find. No expiry: dropped only once that run is confirmed stopped or
 # changed. Every node check retries them, rented or not, so a pod deleted or reassigned since never strands one
 HALF_STARTED_STOP_INDEX_PREFIX = "half_started_stop_index:"
+# the executor uuids whose index above holds a record: written and dropped with the record, so one read a cycle tells
+# every node check whether it has a pending stop, instead of one index read per node in the cycle's Redis burst
+HALF_STARTED_STOP_EXECUTORS_KEY = "half_started_stop_executors"
 # DAH-5904: "<executor uuid>:<filler container name>" while the cycle snapshot lists that filler on that node
 RECENT_FILLER_PREFIX = "recent_filler:"
 # a filler stopped for a customer rent leaves the snapshot at once but stays on the host until its delete lands:
@@ -369,6 +372,10 @@ class RedisWrites:
         self.ops.append(RedisWrite("hdel", (key, field), {}))
         return self
 
+    def sadd(self, key: str, elem: str) -> "RedisWrites":
+        self.ops.append(RedisWrite("sadd", (key, elem), {}))
+        return self
+
     def expire(self, key: str, seconds: int) -> "RedisWrites":
         self.ops.append(RedisWrite("expire", (key, seconds), {}))
         return self
@@ -386,6 +393,11 @@ class RecentGpuReset(BaseModel):
 
 def last_scored_result_key(miner_hotkey: str, executor_id: str) -> str:
     return f"{LAST_SCORED_RESULT_PREFIX}:{miner_hotkey}:{executor_id}"
+
+
+def last_scored_result_vouch_key(miner_hotkey: str, executor_id: str) -> str:
+    """The job block of the last cycle that kept the node's last scored result eligible (DAH-5933)."""
+    return f"{LAST_SCORED_RESULT_PREFIX}_vouch:{miner_hotkey}:{executor_id}"
 
 
 def _verified_job_field(miner_hotkey: str, executor_id: str) -> str:
@@ -893,6 +905,15 @@ class RedisService:
             return []
         return await self.redis.mget(keys)
 
+    async def read_and_take(self, key: str, taken_key: str) -> tuple:
+        """`key` and `taken_key` read in one MULTI that also deletes `taken_key`: a value read is never read again."""
+        async with self.redis.pipeline(transaction=True) as pipe:
+            pipe.get(key)
+            pipe.get(taken_key)
+            pipe.delete(taken_key)
+            value, taken, _ = await pipe.execute()
+        return value, taken
+
     async def delete(self, key: str):
         """Remove a key from Redis."""
         await self.redis.delete(key)
@@ -959,6 +980,49 @@ class RedisService:
 
     async def hdel(self, key: str, *fields: str):
         await self.redis.hdel(key, *fields)
+
+    async def mark_half_started_stop(self, executor_uuid: str, field: str, record: str) -> None:
+        """The pending stop's record and its executor's entry in the pending set, in one MULTI/EXEC."""
+        await self.write_atomically(
+            RedisWrites()
+            .hset(f"{HALF_STARTED_STOP_INDEX_PREFIX}{executor_uuid}", field, record)
+            .sadd(HALF_STARTED_STOP_EXECUTORS_KEY, executor_uuid)
+        )
+
+    async def forget_half_started_stop(self, executor_uuid: str, field: str | None) -> None:
+        """Drops the record (none: only a stale set entry) and, when it was the executor's last one, its set entry.
+        Watched: a record written meanwhile aborts the drop of the set entry and the step is redone."""
+        index = f"{HALF_STARTED_STOP_INDEX_PREFIX}{executor_uuid}"
+        async with self.redis.pipeline(transaction=True) as pipe:
+            while True:
+                try:
+                    await pipe.watch(index)
+                    remaining = await pipe.hlen(index) - (1 if field and await pipe.hexists(index, field) else 0)
+                    pipe.multi()
+                    if field:
+                        pipe.hdel(index, field)
+                    if remaining == 0:
+                        pipe.srem(HALF_STARTED_STOP_EXECUTORS_KEY, executor_uuid)
+                    await pipe.execute()
+                    return
+                except redis.exceptions.WatchError:
+                    continue
+
+    async def half_started_stop_executors(self) -> frozenset[str]:
+        """The executors with a pending half-started stop, in one round trip; complete only once this process has run
+        backfill_half_started_stop_executors."""
+        members = await self.redis.smembers(HALF_STARTED_STOP_EXECUTORS_KEY)
+        return frozenset(m.decode() if isinstance(m, bytes) else m for m in members)
+
+    async def backfill_half_started_stop_executors(self) -> None:
+        """Adds every executor whose index holds a record to the pending set (records written before the set
+        existed or by an earlier release run since, e.g. a rollback). Run once per process, no stored marker: a marker
+        would outlive a rollback whose release writes records without set entries. Idempotent: an entry for an index
+        emptied meanwhile only costs that node one index read, which drops it."""
+        async for key in self.redis.scan_iter(match=f"{HALF_STARTED_STOP_INDEX_PREFIX}*", count=1000):
+            key = key.decode() if isinstance(key, bytes) else key
+            if await self.redis.hlen(key):
+                await self.redis.sadd(HALF_STARTED_STOP_EXECUTORS_KEY, key.removeprefix(HALF_STARTED_STOP_INDEX_PREFIX))
 
     async def write_atomically(self, writes: RedisWrites) -> None:
         """Apply every write in `writes` as one MULTI/EXEC, or none of them.

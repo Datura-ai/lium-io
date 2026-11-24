@@ -2,7 +2,7 @@
 
 `python_path` and `root_dir` arrive in the executor's answer, so they must not pick what runs as root on the node.
 The scripts ship with the validator: the image copies them from the executor sources at build (Dockerfile,
-`executor_src` build context) into src/executor_payloads; in the repository they are read from neurons/executor/src.
+`executor_setup` build context, its src/) into src/executor_payloads; in the repository they are read from neurons/executor/src.
 Each command writes them into a fresh root-only directory before running them. The interpreter is the one the executor
 image installs, at the path the image fixes; the validator names it, the executor does not.
 """

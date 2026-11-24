@@ -50,7 +50,7 @@ from .rented_pod_resources import RentedPodResourcesCheck
 from .rented_throughput import RentedThroughputCheck
 from .rented_gpu_drop import RentedGpuDropCheck
 from .provider_maintenance import ProviderMaintenanceCheck
-from .rented_machine import HalfStartedStopRetryCheck, TenantEnforcementCheck
+from .rented_machine import HalfStartedStopRetryCheck, RentedSinceStartCheck, TenantEnforcementCheck
 from .score import ScoreCheck
 from .spec_change import SpecChangeCheck
 from .storage_limit import StorageLimitCheck
@@ -124,6 +124,7 @@ __all__ = [
     "TdxHostCheck",
     "ProviderMaintenanceCheck",
     "HalfStartedStopRetryCheck",
+    "RentedSinceStartCheck",
     "TenantEnforcementCheck",
     "ScoreCheck",
     "StaleContainerCleanupCheck",
