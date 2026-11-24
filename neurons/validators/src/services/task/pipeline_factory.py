@@ -334,8 +334,6 @@ class PipelineFactory:
                 NeedrestartGuardCheck(),
                 # DAH-6804: same place: installs the boot-time layer reset on idle Sysbox hosts without it
                 SysboxLayerResetCheck(),
-                # DAH-7041: the create refuses every rental on a host with an unusable kernel.pid_max; not listed then
-                HostPidMaxCheck(),
                 # Non-fatal, right after the scrape. A rented node that lost a GPU fails the fatal
                 # GPU checks below (DETAILS_MISMATCH, GPU_MISSING), which halt the cycle before
                 # TenantEnforcementCheck; this reports it to the backend on that same cycle.
@@ -356,6 +354,9 @@ class PipelineFactory:
                 # the published specs had no tdx_host_supported key and the backend stored false,
                 # so every rented TDX-capable host read as not capable.
                 TdxHostCheck(),
+                # DAH-7041: the create refuses every rental on a host with an unusable kernel.pid_max; not listed then.
+                # Fatal, so it runs after every non-fatal check above: a halt here must not skip one of them
+                HostPidMaxCheck(),
                 GpuCountCheck(),
                 GpuModelValidCheck(),
                 # Pure-data model<->VRAM gate. No SSH/GPU dependency, so it runs
@@ -548,8 +549,6 @@ class PipelineFactory:
                 NeedrestartGuardCheck(),
                 # DAH-6804: same place: installs the boot-time layer reset on idle Sysbox hosts without it
                 SysboxLayerResetCheck(),
-                # DAH-7041: the create refuses every rental on a host with an unusable kernel.pid_max; not listed then
-                HostPidMaxCheck(),
                 RentedGpuDropCheck(),
                 GpuLossHoldCheck(),
                 GpuThermalThrottleCheck(),
@@ -558,6 +557,8 @@ class PipelineFactory:
                 # DAH-4961: a partly rented split node's disk per free split, pure data, before the rented halt
                 SplitDiskCheck(),
                 TdxHostCheck(),
+                # DAH-7041: same place as in build_checks()
+                HostPidMaxCheck(),
                 GpuCountCheck(),
                 GpuModelValidCheck(),
                 GpuVramPrecheck(),
@@ -655,8 +656,6 @@ class PipelineFactory:
                 NeedrestartGuardCheck(write=False),
                 # DAH-6804: same place as in build_checks(); under DRY_RUN it reports and installs nothing
                 SysboxLayerResetCheck(write=False),
-                # DAH-7041: same place as in build_checks(); one read-only cat
-                HostPidMaxCheck(),
                 # RentedGpuDropCheck: same place as in build_checks(); under DRY_RUN it logs and posts nothing.
                 RentedGpuDropCheck(),
                 # DAH-4457: same place as in build_checks(); under DRY_RUN it reads the hold and writes none.
@@ -669,6 +668,8 @@ class PipelineFactory:
                 SplitDiskCheck(),
                 # DAH-3484: before the rented halt, same as build_checks().
                 TdxHostCheck(),
+                # DAH-7041: same place as in build_checks(); one read-only cat
+                HostPidMaxCheck(),
                 GpuCountCheck(),
                 GpuModelValidCheck(),
                 GpuVramPrecheck(),

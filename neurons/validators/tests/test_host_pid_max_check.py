@@ -114,6 +114,14 @@ def _names(checks):
     return [type(c).__name__ for c in checks]
 
 
-def test_every_pipeline_reads_it():
-    assert "HostPidMaxCheck" in _names(PipelineFactory.build_checks())
-    assert "HostPidMaxCheck" in _names(PipelineFactory.build_dry_run_checks())
+@pytest.mark.parametrize(
+    "build",
+    [PipelineFactory.build_checks, PipelineFactory.build_fast_path_checks, PipelineFactory.build_dry_run_checks],
+)
+def test_every_pipeline_reads_it_after_the_non_fatal_checks(build):
+    """It halts an idle node's cycle: the non-fatal checks before the fatal GPU checks (the GPU dropout record among
+    them) must still run on that cycle, or a dropout seen with it is never recorded."""
+    names = _names(build())
+    at = names.index("HostPidMaxCheck")
+    assert at > names.index("RentedGpuDropCheck") and at > names.index("GpuLossHoldCheck")
+    assert names[at + 1] == "GpuCountCheck"
