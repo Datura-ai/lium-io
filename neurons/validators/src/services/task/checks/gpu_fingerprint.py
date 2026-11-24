@@ -35,6 +35,11 @@ def as_listed(spec: str) -> str:
     return f"{_SAME_MODEL[model]}{sep}{count}" if model in _SAME_MODEL else spec
 
 
+def listed_model(spec: str) -> str:
+    # the model only: a rented dropout respecs the record's count but keeps every anchored UUID (DAH-7001)
+    return as_listed(spec).rpartition(":")[0]
+
+
 def split_uuids(csv: str) -> list[str]:
     """The distinct UUIDs of a comma-joined list, sorted.
 
@@ -106,7 +111,7 @@ class GpuFingerprintCheck:
         if full_set_changed(anchor, current):
             prev_spec = verified.get("spec") or ""
             current_spec = ctx.state.gpu_model_count or ""
-            if prev_spec and current_spec and as_listed(prev_spec) != as_listed(current_spec):
+            if prev_spec and current_spec and listed_model(prev_spec) != listed_model(current_spec):
                 # other cards of another model are another machine: never anchored under this node, whatever ends
                 # the run; SpecChangeCheck fails it (DAH-7001)
                 event = render_message(

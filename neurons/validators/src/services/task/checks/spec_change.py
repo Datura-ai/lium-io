@@ -4,7 +4,7 @@ from services.redis_service import GPU_ANCHOR_KEY
 
 from ..messages import SpecChangeMessages as Msg, render_message
 from ..pipeline import CheckResult, Context
-from .gpu_fingerprint import as_listed, full_set_changed, split_uuids
+from .gpu_fingerprint import as_listed, full_set_changed, listed_model, split_uuids
 
 
 class SpecChangeCheck:
@@ -26,7 +26,7 @@ class SpecChangeCheck:
             # a full set of other cards of another model is another machine, not this node: the record keeps the
             # node's model and cards (the fingerprint check never re-anchors them), so it fails every cycle until
             # they are back. Only the same cards under a new name are verified as they are now (DAH-6295).
-            other_machine = full_set_changed(
+            other_machine = listed_model(prev_spec) != listed_model(current_spec) and full_set_changed(
                 split_uuids((ctx.verified or {}).get(GPU_ANCHOR_KEY) or ""), split_uuids(ctx.state.gpu_uuids or "")
             )
             event = render_message(

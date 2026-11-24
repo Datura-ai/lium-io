@@ -160,6 +160,8 @@ async def test_the_run_still_ends_as_the_fingerprint_failure_after_the_rented_ch
         ("NVIDIA H100 80GB HBM3:2", "NVIDIA B300 SXM6 AC:2", False),  # another model: another machine
         ("NVIDIA B300 SXM6 AC:2", "NVIDIA B300 SXM6 PC:2", True),  # one card under two datacenter names
         ("NVIDIA H100 80GB HBM3:2", "NVIDIA H100 80GB HBM3:2", True),
+        # a rented dropout respecs the record to one card but keeps both UUIDs: the same model is still re-anchored
+        ("NVIDIA A100 80GB PCIe:1", "NVIDIA A100 80GB PCIe:2", True),
     ],
 )
 @pytest.mark.asyncio

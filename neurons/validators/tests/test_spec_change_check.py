@@ -110,3 +110,20 @@ async def test_other_cards_of_the_same_card_pair_still_pass(context_factory):
 
     assert result.passed is True
     assert "gpu_reanchor" not in result.updates
+
+
+@pytest.mark.asyncio
+async def test_other_cards_of_the_records_model_after_a_dropout_respec_are_verified_as_they_are(context_factory):
+    # a rented dropout respecs the record to A100:1 but keeps both UUIDs; a later full set of other A100s is the
+    # same model, so it is respecced (not held as another machine) and verifies again (DAH-7001)
+    ctx = context_factory(
+        services=build_services(),
+        config=build_context_config(),
+        state=build_state(gpu_model_count="NVIDIA A100 80GB PCIe:2", gpu_uuids="gpu-003,gpu-004"),
+        verified={"spec": "NVIDIA A100 80GB PCIe:1", "uuids": "gpu-001,gpu-002"},
+    ).model_copy(update={"gpu_fingerprint_passed": True})
+
+    result = await SpecChangeCheck().run(ctx)
+
+    assert result.updates == {"clear_verified_job_info": True, "gpu_respec": True}
+    assert "original machine" not in (result.event.remediation or "")
