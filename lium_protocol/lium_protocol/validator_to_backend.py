@@ -385,7 +385,7 @@ class ResetVerifiedJobRequest(ValidatorMessage):
     miner_hotkey: str
     executor_uuid: str
     reason: ResetVerifiedJobReason = ResetVerifiedJobReason.DEFAULT
-    # 2.19.0: the check meant the reset for an idle node only; the backend applies it only while no customer pod runs
+    # 2.23.0: the check meant the reset for an idle node only; the backend applies it only while no customer pod runs
     # on the node. False (an older validator) = applied as before; an older backend ignores the field.
     unrented_only: bool = False
 
