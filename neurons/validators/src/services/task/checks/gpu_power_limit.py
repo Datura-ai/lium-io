@@ -104,6 +104,17 @@ async def _restore_records_of_this_executor(ctx: Context, gpu_uuids: list[str]) 
     return [record for record in read_result.records if record.executor_id == ctx.executor.uuid]
 
 
+async def _host_limit_records_under_miner_job(
+    ctx: Context, default_job_owner: str | None
+) -> list[GpuPowerRestoreRecord]:
+    """Under the provider's own capped Default Job (DAH-5861), the host's own limits recorded
+    before the cap, as under Pearl; none under any other owner."""
+    if default_job_owner != DEFAULT_JOB_OWNER_MINER:
+        return []
+    uuids = [detail["uuid"] for detail in ctx.state.gpu_details or [] if detail.get("uuid")]
+    return await _restore_records_of_this_executor(ctx, uuids)
+
+
 async def _filler_pods_running(ctx: Context, pod_ids: set[str]) -> set[str]:
     """The pods among these whose filler container the host reports as running now (DAH-2786). A pod the host does
     not answer for is not in the result."""
@@ -173,13 +184,18 @@ class GpuPowerLimitCheck:
                 updates=_with_host_limits(ctx, readout.records, readout.recapped_watts_by_uuid),
             )
 
+        host_limit_records = await _host_limit_records_under_miner_job(ctx, default_job_owner)
+        host_watts_by_uuid = {record.gpu_uuid: record.watts for record in host_limit_records}
         measurements: list[GpuPowerMeasurement] = []
         incomplete: list[GpuPowerMeasurement] = []
         rejected: list[GpuPowerMeasurement] = []
         floors = await self._rented_floors(ctx)
 
         for index, detail in enumerate(ctx.state.gpu_details or []):
-            current_limit = _to_float(detail.get("power_limit"))
+            # under the provider's own cap the floor and the tier judge the host's recorded limit
+            current_limit = _to_float(
+                host_watts_by_uuid.get(detail.get("uuid"), detail.get("power_limit"))
+            )
             default_limit = _to_float(detail.get("power_default_limit"))
             max_limit = _to_float(detail.get("power_max_limit"))
             measurement = GpuPowerMeasurement(
@@ -204,7 +220,11 @@ class GpuPowerLimitCheck:
                 rejected.append(measurement)
 
         if rejected:
-            stale_cap_event = await self._rescue_stale_lium_caps(ctx, rejected)
+            # a recorded host limit is the host's own setting, never a stale cap of ours to rescue
+            host_limit_rejected = any(m.uuid in host_watts_by_uuid for m in rejected)
+            stale_cap_event = (
+                None if host_limit_rejected else await self._rescue_stale_lium_caps(ctx, rejected)
+            )
             if stale_cap_event is not None:
                 return CheckResult(passed=True, event=stale_cap_event)
             measured = "; ".join(
@@ -280,12 +300,9 @@ class GpuPowerLimitCheck:
                 "measurements": _dump_measurements(measurements),
             },
         )
-        updates: dict[str, Any] = {}
-        if default_job_owner == DEFAULT_JOB_OWNER_MINER:
-            # the provider's own capped job (DAH-5861): the badge judges the host's pre-cap limit, as under Pearl
-            records = await _restore_records_of_this_executor(ctx, [m.uuid for m in measurements if m.uuid])
-            updates = _with_host_limits(ctx, records)
-        return CheckResult(passed=True, event=event, updates=updates)
+        return CheckResult(
+            passed=True, event=event, updates=_with_host_limits(ctx, host_limit_records)
+        )
 
     async def _remember_tier_ratios(self, ctx: Context, measurements: list[GpuPowerMeasurement]) -> bool:
         """Keep each GPU's passing reading in the 80 % tier (and clear it at stock) for a rental-start

@@ -552,6 +552,34 @@ async def test_the_host_limit_under_our_pearl_cap_reaches_the_specs(
     assert detail["power_limit"] == live  # Pearl's guard still reads the live cap
 
 
+@pytest.mark.parametrize(
+    ("recorded_watts", "passed", "kept_tier"),
+    [
+        (245, False, None),  # a 70 % host limit under the provider's 80 % cap fails the floor
+        (350, True, None),  # a stock host limit keeps no 80 % tier reading for the rental start
+        (280, True, "0.8"),  # an 80 % host limit keeps its tier
+    ],
+)
+@pytest.mark.asyncio
+async def test_under_the_providers_own_cap_the_floor_and_tier_judge_the_recorded_host_limit(
+    context_factory, read_records_mock, recorded_watts, passed, kept_tier
+) -> None:
+    # DAH-5861: the provider's 80 % Default Job cap (280 of 350 W) is lifted before any rental
+    redis = FakeRedis()
+    read_records_mock.return_value = _read_result(
+        _restore_record().model_copy(update={"watts": recorded_watts})
+    )
+    ctx = context_factory(
+        state=_state(current_limit=280, default_limit=350, default_job_owner="miner"),
+        services=build_services(redis=redis),
+    )
+
+    result = await GpuPowerLimitCheck().run(ctx)
+
+    assert result.passed is passed
+    assert redis.store.get(scored_tier_ratio_key(_EXECUTOR_UUID, "GPU-abc")) == kept_tier
+
+
 @pytest.mark.asyncio
 async def test_a_low_power_limit_names_each_gpu_measured_and_required(context_factory, read_records_mock) -> None:
     ctx = context_factory(state=_state(current_limit=105, default_limit=350))
