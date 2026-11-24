@@ -1009,16 +1009,18 @@ async def test_a_retry_that_no_longer_fits_after_the_build_keeps_the_stdin_verdi
     # the build counts against the 780 s task budget; a retry whose upload (300 s) plus scrape cannot finish
     # is not started, even when the scrape alone would fit
     mocker.patch(
-        "neurons.validators.src.services.task.checks.machine_spec_scrape.task_seconds_left", return_value=599
+        "neurons.validators.src.services.task.checks.machine_spec_scrape.task_seconds_left", side_effect=[700, 599]
     )
     runner = DummySSHCommandRunner(
         result=make_command_result(success=False, exit_code=1, stderr="no psutil", duration_ms=1600)
     )
     ssh_client = DummySSHClient()
-    ctx = _stdin_scrape_ctx(context_factory, runner, ssh_client, FakeBinaryBuild())
+    binary_build = FakeBinaryBuild()
+    ctx = _stdin_scrape_ctx(context_factory, runner, ssh_client, binary_build)
 
     result = await MachineSpecScrapeCheck().run(ctx)
 
+    assert binary_build.ensure_calls == 1
     assert result.passed is False
     assert result.event.what_we_saw["delivery"] == "stdin"
     assert len(runner.calls) == 1
