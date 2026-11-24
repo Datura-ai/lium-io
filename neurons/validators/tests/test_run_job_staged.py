@@ -140,3 +140,35 @@ def test_the_credentials_file_never_outlives_a_detached_job_whose_log_cannot_be_
         ))
     assert len(uploaded) == 1 and not Path(uploaded[0]).exists()
     assert sorted(p.name for p in jobs.iterdir()) == ["helper.py"]
+
+
+def test_a_job_cancelled_after_its_credentials_were_written_leaves_none_behind(
+    jobs: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import asyncio
+
+    uploaded: list[str] = []
+    started: list[str] = []
+
+    async def upload(ssh_client, auth_token, volume_info, directory):
+        # written whole, then cancelled while the upload closes, before the job starts
+        path = Path(directory) / "secrets.json"
+        path.write_text("{}")
+        uploaded.append(str(path))
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(storage_operations, "upload_secrets_file", upload)
+
+    async def run(command: str, check: bool = False, **_) -> SimpleNamespace:
+        if "nohup" in command:
+            started.append(command)
+        done = _sh(command, jobs)
+        return SimpleNamespace(exit_status=done.returncode, stdout=done.stdout, stderr=done.stderr)
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(storage_operations.run_job_with_secrets(
+            SimpleNamespace(run=run), "backup", ("job.py", "helper.py"), "token", None,
+            lambda secrets_file: ["--secrets-file", secrets_file], log=str(tmp_path / "job.log"),
+        ))
+    assert len(uploaded) == 1 and not Path(uploaded[0]).exists() and started == []
+    assert sorted(p.name for p in jobs.iterdir()) == ["helper.py"]

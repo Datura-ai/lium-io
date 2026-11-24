@@ -656,6 +656,8 @@ class PipelineFactory:
         return cast(
             list[Check],
             [
+                # as in build_checks(): the scrape below runs from a root-only directory, so a non-root login is refused first
+                LoginUserCheck(),
                 # StartGPUMonitorCheck(),  # SKIP: Starts processes on executor
                 UploadFilesCheck(),
                 MachineSpecScrapeCheck(),

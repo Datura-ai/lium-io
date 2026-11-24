@@ -93,7 +93,7 @@ from services.task.availability import (
     build_rented_executor_not_listed_event,
     RunningOutageTally,
 )
-from services.task.messages import TenantEnforcementMessages
+from services.task.messages import LoginUserMessages, TenantEnforcementMessages
 from incentive.config import BASE_GPU_MAP
 from services.task_service import TaskService, JobResult
 from services.storage_operations import (
@@ -569,11 +569,13 @@ class MinerService:
             # DAH-6546: a rerun that ran its checks is the latest verdict, failed or not; a pod still on the old GPUs
             # fails it with its own pod_gpus_gone event, and its rented-GPU drop report moves the pod as the first run's
             # did. An errored run (create_task's log_status "error") has no verdict, nor has one whose SSH session died
-            # (its later checks never ran, review 4602277079): the first stands.
+            # (its later checks never ran, review 4602277079), nor has one whose login uid could not be read (it ran no
+            # check): the first stands.
             if (
                 isinstance(rerun, JobResult)
                 and rerun.log_status != "error"
-                and rerun.failure_reason_code != TenantEnforcementMessages.EXECUTOR_TRANSPORT_UNREACHABLE.reason
+                and rerun.failure_reason_code
+                not in (TenantEnforcementMessages.EXECUTOR_TRANSPORT_UNREACHABLE.reason, LoginUserMessages.UNREAD.reason)
             ):
                 raw_results[i] = rerun
         passed = [r for r in reruns if isinstance(r, JobResult) and r.is_successful]

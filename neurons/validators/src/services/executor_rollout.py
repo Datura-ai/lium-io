@@ -562,8 +562,9 @@ def withhold_renter_gpu_reset_verdicts(
                 WithheldVerdict(
                     miner_hotkey=miner_hotkey,
                     result=result,
-                    # the node's own checks can spend the task's time: that keeps no miner active (review)
-                    keeps_miner_active=result.failure_reason_code not in NO_TASK_TIME_REASONS,
+                    # the node's own checks can spend the task's time, and an unread uid passed no check: neither
+                    # keeps a miner active (review)
+                    keeps_miner_active=not login_unread and result.failure_reason_code not in NO_TASK_TIME_REASONS,
                 )
             )
             logger.info(

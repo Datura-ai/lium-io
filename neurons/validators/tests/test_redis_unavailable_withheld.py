@@ -112,3 +112,21 @@ async def test_a_run_whose_login_uid_could_not_be_read_records_no_verification_o
         verified_job_info={}, log_text="", success=False, validation_event=event,
     )
     assert handler._persist_verification_data.await_count == (1 if persisted else 0)
+
+
+@pytest.mark.parametrize("other_executor_passes, floored", [(False, {}), (True, {7: 1})])
+def test_an_unread_login_uid_alone_earns_no_eligibility_floor(other_executor_passes, floored):
+    # the weight vector a miner gets when its only run's uid was unread, and when another of its executors passed
+    from clients.subtensor_client import _apply_eligibility_floor
+    from services.executor_rollout import session_kept_hotkeys
+
+    results = [_failed("node-1", "LOGIN_USER_UNREAD")] + ([_scored("node-2")] if other_executor_passes else [])
+    standing, withheld = withhold_renter_gpu_reset_verdicts({"5Miner": results})
+    active = {
+        hotkey for hotkey, rs in standing.items() if any(r.is_successful for r in rs)
+    } | session_kept_hotkeys(withheld)
+
+    miners = [MagicMock(uid=100, hotkey="burner"), MagicMock(uid=7, hotkey="5Miner")]
+    uids, weights, _ = _apply_eligibility_floor([100], [65535], miners, active, {100})
+
+    assert dict(zip(uids, weights)) == {100: 65535 - sum(floored.values()), **floored}

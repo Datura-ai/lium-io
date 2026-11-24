@@ -14,8 +14,11 @@ from services import executor_payload
 class _LocalSSH:
     """Runs the probe command locally, its stdin carrying the staged files."""
 
+    def __init__(self, cwd=None):
+        self.cwd = cwd
+
     async def run(self, command, check=False, input=None):
-        done = subprocess.run(command, shell=True, input=input, capture_output=True, text=True)
+        done = subprocess.run(command, shell=True, input=input, capture_output=True, text=True, cwd=self.cwd)
         return SimpleNamespace(exit_status=done.returncode, stderr=done.stderr)
 
 
@@ -42,3 +45,17 @@ def test_an_unknown_field_is_reported_missing(service):
 def test_a_probe_that_cannot_run_fails_rather_than_reading_as_missing(service):
     with pytest.raises(RuntimeError, match="exit 127"):
         _probe("bootstrap", python="/nonexistent/python")
+
+
+def test_the_probe_imports_nothing_from_the_login_directory(service, tmp_path_factory):
+    # modules in the session's working directory, under the names the probe and the staged models import
+    cwd = tmp_path_factory.mktemp("login")
+    marker = cwd / "imported"
+    module = f"open({str(marker)!r}, 'a').write(__name__)\n"
+    (cwd / "dataclasses.py").write_text(module)
+    (cwd / "storage").mkdir()
+    (cwd / "storage" / "__init__.py").write_text(module)
+    (cwd / "storage" / "models.py").write_text(module + "class WorkspaceSpec:\n    __dataclass_fields__ = {}\n")
+
+    assert asyncio.run(supports_workspace_field(_LocalSSH(cwd), sys.executable, "bootstrap")) is True
+    assert not marker.exists()

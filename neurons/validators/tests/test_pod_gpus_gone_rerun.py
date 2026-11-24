@@ -110,7 +110,7 @@ async def test_a_failed_rerun_is_the_result_not_the_stale_first_one(rest_service
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("rerun", ["timeout", "errored", "session_lost"])
+@pytest.mark.parametrize("rerun", ["timeout", "errored", "session_lost", "uid_unread"])
 async def test_a_rerun_with_no_verdict_keeps_the_first(rest_service, rerun):  # noqa: F811
     # review 4601760468: create_task turns an exception into a log_status "error" result, which has no verdict either
     rest_service.miner_returns(LISTED)
@@ -121,6 +121,10 @@ async def test_a_rerun_with_no_verdict_keeps_the_first(rest_service, rerun):  # 
     session_lost = _job_result(LISTED, score=0.0)
     session_lost.log_status = "warning"
     session_lost.failure_reason_code = "EXECUTOR_TRANSPORT_UNREACHABLE"
+    # a rerun whose login uid could not be read stopped before any check
+    uid_unread = _job_result(LISTED, score=0.0)
+    uid_unread.log_status = "warning"
+    uid_unread.failure_reason_code = "LOGIN_USER_UNREAD"
     queue = [first]
 
     async def create_task(miner_info, executor_info, **_):
@@ -130,6 +134,8 @@ async def test_a_rerun_with_no_verdict_keeps_the_first(rest_service, rerun):  # 
             return errored
         if rerun == "session_lost":
             return session_lost
+        if rerun == "uid_unread":
+            return uid_unread
         raise TimeoutError
 
     rest_service.task_service.create_task = AsyncMock(side_effect=create_task)

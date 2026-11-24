@@ -74,3 +74,45 @@ async def test_only_a_confirmed_root_uid_reaches_the_next_step(stdout, ok, error
 async def test_runs_after_the_account_check_and_before_anything_is_installed(fast_path):
     kinds = [type(c) for c in PipelineFactory.build_checks(fast_path=fast_path)]
     assert kinds.index(NodeAccountCheck) + 1 == kinds.index(LoginUserCheck) == kinds.index(StartGPUMonitorCheck) - 1
+
+
+class _NodeShell:
+    """Records every command the run sends to the node; `id -u` answers `uid`, anything else fails."""
+
+    def __init__(self, uid: str):
+        self.uid, self.commands = uid, []
+
+    async def run(self, cmd, *args, **kwargs):
+        self.commands.append(cmd)
+        from types import SimpleNamespace
+
+        return SimpleNamespace(exit_status=0 if cmd == "id -u" else 1, stdout=self.uid if cmd == "id -u" else "", stderr="")
+
+
+@pytest.mark.parametrize("uid, reason", [("1000\n", "LOGIN_USER_NOT_ROOT"), ("\n", "LOGIN_USER_UNREAD")])
+@pytest.mark.parametrize("build", ["standard", "fast", "dry_run"])
+async def test_no_host_command_runs_after_a_login_that_is_not_confirmed_root(monkeypatch, build, uid, reason):
+    from unittest.mock import AsyncMock
+
+    from services.task.checks import rental_egress_guard
+    from services.task.pipeline import Pipeline
+
+    checks = {
+        "standard": PipelineFactory.build_checks,
+        "fast": PipelineFactory.build_fast_path_checks,
+        "dry_run": PipelineFactory.build_dry_run_checks,
+    }[build]()
+    # the completion guard is due: only the login decides whether it runs
+    monkeypatch.setattr(rental_egress_guard, "task_seconds_left", lambda ctx: 3600)
+    monkeypatch.setattr(rental_egress_guard, "rental_of_this_node", lambda ctx: None)
+    for check in checks:
+        if isinstance(check, rental_egress_guard.RentalEgressGuardCheck):
+            monkeypatch.setattr(check, "_last_run", {})
+    shell = _NodeShell(uid)
+    runner = _Runner(uid)
+    runner.commands = shell.commands  # one log, in the order the node saw them
+    ok, events, _ = await Pipeline(checks, AsyncMock()).run(make_context(ssh=shell, runner=runner))
+
+    assert ok is False and events[-1].reason_code == reason
+    # the login read is the last command: nothing installed, scraped or run on the host after it
+    assert shell.commands[-1] == "id -u"

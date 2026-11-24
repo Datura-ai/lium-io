@@ -207,8 +207,10 @@ async def supports_storage_operation(
     engine: object,
 ) -> bool:
     required_binary = "/usr/local/bin/restic" if engine == "restic" else "/usr/bin/aws"
+    # the interpreter the validator runs the operation with must start, or the run would end before it could report
     result = await ssh_client.run(
-        f"test -r {shlex.quote(REMOTE_RUNNER_PATH)} && test -x {shlex.quote(required_binary)}",
+        f"test -r {shlex.quote(REMOTE_RUNNER_PATH)} && test -x {shlex.quote(required_binary)} && "
+        f"{shlex.quote(executor_payload.EXECUTOR_PYTHON)} -I -c ''",
         check=False,
     )
     return result.exit_status == 0
@@ -246,7 +248,8 @@ async def supports_workspace_field(
     """
     result = await ssh_client.run(
         f"{executor_payload.unpack('storage', cleanup=True)}; "
-        f"{shlex.quote(python_path)} -E -s -c {shlex.quote(_WORKSPACE_FIELD_PROBE)} {shlex.quote(field)} \"$d\"",
+        # -I: only the standard library and the staged directory the probe adds are importable
+        f"{shlex.quote(python_path)} -I -c {shlex.quote(_WORKSPACE_FIELD_PROBE)} {shlex.quote(field)} \"$d\"",
         input=executor_payload.archive(executor_payload.STORAGE).decode(),
         check=False,
     )
@@ -375,13 +378,21 @@ _FINISHED_MARKER_SWEEP_MINUTES = 24 * 60
 
 def _incumbent_condition(files: StorageOperationFiles) -> str:
     """Shell test, true when the operation has a result or a live run: its done marker or status, or a launcher (this
-    validator's) or runner PID (an older validator's, which records no launcher) still running this operation's spec. A
-    PID counts only while its process carries this operation's exact --spec path (a reused PID does not)."""
+    validator's) or runner PID (an older validator's, which records no launcher) still running this operation's spec,
+    or an older validator's runner of this spec that recorded no PID. A PID counts only while its process carries this
+    operation's exact --spec path (a reused PID does not)."""
     q = lambda path: shlex.quote(str(path))  # noqa: E731
     live = lambda path: _live(path, files)  # noqa: E731
+    # an older validator's runner that never recorded its PID, found by its command line in this mount namespace; the
+    # bracketed dot keeps the pattern from matching the shell that carries it
+    legacy = f"{REMOTE_RUNNER_PATH} --spec {files.spec} ".replace(".", "[.]")
+    legacy_live = f"pgrep -f {executor_payload.SAME_MOUNT_NS} -- {shlex.quote(legacy)} >/dev/null 2>&1"
     # liveness first, then the status, then the done marker: the order the wrapper publishes them in reverse (status,
     # then done, then it exits), so a run that ends between two reads is still found by a later one
-    return f"{{ {live(files.launcher)} || {live(files.pid)} || [ -s {q(files.status)} ] || [ -e {q(files.done)} ]; }}"
+    return (
+        f"{{ {live(files.launcher)} || {live(files.pid)} || {legacy_live} || [ -s {q(files.status)} ] || "
+        f"[ -e {q(files.done)} ]; }}"
+    )
 
 
 def _live(path, files: StorageOperationFiles) -> str:
@@ -440,8 +451,9 @@ async def _settle_failed_dispatch(
     result = await ssh_client.run(
         f"install -d -m 0700 {q(REMOTE_OPERATION_DIRECTORY)} 2>/dev/null; {_lock_if_possible(files)}"
         f'if {_incumbent_condition(files)}; then echo {_INCUMBENT}; '
-        # unlocked, "no run" may change before a report: nothing is recorded and the outcome is unknown
-        f'elif [ -n "$locked" ] && {failed}; then echo {_RECORDED}; fi',
+        # unlocked, "no run" may change before a report: nothing is recorded and the outcome is unknown. Locked with no
+        # run, a spec is one a launch wrote and never handed to a runner: it goes before the failure is recorded
+        f'elif [ -n "$locked" ] && rm -f {q(files.spec)} && {failed}; then echo {_RECORDED}; fi',
         check=False,
     )
     outcome = (result.stdout or "").strip() if result.exit_status == 0 and isinstance(result.stdout, str) else ""
@@ -466,12 +478,16 @@ def _launch_command(
         f'{shlex.quote(python_path)} -E -s "$D"/{executor_payload.STORAGE[0]} '
         f"--spec {q(files.spec)} --cancel-file {q(files.cancel)}"
     )
+    done_tmp = q(f"{files.done}.tmp")
     terminal_cleanup = (
         ""
         if retain_terminal_artifacts
         # the done marker first: a re-dispatch after this run must find it finished, not relaunch it. A failed run
-        # keeps its log: a runner that dies before reporting leaves no other trace
-        else f"; : > {q(files.done)}; rm -f {q(files.status)}; "
+        # keeps its log: a runner that dies before reporting leaves no other trace. A runner that ended before it read
+        # its spec reported nothing: the marker holds that failure (no credential) for the next dispatch to report
+        else f"; {{ [ -z \"$unread\" ] || [ \"$result\" = 0 ] || "
+        f"echo \"Storage runner exited $result before it read its operation\"; }} > {done_tmp} "
+        f"&& mv {done_tmp} {q(files.done)} || : > {q(files.done)}; rm -f {q(files.status)}; "
         f'if [ "$result" = 0 ]; then rm -f {q(files.log)}; '
         f"else echo \"runner exited $result\" >> {q(files.log)}; fi"
     )
@@ -486,8 +502,11 @@ def _launch_command(
         f"{runner} & child=$!; "
         f"printf '%s\\n' \"$child\" > {q(files.pid)}; "
         "trap 'kill -TERM \"$child\" 2>/dev/null || true' TERM INT; "
-        # the status first, published whole, and only then the staged tree: a waiter that finds the runner gone reads it
-        f'wait "$child"; result=$?; printf \'%s\\n\' "$result" > {status_tmp} && mv {status_tmp} {q(files.status)}; '
+        # the runner removes the spec it read and keeps at most its reporter: a spec still holding the operation was
+        # never read. Then the status, published whole, and only then the staged tree: a waiter that finds the runner
+        # gone reads it
+        f'wait "$child"; result=$?; unread=; grep -qF \'"engine":\' {q(files.spec)} 2>/dev/null && unread=1; '
+        f'printf \'%s\\n\' "$result" > {status_tmp} && mv {status_tmp} {q(files.status)}; '
         'rm -rf "$D"; '
         f"rm -f {q(files.spec)} {q(files.pid)} {q(files.cancel)}{terminal_cleanup}"
     )
@@ -537,7 +556,8 @@ async def run_job_with_secrets(
         # directory removes the credentials, and the job's shell removes it when it ends
         secrets_file = await upload_secrets_file(ssh_client, auth_token, volume_info, stage_dir)
         await ssh_client.run(executor_payload.run_job(stage_dir, files, argv(secrets_file), log=log), check=True, **run_kwargs)
-    except Exception:
+    except BaseException:
+        # a cancellation too: the directory goes now, while the session is still open
         await ssh_client.run(f"rm -rf -- {shlex.quote(stage_dir)}", check=False)
         raise
 
@@ -597,17 +617,16 @@ async def _operation_state(
     pid_path = shlex.quote(str(files.pid))
     command = (
         f"if test -s {status_path}; then printf 'STATUS:'; cat {status_path}; "
-        f"elif test -s {pid_path}; then pid=$(cat {pid_path}); "
-        "case \"$pid\" in (*[!0-9]*|'') echo INVALID;; "
-        '(*) if kill -0 "$pid" 2>/dev/null; then echo RUNNING; '
+        # the pid is read once: no pid (yet, or any more) is STARTING, anything but digits INVALID
+        f"else pid=$(cat {pid_path} 2>/dev/null); "
+        "case \"$pid\" in ('') state=STARTING;; (*[!0-9]*) state=INVALID;; "
+        '(*) if kill -0 "$pid" 2>/dev/null; then state=RUNNING; '
         # the runner has exited but its wrapper may still be publishing the status: wait for it, then read it again
-        f"elif {_live(files.launcher, files)}; then echo RUNNING; "
-        f"elif test -s {status_path}; then printf 'STATUS:'; cat {status_path}; "
-        "else echo EXITED; fi;; esac; "
-        # the wrapper publishes the status before it removes the pid, so a pid gone since the first read means the
-        # status is there now: read it again before calling the runner not started
-        f"elif test -s {status_path}; then printf 'STATUS:'; cat {status_path}; "
-        "else echo STARTING; fi"
+        f"elif {_live(files.launcher, files)}; then state=RUNNING; else state=EXITED; fi;; esac; "
+        # the wrapper publishes the status before it removes the pid, so whatever the pid read gave, a status there
+        # now is the run's result: read it again before calling the runner not started, invalid or gone
+        f'if [ "$state" != RUNNING ] && test -s {status_path}; then printf \'STATUS:\'; cat {status_path}; '
+        'else echo "$state"; fi; fi'
     )
     result = await ssh_client.run(command, check=False)
     return (result.stdout or "").strip()
