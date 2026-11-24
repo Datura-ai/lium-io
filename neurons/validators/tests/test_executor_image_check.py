@@ -96,6 +96,7 @@ async def test_rented_outdated_executor_passes_and_keeps_its_incentive():
     assert result.passed is True
     assert result.updates["state"].executor_image_report.status is ImageVerdict.OUTDATED
     assert result.event.impact == "Rental and incentive continue; update the image before the rental ends"
+    assert result.event.severity == "warning"  # not an ERROR line every cycle for a node that keeps its incentive
 
 
 @pytest.mark.asyncio

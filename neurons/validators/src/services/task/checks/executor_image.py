@@ -120,8 +120,12 @@ class ExecutorImageCheck:
                 impact = "Rental can continue, but no incentive until the image is official"
             else:
                 impact = "Rental and incentive continue; update the image before the rental ends"
+            if report.status is ImageVerdict.UNOFFICIAL:
+                template = Msg.UNOFFICIAL
+            else:
+                template = Msg.RENTED_OUTDATED if is_rented else Msg.OUTDATED
             event = render_message(
-                Msg.UNOFFICIAL if report.status is ImageVerdict.UNOFFICIAL else Msg.OUTDATED,
+                template,
                 ctx=ctx,
                 check_id=self.check_id,
                 what=what,
