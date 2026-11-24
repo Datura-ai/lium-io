@@ -157,6 +157,7 @@ from services.host_memory_guard import apply_host_memory_guard
 from services.image_flatten import (
     FLATTEN_NO_DISK_RENTER_SENTENCE,
     FLATTEN_SIZING_SLACK_BYTES,
+    FlattenLockTimedOut,
     FlattenMeasureFailed,
     ImageFlattenNoDisk,
     flatten_copy_bytes,
@@ -1312,11 +1313,21 @@ def sysbox_many_layers_sentence(exc: Exception) -> str | None:
     return None
 
 
+# flatten_wait: the backend tells the renter to wait only on the lock timeout; any other failure (the command
+# crashing, the SSH link dropping) is the node failing the step, so the renter is told to pick another node
+FLATTEN_LOCK_TIMEOUT_STEP_DETAIL = "an image copy on the node held its disk lock past the wait"
+FLATTEN_WAIT_FAILED_STEP_DETAIL = "the node failed the disk lock wait"
+
+
 def failure_step_detail(exc: BaseException, current_step: str | None) -> str | None:
-    """Volume steps return the daemon reason via volume_step_detail. Other steps return
-    DEAD_DOCKER_SSH_SESSION_HINT on a dead Docker SSH session, else None."""
+    """Volume steps return the daemon reason via volume_step_detail; flatten_wait says whether its lock timed out.
+    Other steps return DEAD_DOCKER_SSH_SESSION_HINT on a dead Docker SSH session, else None."""
     if current_step in VOLUME_STEP_NAMES:
         return volume_step_detail(exc)
+    if current_step == "flatten_wait":
+        if isinstance(exc, FlattenLockTimedOut):
+            return FLATTEN_LOCK_TIMEOUT_STEP_DETAIL
+        return FLATTEN_WAIT_FAILED_STEP_DETAIL
     if isinstance(exc, CustomBuildFailed):
         return None
     if _is_dead_docker_ssh_session(exc):
