@@ -197,7 +197,7 @@ def test_it_runs_right_after_the_needrestart_guard_before_any_fatal_check(pipeli
 
 @pytest.mark.asyncio
 async def test_an_image_built_without_the_setup_script_installs_nothing(context_factory, mode, monkeypatch, tmp_path):
-    # the Dockerfile's empty placeholder, when a build does not pass the executor_setup context
+    # an empty script file (no image ships one since DAH-6980: a build without the executor_setup context fails)
     from neurons.validators.src.services.task.checks import sysbox_layer_reset
 
     (tmp_path / "nvidia_docker_sysbox_setup.sh").write_text("")
