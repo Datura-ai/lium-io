@@ -641,10 +641,6 @@ class Settings(BaseSettings):
     SPOT_IDLE_PAY_SECURE_DECISION_ENABLED: bool = Field(
         env="SPOT_IDLE_PAY_SECURE_DECISION_ENABLED", default=False
     )
-    # DAH-2621 RAM/VRAM gate. True: an unrented executor whose system RAM is below half its GPU VRAM forfeits
-    # the unrented incentive (stays active and rentable). False: the would-be exclusion is only logged
-    # (shadow), so the affected fleet is seen and providers are told before it is enforced.
-    ENABLE_UNRENTED_RAM_BELOW_VRAM_LIMIT: bool = Field(env="ENABLE_UNRENTED_RAM_BELOW_VRAM_LIMIT", default=False)
     # Spot rental incentive, independent of the flag above. True: a rented spot node the backend
     # lists in provider_spot_executor_ids earns rental incentive at 0.5 x what the same node would
     # earn rented as secure (0.5 = SPOT_RENTAL_INCENTIVE_FACTOR); a node that is spot as a
