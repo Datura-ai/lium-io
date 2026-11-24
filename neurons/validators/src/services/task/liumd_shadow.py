@@ -72,9 +72,6 @@ logger = logging.getLogger(__name__)
 
 LIUMD_SHADOW_EVENT = "[liumd_shadow] comparison"
 EVIDENCE_SHADOW_EVENT = "[liumd_evidence] shadow"
-# The validator's own thresholds on the evidence document; only ever logged (shadow).
-EVIDENCE_SPREAD_FAIL_MS = 5000
-EVIDENCE_WALL_CLOCK_MIN_MS = 150
 EVIDENCE_SOURCE_FIELDS: dict[str, tuple[str, ...]] = {
     "nvml": ("uuid", "pci", "model", "vram_mb"),
     "proc": ("uuid", "pci", "model"),
@@ -331,7 +328,13 @@ def _has_duplicates(values: list[str | None]) -> bool:
     return len(present) != len(set(present))
 
 
-def evaluate_evidence(evidence: Any, claimed_count: Any) -> dict[str, Any]:
+def evaluate_evidence(
+    evidence: Any,
+    claimed_count: Any,
+    *,
+    spread_fail_ms: int | None = None,
+    wall_clock_min_ms: int | None = None,
+) -> dict[str, Any]:
     """The validator's own verdict on the executor's evidence document: hard mismatches against the
     claim, duplicate cards, and the liumd timing floors. Defensive: junk reads as no evidence."""
     document = _as_dict(evidence)
@@ -413,10 +416,15 @@ def evaluate_evidence(evidence: Any, claimed_count: Any) -> dict[str, Any]:
         vendor = _as_text(_as_dict(sources.get("sysfs")).get("vendor"))
         if vendor is not None and vendor.lower() != EVIDENCE_SYSFS_VENDOR:
             add("sysfs_vendor_mismatch")
-    if spread is not None and spread > EVIDENCE_SPREAD_FAIL_MS:
-        add(f"spread_over_{EVIDENCE_SPREAD_FAIL_MS}ms")
+    if spread is not None and spread_fail_ms is not None and spread > spread_fail_ms:
+        add("spread_over_limit")
     # No timing sample (a single-card matmul) means the wall-clock floor has nothing to judge.
-    if wall is not None and (workers or has_timing) and wall < EVIDENCE_WALL_CLOCK_MIN_MS:
+    if (
+        wall is not None
+        and (workers or has_timing)
+        and wall_clock_min_ms is not None
+        and wall < wall_clock_min_ms
+    ):
         add("wall_clock_too_short")
 
     judged.update(
@@ -447,7 +455,12 @@ def _evidence_record(
     if not isinstance(evidence, dict) or not evidence:
         return None
     try:
-        judged = evaluate_evidence(evidence, _claimed_gpu_count(ctx))
+        judged = evaluate_evidence(
+            evidence,
+            _claimed_gpu_count(ctx),
+            spread_fail_ms=settings.VALIDATOR_LIUMD_EVIDENCE_SPREAD_MS,
+            wall_clock_min_ms=settings.VALIDATOR_LIUMD_EVIDENCE_WALL_CLOCK_MIN_MS,
+        )
     except Exception:  # noqa: BLE001 — malformed evidence never reaches the node's result
         return None
     return {**judged, "mode": settings.VALIDATOR_LIUMD_EVIDENCE_MODE}

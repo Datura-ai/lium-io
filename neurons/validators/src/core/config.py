@@ -373,6 +373,12 @@ class Settings(BaseSettings):
     VALIDATOR_LIUMD_EVIDENCE_MODE: Literal["off", "shadow", "warn", "enforce"] = Field(
         env="VALIDATOR_LIUMD_EVIDENCE_MODE", default="off"
     )
+    VALIDATOR_LIUMD_EVIDENCE_SPREAD_MS: int | None = Field(
+        env="VALIDATOR_LIUMD_EVIDENCE_SPREAD_MS", default=None
+    )
+    VALIDATOR_LIUMD_EVIDENCE_WALL_CLOCK_MIN_MS: int | None = Field(
+        env="VALIDATOR_LIUMD_EVIDENCE_WALL_CLOCK_MIN_MS", default=None
+    )
     # Use the full machine-scrape document returned by the same early `liumd run` instead of
     # running the Python machine scrape. Off: Python remains authoritative and the early run is
     # only compared in the shadow. On: a liumd document that cannot be read (unavailable, empty,

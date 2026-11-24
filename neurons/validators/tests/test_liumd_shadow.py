@@ -1366,22 +1366,22 @@ def test_a_source_that_disagrees_with_the_card_is_a_reason():
     assert "proc_model_mismatch" in judged["reasons"] and judged["would_fail"] is True
 
 
-def test_a_first_result_spread_over_five_seconds_is_a_reason():
+def test_a_first_result_spread_over_the_configured_limit_is_a_reason():
     cards = [
         _evidence_card(0, first=1_000),
-        _evidence_card(1, uuid="GPU-2", pci="0000:32:00.0", first=6_001),
+        _evidence_card(1, uuid="GPU-2", pci="0000:32:00.0", first=1_006),
     ]
 
-    judged = evaluate_evidence(_evidence(*cards, wall=10_000), 2)
+    judged = evaluate_evidence(_evidence(*cards, wall=10_000), 2, spread_fail_ms=5)
 
-    assert judged["first_result_spread_ms"] == 5_001
-    assert "spread_over_5000ms" in judged["reasons"] and judged["would_fail"] is True
+    assert judged["first_result_spread_ms"] == 6
+    assert "spread_over_limit" in judged["reasons"] and judged["would_fail"] is True
 
 
-def test_a_wall_clock_under_150ms_is_a_reason():
-    judged = evaluate_evidence(_evidence(_evidence_card(), wall=149), 1)
+def test_a_wall_clock_under_the_configured_floor_is_a_reason():
+    judged = evaluate_evidence(_evidence(_evidence_card(), wall=9), 1, wall_clock_min_ms=10)
 
-    assert judged["wall_clock_ms"] == 149
+    assert judged["wall_clock_ms"] == 9
     assert "wall_clock_too_short" in judged["reasons"] and judged["would_fail"] is True
 
 
@@ -1418,6 +1418,7 @@ async def test_evidence_that_would_fail_never_changes_the_result(
     keypair, monkeypatch, verifyx_service, gpu_steps, caplog
 ):
     monkeypatch.setattr(settings, "VALIDATOR_LIUMD_EVIDENCE_MODE", "shadow")
+    monkeypatch.setattr(settings, "VALIDATOR_LIUMD_EVIDENCE_WALL_CLOCK_MIN_MS", 150)
     fake = FakeLiumd(evidence=_evidence(_evidence_card(), wall=149))
 
     with caplog.at_level(logging.INFO, logger=liumd_shadow.__name__):
