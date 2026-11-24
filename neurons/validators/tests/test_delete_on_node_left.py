@@ -94,11 +94,13 @@ def _daemon_stub(
     container_pod: str | None = None,
     prev_owner: str | None = None,
     sticky_prev: bool = False,
+    kept_pod: str | None = None,
 ) -> Path:
     """A docker stub. Each file under containers/ is a container named as the file, holding "<id> <registration
     label> <pod label>": the pod's container (`cid`, labelled `container_owner` and `container_pod`, default
     `pod_id`) and its parked edit container `<name>__prev` (`pid`, labelled `prev_owner`). The kept container `kept1`
-    exists while its file does. A removal deletes each unless sticky. `inspect_fails` makes inspect fail as a daemon
+    (left registration, pod `kept_pod`, default `pod_id`) exists while its file does, listed when every label filter
+    matches. A removal deletes each unless sticky. `inspect_fails` makes inspect fail as a daemon
     error would, with the containers still there. Each file under volumes/ is a volume whose lines are its labels
     (`inuse` marks one a container still uses), inspected as "<pod id> <registration>" and removed by name."""
     log, containers, kept, volumes = (
@@ -106,7 +108,7 @@ def _daemon_stub(
     )
     volumes.mkdir(exist_ok=True)
     containers.mkdir(exist_ok=True)
-    kept.write_text("")
+    kept.write_text(f"io.lium.executor_id={LEFT_LABEL} io.lium.pod_id={pod_id if kept_pod is None else kept_pod}")
     name = f"pod_{pod_id}"
     for container_name, cid, owner, pod in [
         (name, "cid", container_owner, pod_id if container_pod is None else container_pod),
@@ -123,7 +125,8 @@ def _daemon_stub(
         f'echo "$*" >> {shlex.quote(str(log))}\n'
         'eval "last=\\${$#}"\n'
         'case "$1" in\n'
-        f'  ps) case "$*" in *label=*) [ -e {k} ] && echo kept1;; '
+        f'  ps) case "$*" in *label=*) [ -e {k} ] || exit 0; for a in "$@"; do case "$a" in label=*) '
+        f'case " $(cat {k}) " in *" ${{a#label=}} "*) ;; *) exit 0;; esac;; esac; done; echo kept1;; '
         f'*name=*) n=${{last#name=^}}; n=${{n%\\$}}; [ -e {cs}/"$n" ] && cut -d" " -f1 {cs}/"$n";; '
         f'*) for f in {cs}/*; do [ -e "$f" ] && cut -d" " -f1 "$f"; done; [ -e {k} ] && echo kept1;; esac; exit 0;;\n'
         + ("  inspect) exit 1;;\n" if inspect_fails else "")
@@ -254,6 +257,15 @@ def test_a_container_under_the_pods_name_labelled_for_another_pod_is_never_touch
     assert "rm" not in calls.replace("inspect", "")
 
 
+def test_a_kept_container_of_another_pod_under_the_pods_kept_name_is_never_touched(tmp_path):
+    # 2394-16: the left registration's label and the kept name's prefix alone do not make it this pod's
+    status, calls = _run(tmp_path, _payload(HOST_BOOT), kept_pod="another-pod")
+
+    assert status == 0
+    assert "kept1" not in "".join(line for line in calls.splitlines(True) if line.startswith("rm"))
+    assert (tmp_path / "kept").exists()
+
+
 @pytest.mark.parametrize("container_owner", [LEFT_LABEL, None])
 def test_the_left_registrations_parked_edit_container_goes_with_it(tmp_path, container_owner):
     # 2394-13: an edit parks the pod's container as <name>__prev; success means it is gone too
@@ -308,6 +320,64 @@ async def test_the_removal_waits_for_every_create_of_the_pod_and_cancels_none(do
     result = await asyncio.wait_for(delete, 5)
 
     assert isinstance(result, ContainerDeleted) and len(order) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("create_ends", [False, True], ids=["still-running", "ended-before-the-answer"])
+async def test_a_create_of_the_pod_registered_during_the_removal_is_never_answered_as_deleted(
+    docker_service, monkeypatch, create_ends
+):
+    # stand check 2394-10: a create of the pod that registers after the final wait, while the host command runs, may
+    # make its container after the removal; the delete then cannot say the node is clean
+    payload = _payload()
+    tracked = inflight_creates.track(payload.pod_id, (payload.miner_hotkey, payload.executor_id))
+    context = contextvars.Context()
+
+    async def a_create_registers_during_the_command(command: str):
+        context.run(tracked.__enter__)
+        if create_ends:
+            context.run(tracked.__exit__, None, None, None)
+        return _make_ssh_command_result(exit_status=0)
+
+    order = _wire_delete(docker_service, monkeypatch, a_create_registers_during_the_command)
+    try:
+        result = await _delete(docker_service, payload)
+    finally:
+        if not create_ends:
+            context.run(tracked.__exit__, None, None, None)
+
+    assert len(order) == 1  # the removal ran
+    assert isinstance(result, FailedContainerRequest)
+
+
+@pytest.mark.asyncio
+async def test_a_create_of_the_pod_registered_right_after_the_final_wait_is_never_answered_as_deleted(
+    docker_service, monkeypatch
+):
+    payload = _payload()
+    order = _wire_delete(docker_service, monkeypatch, _host_exits(0))
+    tracked = inflight_creates.track(payload.pod_id, ("miner-b", "replacement-executor"))
+    context = contextvars.Context()
+    wait = inflight_creates.wait_for_no_create
+    waits = 0
+
+    async def the_final_wait_passes_then_a_create_registers(pod_id, timeout):
+        nonlocal waits
+        waits += 1
+        passed = await wait(pod_id, timeout)
+        if waits == 2:
+            context.run(tracked.__enter__)
+        return passed
+
+    monkeypatch.setattr(inflight_creates, "wait_for_no_create", the_final_wait_passes_then_a_create_registers)
+    try:
+        result = await _delete(docker_service, payload)
+    finally:
+        context.run(tracked.__exit__, None, None, None)
+
+    assert waits == 2
+    assert isinstance(result, FailedContainerRequest)
+    assert len(order) <= 1
 
 
 # the answer deadline the test shrinks it to, and the bounds the host command and the dial keep inside it

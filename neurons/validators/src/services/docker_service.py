@@ -1857,6 +1857,10 @@ class _CreatesOfThePodStillRunning(RuntimeError):
     """A create of the moved pod was still running when the node-left delete's wait ran out."""
 
 
+class _CreateOfThePodDuringRemoval(RuntimeError):
+    """A create of the moved pod registered after the final wait: it may make its container after the removal."""
+
+
 def _executor_label(payload) -> str:
     # the registration pair, as executor_key: one executor id can be registered by two miners on one daemon
     return f"{payload.miner_hotkey}:{payload.executor_id}"
@@ -1934,7 +1938,9 @@ def _node_left_delete_command(payload: ContainerDeleteOnNodeLeftRequest) -> str:
         ]
     lines += [
         f"kept=$(/usr/bin/docker ps -aq --no-trunc --filter name=^{shlex.quote(_kept_container_prefix(payload.container_name))} "
-        f"--filter label={shlex.quote(f'{LIUM_EXECUTOR_ID_LABEL}={_executor_label(payload)}')}) || exit 1",
+        f"--filter label={shlex.quote(f'{LIUM_EXECUTOR_ID_LABEL}={_executor_label(payload)}')} "
+        # label filters all apply: a kept name's prefix and the registration alone do not make it this pod's
+        f"--filter label={shlex.quote(f'{LIUM_POD_ID_LABEL}={payload.pod_id}')}) || exit 1",
         'set -- $ids $kept',
         '[ $# -eq 0 ] || /usr/bin/docker rm -fv "$@" >/dev/null 2>&1',
         # done only when a listing that succeeded shows none of the selected containers
@@ -2244,12 +2250,16 @@ class _EditSwap:
             # Both exist: the earlier edit's replacement is the pod now and its cleanup did not run;
             # the leftover parked one is stale and must not block the rename. Its layer may hold renter
             # files (the earlier edit could not rename it to the kept name): then it stays and the edit stops.
-            if not await self._layer_safe_to_remove(ids_by_name.get(parked) or parked):
+            # removed by the ID whose label and layer were checked: by now the name may be a replacement's
+            parked_id = ids_by_name.get(parked)
+            if parked_id is None:
+                raise Exception("[park_current_container] docker ps listed a parked container without its ID; the pod was left as it was")
+            if not await self._layer_safe_to_remove(parked_id):
                 raise Exception(
                     f"[park_current_container] a parked container from an earlier edit ({parked}) holds renter "
                     "files under the volume path; the pod was left as it was"
                 )
-            await self._run(f"/usr/bin/docker rm -fv {shlex.quote(parked)} 2>/dev/null || true")
+            await self._run(f"/usr/bin/docker rm -fv {shlex.quote(parked_id)} 2>/dev/null || true")
         if recover_kept:
             kept.remove(recover_kept)
         for leftover in list(kept):
@@ -2602,6 +2612,8 @@ class _InflightCreateRegistry:
         self._held: contextvars.ContextVar[dict[str, ExecutorKey]] = contextvars.ContextVar(
             "inflight_create_held_pods", default={}
         )
+        # per pod, set by each create that registers while watched (`watch_registrations`)
+        self._watchers: dict[str, list[asyncio.Event]] = {}
 
     @contextlib.contextmanager
     def track(self, pod_id: str, executor: ExecutorKey) -> Iterator[None]:
@@ -2610,6 +2622,8 @@ class _InflightCreateRegistry:
             yield
             return
         token = self._held.set({**held, pod_id: executor})
+        for registered in self._watchers.get(pod_id, ()):
+            registered.set()
         key = (pod_id, executor)
         create = self._creates.setdefault(key, _InflightCreate())
         create.running += 1
@@ -2621,6 +2635,19 @@ class _InflightCreateRegistry:
             if create.running <= 0:
                 self._creates.pop(key, None)
                 create.done.set()
+
+    @contextlib.contextmanager
+    def watch_registrations(self, pod_id: str) -> Iterator[asyncio.Event]:
+        """An event set when any create of the pod registers inside the block."""
+        registered = asyncio.Event()
+        self._watchers.setdefault(pod_id, []).append(registered)
+        try:
+            yield registered
+        finally:
+            watchers = self._watchers[pod_id]
+            watchers.remove(registered)
+            if not watchers:
+                del self._watchers[pod_id]
 
     def _matching(self, pod_id: str, executor: ExecutorKey | None) -> list[_InflightCreate]:
         executor = executor or self._held.get().get(pod_id)
@@ -2669,8 +2696,10 @@ class _InflightCreateRegistry:
         """Exactly one create for this pod is running in this process (the caller's), on any registration.
 
         Its callers remove what is named by the pod alone (the container, its volume, build artifacts), so a create
-        of the pod on another registration, which may share the daemon, keeps them from it too (DAH-6531)."""
-        return sum(create.running for (pod, _), create in self._creates.items() if pod == pod_id) == 1
+        of the pod on another registration, which may share the daemon, keeps them from it too (DAH-6531). A caller
+        that holds no create of the pod counts every one as another's."""
+        running = sum(create.running for (pod, _), create in self._creates.items() if pod == pod_id)
+        return running == (1 if pod_id in self._held.get() else 0)
 
     async def wait_until_done(self, pod_id: str, timeout: float, executor: ExecutorKey | None = None) -> bool:
         """Wait for the create(s) on this pod to leave. False when the wait ran out."""
@@ -6073,7 +6102,10 @@ class DockerService:
                     if check.exit_status in (124, 137):
                         # the host's timeout cut the check short: Docker is wedged, so the sweep ends here
                         raise TimeoutError(f"the check of leftover {own_id} hit the host timeout")
-                    if check.exit_status == 0:
+                    # read after the check: another create of the pod (any registration) may take the name meanwhile
+                    if check.exit_status == 0 and inflight_creates.is_only_create_on_any_registration(
+                        pod_name.removeprefix(POD_CONTAINER_PREFIX)
+                    ):
                         marked = _MarkOwnRemovalsOnSubmit(ssh_client, [own_id])
                         rm_timeout = _CUSTOMER_CONTAINER_REMOVAL_TIMEOUT_SECONDS
                         # asyncssh's timeout= bounds only the command, not its channel open
@@ -15388,6 +15420,9 @@ class DockerService:
         except _CreatesOfThePodStillRunning:
             log.error("Creates of the moved pod were still running; nothing deleted on the node it left")
             return self._failed_delete(payload, msg="Creates of the pod were still running; nothing deleted")
+        except _CreateOfThePodDuringRemoval:
+            log.error("A create of the moved pod started during the removal on the node it left")
+            return self._failed_delete(payload, msg="A create of the pod started during the removal; not confirmed deleted")
         except (AttestationError, RentalDockerConnectionError) as exc:
             log.error("Delete for the node a moved pod left could not connect", error=str(exc))
             return self._failed_delete(payload, msg=f"Could not connect: {exc}")
@@ -15419,7 +15454,12 @@ class DockerService:
         remaining = max(0.0, creates_by - asyncio.get_running_loop().time())
         if not await inflight_creates.wait_for_no_create(pod_id, remaining):
             raise _CreatesOfThePodStillRunning(pod_id)
-        return await _run_with_host_timeout(ssh_client, command, _PARK_COMMAND_TIMEOUT_SECONDS)
+        # no await between the wait and the watch: every create registering after the wait is seen
+        with inflight_creates.watch_registrations(pod_id) as registered:
+            result = await _run_with_host_timeout(ssh_client, command, _PARK_COMMAND_TIMEOUT_SECONDS)
+        if registered.is_set() or inflight_creates.is_running(pod_id):
+            raise _CreateOfThePodDuringRemoval(pod_id)
+        return result
 
     async def _stop_create_before_delete(self, payload: ContainerDeleteRequest, executor_info: ExecutorSSHInfo):
         """The delete's steps before its teardown: the refusal to answer, or None."""

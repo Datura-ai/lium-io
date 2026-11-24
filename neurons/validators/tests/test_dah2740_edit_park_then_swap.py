@@ -675,7 +675,9 @@ async def test_a_leftover_parked_container_next_to_the_pod_is_removed_before_par
     result = await _run(svc, payload)
 
     assert isinstance(result, ContainerCreated)
-    assert ssh.commands.index(f"/usr/bin/docker rm -fv {prev} 2>/dev/null || true") < ssh.commands.index(f"/usr/bin/docker rename {name} {parked}")
+    # stand check 2394-18: by the ID whose label and layer were checked; the name may be a foreign replacement's by now
+    assert ssh.commands.index(f"/usr/bin/docker rm -fv id-{prev} 2>/dev/null || true") < ssh.commands.index(f"/usr/bin/docker rename {name} {parked}")
+    assert not any(c.startswith(f"/usr/bin/docker rm -fv {prev}") for c in ssh.commands)
 
 
 def test_the_cycle_cleanup_protects_the_parked_twin_of_every_rented_pod():

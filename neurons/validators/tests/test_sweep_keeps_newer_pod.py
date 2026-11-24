@@ -368,3 +368,55 @@ async def test_a_host_timeout_of_the_check_or_removal_ends_the_sweep_before_any_
     assert retry_ssh_mock.await_args_list == []
     assert own_sweep_removals.sent_rm_for(OWN_ID) is (stalled == "rm")  # a removal that may still complete stays marked
     own_sweep_removals.clear()
+
+
+@pytest.mark.parametrize(
+    "others",
+    [
+        [("miner-b", "exec-b")],  # another registration's create of the pod
+        [("miner-a", "exec-a"), ("miner-a", "exec-a")],  # this registration's create, registered twice
+    ],
+    ids=["other-registration", "same-registration-twice"],
+)
+@pytest.mark.parametrize("caller_tracked", [True, False])
+@pytest.mark.asyncio
+async def test_the_sweep_keeps_the_pods_leftover_while_another_create_of_the_pod_runs(
+    retry_ssh_mock, others, caller_tracked
+):
+    # stand check 2394-19: the leftover is named by the pod alone, so another live create of the pod may be about to
+    # take it; only the one create of the pod (the caller's, if tracked) may remove it
+    import contextlib
+    import contextvars
+
+    registry = ds_module.inflight_creates
+    own_sweep_removals.clear()
+    ssh_client, seen = _sweep_ssh(f"pod_target {OWN_ID}\n", {})
+    tracked = [(contextvars.Context(), registry.track("target", executor)) for executor in others]
+    for ctx, cm in tracked:  # each in its own context, as separate creates are
+        ctx.run(cm.__enter__)
+    try:
+        with registry.track("target", ("miner-a", "exec-a")) if caller_tracked else contextlib.nullcontext():
+            removed = await _sweep_service().clean_existing_containers(
+                ssh_client=ssh_client, default_extra={}, pod_name="pod_target", active_container_names=[], pod_owner=OWNER
+            )
+    finally:
+        for ctx, cm in tracked:
+            ctx.run(cm.__exit__, None, None, None)
+
+    assert "rm" not in [kind for kind, _ in seen]
+    assert not own_sweep_removals.sent_rm_for(OWN_ID)
+    assert removed == []
+    own_sweep_removals.clear()
+
+
+@pytest.mark.asyncio
+async def test_the_sweep_of_the_only_create_of_the_pod_removes_its_leftover(retry_ssh_mock):
+    own_sweep_removals.clear()
+    ssh_client, seen = _sweep_ssh(f"pod_target {OWN_ID}\n", {})
+    with ds_module.inflight_creates.track("target", ("miner-a", "exec-a")):
+        removed = await _sweep_service().clean_existing_containers(
+            ssh_client=ssh_client, default_extra={}, pod_name="pod_target", active_container_names=[], pod_owner=OWNER
+        )
+
+    assert removed == ["pod_target"] and own_sweep_removals.sent_rm_for(OWN_ID)
+    own_sweep_removals.clear()
