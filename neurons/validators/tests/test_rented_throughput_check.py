@@ -146,6 +146,7 @@ def flags(*, read_pressure: bool = True, enforce_pressure: bool = False, reachab
         RENTED_THROUGHPUT_BUSY_MBPS=200.0,
         RENTED_THROUGHPUT_DISK_BUSY_MB_PER_S=200.0,
         CONTAINER_DOWNLOAD_SPEED_MIN_MBPS=10.0,
+        CONTAINER_SPEED_FLEET_RULE_ENFORCED=True,
         CONTAINER_UPLOAD_SPEED_MIN_MBPS=10.0,
         DISK_PRESSURE_CHECK_ENABLED=read_pressure,
         DISK_PRESSURE_GATE_ENFORCEMENT_ENABLED=enforce_pressure,
@@ -1438,12 +1439,18 @@ async def test_a_rented_pod_slow_to_pypi_only_on_this_providers_path_fails():
         assert net == "pass"
 
 
-@pytest.mark.parametrize("answer, recorded", [(SLOW_NET, True), (BUSY_NET, False), (NO_COUNTERS, False)])
+# the probe stopped before it reported the upload endpoint
+PARTIAL_NET = "".join(ln for ln in SLOW_NET.splitlines(keepends=True) if "ep=cf_up" not in ln)
+
+
+@pytest.mark.parametrize(
+    "answer, recorded", [(SLOW_NET, True), (BUSY_NET, False), (NO_COUNTERS, False), (PARTIAL_NET, False)]
+)
 async def test_only_a_reading_this_check_judges_goes_into_the_fleet_window(answer, recorded):
-    # lio#2411: a slow reading on a busy or unmeasured host is no verdict here, so it never speaks for the endpoint
+    # a slow reading on a busy, unmeasured or partly measured host is no verdict here, so it never speaks for the endpoint
     with flags():
         fleet = FleetRedis()
         ctx, _ = make_ctx(answer, redis=fleet)
         await RentedThroughputCheck()._measure_and_judge(ctx)
-        mine = [m for ms in fleet.fleet.values() for _, m in ms if m.startswith(f"{ctx.miner_hotkey}|")]
+        mine = [m for ms in fleet.fleet.values() for _, m in ms if json.loads(m)[0] == ctx.miner_hotkey]
         assert bool(mine) is recorded

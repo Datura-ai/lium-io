@@ -629,11 +629,14 @@ class RentedThroughputCheck:
         # the fleet window holds only readings this check judges: an unsure or incomplete measurement is never a pass
         # or a fail here, and _excuse turns a slow reading under renter load into no verdict
         loaded = net_load(own) or net_load(maybe)
-        judged_here = [] if net_unsure or net_incomplete else [r for r in endpoints if not (loaded and _is_slow(r))]
+        partial = any(r.error == "no_output" for r in endpoints)  # the probe died before reporting every endpoint
+        judged_here = (
+            [] if net_unsure or net_incomplete or partial else [r for r in endpoints if not (loaded and _is_slow(r))]
+        )
         judged = await ContainerDownloadSpeedCheck()._judge(ctx, endpoints, fleet=judged_here)
         if judged.is_failing:
             net = "fail"
-        elif any(r.error == "no_output" for r in endpoints):
+        elif partial:
             # the fetch container did not start or died before reporting: nothing measured, no strike
             net = "inconclusive"
         elif judged.has_no_verdict:

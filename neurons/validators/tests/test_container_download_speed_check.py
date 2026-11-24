@@ -91,6 +91,11 @@ class FakeRedis:
         return -1 if key in self.store else -2
 
 
+def member(hotkey: str, uuid: str, at: float, bad: int) -> str:
+    """One fleet-window entry as the check writes it."""
+    return json.dumps([hotkey, uuid, round(at, 3), bad])
+
+
 class FleetRedis(FakeRedis):
     """FakeRedis with the endpoint fleet window, preloaded with other providers' readings."""
 
@@ -100,7 +105,7 @@ class FleetRedis(FakeRedis):
         for endpoint, (slow, total) in slow_share.items():
             for i in range(total):
                 self.fleet.setdefault(endpoint, []).append(
-                    (Clock.now - 60, f"5Other{i % 7}|node-{i}|{Clock.now - 60:.3f}|{int(i < slow)}")
+                    (Clock.now - 60, member(f"5Other{i % 7}", f"node-{i}", Clock.now - 60, int(i < slow)))
                 )
 
     async def record_endpoint_speed(self, endpoint, member, now, window_seconds):
@@ -118,11 +123,12 @@ class Clock:
 
 
 @contextmanager
-def flags(*, reachable=True):
+def flags(*, reachable=True, enforced=True):
     fake = SimpleNamespace(
         CONTAINER_DOWNLOAD_SPEED_CHECK_ENABLED=True,
         CONTAINER_DOWNLOAD_SPEED_MIN_MBPS=10.0,
         CONTAINER_UPLOAD_SPEED_MIN_MBPS=10.0,
+        CONTAINER_SPEED_FLEET_RULE_ENFORCED=enforced,
         CONTAINER_DOWNLOAD_SPEED_INTERVAL_HOURS=6.0,
     )
     clock = Clock()
@@ -244,8 +250,8 @@ async def test_one_slow_cdn_that_only_this_provider_reads_slow_fails_the_node():
         assert second.passed is False and second.event.reason_code == Msg.SLOW.reason
         assert [r["endpoint"] for r in second.event.what_we_saw["endpoints"] if r["mbps"] < 10] == ["pypi"]
         # this node's own readings went into the window under its hotkey
-        mine = [m for _, m in redis.fleet["pypi"] if m.startswith(f"{ctx.miner_hotkey}|")]
-        assert len(mine) == 2 and all(m.endswith("|1") for m in mine)
+        mine = [json.loads(m) for _, m in redis.fleet["pypi"] if json.loads(m)[0] == ctx.miner_hotkey]
+        assert len(mine) == 2 and all(m[3] == 1 for m in mine)
 
 
 async def test_the_fleet_control_leaves_out_this_providers_own_nodes():
@@ -342,10 +348,9 @@ async def test_slow_then_fast_resets():
     [
         line("cf_up", 0, 0.1, 1, "wget: server returned error: HTTP/1.1 403 Forbidden"),
         line("cf_up", 0, 0.1, 1, "wget: server returned error: HTTP/1.1 429 Too Many Requests"),
-        UP,
     ],
 )
-async def test_fast_downloads_clear_a_failure_when_the_upload_receiver_refuses(upload):
+async def test_an_upload_the_receiver_refuses_is_inconclusive_and_keeps_the_streak(upload):
     fast_downloads = RENTALS + line("pypi", CAP_BYTES, 1.0, 0) + line("hf", CAP_BYTES, 1.0, 0) + upload
     with flags() as clock:
         ctx, runner, redis = make_ctx(SLOW, fast_downloads)
@@ -354,8 +359,82 @@ async def test_fast_downloads_clear_a_failure_when_the_upload_receiver_refuses(u
         assert json.loads(next(iter(redis.store.values())))["failures_in_a_row"] == 1
         clock.now += 31 * 60
         res = await check.run(ctx)
+    assert res.passed and res.event.reason_code == Msg.SLOW_ONCE.reason
+    saved = json.loads(next(iter(redis.store.values())))
+    assert saved["failures_in_a_row"] == 1 and saved["measured"] is False
+
+
+async def test_fast_downloads_and_upload_clear_a_failure():
+    with flags() as clock:
+        ctx, runner, redis = make_ctx(SLOW, FAST)
+        check = ContainerDownloadSpeedCheck()
+        await check.run(ctx)
+        clock.now += 31 * 60
+        res = await check.run(ctx)
     assert res.passed and res.event.reason_code == Msg.OK.reason
     assert json.loads(next(iter(redis.store.values())))["failures_in_a_row"] == 0
+
+
+@pytest.mark.parametrize(
+    "stderr",
+    ["wget: error getting response: Connection reset by peer", "wget: can't connect to remote host: Connection refused"],
+)
+async def test_an_upload_error_is_judged_by_the_fleet_and_recorded_in_its_window(stderr):
+    cut_up = FAST.replace(UP, line("cf_up", 0, 0.2, 1, stderr))
+    with flags():
+        # the other providers' uploads go through: this node's failed upload is its own
+        fleet = FleetRedis(pypi=(0, 30), hf=(0, 30), cf_up=(0, 30))
+        ctx, _, _ = make_ctx(cut_up, redis=fleet)
+        res = await ContainerDownloadSpeedCheck().run(ctx)
+        assert res.event.reason_code == Msg.SLOW_ONCE.reason
+        assert json.loads(fleet.fleet["cf_up"][-1][1])[3] == 1
+    with flags():
+        # a quarter of the fleet fails the upload too: the receiver's doing, no verdict
+        ctx, _, redis = make_ctx(cut_up, redis=FleetRedis(pypi=(0, 30), hf=(0, 30), cf_up=(10, 30)))
+        res = await ContainerDownloadSpeedCheck().run(ctx)
+        assert res.passed and res.event.reason_code == Msg.UNMEASURED.reason
+        assert json.loads(next(iter(redis.store.values())))["failures_in_a_row"] == 0
+
+
+async def test_a_window_entry_in_another_format_is_skipped_not_fatal():
+    with flags():
+        fleet = FleetRedis(pypi=(0, 30), hf=(0, 30), cf_up=(0, 30))
+        for junk in ("5Old|node|1790000000.000|1", "not json", json.dumps({"a": 1}), json.dumps([1, 2])):
+            fleet.fleet["pypi"].append((Clock.now - 30, junk))
+        ctx, _, _ = make_ctx(PYPI_ONLY_SLOW, redis=fleet)
+        res = await ContainerDownloadSpeedCheck().run(ctx)
+    assert res.event.reason_code == Msg.SLOW_ONCE.reason
+
+
+async def test_a_uuid_with_any_character_round_trips_through_the_window():
+    with flags():
+        fleet = FleetRedis()
+        ctx, _, _ = make_ctx(PYPI_ONLY_SLOW, redis=fleet)
+        ctx.executor.uuid = 'odd|uuid"]'
+        await ContainerDownloadSpeedCheck().run(ctx)
+    assert json.loads(fleet.fleet["pypi"][-1][1])[1] == 'odd|uuid"]'
+
+
+async def test_record_only_logs_what_the_fleet_rule_would_fail_and_scores_as_before(caplog):
+    cut_up = FAST.replace(UP, line("cf_up", 0, 0.2, 1, "wget: error getting response: Connection reset by peer"))
+    for stdout in (PYPI_ONLY_SLOW, cut_up):
+        with flags(enforced=False):
+            fleet = FleetRedis(pypi=(0, 30), hf=(0, 30), cf_up=(0, 30))
+            ctx, _, redis = make_ctx(stdout, redis=fleet)
+            caplog.clear()
+            with caplog.at_level("INFO"):
+                res = await ContainerDownloadSpeedCheck().run(ctx)
+            assert res.passed and res.event.reason_code == Msg.OK.reason
+            assert json.loads(next(iter(redis.store.values())))["failures_in_a_row"] == 0
+            logged = next(r for r in caplog.records if "CONTAINER_DOWNLOAD_SPEED" in r.getMessage())
+            assert logged.msg.extra["would_fail"] == ["pypi" if stdout is PYPI_ONLY_SLOW else "cf_up"]
+            # the readings still go into the window, so the rule can be read before it is enforced
+            assert json.loads(fleet.fleet["pypi"][-1][1])[0] == ctx.miner_hotkey
+    with flags(enforced=False):
+        # the rule that was already enforced (every download slow) still is
+        ctx, _, _ = make_ctx(SLOW)
+        res = await ContainerDownloadSpeedCheck().run(ctx)
+        assert res.event.reason_code == Msg.SLOW_ONCE.reason
 
 
 async def test_endpoint_unreachable_counts_only_when_the_validator_reaches_it():
@@ -500,13 +579,13 @@ def test_the_upload_body_has_no_nul_bytes(tmp_path):
 
 
 async def test_the_fleet_control_counts_each_other_node_once_by_its_latest_reading():
-    # lio#2411: 3 slow nodes re-read every retry (6 readings each) outnumbered 30 fast nodes read once and excused PyPI
+    # each other node counts once, by its latest reading in the window
     with flags():
         fleet = FleetRedis(pypi=(0, 30), hf=(0, 30), cf_up=(0, 30))
         for n in range(3):
             for k in range(6):
                 at = Clock.now - 3000 + k * 300
-                fleet.fleet["pypi"].append((at, f"5Slow|slow-{n}|{at:.3f}|1"))
+                fleet.fleet["pypi"].append((at, member("5Slow", f"slow-{n}", at, 1)))
         ctx, _, _ = make_ctx(PYPI_ONLY_SLOW, redis=fleet)
         res = await ContainerDownloadSpeedCheck().run(ctx)
         assert res.event.reason_code == Msg.SLOW_ONCE.reason
@@ -514,7 +593,7 @@ async def test_the_fleet_control_counts_each_other_node_once_by_its_latest_readi
         # a node that read slow and then fast counts as fast
         fleet = FleetRedis(pypi=(10, 30), hf=(0, 30), cf_up=(0, 30))
         for i in range(10):
-            fleet.fleet["pypi"].append((Clock.now - 30, f"5Other{i % 7}|node-{i}|{Clock.now - 30:.3f}|0"))
+            fleet.fleet["pypi"].append((Clock.now - 30, member(f"5Other{i % 7}", f"node-{i}", Clock.now - 30, 0)))
         ctx, _, _ = make_ctx(PYPI_ONLY_SLOW, redis=fleet)
         res = await ContainerDownloadSpeedCheck().run(ctx)
         assert res.event.reason_code == Msg.SLOW_ONCE.reason
