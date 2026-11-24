@@ -534,7 +534,7 @@ async def test_a_slow_dockerd_keeps_the_park_within_one_wait(svc, monkeypatch):
     ssh = _ssh_recording(stop_exit=1)
     inner_run, inner_open = ssh.run, ssh.create_process
     direct_kill = DockerCommand.kill_container_processes(_kept(payload))
-    host_timeouts = []
+    host_timeouts, rename_back_timeouts = [], []
 
     async def no_exit_event(cmd, *args, **kwargs):
         if cmd.startswith("/usr/bin/docker kill"):
@@ -551,6 +551,8 @@ async def test_a_slow_dockerd_keeps_the_park_within_one_wait(svc, monkeypatch):
             host_timeouts.append(int(shlex.split(command)[3]))
         if "{{.State.Running}}" in inner:
             clock[0] += 12  # dockerd answers each read late, still "running"
+        if inner.startswith("/usr/bin/docker rename kept_unmounted_"):
+            rename_back_timeouts.append(int(shlex.split(command)[3]))
         return await inner_open(command)
 
     ssh.run = no_exit_event
@@ -562,6 +564,8 @@ async def test_a_slow_dockerd_keeps_the_park_within_one_wait(svc, monkeypatch):
     # the direct kill comes first, then reads that each end by the one 30 s budget; none starts past it
     # (the last entry is the park's own final read before it decides whether to rename back: past the budget, 1 s)
     assert host_timeouts == [30, 30, 18, 6, 1]
+    # the rename back is a write: cut short after dockerd applied it, the restore would remove the renter's pod
+    assert rename_back_timeouts == [60]
     assert isinstance(result, FailedContainerRequest) and result.failure_step == "park_current_container"
 
 

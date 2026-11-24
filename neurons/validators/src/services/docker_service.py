@@ -2187,8 +2187,9 @@ class _EditSwap:
             left = _seconds_left(self._kill_deadline) if self._kill_deadline is not None else None
             running = await self._run(f"/usr/bin/docker inspect -f '{{{{.State.Running}}}}' {shlex.quote(parked)}", left)
             if running.exit_status == 0 and (running.stdout or "").strip() == "true":
+                # a write keeps the full timeout: cut short after dockerd applied it, the restore would remove the pod
                 renamed_back = await self._run(
-                    f"/usr/bin/docker rename {shlex.quote(parked)} {shlex.quote(self.container_name)}", left
+                    f"/usr/bin/docker rename {shlex.quote(parked)} {shlex.quote(self.container_name)}"
                 )
                 if renamed_back.exit_status == 0:
                     self.parked_name = None
