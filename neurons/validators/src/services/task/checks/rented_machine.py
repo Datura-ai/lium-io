@@ -43,13 +43,13 @@ from ..messages import PortCountMessages, TenantEnforcementMessages as Msg
 from ..messages import render_message
 from ..pipeline import Check, CheckResult, Context
 from . import port_connectivity
+from .gpu_fault_probe import forget_unknown_streak
 from .gpu_usage import _fillers_off_their_image
 from .port_connectivity import PortConnectivityCheck
 from .provider_maintenance import maintenance_failure, maintenance_window_at_cycle_start
 from .rental_owner import rental_of_this_node
 from .task_time import task_seconds_left
 from .port_count import (
-    hidden_from_renters_text,
     port_count_below_listing_floor,
     port_floor_what,
     split_port_shortfall,
@@ -347,6 +347,10 @@ class TenantEnforcementCheck:
         closed_pod_ids: set[str] = set()
 
         def with_pod_states(result: CheckResult) -> CheckResult:
+            if result.updates.get("rented") is not False:
+                # the run ends here as rented and never reaches the kernel-fault probe, so the no-verdicts before
+                # and after it are not in a row. A stale-pod run goes on as idle (rented=False) and is probed: no reset.
+                forget_unknown_streak(ctx)
             return _with_pod_states(result, ctx, rented_pods, state_by_pod_id)
 
         # DAH-4709: inside the window every pod's state is still read for the backend, but a pod that is down
@@ -490,7 +494,7 @@ class TenantEnforcementCheck:
                     # Every listed pod is stale here (the check above): the floor applies to an idle node.
                     port_count_below_floor = port_count_below_listing_floor(ctx.state)
                     # DAH-3698 (owner rule): only a rented split node is exempt from its per-split ports, so a
-                    # node whose every listed pod is stale is idle and needs them, with or without the floor flag
+                    # node whose every listed pod is stale is idle and needs them
                     split_short = split_port_shortfall(ctx.state)
                     reprobed: dict[str, Any] = {}
                     if split_short is not None:
@@ -525,10 +529,7 @@ class TenantEnforcementCheck:
                                 updates={"default_extra": extra, "rented": False, "ssh_pub_keys": None, **reprobed},
                             )
                         )
-                    if (
-                        port_count_below_floor is not None
-                        and settings.ENFORCE_PORT_FLOOR_ON_STALE_POD
-                    ):
+                    if port_count_below_floor is not None:
                         event = render_message(
                             PortCountMessages.INSUFFICIENT_PORTS,
                             ctx=ctx,
@@ -543,19 +544,10 @@ class TenantEnforcementCheck:
                                 updates={"default_extra": extra, "rented": False, "ssh_pub_keys": None},
                             )
                         )
-                    impact = None
-                    if port_count_below_floor is not None:
-                        stale_what["port_floor"] = port_floor_what(ctx.state, port_count_below_floor)
-                        impact = (
-                            f"{hidden_from_renters_text(port_count_below_floor)}; "
-                            "the port floor applied only while the pod was listed"
-                        )
                     event = render_message(
                         Msg.STALE_POD_NOT_RUNNING,
                         ctx=ctx,
                         check_id=self.check_id,
-                        severity="warning" if port_count_below_floor is not None else None,
-                        impact=impact,
                         what=stale_what,
                         extra=extra,
                     )
@@ -567,6 +559,9 @@ class TenantEnforcementCheck:
                                 "default_extra": extra,
                                 "rented": False,
                                 "ssh_pub_keys": None,
+                                # a later halt judges only a fresher rental read, never this listing twice (a
+                                # second answer could differ)
+                                "rentals_judged_closed": ctx.state.rented_data,
                                 **reprobed,
                             },
                         )
@@ -864,6 +859,30 @@ class HostGpuContainerFailure(BaseModel):
     stderr_tail: str
     stdout_tail: str
 
+
+
+class RentedSinceStartCheck:
+    """DAH-5933 review, fast path: the rented halt again after a check that re-reads the rentals. PortCountCheck and
+    CapabilityCheck can find a customer pod that started during the run and put it in the snapshot; the halt then
+    handles that rental before `POST /verify` or VerifyX puts load on the node. A node still idle passes, and so does
+    the same snapshot an earlier halt judged all closed, until a fresher rental read lists a pod."""
+
+    check_id = TenantEnforcementCheck.check_id
+    replays_after_session_drop = TenantEnforcementCheck.replays_after_session_drop
+    fatal = True
+
+    def __init__(self, halt: TenantEnforcementCheck):
+        self.halt = halt
+
+    async def run(self, ctx: Context) -> CheckResult:
+        rented_executor = rental_of_this_node(ctx)
+        # the same snapshot an earlier halt judged all closed is not judged again; a fresher rental read is
+        if rented_executor and rented_executor.pods and ctx.state.rented_data is not ctx.rentals_judged_closed:
+            return await self.halt.run(ctx)
+        event = render_message(
+            Msg.STILL_NOT_RENTED, ctx=ctx, check_id=self.check_id, what={"executor_uuid": ctx.executor.uuid}
+        )
+        return CheckResult(passed=True, event=event)
 
 async def _host_gpu_container_failure(
     ctx: Context, pod_status: str | None

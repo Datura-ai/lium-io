@@ -9,5 +9,8 @@ TASK_TIMEOUT_MARGIN_SECONDS = 120
 
 
 def task_seconds_left(ctx: Context) -> float:
-    """Seconds before the executor task is cancelled."""
-    return settings.JOB_TIME_OUT - TASK_TIMEOUT_MARGIN_SECONDS - (time.monotonic() - ctx.started_at_monotonic)
+    """Seconds before the executor task is cancelled: by its own timeout, or by an express recheck's earlier deadline."""
+    left = settings.JOB_TIME_OUT - TASK_TIMEOUT_MARGIN_SECONDS - (time.monotonic() - ctx.started_at_monotonic)
+    if ctx.deadline_monotonic is None:
+        return left
+    return min(left, ctx.deadline_monotonic - time.monotonic())

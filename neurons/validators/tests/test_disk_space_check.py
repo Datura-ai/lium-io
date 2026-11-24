@@ -358,3 +358,45 @@ async def test_a_failed_disk_floor_names_the_measured_and_required_value(context
     result = await DiskSpaceCheck().run(ctx)
 
     assert result.event.remediation.startswith(measured)
+
+
+_KEPT_POD = "11111111-2222-3333-4444-555555555555"
+
+
+def _kept_state(utilization: float, free_gb: float, by_volume: dict | None, kept_ids: list[str]):
+    hard_disk = {"utilization": utilization, "free": free_gb * KB_PER_GB, "total": 200 * KB_PER_GB}
+    if by_volume is not None:
+        hard_disk["by_volume"] = by_volume
+    rented_data = RentedExecutorsResponse(executors={}, banned_guids=[], retained_volume_pod_ids=kept_ids)
+    return build_state(specs={"hard_disk": hard_disk}, rented_data=rented_data)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "utilization, free_gb, by_volume, kept_ids, reason",
+    [
+        # 30 GB of a 200 GB disk is the stopped renter's kept volume: 95% full is 80% without it
+        (95, 60, {f"volume_{_KEPT_POD}": 30 * KB_PER_GB}, [_KEPT_POD], Msg.OK.reason),
+        # no kept volume listed
+        (95, 60, {f"volume_{_KEPT_POD}": 30 * KB_PER_GB}, [], Msg.TOO_FULL.reason),
+        # the listed pod's volume is not on this host
+        (95, 60, {"volume_other": 30 * KB_PER_GB}, [_KEPT_POD], Msg.TOO_FULL.reason),
+        # its size cannot be read: no credit
+        (95, 60, {f"volume_{_KEPT_POD}": "n/a"}, [_KEPT_POD], Msg.TOO_FULL.reason),
+        (95, 60, {f"volume_{_KEPT_POD}": None}, [_KEPT_POD], Msg.TOO_FULL.reason),
+        (95, 60, {f"volume_{_KEPT_POD}": float("nan")}, [_KEPT_POD], Msg.TOO_FULL.reason),
+        (95, 60, {f"volume_{_KEPT_POD}": -30 * KB_PER_GB}, [_KEPT_POD], Msg.TOO_FULL.reason),
+        (95, 60, None, [_KEPT_POD], Msg.TOO_FULL.reason),
+        # the free floor stays on real free disk, the room a new rental gets
+        (50, settings.MIN_FREE_DISK_GB - 1, {f"volume_{_KEPT_POD}": 100 * KB_PER_GB}, [_KEPT_POD], Msg.FREE_TOO_LOW.reason),
+    ],
+)
+async def test_a_kept_volume_counts_as_free_toward_the_utilization_cap(
+    context_factory, utilization, free_gb, by_volume, kept_ids, reason
+):
+    ctx = context_factory(state=_kept_state(utilization, free_gb, by_volume, kept_ids))
+
+    result = await DiskSpaceCheck().run(ctx)
+
+    assert result.event.reason_code == reason
+    assert result.passed is (reason == Msg.OK.reason)

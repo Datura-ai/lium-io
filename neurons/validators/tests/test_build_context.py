@@ -25,21 +25,23 @@ def _archive(
     hardlinks: dict[str, str] | None = None,
 ) -> bytes:
     buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        for name, data in (entries or {"app.py": b"print('hi')\n"}).items():
-            info = tarfile.TarInfo(name)
-            info.size = len(data)
-            tar.addfile(info, io.BytesIO(data))
-        for name, target in (links or {}).items():
-            info = tarfile.TarInfo(name)
-            info.type = tarfile.SYMTYPE
-            info.linkname = target
-            tar.addfile(info)
-        for name, target in (hardlinks or {}).items():
-            info = tarfile.TarInfo(name)
-            info.type = tarfile.LNKTYPE
-            info.linkname = target
-            tar.addfile(info)
+    # mtime=0 keeps the archive bytes, and so pytest's generated ids, identical in every worker
+    with gzip.GzipFile(fileobj=buf, mode="wb", mtime=0) as gz:
+        with tarfile.open(fileobj=gz, mode="w") as tar:
+            for name, data in (entries or {"app.py": b"print('hi')\n"}).items():
+                info = tarfile.TarInfo(name)
+                info.size = len(data)
+                tar.addfile(info, io.BytesIO(data))
+            for name, target in (links or {}).items():
+                info = tarfile.TarInfo(name)
+                info.type = tarfile.SYMTYPE
+                info.linkname = target
+                tar.addfile(info)
+            for name, target in (hardlinks or {}).items():
+                info = tarfile.TarInfo(name)
+                info.type = tarfile.LNKTYPE
+                info.linkname = target
+                tar.addfile(info)
     return buf.getvalue()
 
 
