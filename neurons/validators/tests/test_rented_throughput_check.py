@@ -138,7 +138,7 @@ def rented(hotkey: str = "miner-hotkey", status: str | None = None) -> RentedExe
 
 
 @contextmanager
-def flags(*, read_pressure: bool = True, enforce_pressure: bool = False, reachable: bool = True):
+def flags(*, read_pressure: bool = True, enforce_pressure: bool = False, reachable: bool = True, enforced: bool = True):
     fake = SimpleNamespace(
         RENTED_THROUGHPUT_CHECK_ENABLED=True,
         RENTED_THROUGHPUT_INTERVAL_HOURS=3.0,
@@ -146,7 +146,7 @@ def flags(*, read_pressure: bool = True, enforce_pressure: bool = False, reachab
         RENTED_THROUGHPUT_BUSY_MBPS=200.0,
         RENTED_THROUGHPUT_DISK_BUSY_MB_PER_S=200.0,
         CONTAINER_DOWNLOAD_SPEED_MIN_MBPS=10.0,
-        CONTAINER_SPEED_FLEET_RULE_ENFORCED=True,
+        CONTAINER_SPEED_FLEET_RULE_ENFORCED=enforced,
         CONTAINER_UPLOAD_SPEED_MIN_MBPS=10.0,
         DISK_PRESSURE_CHECK_ENABLED=read_pressure,
         DISK_PRESSURE_GATE_ENFORCEMENT_ENABLED=enforce_pressure,
@@ -545,6 +545,17 @@ async def test_validator_side_fetch_errors_stay_no_verdict():
     http_error += line("hf", CAP_BYTES, 1.0, 0)
     with flags():
         ctx = make_ctx(snaps() + disk() + http_error)[0]
+        _, net, _ = await RentedThroughputCheck()._measure_and_judge(ctx)
+    assert net == "none"
+
+
+# an upload the receiver refuses (HTTP 429) measured nothing: no verdict, never a pass, enforced or record-only
+@pytest.mark.parametrize("enforced", [True, False])
+async def test_an_upload_the_receiver_refuses_is_no_verdict(enforced):
+    refused = RENTALS + line("pypi", CAP_BYTES, 1.0, 0) + line("hf", CAP_BYTES, 1.0, 0)
+    refused += line("cf_up", 0, 0.1, 1, "wget: server returned error: HTTP/1.1 429 Too Many Requests")
+    with flags(enforced=enforced):
+        ctx = make_ctx(snaps() + disk() + refused)[0]
         _, net, _ = await RentedThroughputCheck()._measure_and_judge(ctx)
     assert net == "none"
 

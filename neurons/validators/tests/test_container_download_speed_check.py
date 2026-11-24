@@ -372,9 +372,10 @@ async def test_slow_then_fast_resets():
         line("cf_up", 0, 0.1, 1, "wget: server returned error: HTTP/1.1 429 Too Many Requests"),
     ],
 )
-async def test_an_upload_the_receiver_refuses_is_inconclusive_and_keeps_the_streak(upload):
+@pytest.mark.parametrize("enforced", [True, False])
+async def test_an_upload_the_receiver_refuses_is_inconclusive_and_keeps_the_streak(upload, enforced):
     fast_downloads = RENTALS + line("pypi", CAP_BYTES, 1.0, 0) + line("hf", CAP_BYTES, 1.0, 0) + upload
-    with flags() as clock:
+    with flags(enforced=enforced) as clock:
         ctx, runner, redis = make_ctx(SLOW, fast_downloads)
         check = ContainerDownloadSpeedCheck()
         await check.run(ctx)
@@ -446,7 +447,9 @@ async def test_record_only_logs_what_the_fleet_rule_would_fail_and_scores_as_bef
             caplog.clear()
             with caplog.at_level("INFO"):
                 res = await ContainerDownloadSpeedCheck().run(ctx)
-            assert res.passed and res.event.reason_code == Msg.OK.reason
+            # a cut upload measured nothing: no verdict, never OK (it could end a streak)
+            expected = Msg.OK if stdout is PYPI_ONLY_SLOW else Msg.UNMEASURED
+            assert res.passed and res.event.reason_code == expected.reason
             assert json.loads(next(iter(redis.store.values())))["failures_in_a_row"] == 0
             logged = next(r for r in caplog.records if "CONTAINER_DOWNLOAD_SPEED" in r.getMessage())
             assert logged.msg.extra["would_fail"] == ["pypi" if stdout is PYPI_ONLY_SLOW else "cf_up"]
