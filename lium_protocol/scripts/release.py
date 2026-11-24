@@ -32,13 +32,17 @@ class Fragment(NamedTuple):
     changelog_entry: str
 
 
+def parse_fragment(text: str, name: str) -> Fragment:
+    """one fragment's bump and changelog entry from its text; SystemExit when it is malformed."""
+    first, _, rest = text.strip().partition("\n")
+    bump, entry = first.strip().lower(), " ".join(rest.split())
+    if bump not in BUMPS or not entry:
+        sys.exit(f"{name}: first line must be one of {BUMPS}, then a one-line changelog entry")
+    return Fragment(bump, entry)
+
+
 def read_fragment(path: Path) -> Fragment:
-    """one fragment's bump and changelog entry; SystemExit when it is malformed."""
-    first, _, rest = path.read_text().strip().partition("\n")
-    bump, text = first.strip().lower(), " ".join(rest.split())
-    if bump not in BUMPS or not text:
-        sys.exit(f"{path}: first line must be one of {BUMPS}, then a one-line changelog entry")
-    return Fragment(bump, text)
+    return parse_fragment(path.read_text(), str(path))
 
 
 def bumped(version: str, bump: str) -> str:
@@ -78,10 +82,10 @@ def release_and_return_new_version(root: Path) -> str:
     readme = root / README
     line = f"- `{new}` — {' '.join(entry.changelog_entry for entry in entries)}\n"
     lines = readme.read_text().splitlines(keepends=True)
-    at = next((i for i, x in enumerate(lines) if x.startswith("- `1.0.0` —")), None)
-    if at is None:
+    first_release_line_index = next((i for i, x in enumerate(lines) if x.startswith("- `1.0.0` —")), None)
+    if first_release_line_index is None:
         sys.exit(f"{README}: no `1.0.0` line to put the new version above")
-    readme.write_text("".join(lines[:at] + [line] + lines[at:]))
+    readme.write_text("".join(lines[:first_release_line_index] + [line] + lines[first_release_line_index:]))
 
     for path in fragments:
         path.unlink()

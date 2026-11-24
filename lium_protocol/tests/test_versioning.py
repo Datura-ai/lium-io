@@ -154,7 +154,7 @@ def test_a_release_that_keeps_the_base_version_fails(repo: Path) -> None:
     commit(repo, "feature")
     (repo / "lium_protocol/changes/new-field.md").unlink()
     result = check(repo)
-    assert result.returncode == 1 and "must raise PROTOCOL_VERSION" in result.stdout
+    assert result.returncode == 1 and "must set PROTOCOL_VERSION" in result.stdout
 
 
 def test_a_release_that_lowers_the_version_fails(repo: Path) -> None:
@@ -166,7 +166,7 @@ def test_a_release_that_lowers_the_version_fails(repo: Path) -> None:
     lower = f"{int(major) - 1}.{minor}.{patch}" if int(major) > 0 else f"{major}.{minor}.{max(int(patch) - 1, 0)}"
     path.write_text(path.read_text().replace(PROTOCOL_VERSION, lower))
     result = check(repo)
-    assert result.returncode == 1 and "must raise PROTOCOL_VERSION" in result.stdout
+    assert result.returncode == 1 and "must set PROTOCOL_VERSION" in result.stdout
 
 
 def test_a_release_that_keeps_a_fragment_of_its_base_fails(repo: Path) -> None:
@@ -186,3 +186,34 @@ def test_a_release_that_keeps_a_fragment_of_its_base_fails(repo: Path) -> None:
     run(repo, "git", "-c", "user.name=t", "-c", "user.email=t@t", "merge", "-q", "--no-ff", "-m", "merge", "release")
     result = run(repo / "lium_protocol", sys.executable, str(SCRIPTS / "check_version.py"), "HEAD^1")
     assert result.returncode == 1 and "breaking.md stays" in result.stdout
+
+
+def test_an_edit_to_a_fragment_on_the_base_fails(repo: Path) -> None:
+    """taiberium on lium-io#2376: only a new fragment counts; editing one already on main is not a change entry"""
+    fragment(repo, "old", "minor")
+    commit(repo, "a feature")
+    change_wire(repo)
+    fragment(repo, "old", "major", "rewritten.")
+    result = check(repo)
+    assert result.returncode == 1 and "old.md is a fragment already on the base" in result.stdout, result.stdout
+
+
+@pytest.mark.parametrize("body", ["minor\n", "patch\na change.\n", ""])
+def test_a_new_fragment_release_py_cannot_read_fails(repo: Path, body: str) -> None:
+    """taiberium on lium-io#2376: an empty or malformed fragment passed here and stopped release.py later"""
+    change_wire(repo)
+    (repo / "lium_protocol/changes").mkdir(exist_ok=True)
+    (repo / "lium_protocol/changes/bad.md").write_text(body)
+    result = check(repo)
+    assert result.returncode == 1 and "first line must be one of" in result.stdout, result.stdout
+
+
+def test_a_release_with_a_bigger_bump_than_its_fragments_fails(repo: Path) -> None:
+    """taiberium on lium-io#2376: a minor fragment released as a major version"""
+    fragment(repo, "new-field", "minor")
+    commit(repo, "feature")
+    (repo / "lium_protocol/changes/new-field.md").unlink()
+    path = repo / "lium_protocol/lium_protocol/__init__.py"
+    path.write_text(path.read_text().replace(PROTOCOL_VERSION, f"{MAJOR + 1}.0.0"))
+    result = check(repo)
+    assert result.returncode == 1 and f"must set PROTOCOL_VERSION to {next_minor()}" in result.stdout, result.stdout
