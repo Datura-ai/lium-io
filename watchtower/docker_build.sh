@@ -84,6 +84,9 @@ if [ "$DEPLOY_ENV" != "prod" ]; then
 WATCHTOWER_ENDPOINT_URL = "$WATCHTOWER_ENDPOINT_URL"
 WATCHTOWER_VALIDATOR_HOTKEY = "$WATCHTOWER_VALIDATOR_HOTKEY"
 EOF
+    # the staging owner key whose signed messages this build follows (unset = message trust stays off)
+    source "$SCRIPT_DIR/../scripts/staging_trust_override.sh"
+    staging_trust_override "$CONFIG_OVERRIDE"
 
     log_info "config_override.py written to $CONFIG_OVERRIDE"
 else
@@ -115,10 +118,11 @@ if [ -n "${PLATFORMS:-}" ]; then
     # one untagged image in the archive (as the executor's), so `skopeo copy` needs no ref; the
     # tag is given at the push. No provenance: it shows as an `unknown` platform on Docker Hub.
     docker buildx build --platform "$PLATFORMS" --provenance=false \
+        --build-context datura="$SCRIPT_DIR/../datura" \
         --output "type=oci,dest=$OCI_ARCHIVE" "$SCRIPT_DIR"
     log_info "Wrote $PLATFORMS image to $OCI_ARCHIVE"
 else
-    docker build -t "$IMAGE_NAME" -t "$VERSION_IMAGE_NAME" "$SCRIPT_DIR"
+    docker build --build-context datura="$SCRIPT_DIR/../datura" -t "$IMAGE_NAME" -t "$VERSION_IMAGE_NAME" "$SCRIPT_DIR"
 fi
 
 log_info "Build complete: ${BOLD}$IMAGE_NAME${NC} ${BOLD}$VERSION_IMAGE_NAME${NC}"
