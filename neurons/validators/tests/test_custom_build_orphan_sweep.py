@@ -201,3 +201,38 @@ async def test_an_older_validators_sweep_never_selects_a_running_builds_attempt_
     gone = _listings("pod-gone", "ab12cd34")
     assert await _current_orphans({"pod-1"}, gone) == (gone["images"], gone["scratch"], gone["dind"])
     assert await _current_orphans({"pod-gone"}, legacy) == ([], [], [])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("first_twenty", ["active", "unreadable"])
+async def test_the_rental_lookups_reach_every_candidate_over_successive_sweeps(context_factory, first_twenty):
+    # 2394-15: a fixed sorted prefix asked the same 20 pods each sweep, so pods past them were never asked or removed
+    names = [f"lium-poddind-pod-{i:02d}.deadbeef" for i in range(1, 26)]
+    ssh = SimpleNamespace(calls=[])
+
+    async def run(cmd, *args, **kwargs):
+        ssh.calls.append(cmd)
+        stdout = "".join(f"{n}\n" for n in names) if "docker ps -a" in cmd else ""
+        return SimpleNamespace(exit_status=0, stdout=stdout, stderr="")
+
+    ssh.run = run
+    ctx = context_factory(ssh=ssh)
+    ctx.services.redis.get_pending_pods = AsyncMock(return_value=[])
+    asked: list[str] = []
+
+    async def rental_active(pod_id):
+        asked.append(pod_id)
+        if int(pod_id[-2:]) > 20:
+            return PodRentalActiveResponse(active=False)
+        if first_twenty == "unreadable":
+            raise TimeoutError
+        return PodRentalActiveResponse(active=True)
+
+    ctx.services.backend.get_pod_rental_active.side_effect = rental_active
+    check = CustomBuildOrphanSweepCheck(interval_seconds=0)
+
+    for _ in range(2):
+        await check.run(ctx)
+
+    assert set(asked) == {f"pod-{i:02d}" for i in range(1, 26)}
+    assert sorted(_removed(ssh)) == names[20:]

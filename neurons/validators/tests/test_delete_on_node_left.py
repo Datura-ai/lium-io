@@ -38,8 +38,11 @@ HOST_BOOT = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
 
 
 def _payload(boot: str = NODE_LEFT_BOOT) -> ContainerDeleteOnNodeLeftRequest:
+    delete = _delete_payload()
     return ContainerDeleteOnNodeLeftRequest(
-        **_delete_payload().model_dump(exclude={"message_type"}), expected_boot_id=boot
+        **delete.model_dump(exclude={"message_type", "container_name"}),
+        container_name=f"pod_{delete.pod_id}",
+        expected_boot_id=boot,
     )
 
 
@@ -87,30 +90,48 @@ def _daemon_stub(
     sticky: bool = False,
     sticky_kept: bool = False,
     inspect_fails: bool = False,
+    pod_id: str = "",
+    container_pod: str | None = None,
+    prev_owner: str | None = None,
+    sticky_prev: bool = False,
 ) -> Path:
-    """A docker stub: the container `cid` exists while its owner file does and the kept container `kept1` while its
-    file does; a removal deletes each unless sticky. `inspect_fails` makes inspect fail as a daemon error would, with
-    the container still there. Each file under volumes/ is a volume whose lines are its labels (`inuse` marks one a
-    container still uses), inspected as "<pod id> <registration>" and removed by name."""
-    log, container, kept, volumes = tmp_path / "calls", tmp_path / "container", tmp_path / "kept", tmp_path / "volumes"
+    """A docker stub. Each file under containers/ is a container named as the file, holding "<id> <registration
+    label> <pod label>": the pod's container (`cid`, labelled `container_owner` and `container_pod`, default
+    `pod_id`) and its parked edit container `<name>__prev` (`pid`, labelled `prev_owner`). The kept container `kept1`
+    exists while its file does. A removal deletes each unless sticky. `inspect_fails` makes inspect fail as a daemon
+    error would, with the containers still there. Each file under volumes/ is a volume whose lines are its labels
+    (`inuse` marks one a container still uses), inspected as "<pod id> <registration>" and removed by name."""
+    log, containers, kept, volumes = (
+        tmp_path / "calls", tmp_path / "containers", tmp_path / "kept", tmp_path / "volumes"
+    )
     volumes.mkdir(exist_ok=True)
+    containers.mkdir(exist_ok=True)
     kept.write_text("")
-    if container_owner is not None:
-        container.write_text(container_owner)
-    c, k, vols = (shlex.quote(str(path)) for path in (container, kept, volumes))
-    rm_container = "true" if sticky else f"rm -f {c}"
+    name = f"pod_{pod_id}"
+    for container_name, cid, owner, pod in [
+        (name, "cid", container_owner, pod_id if container_pod is None else container_pod),
+        (f"{name}__prev", "pid", prev_owner, pod_id),
+    ]:
+        if owner is not None:
+            (containers / container_name).write_text(f"{cid} {owner} {pod}")
+    cs, k, vols = (shlex.quote(str(path)) for path in (containers, kept, volumes))
+    sticky_ids = " ".join(cid for cid, on in [("cid", sticky), ("pid", sticky_prev)] if on) or "-"
     rm_kept = "true" if sticky_kept else f"rm -f {k}"
     stub = tmp_path / "docker"
     stub.write_text(
         "#!/bin/sh\n"
         f'echo "$*" >> {shlex.quote(str(log))}\n'
+        'eval "last=\\${$#}"\n'
         'case "$1" in\n'
-        f'  ps) case "$*" in *label=*) [ -e {k} ] && echo kept1;; *name=*) [ -e {c} ] && echo cid;; '
-        f"*) [ -e {c} ] && echo cid; [ -e {k} ] && echo kept1;; esac; exit 0;;\n"
+        f'  ps) case "$*" in *label=*) [ -e {k} ] && echo kept1;; '
+        f'*name=*) n=${{last#name=^}}; n=${{n%\\$}}; [ -e {cs}/"$n" ] && cut -d" " -f1 {cs}/"$n";; '
+        f'*) for f in {cs}/*; do [ -e "$f" ] && cut -d" " -f1 "$f"; done; [ -e {k} ] && echo kept1;; esac; exit 0;;\n'
         + ("  inspect) exit 1;;\n" if inspect_fails else "")
-        + f'  inspect) [ -e {c} ] || exit 1; case "$*" in *-f*) printf "cid "; cat {c};; esac;;\n'
-        f'  rm) for a in "$@"; do case "$a" in cid) {rm_container};; kept1) {rm_kept};; esac; done;;\n'
-        '  volume) eval "v=\\${$#}"; f=' + vols + '/$v; [ -e "$f" ] || exit 1; case "$2" in\n'
+        + f'  inspect) [ -e {cs}/"$last" ] || exit 1; cat {cs}/"$last";;\n'
+        f'  rm) for a in "$@"; do case "$a" in kept1) {rm_kept};; -*) ;; '
+        f'*) case " {sticky_ids} " in *" $a "*) ;; *) for f in {cs}/*; do '
+        f'[ -e "$f" ] && [ "$(cut -d" " -f1 "$f")" = "$a" ] && rm -f "$f"; done;; esac;; esac; done;;\n'
+        '  volume) f=' + vols + '/$last; [ -e "$f" ] || exit 1; case "$2" in\n'
         '    inspect) pod=$(sed -n "s/^io.lium.pod_id=//p" "$f"); ex=$(sed -n "s/^io.lium.executor_id=//p" "$f"); '
         'echo "$pod $ex";;\n'
         '    rm) grep -qx inuse "$f" && exit 1; rm -f "$f";;\n'
@@ -129,7 +150,7 @@ def _volume(tmp_path: Path, name: str, *labels: str) -> Path:
 
 
 def _run(tmp_path: Path, payload, container_owner: str | None = LEFT_LABEL, **stub) -> tuple[int, str]:
-    stub = _daemon_stub(tmp_path, container_owner, **stub)
+    stub = _daemon_stub(tmp_path, container_owner, pod_id=payload.pod_id, **stub)
     payload = payload.model_copy(update={"executor_id": LEFT, "miner_hotkey": LEFT_MINER})
     command = _node_left_delete_command(payload).replace("/usr/bin/docker", str(stub))
     done = subprocess.run(["sh", "-c", command], capture_output=True, text=True)
@@ -216,6 +237,45 @@ def test_a_failed_inspect_of_a_container_still_there_removes_nothing_and_fails(t
 
     assert status == 1
     assert "rm " not in calls
+
+
+def test_a_delete_naming_another_pods_container_is_refused():
+    # 2394-12: the name is the pod's own; another pod's container (and its kept containers) is never selected
+    payload = _payload(HOST_BOOT)
+    with pytest.raises(ValueError):
+        _node_left_delete_command(payload.model_copy(update={"container_name": "pod_another"}))
+
+
+def test_a_container_under_the_pods_name_labelled_for_another_pod_is_never_touched(tmp_path):
+    # 2394-12: the left registration's label alone does not make it this pod's
+    status, calls = _run(tmp_path, _payload(HOST_BOOT), container_pod="another-pod")
+
+    assert status == 97
+    assert "rm" not in calls.replace("inspect", "")
+
+
+@pytest.mark.parametrize("container_owner", [LEFT_LABEL, None])
+def test_the_left_registrations_parked_edit_container_goes_with_it(tmp_path, container_owner):
+    # 2394-13: an edit parks the pod's container as <name>__prev; success means it is gone too
+    status, calls = _run(tmp_path, _payload(HOST_BOOT), container_owner=container_owner, prev_owner=LEFT_LABEL)
+
+    assert status == 0
+    assert ("rm -fv cid pid kept1" if container_owner else "rm -fv pid kept1") in calls
+    assert not any((tmp_path / "containers").iterdir())
+
+
+def test_a_parked_edit_container_still_present_fails_the_delete(tmp_path):
+    status, _ = _run(tmp_path, _payload(HOST_BOOT), prev_owner=LEFT_LABEL, sticky_prev=True)
+
+    assert status == 1
+
+
+@pytest.mark.parametrize("prev_owner", [f"miner-b:{LEFT}", ""])
+def test_a_parked_edit_container_of_another_registration_keeps_everything(tmp_path, prev_owner):
+    status, calls = _run(tmp_path, _payload(HOST_BOOT), prev_owner=prev_owner)
+
+    assert status == 97
+    assert "rm" not in calls.replace("inspect", "")
 
 
 @pytest.mark.parametrize("missing", ["executor_id", "miner_hotkey", "expected_boot_id"])

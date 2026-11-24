@@ -2651,7 +2651,9 @@ class MinerService:
                             log_extra=default_extra,
                         )
 
-                    if executor:
+                    # the node-left delete's endpoint may be the replacement's by now: the entry keyed by it is
+                    # not the left node's (DAH-6531)
+                    if executor and not isinstance(payload, ContainerDeleteOnNodeLeftRequest):
                         logger.info(
                             _m(
                                 "Remove rented machine from redis",

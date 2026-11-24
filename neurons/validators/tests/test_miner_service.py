@@ -543,3 +543,24 @@ def test_a_start_request_failing_before_docker_is_reported_as_a_start_failure(mi
 
     assert isinstance(result, FailedContainerRequest)
     assert result.error_type == FailedContainerErrorTypes.ContainerStartFailed
+
+
+@pytest.mark.asyncio
+async def test_a_node_left_delete_whose_miner_names_another_executor_keeps_that_executors_rental_entry(
+    mocker, miner_service
+):
+    # DAH-6531 (2394-11): the endpoint the left node had may be the replacement's now; the entry keyed by it is not
+    # the left node's to erase
+    from payload_models.payloads import ContainerDeleteOnNodeLeftRequest, FailedContainerRequest
+
+    _wire_common_mocks(mocker, miner_service, str(uuid4()))
+    delete = mocker.patch("services.miner_service.DockerService.delete_container", AsyncMock())
+    pod_id = str(uuid4())
+    payload = ContainerDeleteOnNodeLeftRequest(
+        miner_hotkey="5TestMiner", executor_id=str(uuid4()), miner_address="192.0.2.1", miner_port=8000,
+        pod_id=pod_id, container_name=f"pod_{pod_id}", expected_boot_id="11111111-2222-4333-8444-555555555555",
+    )
+
+    assert isinstance(await miner_service._handle_container(payload), FailedContainerRequest)
+    miner_service.redis_service.remove_rented_machine.assert_not_awaited()
+    delete.assert_not_awaited()

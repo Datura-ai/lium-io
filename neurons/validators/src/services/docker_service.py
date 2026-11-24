@@ -1898,10 +1898,11 @@ def _pod_volume_labels(payload) -> dict[str, str]:
 
 
 def _node_left_delete_command(payload: ContainerDeleteOnNodeLeftRequest) -> str:
-    """Exits 97 on another boot, or when the pod's container there was created for another registration (a
-    replacement made on this host through a re-pointed registration or another miner's registration of the same
-    executor); 0 once the left registration's container and its kept edit containers are gone. Unlabelled
-    containers (made before the label) are kept.
+    """Exits 97 on another boot, or when the pod's container or its parked edit container (``<name>__prev``) there
+    was created for another registration or another pod (a replacement made on this host through a re-pointed
+    registration or another miner's registration of the same executor); 0 once the left registration's container,
+    its parked edit container and its kept edit containers are gone. Unlabelled containers (made before the labels)
+    are kept.
 
     The pod's named volume is never removed here: one pod keeps one volume name on every registration, so on a
     daemon two registrations share it may be the replacement's, mounted or about to be, and nothing on the host
@@ -1910,25 +1911,35 @@ def _node_left_delete_command(payload: ContainerDeleteOnNodeLeftRequest) -> str:
         raise ValueError("the delete names no registration")
     if not payload.expected_boot_id:
         raise ValueError("the delete names no boot id")
-    name = shlex.quote(payload.container_name)
-    owner = shlex.quote(_executor_label(payload))
-    found = f'{{{{.Id}}}} {{{{index .Config.Labels "{LIUM_EXECUTOR_ID_LABEL}"}}}}'
+    if payload.container_name != DockerService.get_container_name(payload):
+        # the name selects the kept containers too: only the pod's own may be named
+        raise ValueError("the delete names another pod's container")
+    owner_and_pod = shlex.quote(f"{_executor_label(payload)} {payload.pod_id}")
+    found = f'{{{{.Id}}}} {{{{index .Config.Labels "{LIUM_EXECUTOR_ID_LABEL}"}}}} {{{{index .Config.Labels "{LIUM_POD_ID_LABEL}"}}}}'
     lines = [
         # an unreadable boot id is not this node's: the read must succeed and give a value before it is compared
         f'boot=$(cat /proc/sys/kernel/random/boot_id) && [ -n "$boot" ] '
         f'&& [ "$boot" = {shlex.quote(payload.expected_boot_id)} ] || exit {_NOT_THE_NODE_LEFT_EXIT}',
-        # a failed inspect is absence only when a listing that succeeded shows no container under the name
-        f"found=$(/usr/bin/docker inspect --type container -f {shlex.quote(found)} {name} 2>/dev/null) "
-        f"|| {{ found=; named=$(/usr/bin/docker ps -aq --no-trunc --filter name=^{name}$) && [ -z \"$named\" ] || exit 1; }}",
-        f'[ -z "$found" ] || [ "${{found#* }}" = {owner} ] || exit {_NOT_THE_NODE_LEFT_EXIT}',
-        # removed by the ID that was checked: a container created under the same name after the check is not it
-        'id=${found%% *}',
+        "ids=",
+    ]
+    for container_name in (payload.container_name, f"{payload.container_name}{EDIT_PARKED_SUFFIX}"):
+        name = shlex.quote(container_name)
+        lines += [
+            # a failed inspect is absence only when a listing that succeeded shows no container under the name
+            f"found=$(/usr/bin/docker inspect --type container -f {shlex.quote(found)} {name} 2>/dev/null) "
+            f"|| {{ found=; named=$(/usr/bin/docker ps -aq --no-trunc --filter name=^{name}$) && [ -z \"$named\" ] || exit 1; }}",
+            f'[ -z "$found" ] || [ "${{found#* }}" = {owner_and_pod} ] || exit {_NOT_THE_NODE_LEFT_EXIT}',
+            # removed by the ID that was checked: a container created under the same name after the check is not it
+            'ids="$ids ${found%% *}"',
+        ]
+    lines += [
         f"kept=$(/usr/bin/docker ps -aq --no-trunc --filter name=^{shlex.quote(_kept_container_prefix(payload.container_name))} "
         f"--filter label={shlex.quote(f'{LIUM_EXECUTOR_ID_LABEL}={_executor_label(payload)}')}) || exit 1",
-        "/usr/bin/docker rm -fv $id $kept >/dev/null 2>&1",
+        'set -- $ids $kept',
+        '[ $# -eq 0 ] || /usr/bin/docker rm -fv "$@" >/dev/null 2>&1',
         # done only when a listing that succeeded shows none of the selected containers
         "left=$(/usr/bin/docker ps -aq --no-trunc) || exit 1",
-        'for c in $id $kept; do case "$left" in *"$c"*) exit 1;; esac; done',
+        'for c in "$@"; do case "$left" in *"$c"*) exit 1;; esac; done',
         "exit 0",
     ]
     return "\n".join(lines)

@@ -124,6 +124,10 @@ class CustomBuildOrphanSweepCheck:
         self._interval = interval_seconds
         # executor_uuid -> last successful sweep monotonic timestamp
         self._last_sweep: dict[str, float] = {}
+        # executor_uuid -> {candidate pod id: the sweep number it was last asked about}, so each sweep asks the
+        # candidates asked longest ago first and every candidate is reached over successive sweeps
+        self._rental_asked: dict[str, dict[str, int]] = {}
+        self._sweeps = 0
 
     def _should_sweep(self, executor_uuid: str, now: float) -> bool:
         last = self._last_sweep.get(executor_uuid)
@@ -219,11 +223,17 @@ class CustomBuildOrphanSweepCheck:
             orphans.append(name)
         return orphans
 
-    @staticmethod
-    async def _pods_confirmed_over(ctx: Context, pod_ids: set[str]) -> set[str]:
+    async def _pods_confirmed_over(self, ctx: Context, pod_ids: set[str]) -> set[str]:
         """The ``pod_ids`` the backend says have no live rental. A failed, timed-out or capped lookup keeps the pod:
-        a removal cannot be undone."""
+        a removal cannot be undone. The cap takes the pods never asked, then those asked longest ago."""
         over: set[str] = set()
+        self._sweeps += 1
+        asked = self._rental_asked.get(ctx.executor.uuid, {})
+        chosen = sorted(pod_ids, key=lambda p: (asked.get(p, 0), p))[:MAX_RENTAL_LOOKUPS]
+        # only current candidates are remembered: a pod whose artifacts are gone is never asked again
+        self._rental_asked[ctx.executor.uuid] = {
+            **{p: asked[p] for p in pod_ids if p in asked}, **dict.fromkeys(chosen, self._sweeps)
+        }
 
         async def ask(pod_id: str) -> None:
             try:
@@ -236,7 +246,7 @@ class CustomBuildOrphanSweepCheck:
 
         try:
             async with asyncio.timeout(RENTAL_LOOKUP_TIMEOUT_SECONDS):
-                await asyncio.gather(*(ask(p) for p in sorted(pod_ids)[:MAX_RENTAL_LOOKUPS]))
+                await asyncio.gather(*(ask(p) for p in chosen))
         except TimeoutError:
             logger.warning("Custom build orphan sweep: rental lookups timed out; unanswered pods kept")
         return over
