@@ -41,8 +41,8 @@ jobs:
       - name: Name the staging validator
         env:
           STAGING_TRUST_OWNER_SS58: "5EeYEmUGfAJeTmVvYSmkpsUmVhiySd2Zch5nyt4tE1HygFX8"
-          STAGING_TRUST_MESSAGE: "lium-validator:test:5DHgdomxxHSQf7neJWcagvGhTMKpqvKWwuprEaFF8C653qty:1"
-          STAGING_TRUST_SIGNATURE: "0x7a850fadcaf52e47cb750e40b157100a610ec6801b07e2c39a7cf95a1384b556007e37b55e265e6ba6aca7f285fdf2185899c3cb0dfe01a93120e6cda57cb283"
+          STAGING_TRUST_MESSAGE: "lium-validator:5DHgdomxxHSQf7neJWcagvGhTMKpqvKWwuprEaFF8C653qty:1"
+          STAGING_TRUST_SIGNATURE: "0x462f3d57f5307db9dc0d1e820015204e57f5fea61f2a3fa330c0507b7554ce333fdc046406d3a4aaf74599109b25bbb5e842377706d4491ae2f8efad8bd35181"
           STAGING_TRUST_API_URL: "https://staging.lium.io/api"
         run: |
           echo '_VALIDATOR_HOTKEY_SS58 = "5DHgdomxxHSQf7neJWcagvGhTMKpqvKWwuprEaFF8C653qty"' > neurons/miners/src/core/config_override.py

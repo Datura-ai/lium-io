@@ -7,12 +7,9 @@ minutes, and from the image
 owner's coldkey signed it and its revision is higher than the held one's (one counter, whoever signed the held one);
 on any error the held message stays.
 
-The taken message is kept in one small file on the reserve_data volume, which outlives a container recreate, with a
-kept message that still waits for a chain read (below); the file also names the signer and the owner for readers,
-but a start never takes an owner or a signer from it. A restarted node checks the kept message against the release
-owner (a fixed owner's build: its own key), so with the backend and the chain both unreachable it keeps trusting the
-same validator; a message another key signed (an owner rotated since the release) stays on the volume, untrusted,
-until a chain read names that key as the owner. The file is written atomically, off the event loop, when a message or an owner is
+The taken message, the key that signed it and the current owner are kept in one small file on the reserve_data
+volume, which outlives a container recreate, so a restarted node keeps trusting the same validator with the backend
+and the chain both unreachable. The file is written atomically, off the event loop, when a message or an owner is
 taken; a failed write is logged and tried again at the next refresh. A missing, unreadable or badly signed file is
 ignored: the node uses the image copy, else the baked hotkeys, and keeps polling.
 
@@ -20,7 +17,7 @@ The owner coldkey starts as the address known at release and is re-read from the
 about once an hour with random jitter. A new owner is taken only when every public node answers with it; a failed or
 disagreeing read keeps the known owner, whose messages are still taken (a chain outage never blocks a validator
 change). An owner change only changes the key that verifies new messages: the held validator stays until the new
-owner signs a higher revision; after a restart it is held again once the chain read confirms that owner.
+owner signs a higher revision.
 
 While no message is held, the executor trusts the hotkeys baked into the image (core.config), as before. A non-prod
 build (core/config_override.py) names its own validator; when it also names a staging owner key
@@ -40,6 +37,7 @@ from http import HTTPStatus
 from pathlib import Path
 
 import aiohttp
+from bittensor_wallet import Keypair
 from datura.validator_trust import (
     PUBLIC_CHAIN_NODES,
     RELEASE_SUBNET_OWNER_COLDKEY,
@@ -123,7 +121,6 @@ class ValidatorTrust:
         read_chain: bool = True,
         message: SignedTrustMessage | None = None,
         api_url: str | None = None,
-        network: str = "",
     ):
         self.state_dir = state_dir
         self.image_message = image_message
@@ -135,11 +132,7 @@ class ValidatorTrust:
         self.message = message
         # a staging build reads its owner's messages from the backend that serves them, not this host's backend
         self.api_url = api_url
-        # the network this build's lines name (datura.validator_trust.trust_line): fixed at build time, never stored
-        self.network = network
         self.owner = self.release_owner
-        # a kept message the release owner did not sign: taken only once a chain read names its signer as the owner
-        self._deferred: SignedTrustMessage | None = None
         self.held: TrustedValidator | None = None
         self.held_signed: SignedTrustMessage | None = None
         # the key that signed the held message: an owner change keeps the message until the new owner signs a higher one
@@ -149,21 +142,18 @@ class ValidatorTrust:
 
     def load(self) -> None:
         """At start: the kept state, then the image copy (signed by the release owner) when its revision is higher.
-        A missing, unreadable or badly signed state is ignored. The volume names no key this node follows: its message
-        is checked against the release owner (a fixed owner's build: its own key), and one another key signed waits for
-        a chain read that names that key (a volume a non-prod build wrote must not choose the owner of a release build)."""
+        A missing, unreadable or badly signed state is ignored."""
         if not self.enabled:
             return
         try:
             state = json.loads((self.state_dir / STATE_FILE).read_text())
-            # the held message, then one that waited for a chain read when this state was written
-            for kept in [_signed(state[k]) for k in ("message", "deferred") if state.get(k) is not None]:
-                try:
-                    self._hold(kept, self.owner)
-                except ValueError:
-                    if not self.read_chain:
-                        raise
-                    self._deferred = kept
+            Keypair(ss58_address=state["owner"])
+            # a fixed owner (no chain reads) takes only its own key's messages from the volume
+            signer = state["signer"] if self.read_chain else self.owner
+            if state["message"] is not None:
+                self._hold(_signed(state["message"]), signer)
+            if self.read_chain:
+                self.owner = state["owner"]
         except FileNotFoundError:
             pass
         except Exception as exc:
@@ -183,7 +173,7 @@ class ValidatorTrust:
     def _hold(self, signed: SignedTrustMessage, signer: str) -> bool:
         """Hold `signed` when `signer` signed it and its revision is higher than the held one's. Raises on a bad
         signature."""
-        trusted = verify_trust_message(signed, signer, self.network)
+        trusted = verify_trust_message(signed, signer)
         if self.held is not None and trusted.revision <= self.held.revision:
             return False
         self.held, self.held_signed, self.held_signer = trusted, signed, signer
@@ -206,8 +196,6 @@ class ValidatorTrust:
             "owner": self.owner,
             "signer": self.held_signer,
             "message": self.held_signed._asdict() if self.held_signed else None,
-            # a kept message waiting for the chain read: written back, so a save before that read never drops it
-            "deferred": self._deferred._asdict() if self._deferred else None,
         }
 
     async def save(self) -> None:
@@ -264,13 +252,7 @@ class ValidatorTrust:
         if owner != self.owner:
             logger.warning("Validator trust: subnet owner changed from %s to %s", self.owner, owner)
             self.owner, self._unsaved = owner, True
-        if self._deferred is not None:
-            kept, self._deferred, self._unsaved = self._deferred, None, True
-            try:
-                self._hold(kept, owner)
-            except ValueError as exc:
-                logger.warning("Validator trust: kept message dropped, not the chain owner's: %s", exc)
-        await self.save()
+            await self.save()
         return True
 
 

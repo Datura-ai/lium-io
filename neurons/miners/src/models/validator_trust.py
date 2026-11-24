@@ -1,6 +1,4 @@
-from datetime import datetime
-
-from sqlalchemy import BigInteger, Column, DateTime
+from sqlalchemy import BigInteger, Column
 from sqlmodel import Field, SQLModel
 
 
@@ -15,7 +13,3 @@ class ValidatorTrustMessage(SQLModel, table=True):
     signature: str
     # the owner coldkey that signed it
     signer: str
-    # the network of the build that wrote the row ("" release, "test" staging); None: a row written before it was kept
-    network: str | None = None
-    # when a chain read had named `signer` as the subnet owner before the row was written; None: never confirmed
-    owner_confirmed_at: datetime | None = Field(default=None, sa_column=Column(DateTime(timezone=True), nullable=True))

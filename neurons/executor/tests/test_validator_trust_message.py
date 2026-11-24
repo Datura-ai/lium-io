@@ -206,13 +206,11 @@ def test_an_owner_change_changes_only_the_verifying_key(
     asyncio.run(trust.refresh_message())
     _chain(monkeypatch, lambda url: new_owner.ss58_address)
     assert asyncio.run(trust.refresh_owner())
-    # the held validator stays, across a restart too; the owner is never taken from the volume, so a restart follows the
-    # release owner again until its own chain read names the new one
+    # the held validator stays, across a restart too
     restarted = _trust(tmp_path)
     assert (restarted.owner, restarted.held.validator, restarted.held.revision) == (
-        owner.ss58_address, new_validator.ss58_address, 7
+        new_owner.ss58_address, new_validator.ss58_address, 7
     )
-    assert asyncio.run(restarted.refresh_owner()) and restarted.owner == new_owner.ss58_address
     assert not restarted.offer(_signed(owner, old_validator, 8))  # the former owner no longer signs
     assert not restarted.offer(_signed(new_owner, old_validator, 7))  # one counter: not higher
     assert restarted.offer(_signed(new_owner, old_validator, 8))
@@ -456,66 +454,3 @@ def test_a_staging_build_reads_its_owner_messages_from_its_own_backend(tmp_path,
     asyncio.run(trust.refresh_message())
     assert asked == ["https://staging.example/api/watchtower/validator-message"]
     assert trust.held.validator == new_validator.ss58_address
-
-
-def test_a_volume_a_staging_build_wrote_never_chooses_a_release_builds_trust(tmp_path, monkeypatch, owner, new_validator):
-    """A dev build (staging owner key, `test` lines) shares the reserve_data volume with the release image a host switches
-    to: the release build must start from the release owner and no staging validator, whatever the volume says."""
-    staging = Keypair.create_from_uri("//LiumTrustStagingOwner")
-    line = trust_line(new_validator.ss58_address, 10**17, "test")
-    dev = ValidatorTrust(state_dir=tmp_path, image_message=tmp_path / "absent.json", owner=staging.ss58_address,
-                         read_chain=False, network="test")
-    dev.load()
-    assert dev.offer(SignedTrustMessage(line, "0x" + staging.sign(line).hex()))
-    asyncio.run(dev.save())
-    assert json.loads((tmp_path / STATE_FILE).read_text())["owner"] == staging.ss58_address
-    # the same key signing a release line, stored as if it were held: still not the release owner's
-    release_line = trust_line(new_validator.ss58_address, 10**17)
-    (tmp_path / STATE_FILE).write_text(json.dumps({"owner": staging.ss58_address, "signer": staging.ss58_address,
-                                                   "message": {"message": release_line,
-                                                               "signature": "0x" + staging.sign(release_line).hex()}}))
-    for state in (dev._state(), json.loads((tmp_path / STATE_FILE).read_text())):
-        (tmp_path / STATE_FILE).write_text(json.dumps(state))
-        prod = _trust(tmp_path)
-        assert prod.held is None and prod.owner == owner.ss58_address
-        _serves(monkeypatch, SignedTrustMessage(line, "0x" + staging.sign(line).hex()))
-        asyncio.run(prod.refresh_message())
-        assert prod.held is None   # nor does a staging-signed message served later
-        _chain(monkeypatch, lambda url: owner.ss58_address)
-        assert asyncio.run(prod.refresh_owner()) and prod.held is None and prod.owner == owner.ss58_address
-
-
-def test_a_kept_message_of_a_new_owner_waits_for_the_chain_read(tmp_path, monkeypatch, owner, new_owner, new_validator):
-    trust = _trust(tmp_path)
-    _chain(monkeypatch, lambda url: new_owner.ss58_address)
-    assert asyncio.run(trust.refresh_owner())
-    _serves(monkeypatch, _signed(new_owner, new_validator, 9))
-    asyncio.run(trust.refresh_message())
-    restarted = _trust(tmp_path)
-    assert restarted.held is None and restarted.owner == owner.ss58_address   # not the release owner's: not yet
-    assert asyncio.run(restarted.refresh_owner())
-    assert (restarted.owner, restarted.held.validator, restarted.held.revision) == (
-        new_owner.ss58_address, new_validator.ss58_address, 9)
-
-
-def test_a_save_while_the_chain_is_down_keeps_the_waiting_message_on_the_volume(
-    tmp_path, monkeypatch, owner, new_owner, old_validator, new_validator
-):
-    # the volume holds a newer owner's rev 5 (B), the image the release owner's rev 1 (A), the chain is down at start
-    waiting = _signed(new_owner, new_validator, 5)
-    (tmp_path / trust_service.STATE_FILE).write_text(json.dumps(
-        {"owner": new_owner.ss58_address, "signer": new_owner.ss58_address, "message": waiting._asdict()}))
-    image = _image(tmp_path, _signed(owner, old_validator, 1))
-    _chain(monkeypatch, _down)
-    _backend(monkeypatch, _down)
-    trust = _trust(tmp_path, image)
-    assert trust.held.validator == old_validator.ss58_address
-    assert not asyncio.run(trust.refresh_owner())
-    asyncio.run(trust.refresh_message())   # the first tick writes the image message
-    kept = json.loads((tmp_path / trust_service.STATE_FILE).read_text())
-    assert kept["deferred"] == waiting._asdict()
-    restarted = _trust(tmp_path, image)   # a restart before any chain read still has B to confirm
-    _chain(monkeypatch, lambda url: new_owner.ss58_address)
-    assert asyncio.run(restarted.refresh_owner())
-    assert (restarted.held.validator, restarted.held.revision) == (new_validator.ss58_address, 5)
-    assert json.loads((tmp_path / trust_service.STATE_FILE).read_text())["deferred"] is None
