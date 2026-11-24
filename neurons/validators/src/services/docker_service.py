@@ -15450,16 +15450,20 @@ class DockerService:
     async def _run_with_no_create_of_the_pod(pod_id: str, ssh_client, command: str, creates_by: float):
         """Run the node-left removal once no registration has a create of the pod running: a delayed create of the
         left registration could otherwise make the container after its removal. The backend sends this delete once,
-        so it waits for those creates (until `creates_by`, loop time) instead of answering a retry."""
-        remaining = max(0.0, creates_by - asyncio.get_running_loop().time())
-        if not await inflight_creates.wait_for_no_create(pod_id, remaining):
-            raise _CreatesOfThePodStillRunning(pod_id)
-        # no await between the wait and the watch: every create registering after the wait is seen
-        with inflight_creates.watch_registrations(pod_id) as registered:
-            result = await _run_with_host_timeout(ssh_client, command, _PARK_COMMAND_TIMEOUT_SECONDS)
-        if registered.is_set() or inflight_creates.is_running(pod_id):
-            raise _CreateOfThePodDuringRemoval(pod_id)
-        return result
+        so it waits for those creates (until `creates_by`, loop time) instead of answering a retry. A create that
+        registers during a removal may make its container after it, so the removal reruns once that create ends;
+        each run starts by `creates_by`, so the last one still ends inside the answer deadline."""
+        loop = asyncio.get_running_loop()
+        while True:
+            if not await inflight_creates.wait_for_no_create(pod_id, max(0.0, creates_by - loop.time())):
+                raise _CreatesOfThePodStillRunning(pod_id)
+            # no await between the wait and the watch: every create registering after the wait is seen
+            with inflight_creates.watch_registrations(pod_id) as registered:
+                result = await _run_with_host_timeout(ssh_client, command, _PARK_COMMAND_TIMEOUT_SECONDS)
+            if not registered.is_set() and not inflight_creates.is_running(pod_id):
+                return result
+            if loop.time() >= creates_by:
+                raise _CreateOfThePodDuringRemoval(pod_id)
 
     async def _stop_create_before_delete(self, payload: ContainerDeleteRequest, executor_info: ExecutorSSHInfo):
         """The delete's steps before its teardown: the refusal to answer, or None."""

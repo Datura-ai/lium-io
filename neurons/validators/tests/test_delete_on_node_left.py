@@ -323,28 +323,53 @@ async def test_the_removal_waits_for_every_create_of_the_pod_and_cancels_none(do
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("create_ends", [False, True], ids=["still-running", "ended-before-the-answer"])
-async def test_a_create_of_the_pod_registered_during_the_removal_is_never_answered_as_deleted(
-    docker_service, monkeypatch, create_ends
+async def test_a_create_of_the_pod_that_registers_during_the_removal_is_removed_by_a_rerun(docker_service, monkeypatch):
+    # gateway review on lium-io#2394 at 8f7f513: the left registration's create registers while the removal runs and
+    # makes its container after it. The backend sends this delete once, so the validator waits for that create and
+    # reruns the identity-checked removal, which removes the second container; only then is it answered as deleted
+    payload = _payload()
+    tracked = inflight_creates.track(payload.pod_id, (payload.miner_hotkey, payload.executor_id))
+    context = contextvars.Context()
+    containers = []
+
+    def the_create_makes_its_container_and_ends():
+        containers.append("pod")
+        context.run(tracked.__exit__, None, None, None)
+
+    async def removal(command: str):
+        containers.clear()  # the command removes the pod's container
+        if len(order) == 1:  # the delayed create registers during the first removal and makes its container after it
+            context.run(tracked.__enter__)
+            asyncio.get_running_loop().call_later(0.05, the_create_makes_its_container_and_ends)
+        return _make_ssh_command_result(exit_status=0)
+
+    order = _wire_delete(docker_service, monkeypatch, removal)
+    result = await asyncio.wait_for(_delete(docker_service, payload), 5)
+
+    assert len(order) == 2  # the second command ran after the create ended
+    assert containers == []  # and removed the container the create made
+    assert isinstance(result, ContainerDeleted)
+
+
+@pytest.mark.asyncio
+async def test_a_create_of_the_pod_registered_during_the_removal_and_still_running_at_the_deadline_is_never_answered_as_deleted(
+    docker_service, monkeypatch
 ):
-    # stand check 2394-10: a create of the pod that registers after the final wait, while the host command runs, may
-    # make its container after the removal; the delete then cannot say the node is clean
+    # stand check 2394-10: a create still running when the time runs out may make its container after the removal
+    _shrink_the_answer_deadline(monkeypatch)
     payload = _payload()
     tracked = inflight_creates.track(payload.pod_id, (payload.miner_hotkey, payload.executor_id))
     context = contextvars.Context()
 
     async def a_create_registers_during_the_command(command: str):
         context.run(tracked.__enter__)
-        if create_ends:
-            context.run(tracked.__exit__, None, None, None)
         return _make_ssh_command_result(exit_status=0)
 
     order = _wire_delete(docker_service, monkeypatch, a_create_registers_during_the_command)
     try:
         result = await _delete(docker_service, payload)
     finally:
-        if not create_ends:
-            context.run(tracked.__exit__, None, None, None)
+        context.run(tracked.__exit__, None, None, None)
 
     assert len(order) == 1  # the removal ran
     assert isinstance(result, FailedContainerRequest)
@@ -354,6 +379,7 @@ async def test_a_create_of_the_pod_registered_during_the_removal_is_never_answer
 async def test_a_create_of_the_pod_registered_right_after_the_final_wait_is_never_answered_as_deleted(
     docker_service, monkeypatch
 ):
+    _shrink_the_answer_deadline(monkeypatch)
     payload = _payload()
     order = _wire_delete(docker_service, monkeypatch, _host_exits(0))
     tracked = inflight_creates.track(payload.pod_id, ("miner-b", "replacement-executor"))
@@ -375,7 +401,7 @@ async def test_a_create_of_the_pod_registered_right_after_the_final_wait_is_neve
     finally:
         context.run(tracked.__exit__, None, None, None)
 
-    assert waits == 2
+    assert waits >= 2
     assert isinstance(result, FailedContainerRequest)
     assert len(order) <= 1
 
