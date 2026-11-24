@@ -1300,6 +1300,18 @@ def test_a_clean_evidence_document_has_no_would_fail():
     assert judged["wall_clock_ms"] == 2377
 
 
+def test_a_single_card_run_without_a_timing_sample_is_not_a_wall_clock_failure():
+    card = _evidence_card()
+    card.pop("timing")
+    document = _evidence(card, wall=0)
+    document["timing"]["worker_count"] = 0
+
+    judged = evaluate_evidence(document, 1)
+
+    assert judged["wall_clock_ms"] == 0
+    assert judged["reasons"] == [] and judged["would_fail"] is False
+
+
 def test_a_claimed_card_with_no_result_is_a_reason():
     judged = evaluate_evidence(_evidence(_evidence_card()), 2)
 

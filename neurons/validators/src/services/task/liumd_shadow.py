@@ -357,6 +357,8 @@ def evaluate_evidence(evidence: Any, claimed_count: Any) -> dict[str, Any]:
     ]
     spread = max(firsts) - min(firsts) if len(firsts) > 1 else None
     timing = _as_dict(document.get("timing"))
+    workers = _as_int(timing.get("worker_count"))
+    has_timing = any(timings)
     wall = _as_int(timing.get("wall_clock_ms"))
     if wall is None:
         starts = [
@@ -401,7 +403,8 @@ def evaluate_evidence(evidence: Any, claimed_count: Any) -> dict[str, Any]:
             add("sysfs_vendor_mismatch")
     if spread is not None and spread > EVIDENCE_SPREAD_FAIL_MS:
         add(f"spread_over_{EVIDENCE_SPREAD_FAIL_MS}ms")
-    if wall is not None and wall < EVIDENCE_WALL_CLOCK_MIN_MS:
+    # No timing sample (a single-card matmul) means the wall-clock floor has nothing to judge.
+    if wall is not None and (workers or has_timing) and wall < EVIDENCE_WALL_CLOCK_MIN_MS:
         add("wall_clock_too_short")
 
     judged.update(
