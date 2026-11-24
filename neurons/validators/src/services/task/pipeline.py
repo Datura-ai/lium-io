@@ -926,7 +926,26 @@ class Pipeline:
 
         for index, step in enumerate(self.checks):
             parallel = isinstance(step, ParallelStage)
-            ran_checks, current_ctx, rented_pod = await self._run_step_cancelled_on_rent(step, current_ctx)
+            step_started = time.perf_counter()
+            try:
+                ran_checks, current_ctx, rented_pod = await self._run_step_cancelled_on_rent(step, current_ctx)
+            except asyncio.CancelledError:
+                # any cancellation inside a step (the per-node or whole-miner limit, shutdown) names the step it
+                # cut; a cancellation outside the steps (connect, context build, result handling) writes nothing
+                step_check_ids = [chk.check_id for chk in step.checks] if parallel else [step.check_id]
+                logger.warning(
+                    _m(
+                        "Validation cancelled mid-step",
+                        extra={
+                            **current_ctx.default_extra,
+                            "cancelled_check_ids": step_check_ids,
+                            "cancelled_step_elapsed_ms": int((time.perf_counter() - step_started) * 1000),
+                            "elapsed_time_ms": int((time.perf_counter() - pipeline_start_time) * 1000),
+                            "steps": dict(steps),
+                        },
+                    )
+                )
+                raise
             if rented_pod:
                 event = rented_since_cycle_start_event(current_ctx, rented_pod)
                 await self.sink.emit(event)
