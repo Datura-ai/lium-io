@@ -36,6 +36,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from datura.requests.validator_requests import MatmulStep, VerifyXStep
+from services.liumd_binary_refresh import ensure_liumd_binary, refresh_liumd_from_answer
 from services.liumd_exec_client import LiumdExecClient, LiumdRefusal
 from services.local_verify_client import (
     DETAIL_MAX_CHARS,
@@ -179,17 +180,64 @@ def start_facts_after_scrape(
 async def _facts_only(ctx: Context, client_factory: Callable[[Context, float], Any]) -> Any:
     """The liumd answer to a facts-only intent, or the LocalVerifyUnavailable it failed with."""
     budget = float(settings.LIUMD_SHADOW_TIMEOUT_SECONDS)
-    intent = build_intent(
-        executor_uuid=ctx.executor.uuid,
-        miner_hotkey=ctx.miner_hotkey,
-        matmul=None,
-        verifyx=None,
-        parallel_gpu=False,
-        deadline_s=executor_deadline_s(int(budget)),
-    )
-    intent["steps"]["inspector"] = False
+
+    def make_intent() -> dict[str, Any]:
+        intent = build_intent(
+            executor_uuid=ctx.executor.uuid,
+            miner_hotkey=ctx.miner_hotkey,
+            matmul=None,
+            verifyx=None,
+            parallel_gpu=False,
+            deadline_s=executor_deadline_s(int(budget)),
+        )
+        intent["steps"]["inspector"] = False
+        return intent
+
     try:
-        return await client_factory(ctx, budget).run(ctx.ssh, intent)
+        answer = await client_factory(ctx, budget).run(ctx.ssh, make_intent())
+    except LocalVerifyUnavailable as exc:
+        answer = exc
+    except Exception as exc:  # noqa: BLE001 — the task is awaited later; never fail the cycle
+        return LocalVerifyUnavailable("internal_error", f"{type(exc).__name__}: {exc}"[:DETAIL_MAX_CHARS])
+
+    if not settings.LIUMD_BINARY_REFRESH_ENABLED:
+        return answer
+    if isinstance(answer, LocalVerifyAnswer):
+        refresh = await refresh_liumd_from_answer(
+            ctx, answer.build_sha, answer.target, budget_seconds=budget
+        )
+    else:
+        refresh = await ensure_liumd_binary(ctx, budget_seconds=budget)
+    if refresh is None:
+        return answer
+    if refresh.skipped:
+        logger.warning(
+            _m(
+                "liumd binary refresh skipped; using the local binary",
+                extra=get_extra_info({**ctx.default_extra, "detail": refresh.detail[:300]}),
+            )
+        )
+        return answer
+    if not refresh.ok:
+        logger.warning(
+            _m(
+                "liumd binary refresh failed; shadow continues",
+                extra=get_extra_info({**ctx.default_extra, "detail": refresh.detail[:300]}),
+            )
+        )
+        if settings.VALIDATOR_LIUMD_SPECS:
+            return LocalVerifyUnavailable("binary_refresh_failed", refresh.detail[:DETAIL_MAX_CHARS])
+        return answer
+    if not refresh.changed:
+        return answer
+    logger.info(
+        _m(
+            "liumd binary refreshed",
+            extra=get_extra_info({**ctx.default_extra, "build_sha": refresh.build_sha}),
+        )
+    )
+    try:
+        return await client_factory(ctx, budget).run(ctx.ssh, make_intent())
     except LocalVerifyUnavailable as exc:
         return exc
     except Exception as exc:  # noqa: BLE001 — the task is awaited later; never fail the cycle
@@ -556,6 +604,17 @@ NOT_COMPARABLE_SPEC_PATHS = frozenset(
         "hard_disk.containers",
         "hard_disk.volumes",
         "docker.containers",
+        "host_memory.mem_available_kb",
+        "host_memory.swap_used_kb",
+        "host_memory.hugepages_free",
+        "host_memory.shmem_kb",
+        "host_memory.page_cache_kb",
+        "host_memory.outside_workloads_kb",
+        "host_memory.outside_workloads_no_cache_kb",
+        "host_memory.mapped_kb",
+        "host_memory.mapped_outside_workloads_kb",
+        "egress_ip",
+        "infiniband_ports",
     }
 )
 LIVE_GPU_DETAIL_FIELDS = frozenset(
@@ -574,8 +633,8 @@ LIVE_GPU_DETAIL_FIELDS = frozenset(
 )
 
 
-def _is_not_comparable(path: str) -> bool:
-    if path in NOT_COMPARABLE_SPEC_PATHS:
+def _is_not_comparable(path: str, extra: frozenset[str] = frozenset()) -> bool:
+    if path in extra or path in NOT_COMPARABLE_SPEC_PATHS:
         return True
     if path in {"hard_disk.by_container", "hard_disk.by_volume"}:
         return True
@@ -589,9 +648,19 @@ def _is_not_comparable(path: str) -> bool:
     return leaf in LIVE_GPU_DETAIL_FIELDS and parent.startswith("gpu.details[")
 
 
-def _spec_diffs(python: Any, liumd: Any, path: str = "") -> list[dict[str, Any]]:
+def _spec_diffs(
+    python: Any, liumd: Any, path: str = "", extra: frozenset[str] = frozenset()
+) -> list[dict[str, Any]]:
     """Every differing leaf in the two normalized specs documents, capped for logging."""
-    if path and _is_not_comparable(path):
+    if path and _is_not_comparable(path, extra):
+        return []
+    if (
+        path.endswith("_scrape_error")
+        and isinstance(python, str)
+        and isinstance(liumd, str)
+        and python
+        and liumd
+    ):
         return []
     diffs: list[dict[str, Any]] = []
     if type(python) is not type(liumd) and not (
@@ -601,7 +670,7 @@ def _spec_diffs(python: Any, liumd: Any, path: str = "") -> list[dict[str, Any]]
     if isinstance(python, dict):
         for key in sorted(set(python) | set(liumd)):
             child = f"{path}.{key}" if path else key
-            if _is_not_comparable(child):
+            if _is_not_comparable(child, extra):
                 continue
             if key not in python or key not in liumd:
                 diffs.append(
@@ -612,13 +681,13 @@ def _spec_diffs(python: Any, liumd: Any, path: str = "") -> list[dict[str, Any]]
                     }
                 )
             else:
-                diffs.extend(_spec_diffs(python[key], liumd[key], child))
+                diffs.extend(_spec_diffs(python[key], liumd[key], child, extra))
     elif isinstance(python, list):
         if len(python) != len(liumd):
             diffs.append({"path": path or "$", "python": len(python), "liumd": len(liumd)})
         else:
             for i, (a, b) in enumerate(zip(python, liumd)):
-                diffs.extend(_spec_diffs(a, b, f"{path}[{i}]"))
+                diffs.extend(_spec_diffs(a, b, f"{path}[{i}]", extra))
     elif python != liumd:
         diffs.append({"path": path or "$", "python": repr(python)[:120], "liumd": repr(liumd)[:120]})
     return diffs[:DETAIL_MAX_CHARS]
@@ -671,8 +740,24 @@ def _facts(ctx: Context, answer: LocalVerifyAnswer) -> dict[str, Any]:
     raw_specs = answer.specs
     liumd_specs = normalize_liumd_specs(raw_specs) if isinstance(raw_specs, dict) and raw_specs else {}
     python_specs = ctx.state.scrape_specs
+    extra: set[str] = set()
+    if isinstance(python_specs, dict):
+        reason = python_specs.get("needrestart_guard_reason")
+        if isinstance(reason, str) and reason:
+            extra.update({"needrestart_guard", "needrestart_guard_unguarded"})
+        if python_specs.get("needrestart_guard") == "missing" and liumd_specs.get(
+            "needrestart_guard"
+        ) in {"present", "partial"}:
+            extra.update({"needrestart_guard", "needrestart_guard_unguarded"})
+        for value_key, error_key in (
+            ("storage_limit_supported", "storage_limit_scrape_error"),
+            ("sysbox_runtime", "sysbox_runtime_scrape_error"),
+        ):
+            error = python_specs.get(error_key)
+            if isinstance(error, str) and "timed out" in error.lower():
+                extra.update({value_key, error_key})
     compared = python_specs is not None and bool(liumd_specs)
-    diffs = _spec_diffs(python_specs, liumd_specs) if compared else []
+    diffs = _spec_diffs(python_specs, liumd_specs, extra=frozenset(extra)) if compared else []
     return {
         "agree": all(c["agree"] for c in checks) if checks else None,
         "checks": checks,

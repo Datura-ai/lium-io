@@ -8,7 +8,6 @@ bounded. Every healthy listed shape stays above these floors.
 from __future__ import annotations
 
 import pytest
-from neurons.validators.src.services.task.checks import spec_floor
 from neurons.validators.src.services.task.checks.spec_floor import SpecFloorCheck
 from neurons.validators.src.services.task.messages import SpecFloorMessages as Msg
 
@@ -16,11 +15,6 @@ from tests.helpers import build_state
 from tests.test_gpu_fingerprint_check import _live_rental
 
 KIB_PER_GB = 1024 * 1024
-
-
-@pytest.fixture(autouse=True)
-def enforced(monkeypatch):
-    monkeypatch.setattr(spec_floor.settings, "SPEC_FLOOR_ENFORCEMENT_ENABLED", True)
 
 
 def _uuid(i: int) -> str:
@@ -91,15 +85,3 @@ async def test_a_live_rental_is_not_halted(context_factory):
 
     assert (result.passed, result.fatal) == (False, False)
     assert result.updates == {"spec_floor_passed": False}
-
-
-@pytest.mark.asyncio
-async def test_with_enforcement_off_a_node_below_the_floors_is_only_logged(context_factory, monkeypatch):
-    monkeypatch.setattr(spec_floor.settings, "SPEC_FLOOR_ENFORCEMENT_ENABLED", False)
-
-    _, result = await _run(context_factory, cpu=0, ram_gb=12)
-
-    assert (result.passed, result.updates) == (True, {})
-    assert result.event.reason_code == Msg.REJECTED.reason
-    assert result.event.severity == "warning"
-    assert result.event.what_we_saw["findings"] == ["cpu_count", "ram_per_gpu"]

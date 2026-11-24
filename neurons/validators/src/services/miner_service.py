@@ -1180,7 +1180,7 @@ class MinerService:
 
         A miner that reached none of its nodes is down itself (its own network, a restart), not its
         nodes: that wave writes none of these rows, so one miner-side blip does not mark every node
-        down (Pixel, 19 Oct). Manual rentals are left out, as the miner cannot reach them anyway. The
+        down (Pixel, 19 Oct). A node that answered with a refusal (``refused_executors``) was reached. Manual rentals are left out, as the miner cannot reach them anyway. The
         zero-executor wave then fails as before.
         """
         if (
@@ -1193,7 +1193,9 @@ class MinerService:
         reached = {str(executor.uuid).lower() for executor in msg.executors}
         manual = {str(uuid).lower() for uuid in ((rented_data and rented_data.manual_rental_executors) or {})}
         reachable = set(known) - manual
-        if reachable and not reached & reachable:
+        # a node that answered with a refusal was reached: the miner is up even when no node took the key
+        refused = {str(uuid).lower(): str(text)[:200] for uuid, text in (msg.refused_executors or {}).items()}
+        if reachable and not (reached | refused.keys()) & reachable:
             if log:
                 logger.warning(
                     _m(
@@ -1218,7 +1220,7 @@ class MinerService:
             if executor_uuid in skip:
                 continue
             event = build_executor_unreachable_by_miner_event(
-                executor_uuid=executor_uuid, miner_hotkey=payload.miner_hotkey
+                executor_uuid=executor_uuid, miner_hotkey=payload.miner_hotkey, refusal=refused.get(executor_uuid)
             )
             log_text = _m(
                 event.event,
@@ -1494,6 +1496,7 @@ class MinerService:
                             else None
                         ),
                         "host_runtime_fault": result.host_runtime_fault,
+                        "rented_pod_faults": result.rented_pod_faults,
                         "check_started_at": (
                             result.check_started_at.isoformat() if result.check_started_at else None
                         ),
@@ -1522,8 +1525,7 @@ class MinerService:
             # only a passed spec moves the backend to these UUIDs; a failed one must not hide the recovery
             if result.is_successful and (gpu_uuids := _gpu_uuids(result)):
                 self.published_gpu_uuids[str(result.executor_info.uuid).lower()] = set(gpu_uuids)
-            if settings.POD_STATES_REPORT_ENABLED:
-                await self._publish_pod_states_report(result, miner_hotkey=miner_hotkey, default_extra=default_extra)
+            await self._publish_pod_states_report(result, miner_hotkey=miner_hotkey, default_extra=default_extra)
 
     @staticmethod
     def _pod_states_capped_for_spec(result: JobResult, default_extra: dict) -> list[dict] | None:
@@ -1533,12 +1535,7 @@ class MinerService:
         if len(bounded) < len(result.pod_states):
             logger.warning(
                 _m(
-                    "pod_states over the spec's bound"
-                    + (
-                        "; every state goes in the PodStatesReport chunks"
-                        if settings.POD_STATES_REPORT_ENABLED
-                        else "; the observed states past it are cut until the reaped queue drains"
-                    ),
+                    "pod_states over the spec's bound; every state goes in the PodStatesReport chunks",
                     extra=get_extra_info(
                         {
                             **default_extra,
@@ -2370,6 +2367,8 @@ class MinerService:
                             executor_image_snapshot=executor_image_snapshot,
                             attestation_nonce=attestation_nonce,
                             first_pass=first_pass,
+                            # DAH-5933 review: an express recheck's wait ends before JOB_TIME_OUT; the checks budget against it
+                            deadline_monotonic=None if job_timeout is None else job_started_at + job_timeout,
                         ),
                         timeout=timeout,
                     )
