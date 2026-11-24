@@ -42,6 +42,7 @@ jobs:
           context: ./neurons/validators
           build-contexts: |
             datura=./datura
+            executor_setup=./neurons/executor
           push: true
           tags: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:staging

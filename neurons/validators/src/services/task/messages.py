@@ -1079,6 +1079,31 @@ class SysboxLayerResetMessages:
         impact="Proceed; score not changed",
         remediation=OUTDATED.remediation,
     )
+    REMOVE_PENDING = MessageTemplate(
+        event="Host boot-time layer reset to be removed",
+        reason="SYSBOX_LAYER_RESET_REMOVE_PENDING",
+        severity="info",
+        category="env",
+        impact="Proceed",
+    )
+    REMOVED = MessageTemplate(
+        event="Host boot-time layer reset removed",
+        reason="SYSBOX_LAYER_RESET_REMOVED",
+        severity="info",
+        category="env",
+        impact="Proceed",
+    )
+    REMOVE_FAILED = MessageTemplate(
+        event="Host boot-time layer reset could not be removed",
+        reason="SYSBOX_LAYER_RESET_REMOVE_FAILED",
+        severity="warning",
+        category="env",
+        impact="Proceed; score not changed",
+        remediation=(
+            "Run `sudo bash nvidia_docker_sysbox_setup.sh --remove-layer-reset` from lium-io neurons/executor on the "
+            "host: it removes lium-sysbox-layer-reset.service and Docker's drop-in for it, and restarts nothing."
+        ),
+    )
     UNKNOWN = MessageTemplate(
         event="Host boot-time layer reset not reported",
         reason="SYSBOX_LAYER_RESET_UNKNOWN",
@@ -1488,6 +1513,13 @@ class TenantEnforcementMessages:
     NOT_RENTED = MessageTemplate(
         event="Executor not rented",
         reason="EXECUTOR_NOT_RENTED",
+        severity="info",
+        category="policy",
+        impact="Proceed",
+    )
+    STILL_NOT_RENTED = MessageTemplate(
+        event="Executor still not rented after the parallel checks",
+        reason="EXECUTOR_STILL_NOT_RENTED",
         severity="info",
         category="policy",
         impact="Proceed",
@@ -2053,6 +2085,20 @@ class VerifyXMessages:
         category="policy",
         impact="Rental probe gets this cycle's time to clear its standing failure; reused last-known VerifyX EMA",
     )
+    NO_TASK_TIME = MessageTemplate(
+        event="VerifyX not finished: not enough task time left",
+        reason="VERIFYX_NO_TASK_TIME",
+        severity="warning",
+        category="policy",
+        impact=(
+            "No verdict this cycle; the node's last scored result stands. The validator's budget, not the node, "
+            "ended it"
+        ),
+        remediation=(
+            "The checks before VerifyX used most of the executor task's time, and VerifyX gets only what the checks "
+            "after it can spare. The next cycle runs it again."
+        ),
+    )
     NO_SPECS = MessageTemplate(
         event="VerifyX validation skipped (no specs)",
         reason="VERIFYX_NO_SPECS",
@@ -2538,6 +2584,29 @@ class RentalVerificationMessages:
         category="policy",
         impact="Proceed",
     )
+    # the backend found a customer rental on the node, started after this cycle's snapshot: the node is scored as
+    # rented and no further check puts load on it
+    RENTED_SINCE_THE_SNAPSHOT = MessageTemplate(
+        event="Node rented during this check",
+        reason="RENTAL_STARTED_DURING_CHECK",
+        severity="info",
+        category="policy",
+        impact=(
+            "No verdict this cycle: the node's rentals changed during it, so no earlier result stands in; the next "
+            "cycle scores the node rented"
+        ),
+        remediation="No action needed.",
+    )
+    # the backend skipped its probe for a pod it still holds but no longer lists as a rental (one it is removing): no
+    # probe ran and the node is not rented, so the check fails instead of being held as a new rental
+    PROBE_SKIPPED_FOR_AN_UNLISTED_POD = MessageTemplate(
+        event="Rental probe skipped for a pod that is not a listed rental",
+        reason="RENTAL_PROBE_SKIPPED_UNLISTED_POD",
+        severity="warning",
+        category="policy",
+        impact="This cycle fails: the rental probe did not run, and the node has no listed rental",
+        remediation="No action needed if a rental on this node just ended; the next cycle probes the node again.",
+    )
     FAILED = MessageTemplate(
         event="Rental verification failed",
         reason="RENTAL_NOT_VERIFIED",
@@ -2602,6 +2671,17 @@ class RentalVerificationMessages:
         category="policy",
         impact="Proceed with existing rental status",
         remediation="Check backend API connectivity and logs",
+    )
+    NO_TASK_TIME = MessageTemplate(
+        event="Rental verification not run: not enough task time left",
+        reason="RENTAL_CHECK_NO_TASK_TIME",
+        severity="warning",
+        category="policy",
+        impact="This cycle fails; the backend's rental probe was not sent, so this is not a backend or API error",
+        remediation=(
+            "The checks before the rental verification used the executor task's time. A slow VerifyX download is "
+            "the usual cause: check the host's download speed. The next cycle runs it again."
+        ),
     )
     FILLER_VERIFIED = MessageTemplate(
         event="Lium default job runtime verified",
@@ -3306,3 +3386,15 @@ class SshdAuthLogMessages:
         category="runtime",
         impact="Proceed; observation only",
     )
+
+
+# DAH-5933: the run left the backend's rental probe, or VerifyX, too little time; the validator's budget, not the
+# node, decides that, so it is no failed check: an idle node carries its last scored result too
+NO_TASK_TIME_REASONS = (RentalVerificationMessages.NO_TASK_TIME.reason, VerifyXMessages.NO_TASK_TIME.reason)
+# results the cycle's snapshot cannot score, held for the cycle-end rented read: a budget stop (above), or a node the
+# backend found rented after the snapshot listed it idle (its GPU count and pool come from that read, never the snapshot)
+CYCLE_END_READ_REASONS = (*NO_TASK_TIME_REASONS, RentalVerificationMessages.RENTED_SINCE_THE_SNAPSHOT.reason)
+# DAH-5933 review at ea74f37: a budget stop after a check that already zeroed the cycle's score. Its own code, since
+# the last event before the stop can be one a rollout withholds (a warn-only EXECUTOR_IMAGE_OUTDATED): no rule withholds
+# or carries this one, so the zero is published as it is
+ZEROED_BEFORE_THE_BUDGET_STOP = "SCORE_ZEROED_BEFORE_THE_TASK_TIME_RAN_OUT"

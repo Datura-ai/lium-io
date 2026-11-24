@@ -1,15 +1,10 @@
-"""DAH-2621: an idle node with too little RAM for its GPU VRAM earns no unrented incentive once enforced."""
+"""DAH-2621: an idle node with too little RAM for its GPU VRAM earns no unrented incentive."""
 
 import pytest
-from core.config import settings
+
 from tests.test_every_zero_incentive_reason import _codes, _idle_full_8x, _incentive
 
 GIB_KB = 1024**2
-
-
-@pytest.fixture
-def enforced(monkeypatch):
-    monkeypatch.setattr(settings, "ENABLE_UNRENTED_RAM_BELOW_VRAM_LIMIT", True)
 
 
 def _node(gpus: int, vram_gb_per_gpu: float, ram_gb: float):
@@ -22,21 +17,11 @@ def _node(gpus: int, vram_gb_per_gpu: float, ram_gb: float):
 
 
 @pytest.mark.asyncio
-async def test_a_node_with_11_gb_ram_and_a_64_gb_card_earns_no_idle_pay(enforced):
+async def test_a_node_with_11_gb_ram_and_a_64_gb_card_earns_no_idle_pay():
     result = await _incentive().calculate_executor_score(_node(1, 64, 11.2))
 
     assert "insufficient_ram_for_vram" in _codes(result)
     assert result.eligible_for_rental_share is False
-
-
-@pytest.mark.asyncio
-async def test_with_the_flag_off_the_gate_only_logs_and_the_node_keeps_idle_pay(caplog):
-    with caplog.at_level("INFO"):
-        result = await _incentive().calculate_executor_score(_node(1, 64, 11.2))
-
-    assert "insufficient_ram_for_vram" not in _codes(result)
-    assert result.eligible_for_rental_share is True
-    assert "(shadow only - flag off)" in caplog.text
 
 
 @pytest.mark.asyncio
@@ -54,14 +39,14 @@ async def test_with_the_flag_off_the_gate_only_logs_and_the_node_keeps_idle_pay(
         (8, 180, 1339.2),
     ],
 )
-async def test_a_node_with_enough_ram_keeps_idle_pay(enforced, gpus, vram, ram):
+async def test_a_node_with_enough_ram_keeps_idle_pay(gpus, vram, ram):
     result = await _incentive().calculate_executor_score(_node(gpus, vram, ram))
 
     assert "insufficient_ram_for_vram" not in _codes(result)
 
 
 @pytest.mark.asyncio
-async def test_a_scrape_without_ram_fails_open_and_says_so(enforced, caplog):
+async def test_a_scrape_without_ram_fails_open_and_says_so(caplog):
     node = _node(1, 64, 0)
     node.spec.pop("ram")
 
@@ -74,7 +59,7 @@ async def test_a_scrape_without_ram_fails_open_and_says_so(enforced, caplog):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("vram", [32, 48, 80, 141, 21])
-async def test_the_ram_the_rejection_names_earns_idle_pay(enforced, vram):
+async def test_the_ram_the_rejection_names_earns_idle_pay(vram):
     # 32 GB VRAM: 16/1.05 = 15.238 rounded to nearest named 15.2 GB, which the gate still rejected
     measured = _incentive()._insufficient_ram(_node(1, vram, 8))
 

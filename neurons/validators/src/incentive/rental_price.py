@@ -436,12 +436,11 @@ class RentalPriceIncentive(DefaultIncentive):
             )
         )
 
-    def _log_insufficient_ram(self, result: JobResult, measured: InsufficientRam, enforced: bool) -> None:
+    def _log_insufficient_ram(self, result: JobResult, measured: InsufficientRam) -> None:
         # structured log for every rental-eligible unrented executor short on RAM for its VRAM
         logger.info(
             _m(
-                "Unrented executor has less system RAM than its GPU VRAM requires"
-                + ("" if enforced else " (shadow only - flag off)"),
+                "Unrented executor has less system RAM than its GPU VRAM requires",
                 extra={
                     "executor_id": str(result.executor_info.uuid),
                     "gpu_model": result.gpu_model,
@@ -450,9 +449,9 @@ class RentalPriceIncentive(DefaultIncentive):
                     "total_ram_gb": measured.ram_gb,
                     "required_ram_gb": measured.required_ram_gb,
                     "min_ram_to_vram_rate": measured.rate,
-                    "enforced": enforced,
+                    "enforced": True,
                     "reason": ZeroIncentiveReason.INSUFFICIENT_RAM_FOR_VRAM,
-                    "pool": "rental_excluded" if enforced else "rental_kept_shadow",
+                    "pool": "rental_excluded",
                 },
             )
         )
@@ -1584,22 +1583,20 @@ class RentalPriceIncentive(DefaultIncentive):
             job_result.record_incentive_log(reason)
 
         # DAH-2621 RAM/VRAM gate: an idle machine with too little RAM for its GPU VRAM forfeits the unrented
-        # incentive (node stays active and rentable). While the flag is off only the would-be exclusion is logged.
-        ram_enforced: bool = settings.ENABLE_UNRENTED_RAM_BELOW_VRAM_LIMIT
+        # incentive (node stays active and rentable).
         insufficient_ram = (
             self._insufficient_ram(job_result, log_if_cannot_measure=eligible_for_rental_share)
-            if self._should_run_idle_pool_gate(idle_pool_candidate, eligible_for_rental_share, ram_enforced)
+            if self._should_run_idle_pool_gate(idle_pool_candidate, eligible_for_rental_share, enforced=True)
             else None
         )
         if insufficient_ram is not None:
             if eligible_for_rental_share:
-                self._log_insufficient_ram(job_result, insufficient_ram, ram_enforced)
-            if ram_enforced:
-                eligible_for_rental_share = False
-                reason: MinerLogLine = MinerLogLine.no_payout_because_insufficient_ram_for_vram(
-                    job_result, insufficient_ram
-                )
-                job_result.record_incentive_log(reason)
+                self._log_insufficient_ram(job_result, insufficient_ram)
+            eligible_for_rental_share = False
+            reason: MinerLogLine = MinerLogLine.no_payout_because_insufficient_ram_for_vram(
+                job_result, insufficient_ram
+            )
+            job_result.record_incentive_log(reason)
 
         # DAH-2546 full 8x capability gate
         missing_capability = (

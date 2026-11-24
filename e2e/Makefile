@@ -30,12 +30,21 @@ else
 endif
 COMPOSE := docker compose --env-file stack.env $(COMPOSE_FILES)
 
-# E2E_CACHE=gha (CI only): bake the images with a GitHub Actions layer cache. One scope per image: a shared scope
-# lets the last export overwrite the others' index. ignore-error: a failed export never fails the build.
+# Layer cache: E2E_CACHE=registry (one cache tag per image in E2E_CACHE_REF, a GHCR repository, outside the 10 GB
+# Actions cache quota and shared by every branch) or E2E_CACHE=gha (the Actions cache, evicted under pressure and
+# scoped to the branch that wrote it; one scope per image so one export does not overwrite another's index).
+# ignore-error: a failed export never fails the build.
 # fs.read=..: the build contexts read ../neurons and ../datura; buildx refuses them otherwise.
 E2E_CACHE ?=
+E2E_CACHE_REF ?=
 BAKE_IMAGES := dind executor miner validator tester
+ifeq ($(E2E_CACHE),registry)
+BAKE_CACHE = $(foreach i,$(BAKE_IMAGES),--set '$(i).cache-from=type=registry,ref=$(E2E_CACHE_REF):$(i)' --set '$(i).cache-to=type=registry,ref=$(E2E_CACHE_REF):$(i),mode=min,ignore-error=true')
+POD_CACHE = --cache-from type=registry,ref=$(E2E_CACHE_REF):pod --cache-to type=registry,ref=$(E2E_CACHE_REF):pod,mode=min,ignore-error=true
+else
 BAKE_CACHE = $(foreach i,$(BAKE_IMAGES),--set '$(i).cache-from=type=$(E2E_CACHE),scope=e2e-$(i)' --set '$(i).cache-to=type=$(E2E_CACHE),scope=e2e-$(i),mode=max,ignore-error=true')
+POD_CACHE = --cache-from type=$(E2E_CACHE),scope=e2e-pod --cache-to type=$(E2E_CACHE),scope=e2e-pod,mode=max,ignore-error=true
+endif
 
 .PHONY: e2e e2e-full build up seed test logs down
 
@@ -56,8 +65,7 @@ ifeq ($(E2E_CACHE),)
 	docker build --progress=plain -t $(E2E_POD_IMAGE) pod
 else
 	docker buildx bake $(COMPOSE_FILES) --allow=fs.read=.. --load $(BAKE_CACHE)
-	docker buildx build --progress=plain --load --cache-from type=$(E2E_CACHE),scope=e2e-pod \
-	  --cache-to type=$(E2E_CACHE),scope=e2e-pod,mode=max,ignore-error=true -t $(E2E_POD_IMAGE) pod
+	docker buildx build --progress=plain --load $(POD_CACHE) -t $(E2E_POD_IMAGE) pod
 endif
 
 up:
