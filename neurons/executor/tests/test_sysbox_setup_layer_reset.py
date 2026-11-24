@@ -104,6 +104,8 @@ def test_the_boot_unit_runs_after_sysbox_and_before_docker(tmp_path):
     assert "After=local-fs.target sysbox.service sysbox-mgr.service containerd.service" in unit
     assert "Before=docker.service\n" in unit
     assert "ExecStart=/usr/bin/python3 -I /usr/local/sbin/lium-sysbox-layer-reset" in unit
+    # DAH-7052: a hung reset holds Docker's start 15 minutes at most
+    assert "\nTimeoutStartSec=15min\n" in unit
 
 
 def test_the_unit_carries_the_version_the_validator_compares(tmp_path):
@@ -154,7 +156,7 @@ def test_once_enable_works_the_next_install_adds_the_dependency_and_the_version(
 
     assert result.returncode == 0, result.stderr
     assert (tmp_path / "etc/systemd/system/docker.service.d/lium-sysbox-layer-reset.conf").read_text().startswith(
-        "[Unit]\nRequires=lium-sysbox-layer-reset.service\n"
+        "[Unit]\nWants=lium-sysbox-layer-reset.service\nAfter=lium-sysbox-layer-reset.service\n"
     )
     unit = (tmp_path / "etc/systemd/system/lium-sysbox-layer-reset.service").read_text()
     assert unit.splitlines()[0] == f"# lium-layer-reset-version={_layer_reset_version()}"
@@ -176,6 +178,66 @@ def test_install_layer_reset_mode_never_runs_the_reset_or_restarts_docker():
     branch = re.search(r"^    --install-layer-reset\)\n(.*?)^        ;;$", open(SCRIPT).read(), re.S | re.M).group(1)
     assert "shift_sysbox_layers_back_at_boot" in branch
     assert not re.search(r"systemctl (re)?start|systemctl restart|/usr/local/sbin/lium-sysbox-layer-reset|--dry-run", branch)
+
+
+def _remove_on_a_live_host(root, disable_fails: bool = False) -> subprocess.CompletedProcess:
+    log = root / "systemctl.log"
+    script = (
+        f'host_path() {{ echo "{root}$1"; }}\n'
+        + f'systemctl() {{ echo "$*" >> "{log}"; [ "$1" = disable ] && {"return 1" if disable_fails else "return 0"}; return 0; }}\n'
+        + _function("remove_layer_reset")
+        + "remove_layer_reset\n"
+    )
+    env = {k: v for k, v in os.environ.items() if k != "SYSBOX_SETUP_HOST_ROOT"}
+    return subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=env)
+
+
+def test_remove_takes_the_reset_out_of_dockers_start_and_restarts_nothing(tmp_path):
+    # DAH-7052: an installed host (enable worked), then the way back
+    assert _install_on_a_live_host(tmp_path, enable_fails=False).returncode == 0
+    (tmp_path / "systemctl.log").unlink()
+
+    result = _remove_on_a_live_host(tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    for path in ("etc/systemd/system/docker.service.d/lium-sysbox-layer-reset.conf",
+                 "etc/systemd/system/lium-sysbox-layer-reset.service", "usr/local/sbin/lium-sysbox-layer-reset"):
+        assert not (tmp_path / path).exists(), path
+    assert (tmp_path / "systemctl.log").read_text() == "disable lium-sysbox-layer-reset.service\ndaemon-reload\n"
+
+
+def test_a_failed_disable_still_leaves_docker_independent_of_the_reset(tmp_path):
+    assert _install_on_a_live_host(tmp_path, enable_fails=False).returncode == 0
+
+    result = _remove_on_a_live_host(tmp_path, disable_fails=True)
+
+    assert result.returncode != 0
+    assert not (tmp_path / "etc/systemd/system/docker.service.d/lium-sysbox-layer-reset.conf").exists()
+    # the unit stays, so the scrape still reports it and the validator tries again
+    assert (tmp_path / "etc/systemd/system/lium-sysbox-layer-reset.service").exists()
+
+
+def test_remove_on_a_host_without_the_reset_is_a_no_op(tmp_path):
+    result = _remove_on_a_live_host(tmp_path)
+    assert result.returncode == 0, result.stderr
+    assert (tmp_path / "systemctl.log").read_text() == "daemon-reload\n"
+
+
+@pytest.mark.skipif(os.getuid() == 0, reason="the not-root answer needs a non-root run")
+def test_remove_layer_reset_mode_answers_one_line_without_root(tmp_path):
+    result = subprocess.run(
+        ["bash", SCRIPT, "--remove-layer-reset"], capture_output=True, text=True, timeout=60,
+        env={**os.environ, "SYSBOX_SETUP_HOST_ROOT": str(tmp_path)},
+    )
+    assert (result.returncode, result.stdout) == (0, "layer_reset_skipped not_root\n")
+
+
+def test_remove_layer_reset_mode_never_stops_or_restarts_docker():
+    text = open(SCRIPT).read()
+    branch = re.search(r"^    --remove-layer-reset\)\n(.*?)^        ;;$", text, re.S | re.M).group(1)
+    assert "remove_layer_reset" in branch
+    code = "\n".join(l for l in (branch + _function("remove_layer_reset")).splitlines() if not l.strip().startswith("#"))
+    assert not re.search(r"systemctl (re)?start|systemctl stop|restart|docker (stop|kill|rm)|python3", code)
 
 
 def test_a_shifted_sysbox_layer_is_found_and_a_runc_container_is_left_alone(tmp_path):
@@ -570,17 +632,18 @@ def test_named_acl_entries_are_shifted_back_also_when_the_owner_already_matches(
     assert fs.xattrs[etc]["system.posix_acl_default"] == want
 
 
-def test_a_failing_reset_keeps_docker_down_and_a_docker_restart_never_reruns_it(tmp_path):
+def test_a_failing_reset_fails_its_unit_but_not_docker_and_a_docker_restart_never_reruns_it(tmp_path):
     reset, fs = _fake_fs(tmp_path)
 
     def broken(*a):
         raise OSError(5, "Input/output error")
 
     reset["os"].lchown = broken
-    with pytest.raises(OSError):  # the unit fails, and with it Docker's start (Requires=)
+    with pytest.raises(OSError):  # the unit fails; Docker still starts after it (DAH-7052: Wants=, not Requires=)
         reset["main"]()
     dropin = (tmp_path / "etc/systemd/system/docker.service.d/lium-sysbox-layer-reset.conf").read_text()
-    assert "Requires=lium-sysbox-layer-reset.service" in dropin
+    assert "Wants=lium-sysbox-layer-reset.service" in dropin
+    assert "Requires=" not in dropin
     assert "After=lium-sysbox-layer-reset.service" in dropin
     assert "ExecStartPost=/bin/touch /run/lium-docker-started" in dropin
     assert "RemainAfterExit=yes" in (tmp_path / "etc/systemd/system/lium-sysbox-layer-reset.service").read_text()

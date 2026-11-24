@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock
 import pytest
 from neurons.validators.src.services.task.checks.sysbox_layer_reset import (
     INSTALL_COMMAND,
+    REMOVE_COMMAND,
     SysboxLayerResetCheck,
     setup_script,
 )
@@ -68,7 +69,7 @@ def test_no_host_view_raises_so_the_scrape_reports_unknown():
 
 def test_the_validator_ships_the_setup_scripts_version():
     assert setup_script() is not None
-    assert setup_script()[1] == CURRENT >= 2
+    assert setup_script()[1] == CURRENT >= 3
 
 
 def _ssh(stdout: str):
@@ -256,3 +257,54 @@ async def test_no_rented_list_this_cycle_installs_nothing(context_factory, mode)
 def test_off_is_the_default():
     fields = getattr(type(settings), "model_fields", None) or type(settings).__fields__
     assert fields["SYSBOX_LAYER_RESET_INSTALL"].default == "off"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("installed", [1, CURRENT - 1, CURRENT, CURRENT + 1])
+async def test_remove_runs_the_scripts_remove_on_an_idle_host_with_the_unit(context_factory, mode, installed):
+    # DAH-7052: every host, allowlisted or not, whatever version it has
+    mode("remove", "")
+    ssh = _ssh("layer_reset_removed\n")
+
+    result = await _run(context_factory, {"sysbox_layer_reset_version": installed}, ssh, hotkey="5NotListed")
+
+    assert (result.passed, result.event.reason_code, result.updates) == (True, Msg.REMOVED.reason, {})
+    assert ssh.run.await_args.args[0] == REMOVE_COMMAND
+    assert "--remove-layer-reset" in REMOVE_COMMAND and "--install-layer-reset" not in REMOVE_COMMAND
+    assert ssh.run.await_args.kwargs["input"] == SETUP_SCRIPT.read_text()
+
+
+@pytest.mark.asyncio
+async def test_remove_leaves_a_host_without_the_unit_alone(context_factory, mode):
+    mode("remove")
+    ssh = _ssh("")
+
+    result = await _run(context_factory, {"sysbox_layer_reset_version": 0}, ssh)
+
+    assert (result.passed, result.event.reason_code) == (True, Msg.OK.reason)
+    ssh.run.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("write,rented", [(False, False), (True, True)])
+async def test_remove_waits_for_an_idle_host_and_skips_dry_run(context_factory, mode, write, rented):
+    mode("remove")
+    ssh = _ssh("layer_reset_removed\n")
+
+    result = await _run(context_factory, {"sysbox_layer_reset_version": CURRENT}, ssh, write=write, rented=rented)
+
+    assert (result.passed, result.event.reason_code) == (True, Msg.REMOVE_PENDING.reason)
+    ssh.run.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "stdout", ["layer_reset_failed remove\n", "layer_reset_skipped not_root\n", "layer_reset_failed nsenter_failed\n", ""]
+)
+async def test_a_remove_that_does_not_work_warns_and_keeps_the_score(context_factory, mode, stdout):
+    mode("remove")
+
+    result = await _run(context_factory, {"sysbox_layer_reset_version": CURRENT}, _ssh(stdout))
+
+    assert (result.passed, result.event.reason_code, result.event.severity) == (True, Msg.REMOVE_FAILED.reason, "warning")
+    assert "--remove-layer-reset" in Msg.REMOVE_FAILED.remediation
