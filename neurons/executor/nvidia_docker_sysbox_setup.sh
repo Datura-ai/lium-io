@@ -622,6 +622,72 @@ UNIT
     [ -n "${SYSBOX_SETUP_HOST_ROOT:-}" ] || systemctl daemon-reload
 }
 
+create_nvidia_device_nodes_before_docker() {
+    # A pod is created with every GPU device node it uses as an explicit --device (they keep the GPUs readable across a
+    # systemd daemon-reload). The driver makes those nodes only when something first opens a GPU, so at boot Docker's
+    # restart-policy start can come before them and fails "error gathering device information while adding custom
+    # device /dev/nvidiaN": the pod stays down until it is recreated. A boot oneshot before Docker makes them first.
+    local bin unit dropin
+    bin=$(host_path /usr/local/sbin/lium-nvidia-device-nodes)
+    unit=$(host_path /etc/systemd/system/lium-nvidia-device-nodes.service)
+    dropin=$(host_path /etc/systemd/system/docker.service.d/lium-nvidia-device-nodes.conf)
+    mkdir -p "$(dirname "$bin")" "$(dirname "$unit")" "$(dirname "$dropin")" || return 1
+    cat > "$bin" <<'SH' || return 1
+#!/bin/sh
+# Lium (nvidia_docker_sysbox_setup.sh): create the NVIDIA device nodes at boot, before Docker starts the pods that
+# use them. nvidia-modprobe only loads the modules and makes the nodes; it does not touch the GPUs.
+gpus="${LIUM_NVIDIA_GPUS_DIR:-/proc/driver/nvidia/gpus}"
+minors() {
+    for info in "$gpus"/*/information; do
+        [ -r "$info" ] && sed -n 's/^Device Minor:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$info"
+    done; }
+if command -v nvidia-modprobe >/dev/null 2>&1; then
+    nvidia-modprobe -c=255  # loads nvidia, makes /dev/nvidiactl
+    for minor in $(minors); do nvidia-modprobe -c="$minor"; done  # /dev/nvidia<minor>
+    nvidia-modprobe -u -c=0  # /dev/nvidia-uvm and /dev/nvidia-uvm-tools
+    nvidia-modprobe -m  # /dev/nvidia-modeset
+    exit 0
+fi
+# No nvidia-modprobe (Ubuntu's nvidia-utils-*-server do not ship it): load the modules and make the nodes from their
+# numbers, as nvidia-modprobe does. 195 is the driver's fixed major; 255 nvidiactl, 254 modeset; mode 0666 its default.
+dev="${LIUM_NVIDIA_DEV_DIR:-/dev}"
+mk() { [ -e "$dev/$1" ] || mknod -m 666 "$dev/$1" c "$2" "$3"; }
+modprobe nvidia || exit 0
+mk nvidiactl 195 255
+for minor in $(minors); do mk "nvidia$minor" 195 "$minor"; done
+if modprobe nvidia-uvm; then
+    uvm=$(awk '$2 == "nvidia-uvm" {print $1}' "${LIUM_NVIDIA_PROC_DEVICES:-/proc/devices}")
+    [ -n "$uvm" ] && mk nvidia-uvm "$uvm" 0 && mk nvidia-uvm-tools "$uvm" 1
+fi
+modprobe nvidia-modeset && mk nvidia-modeset 195 254
+exit 0
+SH
+    chmod 755 "$bin" || return 1
+    cat > "$unit" <<'UNIT' || return 1
+[Unit]
+Description=Lium: create the NVIDIA device nodes before Docker starts the pods
+After=systemd-modules-load.service
+Before=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# a hung nvidia-modprobe is killed here, so Docker (which only Wants this unit) still starts:
+# SIGKILL at the start timeout (systemd 246+), and a short stop wait bounds it on older systemd
+TimeoutStartSec=60
+TimeoutStartFailureMode=kill
+TimeoutStopSec=5
+ExecStart=/usr/local/sbin/lium-nvidia-device-nodes
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+    # Wants, not Requires: a node it could not make fails only the pod that needs it, never Docker itself
+    printf '[Unit]\nWants=lium-nvidia-device-nodes.service\nAfter=lium-nvidia-device-nodes.service\n' > "$dropin" || return 1
+    [ -n "${SYSBOX_SETUP_HOST_ROOT:-}" ] && return 0
+    systemctl daemon-reload && systemctl enable lium-nvidia-device-nodes.service >/dev/null 2>&1
+}
+
 self_cmd() {
     # how to run this script again: the file when there is one, else the one-liner (curl | bash). A leading VAR=VALUE
     # argument goes after sudo (sudo's env_reset drops variables set before it); the rest are the script's options.
@@ -783,24 +849,43 @@ check_fuse3() {
 FUSERMOUNT3_PROFILE=/etc/apparmor.d/fusermount3
 FUSERMOUNT3_LOCAL=/etc/apparmor.d/local/fusermount3
 FUSERMOUNT3_RULE='mount fstype=@{fuse_types} -> /var/lib/sysboxfs/**,'
+# without it a stopped container's sysbox-fs mount stays behind and the next sysbox container start fails
+FUSERMOUNT3_UMOUNT_RULE='umount /var/lib/sysboxfs/**,'
 
-# the profile only binds when AppArmor is on: with apparmor=0 there is nothing to fix and apparmor_parser fails
+# only a profile the kernel holds in enforce mode binds. A file on disk is not enough: with apparmor=0 there is nothing to
+# fix (apparmor_parser fails), and a profile the provider unloaded (aa-disable) must not be loaded back by a reload
 fusermount3_profile_enforced() {
-    [ -f "$(host_path "$FUSERMOUNT3_PROFILE")" ] && grep -q Y "$(host_path /sys/module/apparmor/parameters/enabled)" 2>/dev/null
+    [ -f "$(host_path "$FUSERMOUNT3_PROFILE")" ] \
+        && grep -qxF 'fusermount3 (enforce)' "$(host_path /sys/kernel/security/apparmor/profiles)" 2>/dev/null
+}
+
+# the rules missing from the local profile, one per line (both are needed: a host with only the mount rule, e.g. added
+# by hand, cannot unmount sysbox-fs)
+# the local profile's active rules, one per line: AppArmor ignores everything after a '#'
+fusermount3_local_rules() {
+    sed -e 's/#.*//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' "$(host_path "$FUSERMOUNT3_LOCAL")" 2>/dev/null | grep -v '^$'
+}
+
+fusermount3_missing_sysboxfs_rules() {
+    local rule
+    for rule in "$FUSERMOUNT3_RULE" "$FUSERMOUNT3_UMOUNT_RULE"; do
+        # only the allow rule itself counts, not a line that merely contains it (e.g. "deny <rule>")
+        fusermount3_local_rules | sed 's/^allow[[:space:]]\+//' | grep -qxF "$rule" || printf '%s\n' "$rule"
+    done
 }
 
 fusermount3_needs_sysboxfs_rule() {
-    fusermount3_profile_enforced && ! grep -qF "$FUSERMOUNT3_RULE" "$(host_path "$FUSERMOUNT3_LOCAL")" 2>/dev/null
+    fusermount3_profile_enforced && [ -n "$(fusermount3_missing_sysboxfs_rules)" ]
 }
 
 check_fusermount3_apparmor() {
     if ! fusermount3_needs_sysboxfs_rule; then
-        pf_pass "fusermount3 may mount sysbox-fs under /var/lib/sysboxfs (no enforced AppArmor profile, or the rule is in $FUSERMOUNT3_LOCAL)."
+        pf_pass "fusermount3 may mount and unmount sysbox-fs under /var/lib/sysboxfs (no enforced AppArmor profile, or both rules are in $FUSERMOUNT3_LOCAL)."
         return 0
     fi
     pf_fix "The AppArmor profile $FUSERMOUNT3_PROFILE (Ubuntu 26.04) stops sysbox-fs mounting under /var/lib/sysboxfs — every sysbox container fails." \
-        "$(self_cmd)   # adds the rule below and reloads the profile" \
-        "or by hand: printf '%s\\n' '$FUSERMOUNT3_RULE' 'umount /var/lib/sysboxfs/**,' | sudo tee -a $FUSERMOUNT3_LOCAL && sudo apparmor_parser -r $FUSERMOUNT3_PROFILE"
+        "$(self_cmd)   # adds the rules below and reloads the profile" \
+        "or by hand: printf '%s\\n' '$FUSERMOUNT3_RULE' '$FUSERMOUNT3_UMOUNT_RULE' | sudo tee -a $FUSERMOUNT3_LOCAL && sudo apparmor_parser -r $FUSERMOUNT3_PROFILE"
 }
 
 # sysbox-ce 0.7.1 ships sysbox-fs (10 s) and sysbox-mgr (45 s) start timeouts and no Restart=: a slow boot leaves
@@ -821,8 +906,8 @@ allow_sysboxfs_in_fusermount3_apparmor() {
     fusermount3_profile_enforced || return 0
     if fusermount3_needs_sysboxfs_rule; then
         mkdir -p "$(dirname "$(host_path "$FUSERMOUNT3_LOCAL")")"
-        printf '%s\n' "# lium: sysbox-fs mounts its FUSE file systems under /var/lib/sysboxfs" \
-            "$FUSERMOUNT3_RULE" 'umount /var/lib/sysboxfs/**,' >> "$(host_path "$FUSERMOUNT3_LOCAL")"
+        { echo "# lium: sysbox-fs mounts its FUSE file systems under /var/lib/sysboxfs"; fusermount3_missing_sysboxfs_rules; } \
+            >> "$(host_path "$FUSERMOUNT3_LOCAL")"
     fi
     # reload even when the rule was already on disk: an earlier run may have written it and then failed to reload
     apparmor_parser -r "$FUSERMOUNT3_PROFILE" || { fail "Could not reload $FUSERMOUNT3_PROFILE with the sysbox-fs rule."; return 1; }
@@ -1429,6 +1514,14 @@ keep_needrestart_off_the_container_runtime && ok "apt (needrestart) never restar
 
 shift_sysbox_layers_back_at_boot && ok "After an unclean stop, each pod's files are shifted back at boot before Docker starts it." \
     || warn "Could not install lium-sysbox-layer-reset.service; after a power loss rented pods may lose sudo and apt."
+
+create_nvidia_device_nodes_before_docker && ok "At boot the NVIDIA device nodes are made before Docker starts the pods." \
+    || warn "Could not install lium-nvidia-device-nodes.service; after a reboot a pod may fail to start (missing /dev/nvidiaN)."
+
+# before "Already working?" and its active-rental and image exits: a host whose profile already exists may hold a
+# hand-added mount-only rule. Only appends missing rules and reloads the profile, so it is safe under rentals; the
+# call after fuse3 is installed covers a profile that appears only then.
+allow_sysboxfs_in_fusermount3_apparmor || exit 1
 
 # ── 2. Already working? ─────────────────────────────────
 

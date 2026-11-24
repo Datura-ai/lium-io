@@ -38,10 +38,12 @@ UNKNOWN = "NVIDIA RTX Future 9000"
 GPU_REFERENCE_TABLE_SHA256 = "ff8ef3b70f35b8966e6f9b338f531c23d76aa1ca7bfb751eed985ddb136b46e4"
 PRICES = {model: price for model, (price, _) in GPU_REFERENCE_TABLE.items()}
 CANDIDATES = [m for m in GPU_REFERENCE_TABLE if m not in gpu_reference_table.NEVER_A_REFERENCE]
+# memory-mod sizes of a factory model: accepted by the precheck, never an unknown card's reference
+MOD_ONLY_SIZES_MB = {"NVIDIA CMP 170HX": {81920}}
 
 
 def _in_band(model: str, vram_mb: int) -> bool:
-    return any(0.90 * vram_mb <= size <= 1.10 * vram_mb for size in GPU_VRAM_SIZES_MB[model])
+    return any(0.90 * vram_mb <= size * 1024 <= 1.10 * vram_mb for size in GPU_REFERENCE_TABLE[model][1])
 
 
 def test_the_reference_table_is_the_one_lium_platform_pins():
@@ -52,7 +54,8 @@ def test_the_reference_table_is_the_one_lium_platform_pins():
 def test_every_candidate_is_a_scored_model_with_the_registry_sizes():
     for model, (_, sizes_gb) in GPU_REFERENCE_TABLE.items():
         assert model in GPU_MODEL_RATES
-        assert sorted(size * 1024 for size in sizes_gb) == sorted(GPU_VRAM_SIZES_MB[model])
+        reference_sizes_mb = set(GPU_VRAM_SIZES_MB[model]) - MOD_ONLY_SIZES_MB.get(model, set())
+        assert sorted(size * 1024 for size in sizes_gb) == sorted(reference_sizes_mb)
     # DAH-5863: the GB10 is scored but never a reference: its unified memory says nothing about a discrete card's
     assert set(GPU_MODEL_RATES) - set(GPU_REFERENCE_TABLE) == {"NVIDIA GB10"}
 
@@ -103,6 +106,7 @@ def test_the_modded_models_are_exactly_the_ones_never_a_reference():
         (22528, "NVIDIA Tesla P40"),
         (32768, "NVIDIA GeForce RTX 5090 D"),
         (49140, "NVIDIA Quadro RTX 8000"),
+        (81920, "NVIDIA A800 80GB PCIe"),
     ],
 )
 def test_an_unknown_card_of_a_modded_size_is_never_paid_as_a_modded_model(vram_mb, reference):

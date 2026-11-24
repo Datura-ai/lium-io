@@ -380,9 +380,11 @@ class PipelineFactory:
                 # DAH-3457: the UUID set is the node's identity and model:count is derived from it, so the
                 # fingerprint check runs first; a missing card is then GPU_MISSING, not SPEC_CHANGED.
                 GpuFingerprintCheck(),
+                # right after the fingerprint: a re-anchor onto other cards of another model is undone here, before a
+                # later check can fail the cycle and the re-anchor is saved without this decision (DAH-7001)
+                SpecChangeCheck(),
                 # DAH-4551: the reported UUIDs checked against each card's NVIDIA-signed identity (shadow by default).
                 GpuAttestationIdentityCheck(),
-                SpecChangeCheck(),
                 BannedProviderCheck(),
                 # DAH-4547: after BannedProviderCheck, which leaves the kernel GPU list in ctx.state.
                 HardwareIdentityCheck(),
@@ -563,9 +565,11 @@ class PipelineFactory:
                 GpuPowerLimitCheck(),
                 NvmlDigestCheck(),
                 GpuFingerprintCheck(),
+                # right after the fingerprint: a re-anchor onto other cards of another model is undone here, before a
+                # later check can fail the cycle and the re-anchor is saved without this decision (DAH-7001)
+                SpecChangeCheck(),
                 # DAH-4551: the reported UUIDs checked against each card's NVIDIA-signed identity (shadow by default).
                 GpuAttestationIdentityCheck(),
-                SpecChangeCheck(),
                 BannedProviderCheck(),
                 # DAH-4547: after BannedProviderCheck, which leaves the kernel GPU list in ctx.state.
                 HardwareIdentityCheck(),
@@ -685,9 +689,11 @@ class PipelineFactory:
                 # DAH-3457: the UUID set is the node's identity and model:count is derived from it, so the
                 # fingerprint check runs first; a missing card is then GPU_MISSING, not SPEC_CHANGED.
                 GpuFingerprintCheck(),
+                # right after the fingerprint: a re-anchor onto other cards of another model is undone here, before a
+                # later check can fail the cycle and the re-anchor is saved without this decision (DAH-7001)
+                SpecChangeCheck(),
                 # DAH-4551: the reported UUIDs checked against each card's NVIDIA-signed identity (shadow by default).
                 GpuAttestationIdentityCheck(),
-                SpecChangeCheck(),
                 BannedProviderCheck(),
                 # DAH-4547: after BannedProviderCheck, which leaves the kernel GPU list in ctx.state.
                 HardwareIdentityCheck(),

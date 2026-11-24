@@ -124,8 +124,8 @@ GPU_VRAM_SIZES_MB: dict[str, list[int]] = {
     "NVIDIA A100-SXM4-40GB": [40960],  # 40 GB; observed: 40960
     "NVIDIA A800 80GB PCIe": [81920],  # 80 GB
     "NVIDIA A10 Tensor Core GPU": [24576],  # 24 GB
-    # Only 8 GB is a factory SKU; 40/64 GB come from the community driver unlock.
-    "NVIDIA CMP 170HX": [8192, 40960, 65536],  # 8/40/64 GB multi-variant
+    # Only 8 GB is a factory SKU; 40/64/80 GB come from the community driver unlock.
+    "NVIDIA CMP 170HX": [8192, 40960, 65536, 81920],  # 8/40/64/80 GB multi-variant
     # Ampere pro
     "NVIDIA RTX A6000": [49152],  # 48 GB; observed: 49140
     "NVIDIA RTX A5000": [24576],  # 24 GB; observed: 24564

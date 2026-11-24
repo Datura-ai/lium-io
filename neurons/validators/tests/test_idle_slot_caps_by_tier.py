@@ -107,3 +107,61 @@ async def test_idle_v100_earns_no_idle_pay():
     assert "V100" not in incentive.config.rental_incentive_gpu_types
     assert result.eligible_for_rental_share is False
     assert result.mining_score == 0
+
+
+H200 = "NVIDIA H200"
+
+
+def test_h200_idle_caps_are_halved():
+    """The H200 idle caps are half the default tier: 5 single cards and 4 full 8-card chassis."""
+    assert MAX_UNRENTED_GPUS_BY_TYPE["H200"] == {1: 5, 8: 32}
+    assert IncentiveConfig().max_unrented_gpus["H200"] == {1: 5, 8: 32}
+
+
+@pytest.mark.asyncio
+async def test_idle_h200_nodes_over_the_halved_caps_share_the_capped_pay():
+    """Five idle 8-card and six idle 1-card H200 nodes exceed the caps; a rented H200 stays out of the idle pool."""
+    jobs = {f"miner_8x_{i}": [_make_pcc_job(f"h200-8x-{i}", H200, 8)] for i in range(5)}
+    jobs.update({f"miner_1x_{i}": [_make_pcc_job(f"h200-1x-{i}", H200, 1)] for i in range(6)})
+    jobs["miner_rented"] = [_make_pcc_job("h200-8x-rented", H200, 8, is_rented=True)]
+
+    incentive = await _run_with_production_config(jobs)
+
+    assert incentive.unrented_count_by_bucket[("H200", 8)] == 40
+    assert incentive.cap_multiplier_by_bucket[("H200", 8)] == pytest.approx(32 / 40)
+    assert incentive.unrented_count_by_bucket[("H200", 1)] == 6
+    assert incentive.cap_multiplier_by_bucket[("H200", 1)] == pytest.approx(5 / 6)
+    for i in range(5):
+        result = jobs[f"miner_8x_{i}"][0]
+        assert result.max_cap == 32
+        assert result.cap_dilution_applied is True
+        assert result.effective_rate == pytest.approx(result.hourly_rate * 32 / 40)
+    for i in range(6):
+        result = jobs[f"miner_1x_{i}"][0]
+        assert result.max_cap == 5
+        assert result.effective_rate == pytest.approx(result.hourly_rate * 5 / 6)
+
+    rented = jobs["miner_rented"][0]
+    assert rented.eligible_for_rental_share is False
+    assert rented.unrented_cap_multiplier is None
+
+
+@pytest.mark.asyncio
+async def test_idle_h200_spot_nodes_over_the_halved_cap_share_the_capped_spot_pay():
+    """Five idle 8-card Spot H200 nodes exceed the halved cap in their own Spot pool."""
+    jobs = {}
+    for i in range(5):
+        job = _make_pcc_job(f"h200-spot-8x-{i}", H200, 8)
+        job.is_spot = True
+        job.is_on_spot_pay_list = True
+        job.has_lium_filler = True
+        job.filler_revenue_per_gpu_hour = 10.0
+        jobs[f"miner_spot_{i}"] = [job]
+
+    incentive = await _run_with_production_config(jobs)
+
+    assert incentive.spot_count_by_bucket[("H200", 8)] == 40
+    for i in range(5):
+        result = jobs[f"miner_spot_{i}"][0]
+        assert result.spot_cap == 32
+        assert result.spot_cap_multiplier == pytest.approx(32 / 40)

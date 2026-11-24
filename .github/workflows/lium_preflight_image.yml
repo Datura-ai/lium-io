@@ -39,7 +39,7 @@ jobs:
       PLATFORMS: "linux/amd64,linux/arm64"
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       # same pinned actions and images as watchtower_image.yml (they run with id-token: write)
       - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
@@ -58,7 +58,7 @@ jobs:
             --output type=oci,dest=/tmp/preflight.oci.tar .
 
       - name: Log in to Docker Hub (OIDC, no stored token)
-        uses: docker/login-action@v4   # >= 4.5.0 for Docker Hub OIDC
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0 (>= 4.5.0 for Docker Hub OIDC)
         env:
           DOCKERHUB_OIDC_CONNECTIONID: ${{ vars.DOCKERHUB_OIDC_CONNECTIONID }}
           DOCKERHUB_OIDC_EXPIREIN: "1800"

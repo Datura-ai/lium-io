@@ -6,7 +6,7 @@ import pytest
 from incentive import config as incentive_config
 from services import const, gpu_spec_table
 from services.const import GPU_MODEL_RATES
-
+from services.gpu_precheck import VramRangeMismatchError, precheck_gpu_spec
 
 # --- Happy path --------------------------------------------------------------
 
@@ -120,7 +120,7 @@ _EXPECTED_WINDOWS: dict[str, list[tuple[int, int]]] = {
     "NVIDIA A100-SXM4-80GB": [(73728, 86016)],
     "NVIDIA A800 80GB PCIe": [(73728, 86016)],
     "NVIDIA A10 Tensor Core GPU": [(22118, 25805)],
-    "NVIDIA CMP 170HX": [(7373, 8602), (36864, 43008), (58982, 68813)],
+    "NVIDIA CMP 170HX": [(7373, 8602), (36864, 43008), (58982, 68813), (73728, 86016)],
     "NVIDIA RTX A6000": [(44237, 51610)],
     "NVIDIA RTX A5000": [(22118, 25805)],
     "NVIDIA RTX A4500": [(18432, 21504)],
@@ -164,3 +164,18 @@ _EXPECTED_WINDOWS: dict[str, list[tuple[int, int]]] = {
 }
 
 
+@pytest.mark.parametrize("model", sorted(_EXPECTED_WINDOWS))
+def test_expected_vram_windows(model):
+    assert gpu_spec_table.get_expected_vram_windows(model) == _EXPECTED_WINDOWS[model]
+
+
+@pytest.mark.parametrize("vram_mb", [8192, 40960, 65536, 81920])
+def test_cmp_170hx_unlocked_variants_pass_precheck(vram_mb):
+    # 40/64/80 GB are community-unlocked boards; the driver names them all "NVIDIA CMP 170HX"
+    precheck_gpu_spec("NVIDIA CMP 170HX", vram_mb)
+
+
+@pytest.mark.parametrize("vram_mb", [24576, 49152, 71680, 98304])
+def test_cmp_170hx_between_variants_fails_precheck(vram_mb):
+    with pytest.raises(VramRangeMismatchError):
+        precheck_gpu_spec("NVIDIA CMP 170HX", vram_mb)
