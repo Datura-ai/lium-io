@@ -493,16 +493,16 @@ async def test_only_the_backends_resend_runs_as_a_resumed_create() -> None:
     await redis_service.add_inflight_backend_create("pod-1", "miner-hk", "exec-1", WorkloadKind.FILLER)
     client = _client(redis_service)
     await client.fail_creates_cut_off_by_restart()
-    seen: list[bool] = []
+    resumed_flag_per_create: list[bool] = []
 
     async def fake_drive_miner_job(job_request: ContainerCreateRequest) -> None:
-        seen.append(resumed_create.get())
+        resumed_flag_per_create.append(resumed_create.get())
 
     client._drive_miner_job = fake_drive_miner_job
     await client._run_miner_job(_create_request())  # the re-send
     await client._run_miner_job(_create_request())  # a later fresh create of the pod
 
-    assert seen == [True, False]
+    assert resumed_flag_per_create == [True, False]
     assert resumed_create.get() is False
 
 
