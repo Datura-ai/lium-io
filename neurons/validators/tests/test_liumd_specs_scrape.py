@@ -175,6 +175,24 @@ async def test_a_slow_liumd_read_times_out_and_falls_back(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_an_unexpected_liumd_read_error_falls_back(monkeypatch):
+    _liumd_on(monkeypatch)
+
+    async def boom():
+        raise RuntimeError("shadow bug")
+
+    task = asyncio.ensure_future(boom())
+    monkeypatch.setattr(liumd_shadow, "start_facts_after_scrape", lambda ctx: task)
+    runner = DummySSHCommandRunner(result=make_command_result(success=True, stdout=FERNET_TOKEN))
+
+    result = await MachineSpecScrapeCheck().run(_ctx(runner))
+
+    assert result.passed is True
+    assert result.event.what_we_saw["liumd_fallback_reason"] == "error"
+    assert len(runner.calls) == 1
+
+
+@pytest.mark.asyncio
 async def test_a_liumd_document_without_gpus_keeps_the_scrape_failure_handling(monkeypatch):
     _liumd_on(monkeypatch)
     _start_reading(monkeypatch, _answer({"gpu": {"count": 0, "details": []}}))

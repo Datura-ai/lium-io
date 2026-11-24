@@ -490,6 +490,11 @@ class MachineSpecScrapeCheck:
         except TimeoutError:
             result = self._fail_liumd(ctx, None, "liumd read timed out", reason="timeout")
             return result, "timeout"
+        except Exception as exc:  # a shadow bug must not fail the scrape
+            result = self._fail_liumd(
+                ctx, None, f"{type(exc).__name__}: {exc}"[:300], reason="error"
+            )
+            return result, "error"
         if not isinstance(answer, LocalVerifyAnswer):
             result = self._fail_liumd(ctx, answer)
             return result, self._liumd_reason(result)
