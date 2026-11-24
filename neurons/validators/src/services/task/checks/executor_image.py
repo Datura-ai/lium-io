@@ -126,7 +126,7 @@ class ExecutorImageCheck:
                 check_id=self.check_id,
                 what=what,
                 impact=impact,
-                remediation=outdated_image_remediation(report.expected_ref),
+                remediation=outdated_image_remediation(report.expected_ref, report.status.value),
                 extra={"executor_image_status": report.status.value},
             )
         return CheckResult(

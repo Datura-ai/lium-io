@@ -130,13 +130,13 @@ def test_score_calculator_zeroes_an_outdated_free_node():
 
 def test_score_calculator_leaves_an_outdated_rented_node_its_score():
     report = replace(policy().report(STALE_DIGEST), rented_when_read=True)
-    scored = make_context(
+    outdated_read_while_rented = make_context(
         state=build_state(gpu_model="NVIDIA H200", executor_image_report=report), collateral_deposited=True
     )
     current = make_context(state=build_state(gpu_model="NVIDIA H200"), collateral_deposited=True)
 
-    assert calculate_scores(scored, True) == calculate_scores(current, True)
-    assert calculate_scores(scored, True)[0] > 0
+    assert calculate_scores(outdated_read_while_rented, True) == calculate_scores(current, True)
+    assert calculate_scores(outdated_read_while_rented, True)[0] > 0
 
 
 @pytest.mark.asyncio
@@ -295,3 +295,12 @@ async def test_an_outdated_image_read_on_a_free_node_records_it_free():
 
     assert result.passed is False
     assert result.updates["state"].executor_image_report.rented_when_read is False
+
+
+def test_only_an_outdated_image_text_says_a_rented_node_keeps_its_incentive():
+    # an UNOFFICIAL build earns nothing, rented or not: its no-pay line must not promise the incentive
+    from services.executor_image_policy import outdated_image_remediation
+
+    assert "keeps its rental and incentive" in outdated_image_remediation("executor:latest", "OUTDATED")
+    unofficial = outdated_image_remediation("executor:latest", "UNOFFICIAL")
+    assert "incentive" not in unofficial and unofficial.endswith("stopped-updating.")

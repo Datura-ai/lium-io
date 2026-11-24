@@ -86,10 +86,13 @@ def build_expected_image_snapshot(digest: str | None) -> ExpectedImageSnapshot:
     return ExpectedImageSnapshot(executor=executor, executor_ref=ref)
 
 
-def outdated_image_remediation(expected_ref: str) -> str:
+def outdated_image_remediation(expected_ref: str, status: str | None) -> str:
+    # a rented node keeps its incentive only on an OUTDATED image; an UNOFFICIAL one earns nothing, rented or not
     consequence = (
         "While the node is free it fails validation, earns nothing and is off the rent list until the executor "
         "image matches the current release; a rented node keeps its rental and incentive."
+        if status == "OUTDATED"
+        else ""
     )
     return (
         f"This node is not running the current {expected_ref} image. "
@@ -98,4 +101,4 @@ def outdated_image_remediation(expected_ref: str) -> str:
         "If auto-update stopped, follow "
         "https://docs.lium.io/providers/nodes/gpu-power-cap#the-standard-stack-which-stopped-updating. "
         f"{consequence}"
-    )
+    ).rstrip()
