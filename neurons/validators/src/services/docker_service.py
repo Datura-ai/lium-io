@@ -1910,13 +1910,25 @@ def _layer_upper_scope(name: str, plaintext_path: str, upper_dir: str | None) ->
         "awk '$5 == \"/\" {for (i = 7; i < NF; i++) if ($i == \"-\") {n = split($(i + 3), o, \",\"); "
         "for (j = 1; j <= n; j++) if (o[j] ~ /^upperdir=/) print substr(o[j], 10); exit}}' \"/proc/$p/mountinfo\""
     )
+    # a sysbox (DinD) pod on the containerd store shows its root as a bind mount with no upperdir: the host's mount
+    # table holds the overlay the store mounted for its rootfs, at a mount point named after the container's full id
+    host_mount_upper = (
+        "[ -n \"$k\" ] && "
+        "awk -v k=\"/$k\" 'substr($5, length($5) - length(k) + 1) == k {for (i = 7; i < NF; i++) if ($i == \"-\") "
+        "{n = split($(i + 3), o, \",\"); for (j = 1; j <= n; j++) if (o[j] ~ /^upperdir=/) {print substr(o[j], 10); "
+        "exit}}}' /proc/1/mountinfo"
+    )
     given = f"u={shlex.quote(upper_dir)}; d=$(v \"$u\")" if upper_dir else "false"
     return (
         'v() { [ -n "$1" ] || return 1; [ -d "/proc/1/root$1" ] && { echo "/proc/1/root$1"; return 0; }; '
         '[ -d "$1" ] && echo "$1"; }; '
-        f"c=$(/usr/bin/docker inspect -f '{{{{.State.Pid}}}} {{{{.GraphDriver.Data.UpperDir}}}}' {name} 2>/dev/null) "
-        f"&& p=\"${{c%% *}}\" && u=\"${{c#* }}\" "
-        f"&& {{ d=$(v \"$u\") || {{ u=$({root_mount_upper} 2>/dev/null) && d=$(v \"$u\"); }} || {{ {given}; }}; }} "
+        f"c=$(/usr/bin/docker inspect -f '{{{{.State.Pid}}}} {{{{.Id}}}}' {name} 2>/dev/null) "
+        f"&& p=\"${{c%% *}}\" && k=\"${{c#* }}\" "
+        # Docker 29's default API omits GraphDriver and a template naming it fails: read it on its own, may be empty
+        f"&& {{ u=$(/usr/bin/docker inspect -f '{{{{with .GraphDriver}}}}{{{{.Data.UpperDir}}}}{{{{end}}}}' {name} "
+        "2>/dev/null) || u=; } "
+        f"&& {{ d=$(v \"$u\") || {{ u=$({root_mount_upper} 2>/dev/null) && d=$(v \"$u\"); }} "
+        f"|| {{ u=$({host_mount_upper} 2>/dev/null) && d=$(v \"$u\"); }} || {{ {given}; }}; }} "
         f"&& echo \"upper $u\" && x=\"$d\"{upper_under} "
         # one window per recorded start, cut short by a later start of Docker's own: its files are the renter's
         f"&& {{ i=$(/usr/bin/docker inspect -f '{{{{.Id}}}} {{{{.State.StartedAt}}}}' {name} 2>/dev/null); "
