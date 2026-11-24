@@ -1925,9 +1925,10 @@ async def _filler_process_ctx(context_factory, cmdline, repository="daturaai/pea
 
 
 @pytest.mark.asyncio
-async def test_unlisted_process_in_a_filler_on_its_own_image(context_factory, caplog):
-    # a GPU process in a PEARL filler on its own image whose command is not the workload's
-    ctx, filler = await _filler_process_ctx(context_factory, "/opt/other/gpu-app --run")
+@pytest.mark.parametrize("repository", ["daturaai/pearl-miner", "ghcr.io/hanlinai/engy-golden-serve"])
+async def test_unlisted_process_in_a_filler_on_its_own_image(context_factory, caplog, repository):
+    # a GPU process in a filler on its own image whose command is not the workload's
+    ctx, filler = await _filler_process_ctx(context_factory, "/opt/other/gpu-app --run", repository)
 
     with caplog.at_level("WARNING"):
         result = await GpuUsageCheck().run(ctx)
@@ -1949,6 +1950,16 @@ async def test_unlisted_process_in_a_filler_on_its_own_image(context_factory, ca
         ("daturaai/dolphin", "VLLM::EngineCore"),
         ("daturaai/dolphin", "python3 -m sonar.entrypoints serve"),
         ("daturaai/dolphin", "sonar serve model"),
+        ("ghcr.io/hanlinai/engy-golden-serve", "python3 -m sglang.launch_server --model-path /models/m --tp 8"),
+        ("ghcr.io/hanlinai/engy-golden-serve", "sglang::scheduler_TP0"),
+        ("ghcr.io/hanlinai/engy-golden-serve", "sglang::detokenizer"),
+        ("ghcr.io/hanlinai/engy-golden-serve", "/usr/local/bin/python3 /usr/local/bin/vllm serve /models/m --tp 8"),
+        ("ghcr.io/hanlinai/engy-golden-serve", "VLLM::EngineCore"),
+        (
+            "ghcr.io/hanlinai/engy-golden-serve",
+            "/usr/bin/python3 -c from multiprocessing.spawn import spawn_main; "
+            "spawn_main(tracker_fd=5, pipe_handle=7) --multiprocessing-fork",
+        ),
         # the engine's GPU P2P probe at start runs in children multiprocessing spawned
         (
             "daturaai/dolphin",
@@ -2278,7 +2289,6 @@ async def test_inline_python_that_is_not_the_workloads_own_child_is_foreign(cont
     "repository, cmdline",
     [
         ("daturaai/dlph", "/opt/dolphinpod/dolphinpod-worker start"),  # retired: no Lium workload runs on it
-        ("ghcr.io/hanlinai/engy-golden-serve", "/opt/other/gpu-app"),  # its serving name is not recorded yet
     ],
 )
 @pytest.mark.asyncio

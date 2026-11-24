@@ -89,10 +89,9 @@ class FillerWorkload:
 
 
 FILLER_WORKLOADS: dict[str, FillerWorkload] = {
-    # the image's supervisor runs whatever executable a deployment slot claims, so the image fixes no
-    # serving name: every GPU process is foreign until the started filler records its serving executable.
-    # Engy starts are paused (none since 19 Nov); a restart needs that record first or its fillers fail here.
-    "ghcr.io/hanlinai/engy-golden-serve": FillerWorkload("ENGY_TEE", ()),
+    # the image's tee_miner serves the model (ENGY_MODEL) through SGLang or vLLM: `python -m sglang.launch_server` and
+    # its children titled `sglang::<role>`, `vllm serve` and `VLLM::EngineCore`, plus the children multiprocessing spawns
+    "ghcr.io/hanlinai/engy-golden-serve": FillerWorkload("ENGY_TEE", ("sglang", "vllm", MULTIPROCESSING_CHILD)),
     # the worker downloads its inference engine at run time; the engine has been vLLM and sonar, and the engine
     # starts GPU children through multiprocessing's spawn start method (sonar's P2P probe at engine start)
     "daturaai/dolphin": FillerWorkload("DPHN", ("dolphinpod", "sonar", "vllm", MULTIPROCESSING_CHILD)),
