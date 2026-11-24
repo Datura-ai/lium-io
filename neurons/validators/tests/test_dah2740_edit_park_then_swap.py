@@ -481,10 +481,11 @@ async def test_a_kill_without_an_exit_event_falls_back_to_killing_the_processes(
     [
         ("gone", 3, None),  # a big sysbox pod's teardown: init is dead, dockerd reports the exit a few reads later
         ("gone", None, "park_current_container"),  # init is dead but dockerd never catches up: not the host's fault
-        ("alive", 1, "container_cleanup"),  # init outlived SIGKILL (F-1633): the host's fault, whatever dockerd says later
+        ("alive", 2, None),  # a pid-namespace init still reaping its children reads alive, then the container stops
+        ("alive", None, "container_cleanup"),  # init outlived SIGKILL (F-1633) and it never stops: the host's fault
         ("unknown", None, "container_cleanup"),  # init unreadable and the container never stops
     ],
-    ids=["slow_teardown_parks", "dockerd_lags", "init_survives", "unreadable_and_running"],
+    ids=["slow_teardown_parks", "dockerd_lags", "reaping_init_parks", "init_survives", "unreadable_and_running"],
 )
 @pytest.mark.asyncio
 async def test_only_an_init_that_outlives_sigkill_is_unkillable(svc, monkeypatch, init, docker_catches_up_after, step):
@@ -559,9 +560,52 @@ async def test_a_slow_dockerd_keeps_the_park_within_one_wait(svc, monkeypatch):
     result = await _run(svc, payload)
 
     # the direct kill comes first, then reads that each end by the one 30 s budget; none starts past it
-    # (the last entry is the park's own final read before it decides whether to rename back)
-    assert host_timeouts == [30, 30, 18, 6, 60]
+    # (the last entry is the park's own final read before it decides whether to rename back: past the budget, 1 s)
+    assert host_timeouts == [30, 30, 18, 6, 1]
     assert isinstance(result, FailedContainerRequest) and result.failure_step == "park_current_container"
+
+
+@pytest.mark.asyncio
+async def test_a_delete_during_the_wait_after_the_kill_ends_the_edit_inside_its_wait(svc, monkeypatch):
+    # DAH-7025 review: a delete arrived during the first post-kill read, which dockerd answered 36 s late; the delete
+    # gave up waiting and tore down while the edit still worked. The edit now gives way and leaves the parked
+    # container to the delete, which removes the pod's kept containers.
+    payload = _edit_payload()
+    ssh = _ssh_recording(stop_exit=1)
+    inner = ssh.run
+    first_read_started, never = asyncio.Event(), asyncio.Event()
+
+    async def dockerd_hangs_after_the_kill(cmd, *args, **kwargs):
+        if cmd.startswith("/usr/bin/docker kill"):
+            ssh.commands.append(cmd)
+            return _ssh_result(exit_status=1, stderr="cannot kill container: tried to kill container, but did not receive an exit event")
+        if cmd == DockerCommand.kill_container_processes(_kept(payload)):
+            ssh.commands.append(cmd)
+            return _ssh_result(stdout="killed pid=4242 shim=4241 init=gone\n")
+        if "docker inspect -f '{{.State.Running}}'" in cmd:
+            ssh.commands.append(cmd)
+            first_read_started.set()
+            await never.wait()
+        return await inner(cmd, *args, **kwargs)
+
+    ssh.run = dockerd_hangs_after_the_kill
+    _patch_happy(svc, monkeypatch, ssh)
+    monkeypatch.setattr(svc, "_bring_up_existing_container", AsyncMock())
+
+    async def tracked_edit():
+        with inflight_creates.track(payload.pod_id, executor_key(payload)):
+            return await _run(svc, payload)
+
+    edit = asyncio.create_task(tracked_edit())
+    await asyncio.wait_for(first_read_started.wait(), 10)
+    assert inflight_creates.cancel(payload.pod_id, executor_key(payload))
+
+    assert await inflight_creates.wait_until_done(payload.pod_id, 5, executor_key(payload))
+    result = await edit
+    assert isinstance(result, FailedContainerRequest) and result.failure_step == "cancelled_by_delete"
+    # nothing after the hung read: no rename back, no restore, no removal of the parked container
+    assert ssh.commands[-1].startswith("/usr/bin/docker inspect -f '{{.State.Running}}'")
+    svc._bring_up_existing_container.assert_not_awaited()
 
 
 def test_the_direct_kill_reads_a_killed_init_as_gone():
