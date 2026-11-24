@@ -922,7 +922,7 @@ async def test_rental_verification_sends_flag_when_customer_rental():
 
     from tests.helpers import make_context
 
-    ctx = make_context(services=services, state=state)
+    ctx = make_context(services=services, state=state, rented=True)
 
     with patch("neurons.validators.src.services.task.checks.rental_verification.settings"):
         result = await RentalVerificationCheck().run(ctx)
@@ -930,6 +930,49 @@ async def test_rental_verification_sends_flag_when_customer_rental():
     assert result.passed is True
     assert backend_client.called_with is not None
     assert backend_client.called_with["rental_in_progress"] is True
+
+
+class _EchoingBackend(DummyBackendClient):
+    """The backend as it answers: with the rental hint set it skips its probe and says so (skipped_rented)."""
+
+    async def check_executor_health(self, *args, rental_in_progress: bool = False, **kwargs):
+        await super().check_executor_health(*args, rental_in_progress=rental_in_progress, **kwargs)
+        if rental_in_progress:
+            return ExecutorHealthCheckResponse(success=True, error=None, reason_code="skipped_rented", details={})
+        return self.response
+
+
+@pytest.mark.asyncio
+async def test_a_pod_the_halt_judged_closed_is_no_rental_hint_and_the_probe_runs():
+    """DAH-5933 review: the snapshot still lists a customer pod the rented halt judged closed. The hint came from that
+    list, so the backend skipped its probe and its skipped_rented echo read as a rental the snapshot missed. The hint
+    is now this run's verdict (not rented), so the backend probes the node."""
+    backend_client = _EchoingBackend(response=ExecutorHealthCheckResponse(success=True, error=None, details={}))
+    services = build_services(backend=backend_client, container_cleanup=ContainerCleanup())
+    state = build_state(
+        specs={"verified_ports": [8080]},
+        rented_data=RentedExecutorsResponse(
+            executors={
+                "executor-123": RentedExecutor(
+                    miner_hotkey="miner-hotkey",
+                    executor_ip_address="127.0.0.1",
+                    executor_ip_port="8000",
+                    pods=[RentedPod(pod_id="pod-1", container_name="c1")],
+                )
+            }
+        ),
+    )
+
+    from tests.helpers import make_context
+
+    ctx = make_context(services=services, state=state, rented=False)
+
+    with patch("neurons.validators.src.services.task.checks.rental_verification.settings"):
+        result = await RentalVerificationCheck().run(ctx)
+
+    assert backend_client.called_with["rental_in_progress"] is False
+    assert result.event.reason_code != Msg.RENTED_SINCE_THE_SNAPSHOT.reason
+    assert result.passed is True
 
 
 @pytest.mark.asyncio
@@ -1325,7 +1368,7 @@ async def test_rental_verification_filler_create_kill_ignored_for_a_customer_ren
         running_fillers=False,
         create_killed=True,
         rented_pods=[RentedPod(pod_id="pod-1", container_name="pod_1")],
-    )
+    ).model_copy(update={"rented": True})  # the run's rented halt judged the customer rental live
 
     result = await _run_filler_check(ctx)
 

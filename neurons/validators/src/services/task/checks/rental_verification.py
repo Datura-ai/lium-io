@@ -32,7 +32,6 @@ from ..messages import MessageTemplate, render_message
 from ..messages import RentalVerificationMessages as Msg
 from ..pipeline import CheckResult, Context
 from .cpu_truth import advertised_cpu_count
-from .rental_owner import rental_of_this_node
 from .task_time import task_seconds_left
 
 
@@ -147,8 +146,9 @@ class RentalVerificationCheck:
             CheckResult with verification status
         """
         rented_data = ctx.state.rented_data
-        rented_executor = rental_of_this_node(ctx)
-        has_customer_rental = bool(rented_executor and rented_executor.pods)
+        # this run's own rental verdict (the rented halt's), not the snapshot's pod list: a pod the halt judged closed
+        # is still listed, and a hint built from it made the backend skip its probe and echo the hint back as a rental
+        has_customer_rental = ctx.rented
         # EVERY filler container on the node, not just one: a GPU-split DPHN node runs one filler per
         # VRAM bundle (DAH-2465), and checking only the first left the siblings unverifiable — a
         # removed sibling was never observed, so it was neither punished nor reconciled (DAH-2471).
