@@ -88,7 +88,10 @@ async def test_every_hard_exclusion_and_every_enforced_gate_is_recorded_in_order
 
     result = await _incentive().calculate_executor_score(
         _idle_full_8x(
-            provider_discord_connected=False, is_new_rentals_paused=True, is_spot=True, spec=dict(SHORT_DISK_SPEC)
+            provider_discord_connected=False,
+            is_new_rentals_paused=True,
+            is_spot=True,
+            spec={**SHORT_DISK_SPEC, "ram": {"total": 16 * 1024**2}},
         )
     )
 
@@ -98,6 +101,7 @@ async def test_every_hard_exclusion_and_every_enforced_gate_is_recorded_in_order
         "new_rentals_paused",
         "price_above_market_p90_soft_limit",
         "insufficient_disk_for_vram",
+        "insufficient_ram_for_vram",
         "flagship_without_ncu_or_split",
     ]
     assert result.mining_score == 0

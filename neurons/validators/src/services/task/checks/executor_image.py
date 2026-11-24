@@ -93,12 +93,12 @@ class ExecutorImageCheck:
                             **ctx.default_extra,
                             "executor_build": {True: "official", False: "unofficial"}.get(published, "unknown"),
                             "observed_digest": report.observed_digest,
-                            "executor_image_unofficial_enforced": settings.EXECUTOR_IMAGE_UNOFFICIAL_ENFORCE,
+                            "executor_image_unofficial_enforced": True,
                         }
                     ),
                 )
             )
-            if published is False and settings.EXECUTOR_IMAGE_UNOFFICIAL_ENFORCE:
+            if published is False:
                 report = replace(report, status=ImageVerdict.UNOFFICIAL)
         # DAH-6845: a free node fails and leaves the rent list until it updates; a rented one passes, and keeps its
         # score too when the image is only OUTDATED (score_calculator, DefaultIncentive), so its renter is untouched.

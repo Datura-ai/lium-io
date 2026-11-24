@@ -32,6 +32,7 @@ from protocol.vc_protocol.compute_requests import (
 from pydantic import BaseModel, ValidationError
 from tenacity import retry, retry_if_result, stop_after_attempt, wait_fixed
 
+from clients.validator_portal_api import portal_owner_hotkeys
 from core.utils import _m, get_extra_info
 
 logger = logging.getLogger(__name__)
@@ -92,6 +93,14 @@ class BackendRejected(Exception):
     def __init__(self, status: int):
         super().__init__(f"backend answered {status}")
         self.status = status
+
+
+class HealthCheckTimedOut(Exception):
+    """The executor health check got no answer within its wait: no API error, the wait ran out."""
+
+    def __init__(self, timeout: float):
+        super().__init__(f"no answer within {timeout} s")
+        self.timeout = timeout
 
 
 class BackendClient:
@@ -598,6 +607,9 @@ class BackendClient:
 
         Returns:
             ExecutorHealthCheckResponse if successful, None otherwise
+
+        Raises:
+            HealthCheckTimedOut: no answer within `timeout`, so the caller can tell its own wait from an API error.
         """
         validator_hotkey = self.keypair.ss58_address
         path = f"/validator/{validator_hotkey}/executor-health-check"
@@ -625,6 +637,12 @@ class BackendClient:
         if executor_id:
             json_data["executor_id"] = executor_id
 
+        # DAH-6740: the backend signs its own SSH key for these too, so the executor of a node the listing's owner set
+        # up under another of their accounts takes it (an older backend ignores the field). It signs them only with
+        # the dated upload_nonce (an undated signature would never expire).
+        owner_hotkeys = portal_owner_hotkeys(miner_hotkey)
+        if owner_hotkeys:
+            json_data["owner_hotkeys"] = sorted(owner_hotkeys)
         if upload_nonce is not None:
             json_data["upload_nonce"] = upload_nonce
 
@@ -636,7 +654,8 @@ class BackendClient:
                     path,
                     ExecutorHealthCheckResponse,
                     json_data=json_data,
-                    timeout=timeout,
+                    # past the wait below, so a timeout is always this wait's own and never read as a failed request
+                    timeout=timeout + 5,
                 ),
                 timeout,
             )
@@ -644,7 +663,7 @@ class BackendClient:
             logger.error(
                 _m("Executor health check timeout", extra=get_extra_info({"path": path, "timeout": timeout}))
             )
-            return None
+            raise HealthCheckTimedOut(timeout) from None
 
     async def report_verification_started(
         self, *, job_batch_id: str, miner_hotkey: str, executor_uuids: list[str], started_at: datetime

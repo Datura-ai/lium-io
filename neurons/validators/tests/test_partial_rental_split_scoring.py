@@ -152,3 +152,18 @@ async def test_an_outdated_image_on_a_partly_rented_node_keeps_the_idle_pay_of_i
     assert "outdated_executor_image" not in [r.reason for r in outdated.zero_incentive_reasons]
     # an image that was never released still excludes the whole node
     assert (await scored("UNOFFICIAL")).incentive == 0
+
+
+@pytest.mark.asyncio
+async def test_node_wide_exclusion_reaches_the_backend_once_on_a_partially_rented_split_node(monkeypatch):
+    # Arrange — both portions are scored and each records the node-wide Discord exclusion.
+    job = _make_job(gpu_count=2, rented_gpu_count=1)
+    job.provider_discord_connected = False
+    incentive = _build_incentive(job)
+    monkeypatch.setattr(incentive, "_calculate_rental_share", AsyncMock(return_value=0.1))
+
+    # Act
+    await incentive.calculate_mining_scores()
+
+    # Assert — one node, one reason
+    assert [reason.reason for reason in job.zero_incentive_reasons] == ["provider_discord_not_connected"]

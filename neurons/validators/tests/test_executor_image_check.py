@@ -2,7 +2,6 @@ from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
-from core.config import settings
 from protocol.vc_protocol.compute_requests import (
     RentedExecutor,
     RentedExecutorsResponse,
@@ -21,11 +20,6 @@ from tests.helpers import build_context_config, build_state, make_context
 
 EXECUTOR_DIGEST = f"sha256:{'a' * 64}"
 STALE_DIGEST = f"sha256:{'c' * 64}"
-
-
-@pytest.fixture
-def unofficial_enforced(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(settings, "EXECUTOR_IMAGE_UNOFFICIAL_ENFORCE", True)
 
 
 def policy() -> ExpectedImageSnapshot:
@@ -100,7 +94,7 @@ async def test_rented_outdated_executor_passes_and_keeps_its_incentive():
 
 
 @pytest.mark.asyncio
-async def test_unobservable_executor_digest_is_unofficial(unofficial_enforced, no_registry_lookup_for_executor_build):
+async def test_unobservable_executor_digest_is_unofficial(no_registry_lookup_for_executor_build):
     no_registry_lookup_for_executor_build.side_effect = real_executor_build_published
     context = make_context(
         config=build_context_config(executor_image_snapshot=policy()),
@@ -158,7 +152,7 @@ async def test_outdated_executor_under_another_miners_rental_on_a_different_endp
 
 @pytest.mark.asyncio
 async def test_unrented_executor_on_a_build_we_never_published_fails(
-    unofficial_enforced, no_registry_lookup_for_executor_build
+    no_registry_lookup_for_executor_build
 ):
     no_registry_lookup_for_executor_build.return_value = False
     context = make_context(
@@ -175,8 +169,8 @@ async def test_unrented_executor_on_a_build_we_never_published_fails(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("published", "build"), [(False, "unofficial"), (True, "official"), (None, "unknown")])
-async def test_with_unofficial_enforcement_off_a_build_is_judged_as_outdated_and_logged(
+@pytest.mark.parametrize(("published", "build"), [(True, "official"), (None, "unknown")])
+async def test_an_outdated_build_not_known_unofficial_is_logged(
     no_registry_lookup_for_executor_build, caplog, published, build
 ):
     no_registry_lookup_for_executor_build.return_value = published

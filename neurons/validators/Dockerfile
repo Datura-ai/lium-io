@@ -1,5 +1,7 @@
 ARG BASE_IMAGE=python:3.11-slim
 
+# DAH-6804/DAH-6980: every build passes the executor_setup build context (neurons/executor); no placeholder stage, so a
+# build without it fails instead of shipping an image whose SysboxLayerResetCheck installs nothing
 FROM $BASE_IMAGE
 
 RUN apt-get update \
@@ -19,6 +21,8 @@ RUN pdm lock --check
 RUN pdm install --prod
 
 COPY . .
+# DAH-6804: SysboxLayerResetCheck runs this script's --install-layer-reset on Sysbox hosts (context: neurons/executor)
+COPY --from=executor_setup nvidia_docker_sysbox_setup.sh /app/executor_setup/
 
 RUN mv libdmcompverify.so /usr/lib/
 RUN mv libverifyx.so /usr/lib/

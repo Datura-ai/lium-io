@@ -46,6 +46,7 @@ from services.docker_service import (
     _remove_and_list_containers_command,
 )
 import services.docker_service as ds_module
+from services.host_memory_guard import host_memory_guard_script
 from services.image_flatten import flatten_wait_command
 from services.nvidia_devices import (
     MissingRentedGpuError,
@@ -599,12 +600,13 @@ async def test_customer_create_keeps_the_listings_but_not_the_volume_facts_after
 
     assert type(result).__name__ == "ContainerCreated", getattr(result, "msg", "")
     # the fail-closed pid_max read every rental makes first and the host RAM read that clamps its memory limit,
-    # then the listing that finds the filler and the rm with its confirming listing in one command — the
-    # removal starts only once the host reads succeed
+    # the host memory guard, then the listing that finds the filler and the rm with its confirming listing in one
+    # command — the removal starts only once the host reads succeed
     assert "pod_ssh_host_key" in _cmds(ssh_client)[-1]
     assert _cmds(ssh_client)[:-1] == [
         "cat /proc/sys/kernel/pid_max",
         "cat /proc/meminfo",
+        host_memory_guard_script(),
         *([] if removal_lost_its_channel else [DOCKER_PS_ALL_NAMES_IDS_CMD, _FILLER_X_REMOVAL, DOCKER_PS_ALL_NAMES_IDS_CMD]),
         # the sizing measures the disk under the node flatten lock
         next((c for c in _cmds(ssh_client) if c.startswith(flatten_wait_command()[:40])), "no flatten wait"),
@@ -846,10 +848,15 @@ async def test_only_a_customer_create_removes_fillers_at_ssh_connect(
     result = await _run_create_container(svc, payload)
 
     assert type(result).__name__ == "ContainerCreated", getattr(result, "msg", "")
-    # the fail-closed pid_max read every rental makes and the host RAM read come first; only then does the removal
-    # run (at SSH connect for a customer create, at the cleanup step for a bootstrap restore), so it is always after
+    # the fail-closed pid_max read every rental makes, the host RAM read and the host memory guard come first; only
+    # then does the removal run (at SSH connect for a customer create, at the cleanup step for a bootstrap restore)
     assert "pod_ssh_host_key" in _cmds(ssh_client)[-1]
-    assert _cmds(ssh_client)[:-1] == ["cat /proc/sys/kernel/pid_max", "cat /proc/meminfo", *commands]
+    assert _cmds(ssh_client)[:-1] == [
+        "cat /proc/sys/kernel/pid_max",
+        "cat /proc/meminfo",
+        host_memory_guard_script(),
+        *commands,
+    ]
     svc.probe_prerun_host.assert_awaited_once()
     # the restore's removal at the cleanup step changed the host: its volume facts are probed again
     assert svc.probe_volume_host.await_count == (2 if bootstrap_restore else 1)
@@ -1200,6 +1207,37 @@ async def test_a_host_read_whose_channel_may_still_hold_the_session_stops_the_cr
 
     assert result.failure_step == step
     svc._abort_if_cancelled_by_delete.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_timed_out_host_memory_guard_whose_channel_may_still_hold_the_session_stops_the_create(
+    svc_fixture, monkeypatch
+):
+    """Review on lium-io#2405: the guard runs on the host reads' session. A guard that times out and whose channel close
+    is not confirmed may still hold a one-session sshd, so the create stops at the guard's step before the delete
+    check, the filler cleanup or the power restore can put a command on the session."""
+    svc = svc_fixture
+    ssh_client = _wire_customer_create_over_the_host(svc, monkeypatch, probe=_probe_with_containers("filler_x"))
+    answer_through_run = ssh_client.create_process
+
+    async def create_process(command, *args, **kwargs):
+        if command != host_memory_guard_script():
+            return await answer_through_run(command, *args, **kwargs)
+        never = asyncio.Event()  # the guard neither ends nor confirms its channel closed
+        return Mock(wait=AsyncMock(side_effect=never.wait), wait_closed=AsyncMock(side_effect=never.wait), close=Mock())
+
+    ssh_client.create_process = create_process
+    monkeypatch.setattr(ds_module, "HOST_MEMORY_GUARD_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(svc, "_abort_if_cancelled_by_delete", AsyncMock())
+
+    result = await asyncio.wait_for(
+        _run_create_container(svc, _deploy_payload(workload_kind=WorkloadKind.FILLER, active_volume_names=["volume_x"])),
+        timeout=5,
+    )
+
+    assert result.failure_step == ds_module.HOST_MEMORY_GUARD_STEP == "host_memory_guard"
+    svc._abort_if_cancelled_by_delete.assert_not_awaited()
+    svc.probe_prerun_host.assert_not_awaited()
 
 
 @pytest.mark.asyncio
