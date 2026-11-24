@@ -695,7 +695,9 @@ def test_counting_and_copying_share_one_deadline(tmp_path, monkeypatch, export_f
         # the count used 1.5 of the 2 seconds: the copy gets at most what is left, or does not start
         assert limits[0] == 2 and all(n <= 1 for n in limits[1:]) and rc in (0, 98)
     else:
-        assert limits == [2, 2] and rc == 0
+        # the shared deadline is whole seconds (`date +%s`): a second boundary between the two calls leaves 1 s
+        # instead of 2, and both passes still get that same budget
+        assert limits and limits == [limits[0], limits[0]] and 1 <= limits[0] <= 2 and rc == 0
     assert "rm -fv cid1" in _calls(tmp_path)
 
 
@@ -759,6 +761,55 @@ async def test_a_failed_wait_for_a_running_flatten_stops_the_create():
     with pytest.raises(RuntimeError, match="image copy") as raised:
         await image_flatten.wait_for_node_flatten(ssh)
     assert not isinstance(raised.value, image_flatten.FlattenMeasureFailed)
+
+
+@pytest.mark.asyncio
+async def test_only_a_lock_held_past_the_wait_reads_as_the_node_busy(tmp_path):
+    """Prod 23 Nov 2026: the wait command crashed (exit 139) in 13 s with no copy running, and the renter was told the
+    node was still preparing its disk. Only flock timing out on a held lock is that."""
+    lock = tmp_path / "lock"
+    lock.touch()
+    held = subprocess.Popen(["flock", str(lock), "sleep", "30"])
+    try:
+        while subprocess.run(["flock", "-n", str(lock), "true"]).returncode == 0:
+            await asyncio.sleep(0.01)
+        wait = image_flatten.flatten_wait_command().replace(FLATTEN_LOCK_PATH, str(lock))
+        wait = wait.replace(f"-w {image_flatten.FLATTEN_TIMEOUT_SECONDS + 300} ", "-w 0 ")
+        timed_out = subprocess.run(["sh", "-c", wait], env={"PATH": os.environ["PATH"]}).returncode
+    finally:
+        held.kill()
+        held.wait()
+    # review: flock itself crashing (segfault, 139) or erroring is the plain lock failure, not the timeout;
+    # its own status is named on stderr
+    fake = tmp_path / "bin"
+    fake.mkdir()
+    (fake / "flock").write_text("#!/bin/sh\nkill -SEGV $$\n")
+    (fake / "flock").chmod(0o755)
+    crashed = subprocess.run(["sh", "-c", wait], env={"PATH": f"{fake}:{os.environ['PATH']}"}, capture_output=True)
+    flock_crashed = crashed.returncode
+    assert flock_crashed == 1 and b"flock failed: exit 139" in crashed.stderr
+
+    with pytest.raises(image_flatten.FlattenLockTimedOut):
+        await image_flatten.wait_for_node_flatten(Mock(run=AsyncMock(return_value=Mock(exit_status=timed_out))))
+    for crashed in (1, flock_crashed):
+        with pytest.raises(RuntimeError) as raised:
+            await image_flatten.wait_for_node_flatten(Mock(run=AsyncMock(return_value=Mock(exit_status=crashed))))
+        assert not isinstance(raised.value, image_flatten.FlattenLockTimedOut)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [image_flatten.FLATTEN_MEASURE_FAILED_EXIT, 1, 64])
+async def test_a_failed_flock_never_reads_as_a_measure_under_the_held_lock(tmp_path, status):
+    # review: a host flock exiting this command's own measure code must not authorize the fallback sizing
+    (tmp_path / "flock").write_text(f"#!/bin/sh\nexit {status}\n")
+    (tmp_path / "flock").chmod(0o755)
+    wait = image_flatten.flatten_wait_command().replace(FLATTEN_LOCK_PATH, str(tmp_path / "lock"))
+    done = subprocess.run(["sh", "-c", wait], env={"PATH": f"{tmp_path}:{os.environ['PATH']}"}, capture_output=True)
+
+    assert done.returncode == 1 and f"flock failed: exit {status}".encode() in done.stderr
+    with pytest.raises(RuntimeError) as raised:
+        await image_flatten.wait_for_node_flatten(Mock(run=AsyncMock(return_value=Mock(exit_status=done.returncode))))
+    assert not isinstance(raised.value, (image_flatten.FlattenMeasureFailed, image_flatten.FlattenLockTimedOut))
 
 
 @pytest.mark.asyncio

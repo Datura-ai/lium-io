@@ -13,6 +13,23 @@ from services.const import DOCKER_DIND_IMAGE, LIUM_POD_ID_LABEL
 _CONTAINER_DEATH_LOG_TAIL_LINES = 100
 _CONTAINER_DEATH_LOG_MAX_CHARS = 4000
 
+# dockerd's two bind refusals name the host address the bind was for:
+#   `failed to bind host port for 0.0.0.0:9101:192.0.2.2:22/tcp: address already in use`
+#   `failed to bind host port 0.0.0.0:9030/tcp: address already in use`
+#   `Bind for 0.0.0.0:9101 failed: port is already allocated`
+_BOUND_HOST_PORT_RE = re.compile(
+    r"(?:Bind for|failed to bind host port(?: for)?) (?:\[[0-9a-fA-F:.]{0,45}\]|[0-9.]{1,15}):(\d{1,5})(?![0-9])"
+)
+
+
+def bound_host_port(text: str) -> int | None:
+    """The host port dockerd could not bind, read from its refusal text; None when the text has none."""
+    match = _BOUND_HOST_PORT_RE.search(text)
+    if match is None:
+        return None
+    port = int(match.group(1))
+    return port if 0 < port <= 65535 else None
+
 
 class DockerCommand:
     """Builds safe docker command strings."""
@@ -267,6 +284,9 @@ class ContainerDeathDiagnostics:
     error: str | None = None
     started_at: str | None = None
     finished_at: str | None = None
+    # how often dockerd's restart policy brought it back, and that policy: a crash loop under it shows here
+    restart_count: int | None = None
+    restart_policy: str | None = None
     logs_tail: str | None = None
     host_context: dict[str, str] | None = None
     capture_error: str | None = None
@@ -283,6 +303,8 @@ class ContainerDeathDiagnostics:
             "container_error": self.error,
             "container_started_at": self.started_at,
             "container_finished_at": self.finished_at,
+            "container_restart_count": self.restart_count,
+            "container_restart_policy": self.restart_policy,
             "container_logs_tail": self.logs_tail,
             "container_host_context": self.host_context,
             "diagnostics_capture_error": self.capture_error,
@@ -346,6 +368,7 @@ async def collect_container_death_diagnostics(
     ssh_client: asyncssh.SSHClientConnection,
     container_name: str,
     diagnostics: ContainerDeathDiagnostics | None = None,
+    read_logs: bool = True,
 ) -> ContainerDeathDiagnostics:
     """Read why a container died over an already-open SSH session.
 
@@ -362,9 +385,14 @@ async def collect_container_death_diagnostics(
 
     try:
         inspect_result = await ssh_client.run(
-            f"/usr/bin/docker inspect --format '{{{{json .State}}}}' {quoted_name}"
+            f"/usr/bin/docker inspect --format '{{{{json .State}}}}{{{{println}}}}{{{{.RestartCount}}}} "
+            f"{{{{.HostConfig.RestartPolicy.Name}}}}' {quoted_name}"
         )
-        raw_state = (inspect_result.stdout or "").strip()
+        raw_state, _, restart = (inspect_result.stdout or "").strip().partition("\n")
+        count, _, policy = restart.strip().partition(" ")
+        # the provider controls the host: plain ASCII digits only ("²".isdigit() is True, int() fails)
+        diagnostics.restart_count = int(count) if count.isascii() and count.isdigit() and len(count) <= 10 else None
+        diagnostics.restart_policy = policy.strip() or None
         if raw_state:
             parsed_state = json.loads(raw_state)
             if isinstance(parsed_state, dict):
@@ -386,7 +414,8 @@ async def collect_container_death_diagnostics(
         capture_errors.append(f"inspect: {exc}")
 
     # a removed container's log went with it: `2>&1` would store docker's "No such container" as its output
-    if not diagnostics.container_missing:
+    # read_logs=False: a renter workload still running may print its own secrets; its output stays off our logs
+    if read_logs and not diagnostics.container_missing:
         try:
             logs_result = await ssh_client.run(
                 f"/usr/bin/docker logs --tail {_CONTAINER_DEATH_LOG_TAIL_LINES} {quoted_name} 2>&1 || true"

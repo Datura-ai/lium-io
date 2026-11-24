@@ -4,4 +4,6 @@
 FROM ubuntu:24.04
 RUN apt-get update && apt-get install -y --no-install-recommends openssh-server ca-certificates && rm -rf /var/lib/apt/lists/* \
   && mkdir -p /run/sshd /root/.ssh && chmod 700 /root/.ssh
-CMD ["sleep", "infinity"]
+# bash traps TERM: docker stop sends it to PID 1, and a bare sleep ignores it until the delete's 30 s grace
+# (CONTAINER_STOP_GRACE_SECONDS) expires, which the rental suite pays on every teardown
+CMD ["bash", "-c", "trap 'exit 0' TERM INT; sleep infinity & wait"]

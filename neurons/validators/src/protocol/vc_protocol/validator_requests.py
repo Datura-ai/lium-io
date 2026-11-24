@@ -234,6 +234,9 @@ class ExecutorSpecRequest(BaseValidatorRequest):
     # DAH-5651: this cycle's DinD test container on the host never answered. None from an older validator;
     # the backend reads it with a silent rented pod as a down host.
     host_runtime_fault: bool | None = None
+    # lium_protocol 2.17.0: the rented pods this cycle's pod checks judged, each with its host-side fault codes
+    # ([] = clean).
+    rented_pod_faults: dict[str, list[str]] | None = None
     # When an express recheck outside the cycle started (lium_protocol 2.11.0); None for a cycle's own report.
     check_started_at: datetime | None = None
 

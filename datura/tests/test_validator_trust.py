@@ -44,10 +44,18 @@ def test_override_trust_release_build_staging_owner_and_plain_non_prod(tmp_path,
     staging, validator = Keypair.create_from_uri("//StagingOwner6670"), Keypair.create_from_uri("//StagingValidator6670")
     line = trust_line(validator.ss58_address, 1)
     signed = {"message": line, "signature": "0x" + staging.sign(line).hex()}
+    url = "https://staging.example/api"
     _override(tmp_path, monkeypatch, "staging_override_6670",
-              f"_STAGING_TRUST_OWNER_SS58 = {staging.ss58_address!r}\n_STAGING_TRUST_MESSAGE = {signed!r}\n")
+              f"_STAGING_TRUST_OWNER_SS58 = {staging.ss58_address!r}\n_STAGING_TRUST_MESSAGE = {signed!r}\n"
+              f"_STAGING_TRUST_API_URL = {url!r}\n")
     assert override_trust("staging_override_6670") == {
-        "owner": staging.ss58_address, "read_chain": False, "message": SignedTrustMessage(**signed)}
+        "owner": staging.ss58_address, "read_chain": False, "message": SignedTrustMessage(**signed), "api_url": url}
+    # a staging owner without the backend that serves its messages would read the host's (prod) backend: refused
+    for bad in ("", '_STAGING_TRUST_API_URL = "http://staging.example/api"\n', '_STAGING_TRUST_API_URL = "https://x/a\\"b"\n'):
+        _override(tmp_path, monkeypatch, f"nourl_override_6670_{len(bad)}",
+                  f"_STAGING_TRUST_OWNER_SS58 = {staging.ss58_address!r}\n_STAGING_TRUST_MESSAGE = {signed!r}\n{bad}")
+        with pytest.raises(ValueError, match="_STAGING_TRUST_API_URL"):
+            override_trust(f"nourl_override_6670_{len(bad)}")
     other = Keypair.create_from_uri("//NotTheStagingOwner6670")
     _override(tmp_path, monkeypatch, "badsig_override_6670",
               f"_STAGING_TRUST_OWNER_SS58 = {other.ss58_address!r}\n_STAGING_TRUST_MESSAGE = {signed!r}\n")

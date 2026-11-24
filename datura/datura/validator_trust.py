@@ -89,8 +89,10 @@ def override_trust(module: str) -> dict:
     """The ValidatorTrust arguments for this build. A release build has no `module` (its config_override) and gets {}:
     the release owner, re-read from chain. A non-prod build that names a staging owner (`_STAGING_TRUST_OWNER_SS58`)
     follows messages that key signed, never reads the chain, and starts from its own signed message
-    (`_STAGING_TRUST_MESSAGE`, {"message", "signature"}) instead of the image copy. A non-prod build naming no owner
-    keeps message trust off and trusts its baked validator, as before. A malformed owner or message fails the start."""
+    (`_STAGING_TRUST_MESSAGE`, {"message", "signature"}) instead of the image copy, and reads new ones from the backend
+    that serves them (`_STAGING_TRUST_API_URL`), never the host's own backend setting. A non-prod build naming no owner
+    keeps message trust off and trusts its baked validator, as before. A malformed or missing owner, message or URL
+    fails the start."""
     import importlib
     import importlib.util
 
@@ -107,4 +109,7 @@ def override_trust(module: str) -> dict:
     signed = SignedTrustMessage(message=str(message["message"]), signature=str(message["signature"])) if message else None
     if signed is not None:
         verify_trust_message(signed, owner)
-    return {"owner": owner, "read_chain": False, "message": signed}
+    api_url = getattr(config, "_STAGING_TRUST_API_URL", None)
+    if not isinstance(api_url, str) or not re.fullmatch(r"https://[A-Za-z0-9.-]+(/[A-Za-z0-9._-]+)*", api_url):
+        raise ValueError(f"{module}: a staging owner needs _STAGING_TRUST_API_URL, the https backend of its messages")
+    return {"owner": owner, "read_chain": False, "message": signed, "api_url": api_url}
