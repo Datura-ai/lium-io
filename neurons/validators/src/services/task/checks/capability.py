@@ -151,6 +151,10 @@ class CapabilityCheck:
             except Exception as exc:
                 failure_reason = str(exc)
         allcards = await judge_all_cards(ctx, specs, result, allcards_skip)
+        if allcards is not None and not allcards_enforced():
+            # shadow: the verdict is logged, never acted on
+            logger.info(_m("All-cards verdict (shadow)", extra=get_extra_info({**ctx.default_extra, **allcards.as_dict()})))
+            allcards = None
 
         # Shadow line: the speed this run measured next to the reported model. Log only.
         log_matmul_speed(specs, result, transport=transport, default_extra=ctx.default_extra)
@@ -212,8 +216,9 @@ class CapabilityCheck:
         elif failure_reason:
             failure_details = {"error": failure_reason}
 
-        if allcards is not None and allcards.outcome == ALLCARDS_DEFERRED:
-            # the run failed on cards that were not the node's to give this cycle: no verdict on them yet
+        if allcards is not None and allcards.outcome == ALLCARDS_DEFERRED and not allcards_skip:
+            # the all-cards run failed on cards that were not the node's to give this cycle: no verdict on them yet.
+            # A skipped run proved nothing, so a failed single-card run is judged below like any other
             return _allcards_deferred_result(ctx, self.check_id, allcards, failure_details)
         if allcards is not None:
             failure_details["allcards"] = allcards.as_dict()
@@ -688,7 +693,12 @@ async def _read_gpu_model_verdict(ctx: Context) -> tuple[bool, list[GpuModelMism
         if raw is None:
             return False, [], set(), True
         stored = json.loads(raw)
-        mismatches = [GpuModelMismatch(**m) for m in stored.get("mismatches") or []]
+        # a work-proof failure stored under enforcement stops failing the node the moment enforcement is off
+        mismatches = [
+            m
+            for m in (GpuModelMismatch(**m) for m in stored.get("mismatches") or [])
+            if m.kind != WORK_PROOF_FAILED or allcards_enforced()
+        ]
         measured_ok = {int(i) for i in stored.get("measured_ok") or []}
     except Exception as exc:
         logger.warning(_m("GPU model verdict read failed", extra=get_extra_info({**ctx.default_extra, "error": str(exc)})))
@@ -773,11 +783,16 @@ def _sample_error_kind(result: ValidationResult) -> str:
 
 
 def _filler_sample_failed_card(sample: dict) -> bool:
-    """A filler sample whose pinned card gave no answer or a wrong one.
+    """A filler sample whose pinned card gave no answer or a wrong one, under all-cards enforcement.
 
     `no_memory` and `timeout` stay a record only. Rationale: DAH-6576.
     """
-    return sample.get("error_kind") in ("no_answer", "wrong_answer")
+    return allcards_enforced() and sample.get("error_kind") in ("no_answer", "wrong_answer")
+
+
+def allcards_enforced() -> bool:
+    """The all-cards work proof fails nodes; off, it runs in shadow and only logs its verdict."""
+    return settings.MATMUL_ALLCARDS_ENFORCEMENT_ENABLED
 
 
 def get_filler_only_container(ctx: Context) -> str | None:

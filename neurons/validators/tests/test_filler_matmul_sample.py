@@ -46,6 +46,12 @@ _real_cycle_index = capability._filler_cycle_index
 
 
 @pytest.fixture(autouse=True)
+def _enforced(monkeypatch):
+    monkeypatch.setattr(capability.settings, "MATMUL_ALLCARDS_ENFORCEMENT_ENABLED", True)
+    monkeypatch.setattr(mvs.settings, "MATMUL_ALLCARDS_ENFORCEMENT_ENABLED", True)
+
+
+@pytest.fixture(autouse=True)
 def clock_cycle(monkeypatch):
     """The wall-clock cycle, starting where this node's offset makes cycle+offset == 0."""
     cycle = {"now": 0}

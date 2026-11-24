@@ -76,6 +76,7 @@ def _pod_on(cards) -> RentedExecutorsResponse:
 def _no_gpu_model_numbers(monkeypatch):
     # the GPU model verdict is not under test: a pass with no speed numbers reads as measured
     monkeypatch.setattr(capability, "unmeasured_cards", lambda *_a, **_kw: set())
+    monkeypatch.setattr(capability.settings, "MATMUL_ALLCARDS_ENFORCEMENT_ENABLED", True)
 
 
 async def _cycle(context_factory, svc, ssh, *, redis, fresh=None, rented_data=None):  # noqa: F811
@@ -237,3 +238,43 @@ async def test_an_honest_pass_records_the_pass(context_factory, svc):  # noqa: F
     assert result.passed is True and result.event.reason_code == Msg.VERIFY_OK.reason
     assert state.allcards_not_proven is False
     assert PASS_KEY in redis.store
+
+
+WRONG = SimpleNamespace(exit_status=0, stdout="UUID: someone-elses", stderr="")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("single_card", [WRONG, RuntimeError("probe crashed")], ids=["wrong_answer", "exception"])
+async def test_a_skipped_cycle_still_fails_a_failed_single_card_run(context_factory, svc, single_card):  # noqa: F811
+    """A skipped all-cards run proves nothing: the single-card run that did run decides, as on any cycle."""
+
+    async def run(cmd, *args, **kwargs):
+        if cmd.startswith("pkill"):
+            return SimpleNamespace(exit_status=0, stdout="", stderr="")
+        if isinstance(single_card, Exception):
+            raise single_card
+        return single_card
+
+    result, _ = await _cycle(
+        context_factory, svc, SimpleNamespace(run=run), redis=_proven(FakeRedis()), rented_data=_live_rental()
+    )
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.VERIFY_FAILED.reason
+
+
+def test_enforcement_is_off_by_default():
+    assert type(capability.settings).model_fields["MATMUL_ALLCARDS_ENFORCEMENT_ENABLED"].default is False
+
+
+@pytest.mark.asyncio
+async def test_in_shadow_a_failed_all_cards_run_fails_no_node(context_factory, svc, monkeypatch):  # noqa: F811
+    """Enforcement off: the proof still runs on every card and logs its verdict, and the node is judged as before."""
+    monkeypatch.setattr(capability.settings, "MATMUL_ALLCARDS_ENFORCEMENT_ENABLED", False)
+    ssh, pinned = _node({i: NO_DEVICE for i in range(1, 8)})
+
+    result, state = await _cycle(context_factory, svc, ssh, redis=FakeRedis())
+
+    assert sorted(set(pinned)) == list(range(8))
+    assert result.passed is True and result.event.reason_code == Msg.VERIFY_OK.reason
+    assert state.allcards_not_proven is False

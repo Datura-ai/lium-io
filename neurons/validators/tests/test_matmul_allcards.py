@@ -19,6 +19,11 @@ import pytest
 import services.matrix_validation_service as mvs
 
 
+@pytest.fixture(autouse=True)
+def _enforced(monkeypatch):
+    monkeypatch.setattr(mvs.settings, "MATMUL_ALLCARDS_ENFORCEMENT_ENABLED", True)
+
+
 @pytest.fixture
 def svc(monkeypatch):
     """Real ValidationService with a fully mocked native wrapper (no .so on the test host)."""
@@ -277,12 +282,13 @@ async def test_the_wall_clock_is_the_flat_90_s_per_wave(svc, monkeypatch, cards,
     assert probe.passed is not over
 
 
-def test_the_check_has_no_switch():
-    # one code path: the all-cards work-proof always runs and always decides
+def test_the_check_has_no_switch_and_enforcement_is_off_by_default():
+    # the all-cards work-proof always runs; only its enforcement has a flag, off until the shadow readout
     from core.config import Settings
 
     fields = Settings.model_fields if hasattr(Settings, "model_fields") else Settings.__fields__
-    assert not [name for name in fields if name.startswith("MATMUL_ALLCARDS")]
+    assert [name for name in fields if name.startswith("MATMUL_ALLCARDS")] == ["MATMUL_ALLCARDS_ENFORCEMENT_ENABLED"]
+    assert fields["MATMUL_ALLCARDS_ENFORCEMENT_ENABLED"].default is False
 
 
 def test_every_scored_model_has_a_work_proof_size():

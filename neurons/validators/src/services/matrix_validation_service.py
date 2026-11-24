@@ -11,6 +11,7 @@ from dataclasses import dataclass
 
 import asyncssh
 
+from core.config import settings
 from core.utils import _m, get_extra_info
 from services.gpu_spec_table import name_reported_by_driver, matmul_probe_vram_mb
 
@@ -395,7 +396,7 @@ class ValidationService:
             "over_wall_clock": over_wall_clock,
             "per_card": per_card,
             "passed": passed,
-            "enforced": True,
+            "enforced": settings.MATMUL_ALLCARDS_ENFORCEMENT_ENABLED,
         }
         log = logger.info if passed else logger.warning
         log(_m("All-cards GPU work-proof", extra=get_extra_info(log_extra)))
@@ -831,8 +832,9 @@ class ValidationService:
         # The SSH transport of the capability matmul: prepare_matmul_challenge → one remote
         # `decrypt_challenge.py` run → evaluate_matmul_output. The local transport (checks/
         # local_verify.py) calls the same two functions around `POST /verify`.
-        # DAH-2671 item 3: all-claimed-cards work-proof. It fails any claimed card without its own
-        # right answer, and the aggregate wall-clock; the caller judges a failed probe card by card
+        # DAH-2671 item 3: all-claimed-cards work-proof. Under MATMUL_ALLCARDS_ENFORCEMENT_ENABLED it fails
+        # any claimed card without its own right answer, and the aggregate wall-clock (off: shadow, it only logs
+        # and never changes the returned result); the caller judges a failed probe card by card
         # (`ValidationResult.all_cards`). Only a single-card host skips it (probe returns None): the
         # single-card run below is that card's proof. A filler-node sample runs beside the filler, so
         # it pins one card per sample instead (checks/capability.py).
@@ -841,7 +843,7 @@ class ValidationService:
             all_cards = await self.probe_all_claimed_cards(
                 ssh_client, executor_info, default_extra, machine_spec
             )
-            if all_cards is not None and not all_cards.passed:
+            if settings.MATMUL_ALLCARDS_ENFORCEMENT_ENABLED and all_cards is not None and not all_cards.passed:
                 return ValidationResult(
                     success=False,
                     error_message=f"All-cards GPU work-proof failed: {all_cards.failure_reason}",
