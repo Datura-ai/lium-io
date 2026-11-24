@@ -175,7 +175,7 @@ def test_cmp_170hx_unlocked_variants_pass_precheck(vram_mb):
     precheck_gpu_spec("NVIDIA CMP 170HX", vram_mb)
 
 
-@pytest.mark.parametrize("vram_mb", [24576, 49152, 98304])
+@pytest.mark.parametrize("vram_mb", [24576, 49152, 71680, 98304])
 def test_cmp_170hx_between_variants_fails_precheck(vram_mb):
     with pytest.raises(VramRangeMismatchError):
         precheck_gpu_spec("NVIDIA CMP 170HX", vram_mb)
