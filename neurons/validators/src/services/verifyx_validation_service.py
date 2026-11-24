@@ -392,7 +392,9 @@ class VerifyXValidationService:
         try:
             payload = challenge.validator.verify_response(challenge_response)
             verification_result = _perform_verification_checks(payload, record_tally=record_tally)
-            _log_verifyx_network_speeds(verification_result.get("network") or {}, default_extra)
+            _log_verifyx_network_speeds(
+                verification_result.get("network") or {}, payload["response_data"], default_extra
+            )
             return VerifyXResponse(data=verification_result)
         except Exception as e:
             return self._failure_response(
@@ -1143,11 +1145,23 @@ def _format_mbps(value: object) -> str:
     return "none"
 
 
-def _log_verifyx_network_speeds(network: dict, default_extra: dict) -> None:
+def _verifyx_test_times_ms(response_data: dict) -> dict:
+    # how long each VerifyX test ran on the executor; a time it did not report is None
+    network_execution = response_data.get("network_execution") or {}
+    return {
+        "memory_ms": (response_data.get("memory_execution") or {}).get("execution_time_ms"),
+        "storage_ms": (response_data.get("storage_execution") or {}).get("execution_time_ms"),
+        "network_ms": network_execution.get("execution_time_ms"),
+        "package_ms": (network_execution.get("download") or {}).get("time_ms"),
+    }
+
+
+def _log_verifyx_network_speeds(network: dict, response_data: dict, default_extra: dict) -> None:
     package_download_mbps = network.get("package_download_speed")
     cloudflare_download_mbps = network.get("capacity_download_speed")
     cloudflare_upload_mbps = network.get("upload_speed")
     exec_id = default_extra.get("executor_uuid") or "none"
+    test_times_ms = _verifyx_test_times_ms(response_data)
     message = (
         "VerifyX network speeds "
         f"package_download_mbps={_format_mbps(package_download_mbps)} "
@@ -1155,7 +1169,8 @@ def _log_verifyx_network_speeds(network: dict, default_extra: dict) -> None:
         f"cloudflare_upload_mbps={_format_mbps(cloudflare_upload_mbps)} "
         f"success={network.get('success')} "
         f"cloudflare_fallback={network.get('cloudflare_fallback', False)} "
-        f"exec={exec_id}"
+        + "".join(f"{key}={value} " for key, value in test_times_ms.items())
+        + f"exec={exec_id}"
     )
     logger.info(
         _m(
@@ -1167,6 +1182,7 @@ def _log_verifyx_network_speeds(network: dict, default_extra: dict) -> None:
                     "cloudflare_download_mbps": cloudflare_download_mbps,
                     "cloudflare_upload_mbps": cloudflare_upload_mbps,
                     "network_success": network.get("success"),
+                    **test_times_ms,
                 }
             ),
         )

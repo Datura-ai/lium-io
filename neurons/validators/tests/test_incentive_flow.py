@@ -1717,3 +1717,24 @@ async def test_the_cycle_vector_covers_every_miner_the_cycle_asked_even_if_the_l
     )
 
     assert validator.miner_scores.get("leaving_miner", 0.0) > 0
+
+
+@pytest.mark.asyncio
+async def test_wave_finish_line_carries_the_wave_duration_cpu_and_miner_counts(
+    validator_with_mocks, create_job_result, create_neuron_info, caplog
+):
+    # Arrange
+    validator = validator_with_mocks
+    validator.miner_scores = {}
+    miners = [create_neuron_info(uid=2, hotkey="miner1"), create_neuron_info(uid=3, hotkey="miner2")]
+    job_results = {"miner1": [create_job_result(score=0.0, gpu_model="H100", gpu_count=1)]}
+
+    # Act
+    with caplog.at_level("INFO"):
+        await _run_sync_with_jobs(validator, miners, job_results)
+
+    # Assert
+    [record] = [r for r in caplog.records if r.getMessage() == "[sync] All Jobs finished"]
+    extra = record.msg.extra
+    assert (extra["miners"], extra["timed_out_miners"]) == (2, 0)
+    assert extra["wave_duration_seconds"] >= 0 and extra["wave_cpu_seconds"] >= 0

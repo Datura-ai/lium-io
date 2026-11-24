@@ -876,7 +876,25 @@ class Pipeline:
 
         for index, step in enumerate(self.checks):
             parallel = isinstance(step, ParallelStage)
-            ran_checks, current_ctx = await self._run_step_surviving_a_dropped_session(step, current_ctx)
+            step_started = time.perf_counter()
+            try:
+                ran_checks, current_ctx = await self._run_step_surviving_a_dropped_session(step, current_ctx)
+            except asyncio.CancelledError:
+                # the task's timeout drops the executor without a result; this names the step it was cut in
+                step_check_ids = [chk.check_id for chk in step.checks] if parallel else [step.check_id]
+                logger.warning(
+                    _m(
+                        "Validation cancelled mid-step",
+                        extra={
+                            **current_ctx.default_extra,
+                            "cancelled_check_ids": step_check_ids,
+                            "cancelled_step_elapsed_ms": int((time.perf_counter() - step_started) * 1000),
+                            "elapsed_time_ms": int((time.perf_counter() - pipeline_start_time) * 1000),
+                            "steps": dict(steps),
+                        },
+                    )
+                )
+                raise
             for ran in ran_checks:
                 ran.result.event.context["execution_time_ms"] = int((ran.finished - ran.started) * 1000)
                 ran.result.event.context["elapsed_time_ms"] = int((ran.finished - pipeline_start_time) * 1000)

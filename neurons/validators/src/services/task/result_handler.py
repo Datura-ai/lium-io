@@ -5,6 +5,7 @@ and converting the validation context into a JobResult for reporting.
 """
 
 import logging
+import time
 from datetime import datetime
 from typing import Any, Optional
 
@@ -119,6 +120,9 @@ class ResultHandler:
                     "success": success,
                     "score": context.score,
                     "job_score": context.job_score,
+                    "job_batch_id": miner_info.job_batch_id,
+                    # counted from the executor task's start, as its 780 s timeout is
+                    "pipeline_elapsed_s": round(time.monotonic() - context.started_at_monotonic, 1),
                 },
             )
         )
