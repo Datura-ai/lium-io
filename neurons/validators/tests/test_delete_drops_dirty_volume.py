@@ -7,6 +7,7 @@ pages at the last close instead of flushing them at the unmount (Kosta85's node,
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import shlex
 import subprocess
@@ -25,6 +26,7 @@ from payload_models.payloads import (
 )
 
 import services.docker_service as docker_service_module
+from services.storage_operations import REMOTE_OPERATION_DIRECTORY
 from core.config import settings
 from core.docker_utils import DockerCommand
 from services.docker_service import (
@@ -151,11 +153,17 @@ def _run_wipe(
     *,
     users: str = "pod_dirty",
     fail: str = "",
+    operation_volumes: tuple[str, ...] = (),
 ) -> subprocess.CompletedProcess:
     """Runs the wipe command under sh against a docker stub whose answers come from the arguments;
     `users` is what `docker ps` lists on the volume, `fail` names the stub call that exits nonzero
     (inspect, ps, info, plugin). Returns the process."""
     host_root = tmp_path / "host"
+    operations = tmp_path / "storage-operations"
+    operations.mkdir(exist_ok=True)
+    for i, name in enumerate(operation_volumes):
+        spec = {"action": "backup", "workspace": {"volume_name": name}}
+        (operations / f"op{i}.json").write_text(json.dumps(spec, separators=(",", ":"), sort_keys=True))
     docker = tmp_path / "docker"
     docker.write_text(
         "#!/bin/sh\n"
@@ -173,6 +181,7 @@ def _run_wipe(
         _wipe_volume_cmd(volume, "pod_dirty")
         .replace("/usr/bin/docker", str(docker))
         .replace("/proc/1/root", str(host_root))
+        .replace(str(REMOTE_OPERATION_DIRECTORY), str(operations))
     )
     return subprocess.run(["sh", "-c", command], capture_output=True, text=True)
 
@@ -220,6 +229,28 @@ def test_wipe_removes_only_the_volumes_files_under_its_expected_host_dir(
     assert not files[wiped_dir].exists()
     assert all(files[other].exists() for other in _OTHER_DIRS)
     assert (tmp_path / "host" / wiped_dir.lstrip("/")).is_dir()
+
+
+@pytest.mark.parametrize("driver, mountpoint", [("local", _LOCAL_MOUNT), ("vloopback:v3", "/mnt/volume_dirty")])
+def test_wipe_leaves_a_volume_whose_backup_is_starting(tmp_path, driver, mountpoint):
+    # DAH-7077: the backup's spec names the volume before its helper mounts it
+    wiped_dir = _LOCAL_MOUNT if driver == "local" else _VLOOPBACK_HOST_DIR
+    files = _host_files(tmp_path, wiped_dir)
+
+    completed = _run_wipe(tmp_path, "volume_dirty", driver, mountpoint, operation_volumes=("other", "volume_dirty"))
+
+    assert completed.returncode == 7
+    assert completed.stdout.strip() == "volume has a storage operation"
+    assert files[wiped_dir].exists()
+
+
+def test_wipe_runs_when_only_another_volume_has_a_storage_operation(tmp_path):
+    files = _host_files(tmp_path, _LOCAL_MOUNT)
+
+    completed = _run_wipe(tmp_path, "volume_dirty", "local", _LOCAL_MOUNT, operation_volumes=("volume_dirty_2",))
+
+    assert completed.returncode == 0, completed.stderr
+    assert not files[_LOCAL_MOUNT].exists()
 
 
 @pytest.mark.parametrize(
