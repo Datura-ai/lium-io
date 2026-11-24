@@ -242,3 +242,21 @@ def test_a_non_prod_build_never_takes_a_message(tmp_path, engine, owner, new_val
 def test_the_image_copy_is_signed_by_the_release_time_owner_coldkey():
     signed = SignedTrustMessage(**json.loads(IMAGE_MESSAGE_PATH.read_text()))
     assert verify_trust_message(signed, RELEASE_SUBNET_OWNER_COLDKEY).revision >= 1
+
+
+@pytest.mark.asyncio
+async def test_a_staging_build_follows_only_its_own_owner_key_and_never_reads_the_chain(
+    tmp_path, monkeypatch, engine, owner, old_validator, new_validator
+):
+    staging = Keypair.create_from_uri("//MinerTrustStagingOwner")
+    monkeypatch.setattr(trust_service, "read_subnet_owner_coldkey", _down)
+    with Session(engine) as session:   # a row the release owner signed is not the staging owner's
+        session.add(ValidatorTrustMessage(revision=7, signer=owner.ss58_address, **_signed(owner, new_validator, 7)._asdict()))
+        session.commit()
+    trust = ValidatorTrust(engine=engine, image_message=_image(tmp_path, _signed(owner, new_validator, 8)),
+                           owner=staging.ss58_address, read_chain=False, message=_signed(staging, old_validator, 1))
+    trust.load()
+    assert trust.report()["validator"] == old_validator.ss58_address and trust.report()["revision"] == 1
+    assert trust.offer(_signed(owner, new_validator, 2)) is False
+    assert await trust.refresh_owner() is False and trust.owner == staging.ss58_address
+    assert trust.offer(_signed(staging, new_validator, 2)) is True

@@ -413,32 +413,30 @@ class DiskHealthMessages:
 
 class GpuThermalThrottleMessages:
     THROTTLED = MessageTemplate(
-        event="GPU thermal throttling under load",
+        # the check names the cause in the event and remediation (gpu_thermal_throttle.CAUSES)
+        event="GPU throttled under load",
         reason="GPU_THERMAL_THROTTLE",
         severity="warning",
         category="env",
         impact="Proceed; score not changed (observation only)",
-        remediation="A busy GPU is held far below its clock by a thermal or hardware slowdown, or by a power cap "
-        "while its power limit is at the default (see gpus[]: temperature_c, graphics_clock_mhz, "
-        "max_graphics_clock_mhz, clocks_event_reasons, reasons). Check `nvidia-smi -q -d "
-        "PERFORMANCE,TEMPERATURE,POWER`, the fans, airflow, the power supply and the datacenter cooling; the "
-        "renter is getting a fraction of the card's speed.",
+        remediation="See gpus[]: causes, temperature_c, graphics_clock_mhz, max_graphics_clock_mhz, "
+        "clocks_event_reasons. A renter on this card gets a fraction of its speed. On a rented node, pause new "
+        "rentals and wait for running ones to end before work that shuts the node down.",
     )
     COLLAPSED = MessageTemplate(
-        event="GPU clock collapsed by thermal throttling",
+        event="GPU clock collapsed under load",
         reason="GPU_THERMAL_COLLAPSE",
         severity="error",
         # an availability error: the backend hides the node and refuses new rentals at once
         category=AVAILABILITY_CATEGORY,
         impact="Node hidden, job skipped and score set to 0 until the hold ends (see remediation)",
-        remediation="A busy GPU runs below half its max clock with a thermal or hardware slowdown set (see "
-        "gpus[], held_gpu_uuids: temperature_c, graphics_clock_mhz, max_graphics_clock_mhz, reasons). Fix the "
-        "cooling (fans, airflow, datacenter temperature; `nvidia-smi -q -d PERFORMANCE,TEMPERATURE`). The hold "
-        "ends when the card runs busy at half its max clock or more with no thermal slowdown (for example under "
-        "the Lium filler or the host's own load), or after 7 days, or when the card is replaced.",
+        remediation="A busy GPU runs below half its max clock with a slowdown the driver reports (see gpus[], "
+        "held_gpu_uuids: causes, temperature_c, graphics_clock_mhz, max_graphics_clock_mhz, reasons). The hold "
+        "ends when the card runs busy at half its max clock or more with no slowdown (for example under the Lium "
+        "filler or the host's own load), or after 7 days, or when the card is replaced.",
     )
     OK = MessageTemplate(
-        event="GPU clocks not thermally throttled",
+        event="GPU clocks not throttled",
         reason="GPU_THERMAL_THROTTLE_OK",
         severity="info",
         category="env",
@@ -773,6 +771,18 @@ class SpecChangeMessages:
         impact="Verification reset; score set to 0",
         remediation="Keep GPU configuration stable between checks.",
     )
+    SPEC_MODEL_CHANGED = MessageTemplate(
+        event="Other GPUs of another model",
+        reason="SPEC_CHANGED",
+        severity="warning",
+        category="env",
+        impact="Node stays unverified; score set to 0",
+        remediation=(
+            "Restore this node's original GPUs or point it back to its original machine. To register another machine "
+            "at the same IP and port, first free that address by updating the existing node's address or deleting "
+            "the existing node. A rented node cannot be deleted."
+        ),
+    )
     SPEC_UNCHANGED = MessageTemplate(
         event="GPU inventory stable",
         reason="SPEC_UNCHANGED",
@@ -783,8 +793,8 @@ class SpecChangeMessages:
 
 
 class GpuFingerprintMessages:
-    # A set that lost or gained cards (a full set of other cards is re-anchored, not this). Its what_we_saw carries
-    # `anchor_hard_would_be`: GPU_MISSING (only anchored cards missing) or ANCHOR_BROKEN (other cards among them).
+    # A set with cards outside the anchor (a full set of other cards is re-anchored, not this). Its what_we_saw
+    # carries `anchor_hard_would_be`: ANCHOR_BROKEN.
     UUID_CHANGED = MessageTemplate(
         event="GPU fingerprints changed",
         reason="GPU_UUID_CHANGED",
@@ -794,7 +804,7 @@ class GpuFingerprintMessages:
         remediation="Ensure every GPU of the node stays attached and visible. A node that comes back with the same "
         "number of GPUs, all of them other cards, is verified again on its own.",
     )
-    # Hard mode: the scrape lists a strict subset of the anchored set. Transient by definition: the node
+    # The scrape lists a strict subset of the anchored set. Transient by definition: the node
     # scores again on the first cycle that shows the full set.
     GPU_MISSING = MessageTemplate(
         event="GPU missing from the listed set",
@@ -1799,7 +1809,7 @@ NO_OUTBOUND_INTERNET_REMEDIATION = (
 
 
 class OutboundInternetMessages:
-    # the rental probe's egress step, under NO_OUTBOUND_INTERNET_ENFORCEMENT_ENABLED
+    # the rental probe's egress step
     NO_OUTBOUND_INTERNET = MessageTemplate(
         event="Containers cannot reach the internet",
         reason="NO_OUTBOUND_INTERNET",
@@ -2770,13 +2780,6 @@ class SpecFloorMessages:
             "Report the machine's real specs: at least one CPU core, 4 GB of RAM per GPU, one card per "
             "counted GPU, and each card's own GPU UUID."
         ),
-    )
-    WARNING = MessageTemplate(
-        event="Hardware specs below the floor",
-        reason="SPEC_FLOOR_REJECTED",
-        severity="warning",
-        category="env",
-        impact="Warning only: score unchanged",
     )
 
 

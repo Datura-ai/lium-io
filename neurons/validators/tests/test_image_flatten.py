@@ -695,7 +695,9 @@ def test_counting_and_copying_share_one_deadline(tmp_path, monkeypatch, export_f
         # the count used 1.5 of the 2 seconds: the copy gets at most what is left, or does not start
         assert limits[0] == 2 and all(n <= 1 for n in limits[1:]) and rc in (0, 98)
     else:
-        assert limits == [2, 2] and rc == 0
+        # the shared deadline is whole seconds (`date +%s`): a second boundary between the two calls leaves 1 s
+        # instead of 2, and both passes still get that same budget
+        assert limits and limits == [limits[0], limits[0]] and 1 <= limits[0] <= 2 and rc == 0
     assert "rm -fv cid1" in _calls(tmp_path)
 
 
