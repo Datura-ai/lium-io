@@ -39,6 +39,11 @@ class DummyBackendClient:
         self.filler_run_active = filler_run_active
         self.filler_run_active_calls: list[str] = []
         self.filler_run_container_missing_flags: list[bool] = []
+        # the backend's rented list read now (get_rented_executors_now); None: it did not answer
+        self.rented_now: RentedExecutorsResponse | None = None
+
+    async def get_rented_executors_now(self) -> RentedExecutorsResponse | None:
+        return self.rented_now
 
     async def get_filler_run_active(
         self, filler_run_id: str, *, container_missing: bool = False
@@ -1592,6 +1597,7 @@ async def test_a_rental_the_snapshot_missed_stops_the_pipeline_as_rented(reason_
     backend_client = DummyBackendClient(
         response=ExecutorHealthCheckResponse(success=True, error=None, reason_code=reason_code)
     )
+    backend_client.rented_now = _rented_list_with_this_nodes_pod()
     services = build_services(
         backend=backend_client,
         container_cleanup=ContainerCleanup(),
@@ -1609,3 +1615,43 @@ async def test_a_rental_the_snapshot_missed_stops_the_pipeline_as_rented(reason_
     assert result.event.reason_code == Msg.RENTED_SINCE_THE_SNAPSHOT.reason
     assert result.event.reason_code in CYCLE_END_READ_REASONS
     assert result.updates == {}
+
+
+def _rented_list_with_this_nodes_pod() -> RentedExecutorsResponse:
+    return RentedExecutorsResponse(
+        executors={
+            "executor-123": RentedExecutor(
+                miner_hotkey="miner-hotkey",
+                executor_ip_address="127.0.0.1",
+                executor_ip_port="8000",
+                pods=[RentedPod(pod_id="pod-1", container_name="c1")],
+            )
+        }
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reason_code", ["skipped_rented", "rented_during_check"])
+@pytest.mark.parametrize(
+    "rented_now", [RentedExecutorsResponse(executors={}), None], ids=["pod-not-listed", "re-read-unanswered"]
+)
+async def test_a_pod_the_backend_is_still_removing_is_no_rental_and_the_check_fails(reason_code, rented_now):
+    """DAH-5933 review: the backend's rented answer counts a pod row it is still removing, which its rented list (the
+    snapshot's and the rented halt's source) leaves out. Such a pod is not a rental that started since the snapshot:
+    the node is not held without a verdict, and with no probe run the check fails."""
+    backend_client = DummyBackendClient(
+        response=ExecutorHealthCheckResponse(success=True, error=None, reason_code=reason_code)
+    )
+    backend_client.rented_now = rented_now
+    services = build_services(backend=backend_client, container_cleanup=ContainerCleanup())
+    state = build_state(specs={"verified_ports": [8080]})
+
+    from tests.helpers import make_context
+    ctx = make_context(services=services, state=state)
+
+    with patch("neurons.validators.src.services.task.checks.rental_verification.settings"):
+        result = await RentalVerificationCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.PROBE_SKIPPED_FOR_AN_UNLISTED_POD.reason
+    assert result.event.reason_code not in CYCLE_END_READ_REASONS

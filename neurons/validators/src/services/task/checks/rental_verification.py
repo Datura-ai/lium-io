@@ -32,6 +32,7 @@ from ..messages import MessageTemplate, render_message
 from ..messages import RentalVerificationMessages as Msg
 from ..pipeline import CheckResult, Context
 from .cpu_truth import advertised_cpu_count
+from .rental_owner import rental_of_this_node
 from .task_time import task_seconds_left
 
 
@@ -285,10 +286,10 @@ class RentalVerificationCheck:
                     updates={},
                 )
 
-            # a customer rental the cycle's snapshot did not see: stop as rented, before any further executor work
-            # (LocalVerify, VerifyX) loads the renter's pod
+            # the backend found the node rented: a customer rental the cycle's snapshot did not see stops as rented,
+            # before any further executor work (LocalVerify, VerifyX) loads the renter's pod
             if response.success and response.reason_code in _RENTED_REASON_CODES:
-                return self._rented_since_the_snapshot(ctx, response)
+                return await self._backend_found_a_rental(ctx, response)
             # Check if verification was successful
             if response.success:
                 event = render_message(
@@ -418,6 +419,33 @@ class RentalVerificationCheck:
                 )
             except TimeoutError:
                 pass  # best effort: the 15-min stale sweep removes a probe left behind
+
+    async def _backend_found_a_rental(self, ctx: Context, response) -> CheckResult:
+        """The backend's rented answer counts every pod row it holds, one it is still removing included; the rented
+        list the snapshot and the rented halt read leaves such a pod out. Only a pod that list shows now is a rental
+        that started since the snapshot. Otherwise no probe ran on a node with no rental, so the check fails; a
+        backend that does not answer the re-read confirms nothing and fails the same way."""
+        try:
+            fresh = await ctx.services.backend.get_rented_executors_now()
+        except Exception:  # noqa: BLE001  (the event's rented_list_read says the re-read failed)
+            fresh = None
+        rental = rental_of_this_node(ctx, rented_data=fresh) if fresh is not None else None
+        if rental is not None and rental.pods:
+            return self._rented_since_the_snapshot(ctx, response)
+        return CheckResult(
+            passed=False,
+            event=render_message(
+                Msg.PROBE_SKIPPED_FOR_AN_UNLISTED_POD,
+                ctx=ctx,
+                check_id=self.check_id,
+                what={
+                    "executor_uuid": ctx.executor.uuid,
+                    "reason_code": response.reason_code,
+                    "rented_list_read": fresh is not None,
+                },
+            ),
+            updates={},
+        )
 
     def _rented_since_the_snapshot(self, ctx: Context, response) -> CheckResult:
         """No verdict from this run: the cycle's snapshot, which every later read of the context (the score, the rented

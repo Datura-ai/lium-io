@@ -2562,6 +2562,16 @@ class RentalVerificationMessages:
         ),
         remediation="No action needed.",
     )
+    # the backend skipped its probe for a pod it still holds but no longer lists as a rental (one it is removing): no
+    # probe ran and the node is not rented, so the check fails instead of being held as a new rental
+    PROBE_SKIPPED_FOR_AN_UNLISTED_POD = MessageTemplate(
+        event="Rental probe skipped for a pod that is not a listed rental",
+        reason="RENTAL_PROBE_SKIPPED_UNLISTED_POD",
+        severity="warning",
+        category="policy",
+        impact="This cycle fails: the rental probe did not run, and the node has no listed rental",
+        remediation="No action needed if a rental on this node just ended; the next cycle probes the node again.",
+    )
     FAILED = MessageTemplate(
         event="Rental verification failed",
         reason="RENTAL_NOT_VERIFIED",
