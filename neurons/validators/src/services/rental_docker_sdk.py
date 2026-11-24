@@ -40,6 +40,11 @@ _DOCKER_SDK_SSH_ADAPTER_LOCK = threading.Lock()
 _DOCKER_SSH_REOPEN_TIMEOUT_SECONDS = 15
 # a create that outlived the client's read timeout holds its name in dockerd until it registers the container
 _INFLIGHT_CREATE_POLL_SECONDS = 2
+# the resume's overall bound on dockerd holding the pod's name: far past the slowest create seen (2 min in prod, a
+# create copying a large image into a new volume), so a slow create is still adopted, while a name dockerd never
+# frees fails the create instead of retrying forever and holding the executor's other creates. A container that
+# registers after it is a closed pod's container, which the next create's sweep of closed pods removes.
+_INFLIGHT_CREATE_DEADLINE_SECONDS = 600
 TRANSPORT_ERROR_CLASS = "transport"
 # The texts docker-py/urllib3/paramiko produce when the SSH channel under a Docker call is gone.
 # Plain substrings, matched against every exception text in the cause chain.
@@ -112,6 +117,10 @@ class ContainerCreateRefused(Exception):
 
 class RentalDockerOperationError(RuntimeError):
     """Raised when Docker SDK reports a rental Docker operation failure."""
+
+
+class InflightCreateNameStillHeld(RentalDockerOperationError):
+    """The resume waited _INFLIGHT_CREATE_DEADLINE_SECONDS and dockerd still held the pod's name: the create fails."""
 
 
 class ContainerNameTakenOnRetry(RentalDockerOperationError):
@@ -643,14 +652,23 @@ class RentalDockerSdkClient:
         so the retry waits for it: adopted once registered, or created here once dockerd released the
         name because that create failed. A delete of the pod does not end the wait: leaving would let
         that container register with nobody to remove it. Either way the caller's delete checkpoint
-        after the run removes the container a delete overtook.
+        after the run removes the container a delete overtook. The wait ends at
+        _INFLIGHT_CREATE_DEADLINE_SECONDS: a name dockerd never frees fails the create
+        (InflightCreateNameStillHeld) rather than retrying it forever.
         """
+        deadline = time.monotonic() + _INFLIGHT_CREATE_DEADLINE_SECONDS
         while True:
             try:
                 return await self._run_container_once(spec, adopt_existing=True)
             except RentalDockerOperationError as exc:
                 if f'"/{spec.name}" is already in use' not in str(exc):
                     raise
+                if time.monotonic() >= deadline:
+                    # no 409 text: the caller's own-leftover removal is for a container that exists, not a held name
+                    raise InflightCreateNameStillHeld(
+                        f"Docker still held the container name {spec.name} "
+                        f"{_INFLIGHT_CREATE_DEADLINE_SECONDS} s after the first create lost its answer"
+                    ) from exc
             await asyncio.sleep(_INFLIGHT_CREATE_POLL_SECONDS)
 
     async def _run_container_once(self, spec: ContainerRunSpec, *, adopt_existing: bool) -> str | None:

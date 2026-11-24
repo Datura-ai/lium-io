@@ -229,6 +229,35 @@ async def test_run_container_retry_adopts_the_first_create_however_long_dockerd_
 
 
 @pytest.mark.asyncio
+async def test_the_resume_wait_ends_at_its_deadline_when_dockerd_never_frees_the_name(monkeypatch):
+    """Review: with no bound, a name dockerd keeps reserved retried the customer create forever and kept the
+    executor's fillers blocked. Past the deadline the create fails, without the 409 text (no own-leftover removal)."""
+    import requests
+    import services.rental_docker_sdk as sdk
+    from services.rental_docker_sdk import InflightCreateNameStillHeld
+
+    monkeypatch.setattr(sdk, "_INFLIGHT_CREATE_POLL_SECONDS", 0)
+    monkeypatch.setattr(sdk, "_INFLIGHT_CREATE_DEADLINE_SECONDS", 0)
+    api = _FakeApiClient(adapter=_FakeAdapter())
+    api.create_container_errors = [
+        requests.exceptions.ReadTimeout("Read timed out. (read timeout=60)"),
+        *[_name_conflict() for _ in range(50)],
+    ]
+
+    def inspect_container(name):
+        api.calls.append("inspect_container")
+        raise _not_found()
+
+    api.inspect_container = inspect_container
+
+    with pytest.raises(InflightCreateNameStillHeld) as raised:
+        await _client(api).run_container(_run_spec())
+    assert isinstance(raised.value, RentalDockerOperationError) and not isinstance(raised.value, ContainerNameTakenOnRetry)
+    assert "already in use" not in str(raised.value)
+    assert api.calls == ["create_container", "inspect_container", "create_container"]
+
+
+@pytest.mark.asyncio
 async def test_run_container_retry_creates_once_dockerd_released_the_name(monkeypatch):
     """The first create failed in dockerd after the read timeout: the name is free again and the retry's
     create is the only container."""
