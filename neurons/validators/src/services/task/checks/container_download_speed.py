@@ -17,7 +17,7 @@ from services.redis_service import get_or_adopt_legacy
 from services.rental_docker_sdk import RENTAL_NETWORK_NAME
 
 from ..messages import ContainerDownloadSpeedMessages as Msg
-from ..messages import render_message
+from ..messages import container_network_remediation, render_message
 from ..pipeline import CheckResult, Context
 from .rental_owner import rental_of_this_node
 
@@ -210,6 +210,17 @@ def _is_slow(r: EndpointReading) -> bool:
 def _is_bad(r: EndpointReading) -> bool:
     """A reading the fleet comparison judges: a slow one, or an upload the container could not complete."""
     return _is_slow(r) or (r.endpoint in _UPLOAD_NAMES and r.error in NODE_SIDE_ERRORS)
+
+
+def _remediation(state: "_State") -> str:
+    """The instructions name the side this reading failed on: the upload counts only once its rule is enforced."""
+    upload = settings.CONTAINER_SPEED_FLEET_RULE_ENFORCED and any(
+        r.endpoint in _UPLOAD_NAMES and _is_bad(r) for r in state.readings
+    )
+    download = any(
+        r.endpoint not in _UPLOAD_NAMES and (_is_slow(r) or r.error in NODE_SIDE_ERRORS) for r in state.readings
+    )
+    return container_network_remediation(upload=upload, download=download or not upload)
 
 
 async def _record_fleet(ctx: Context, readings: list[EndpointReading], now: float) -> None:
@@ -426,7 +437,9 @@ class ContainerDownloadSpeedCheck:
         }
         if state.failures_in_a_row >= READINGS_BEFORE_VERDICT:
             template = Msg.SLOW if enforced else Msg.SLOW_OBSERVED
-            event = render_message(template, ctx=ctx, check_id=self.check_id, what=what)
+            event = render_message(
+                template, ctx=ctx, check_id=self.check_id, what=what, remediation=_remediation(state)
+            )
             return CheckResult(passed=not enforced, event=event)
         if not probed:
             what["read_at"] = state.at
@@ -438,7 +451,11 @@ class ContainerDownloadSpeedCheck:
             template = Msg.OK
         else:
             template = Msg.UNMEASURED
-        return CheckResult(passed=True, event=render_message(template, ctx=ctx, check_id=self.check_id, what=what))
+        remediation = _remediation(state) if template is Msg.SLOW_ONCE else None
+        return CheckResult(
+            passed=True,
+            event=render_message(template, ctx=ctx, check_id=self.check_id, what=what, remediation=remediation),
+        )
 
     async def _save(self, ctx: Context, key: str, state: _State) -> None:
         payload = {

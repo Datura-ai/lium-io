@@ -1425,6 +1425,19 @@ def test_a_failed_upload_is_shown_against_the_upload_minimum(failed, detail):
     assert slow_detail(_State(at=0, net_failures=2, reading=reading)) == detail
 
 
+@pytest.mark.parametrize(
+    "failed, download, upload",
+    [
+        (["pypi 1.5 Mbps", "hf 2.0 Mbps"], True, False),
+        (["cf_up 3.0 Mbps"], False, True),
+        (["pypi 1.5 Mbps", "cf_up 3.0 Mbps"], True, True),
+    ],
+)
+def test_the_rented_instructions_name_only_the_network_side_that_failed(failed, download, upload):
+    text = RentedThroughputCheck._remediation(_State(at=0, net_failures=2, reading={"net_failed": failed}), Msg.SLOW)
+    assert ("downloading from PyPI" in text) is download and ("uploading" in text) is upload
+
+
 async def test_a_rented_pod_slow_to_pypi_only_on_this_providers_path_fails():
     # PyPI slow and HF fast on one node only: the old rule passed it
     answer = snaps() + disk() + PYPI_ONLY_SLOW

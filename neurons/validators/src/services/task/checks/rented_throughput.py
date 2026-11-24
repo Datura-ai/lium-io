@@ -25,7 +25,7 @@ from ..host_disk import (
     parse_disk_pressure,
 )
 from ..messages import RentedThroughputMessages as Msg
-from ..messages import render_message
+from ..messages import render_message, rented_throughput_remediation
 from ..pipeline import CheckResult, Context
 from ..runner import SSHCommandResult
 from .container_download_speed import (
@@ -709,6 +709,17 @@ class RentedThroughputCheck:
             reading["error"] = f"{result.error_type}: {(result.error_message or '')[-200:]}"
         return reading
 
+    @staticmethod
+    def _remediation(state: _State, template) -> str:
+        """SLOW's instructions name the network side its confirmed readings failed on; NOT_RUN keeps its own."""
+        if template is not Msg.SLOW:
+            return template.remediation
+        failed = [e.split(" ", 1)[0] for e in (state.reading.get("net_failed") or [])]
+        upload = any(name in _UPLOAD_NAMES for name in failed)
+        return rented_throughput_remediation(
+            upload=upload, download=not upload or any(name not in _UPLOAD_NAMES for name in failed)
+        )
+
     def _verdict(self, ctx: Context, state: _State, *, probed: bool) -> CheckResult:
         what: dict[str, Any] = {
             **state.reading,
@@ -726,7 +737,7 @@ class RentedThroughputCheck:
                 ctx=ctx,
                 check_id=self.check_id,
                 what={**what, "failed": detail} if detail else what,
-                remediation=f"failed: {detail}. {template.remediation}" if detail else None,
+                remediation=f"failed: {detail}. {self._remediation(state, template)}" if detail else None,
             )
             # NOT_RUN measured nothing, so scoring and the portal must not call it slow
             updates = (

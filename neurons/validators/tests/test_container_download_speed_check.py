@@ -272,6 +272,28 @@ async def test_too_few_fleet_readings_keep_the_excuse():
         assert res.passed and res.event.reason_code == Msg.OK.reason
 
 
+@pytest.mark.parametrize("enforced", [True, False])
+async def test_the_instructions_name_slow_downloads_only_when_the_upload_was_fast(enforced):
+    with flags(enforced=enforced) as clock:
+        ctx, _, _ = make_ctx(SLOW, SLOW)
+        check = ContainerDownloadSpeedCheck()
+        first = await check.run(ctx)
+        clock.now += 31 * 60
+        second = await check.run(ctx)
+    for res in (first, second):
+        assert "downloads from PyPI or Hugging Face too slowly" in res.event.remediation
+        assert "upload" not in res.event.remediation
+
+
+async def test_the_instructions_name_the_upload_when_only_the_upload_was_slow():
+    slow_up = FAST.replace(UP, line("cf_up", 0, 30.0, 143))
+    with flags():
+        ctx, _, _ = make_ctx(slow_up, redis=FleetRedis(pypi=(0, 30), hf=(0, 30), cf_up=(1, 30)))
+        res = await ContainerDownloadSpeedCheck().run(ctx)
+    assert res.event.reason_code == Msg.SLOW_ONCE.reason
+    assert "uploads too slowly" in res.event.remediation and "PyPI" not in res.event.remediation
+
+
 async def test_a_slow_upload_fails_unless_the_fleet_uploads_slow_too():
     slow_up = FAST.replace(UP, line("cf_up", 0, 30.0, 143))  # the upload did not finish in time: an upper-bound slow reading
     with flags():
