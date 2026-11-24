@@ -1,10 +1,7 @@
 ARG BASE_IMAGE=python:3.11-slim
 
-# DAH-6804: the executor_setup build context (neurons/executor) replaces this stage; a build without it (the staging
-# workflow until its build-contexts list it) ships an empty placeholder, and SysboxLayerResetCheck then installs nothing
-FROM $BASE_IMAGE AS executor_setup
-RUN touch /nvidia_docker_sysbox_setup.sh
-
+# DAH-6804/DAH-6980: every build passes the executor_setup build context (neurons/executor); no placeholder stage, so a
+# build without it fails instead of shipping an image whose SysboxLayerResetCheck installs nothing
 FROM $BASE_IMAGE
 
 RUN apt-get update \

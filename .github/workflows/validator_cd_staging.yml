@@ -43,6 +43,7 @@ jobs:
           build-contexts: |
             datura=./datura
             liumd=./neurons/executor/liumd
+            executor_setup=./neurons/executor
           push: true
           tags: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:staging
