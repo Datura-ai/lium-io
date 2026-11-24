@@ -1213,6 +1213,9 @@ async def test_lifecycle_operations_pass_container_names_as_sdk_data(
         _all_host_commands(retried_commands, ssh_client),
         ["CONTAINER_MARKER"],
     )
+    # start keeps TCB fail-closed; stop and delete only tear down, so a TCB status cannot block them
+    teardown = [c.kwargs.get("teardown", False) for c in docker_service._prepare_known_hosts_policy.await_args_list]
+    assert teardown == [False, True, True]
     # the start runs the id read for that name (as SDK data too), not the name itself
     assert docker_client.started_containers == ["cid"]
     # two stops: the explicit stop_container call + the graceful stop inside
