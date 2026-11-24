@@ -31,7 +31,7 @@ DISK_HELPERS = {
     "DOCKER_SOCKET_PATH",
     "DOCKER_API_TIMEOUT_SECONDS",
     "VLOOPBACK_DRIVER_PREFIX",
-    "VLOOPBACK_HOST_DATA_DIR_NAMES",
+    "vloopback_plugin_data_dirs",
     "UnixSocketHTTPConnection",
     "docker_api_get",
     "get_vloopback_volume_bytes",
@@ -62,6 +62,18 @@ def scrape() -> dict:
     )
 
 
+def _plugin(plugin_id: str, name: str, data_dir: str) -> dict:
+    # one GET /plugins entry as docker returns it; every vloopback build mounts the host's / at /srv
+    mounts = [{"Destination": "/dev", "Source": "/dev"}, {"Destination": "/srv", "Source": "/"}]
+    return {"Id": plugin_id, "Name": name, "Settings": {"Env": [f"DATA_DIR={data_dir}", "LOG_LEVEL=2"], "Mounts": mounts}}
+
+
+# the setups' own plugins: the old one keeps DATA_DIR in its rootfs, v2 and v3 on the host (loopback_plugin_setup.py)
+OLD_PLUGIN = _plugin("abc", "vloopback:latest", "/var/lib/docker/loopback")
+V2_PLUGIN = _plugin("p2", "vloopback:v2", "/srv/var/lib/docker/vloopback-v2")
+V3_PLUGIN = _plugin("p3", "vloopback:v3", "/srv/var/lib/docker/vloopback-v3")
+
+
 CONTAINERS_PATH = "/containers/json?all=1&size=1"
 DF_PATH = "/system/df?type=image&type=volume&type=build-cache"
 
@@ -69,7 +81,7 @@ DF_PATH = "/system/df?type=image&type=volume&type=build-cache"
 def _stub_docker_api(scrape: dict, responses: dict) -> None:
     # a "/system/df" stub keeps docker's full answer in one place: its Containers are served by the
     # containers listing the scrape now reads them from, the rest by the typed /system/df call
-    responses = dict(responses)
+    responses = {"/plugins": [V2_PLUGIN], **responses}
     if "/system/df" in responses:
         df = dict(responses.pop("/system/df"))
         responses.setdefault(CONTAINERS_PATH, df.pop("Containers", []))
@@ -188,6 +200,7 @@ def test_pod_sizes_survive_a_failed_system_df(scrape: dict, monkeypatch) -> None
         ),
     )
     responses = {
+        "/plugins": [V2_PLUGIN],
         CONTAINERS_PATH: [
             {"Names": ["/container_pod1"], "SizeRw": 4096, "Mounts": [{"Type": "volume", "Name": "volume_pod1"}]},
             # a dind pod whose anonymous local volume only /system/df sizes: unknown, not undercounted
@@ -377,6 +390,7 @@ def test_an_attached_s3fs_volume_is_never_required_for_a_pods_size(scrape: dict,
     )
     monkeypatch.setitem(scrape, "local_volume_bytes", lambda path, deadline: pytest.fail(f"walked {path}"))
     responses = {
+        "/plugins": [V2_PLUGIN],
         CONTAINERS_PATH: [
             {
                 "Names": ["/pod_attached"],
@@ -562,7 +576,7 @@ def test_vloopback_volumes_are_added_to_the_local_driver_total(scrape: dict, mon
             "_Os",
             (),
             {
-                "path": os.path,
+                "path": SimpleNamespace(join=os.path.join, isdir=lambda path: True),
                 "stat": staticmethod(lambda path: type("_Stat", (), {"st_blocks": blocks_by_path[path]})),
             },
         ),
@@ -572,6 +586,7 @@ def test_vloopback_volumes_are_added_to_the_local_driver_total(scrape: dict, mon
         {
             "/system/df": {"LayersSize": 0, "Containers": [], "Volumes": [{"UsageData": {"Size": 1024}}]},
             "/info": {"DockerRootDir": "/var/lib/docker"},
+            "/plugins": [OLD_PLUGIN],
             "/volumes": {
                 "Volumes": [
                     {"Name": "volume_full", "Driver": "vloopback"},
@@ -604,7 +619,7 @@ def test_vloopback_volume_missing_its_backing_file_is_skipped(scrape: dict, monk
             "_Os",
             (),
             {
-                "path": os.path,
+                "path": SimpleNamespace(join=os.path.join, isdir=lambda path: True),
                 "stat": staticmethod(lambda path: (_ for _ in ()).throw(FileNotFoundError(path))),
             },
         ),
@@ -617,16 +632,24 @@ def test_vloopback_volume_missing_its_backing_file_is_skipped(scrape: dict, monk
     assert total == 0
 
 
-def test_missing_plugin_data_dir_raises_instead_of_reporting_zero(scrape: dict, monkeypatch) -> None:
-    # Arrange — the glob finds no plugin rootfs at all, so every volume would be counted as 0.
+@pytest.mark.parametrize(
+    "plugins",
+    [
+        [],
+        [{"Id": "x", "Name": "vloopback:latest", "Settings": {"Env": ["LOG_LEVEL=2"]}}],
+        [{"Id": "x", "Name": "vloopback:latest", "Settings": {"Env": ["DATA_DIR=relative"]}}],
+        [_plugin("y", "other-driver:latest", "/srv/var/lib/other")],
+        # reported, but the directory is not on the host
+        [V2_PLUGIN],
+    ],
+    ids=["no-plugin", "no-data-dir", "relative-data-dir", "only-another-driver", "data-dir-absent"],
+)
+def test_missing_plugin_data_dir_raises_instead_of_reporting_zero(scrape: dict, monkeypatch, plugins) -> None:
+    # Arrange — docker reports no vloopback plugin DATA_DIR, so every volume would be counted as 0.
     # That is a structural miss, not a single unmaterialised volume: reporting 0 TB of volumes
     # reads as "the disk is free", so it has to surface as an error key instead.
-    _stub_docker_api(scrape, {"/volumes": {"Volumes": [{"Name": "volume_full", "Driver": "vloopback"}]}})
-    monkeypatch.setitem(
-        scrape,
-        "glob",
-        type("_Glob", (), {"glob": staticmethod(lambda pattern: [])}),
-    )
+    _stub_docker_api(scrape, {"/plugins": plugins, "/volumes": {"Volumes": [{"Name": "volume_full", "Driver": "vloopback"}]}})
+    monkeypatch.setitem(scrape, "os", SimpleNamespace(path=SimpleNamespace(join=os.path.join, isdir=lambda path: False)))
 
     # Act / Assert
     with pytest.raises(RuntimeError):
@@ -652,16 +675,62 @@ def test_vloopback_volume_bytes_counts_the_v2_and_v3_host_data_dirs_beside_the_o
         return SimpleNamespace(st_blocks=blocks[path])
 
     monkeypatch.setitem(scrape, "glob", SimpleNamespace(glob=lambda pattern: [old_dir] if old_blocks else []))
-    path = SimpleNamespace(join=os.path.join, isdir=lambda candidate: candidate in (v2_dir, v3_dir))
+    path = SimpleNamespace(join=os.path.join, isdir=lambda candidate: candidate in (old_dir, v2_dir, v3_dir))
     monkeypatch.setitem(scrape, "os", SimpleNamespace(path=path, stat=stat))
     volumes = [
         {"Name": "volume_old", "Driver": "vloopback:latest"},
         {"Name": "volume_v2", "Driver": "vloopback:v2"},
         {"Name": "volume_v3", "Driver": "vloopback:v3"},
     ]
-    _stub_docker_api(scrape, {"/volumes": {"Volumes": volumes}})
+    plugins = ([OLD_PLUGIN] if old_blocks else []) + [V2_PLUGIN, V3_PLUGIN]
+    _stub_docker_api(scrape, {"/plugins": plugins, "/volumes": {"Volumes": volumes}})
 
     assert scrape["get_vloopback_volume_bytes"]("/var/lib/docker") == (total_blocks + 96) * 512
+
+
+@pytest.mark.parametrize(
+    "plugin, backing_dir",
+    [
+        # DATA_DIR set by hand to another host dir, reached through the plugin's / -> /srv mount
+        (_plugin("c1", "vloopback:latest", "/srv/data/loop-volumes"), "/proc/1/root/data/loop-volumes"),
+        # DATA_DIR outside any mount: inside that plugin's own rootfs, by its ID
+        (_plugin("c2", "vloopback:latest", "/custom/loop"), "/proc/1/root/var/lib/docker/plugins/c2/rootfs/custom/loop"),
+        # the longest mount wins over / -> /srv
+        (
+            {
+                "Id": "c3",
+                "Name": "vloopback:v9",
+                "Settings": {
+                    "Env": ["DATA_DIR=/srv/mnt/data/v"],
+                    "Mounts": [{"Destination": "/srv", "Source": "/"}, {"Destination": "/srv/mnt/data", "Source": "/disk2"}],
+                },
+            },
+            "/proc/1/root/disk2/v",
+        ),
+    ],
+    ids=["hand-set-host-dir", "rootfs-dir", "nested-mount"],
+)
+def test_vloopback_volume_bytes_reads_a_custom_data_dir_from_the_plugin(scrape: dict, monkeypatch, plugin, backing_dir) -> None:
+    # Arrange — DAH-7020: a plugin whose DATA_DIR is none of the setups' own; the scrape reads it from docker
+    blocks = {f"{backing_dir}/volume_pod": 2048}
+
+    def stat(path):
+        if path not in blocks:
+            raise FileNotFoundError(path)
+        return SimpleNamespace(st_blocks=blocks[path])
+
+    monkeypatch.setitem(scrape, "glob", SimpleNamespace(glob=lambda pattern: []))
+    path = SimpleNamespace(join=os.path.join, isdir=lambda candidate: candidate == backing_dir)
+    monkeypatch.setitem(scrape, "os", SimpleNamespace(path=path, stat=stat))
+    _stub_docker_api(scrape, {"/plugins": [plugin], "/volumes": {"Volumes": [{"Name": "volume_pod", "Driver": plugin["Name"]}]}})
+
+    # Act
+    sizes = {}
+    total = scrape["get_vloopback_volume_bytes"]("/var/lib/docker", False, sizes)
+
+    # Assert
+    assert total == 2048 * 512
+    assert sizes == {"volume_pod": 2048 * 512}
 
 
 def _obfuscation_tables() -> tuple[set[str], set[str]]:
