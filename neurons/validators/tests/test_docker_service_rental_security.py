@@ -759,11 +759,13 @@ async def test_create_s3fs_volume_retries_a_failed_plugin_install(
 class InstalledPluginSSHClient(RecordingSSHClient):
     # answers `plugin inspect` with the installed instance's reference, `docker ps` with the containers holding the
     # volume, `plugin rm` with plugin_rm_exit, every other command with `stdout`
-    def __init__(self, reference: str, stdout: str = "", plugin_rm_exit: int = 0, holders: str = ""):
+    # `disabled`: the instance was left disabled, so `volume rm` fails (and the volume keeps it in use) until enabled
+    def __init__(self, reference: str, stdout: str = "", plugin_rm_exit: int = 0, holders: str = "", disabled=False):
         super().__init__(stdout=stdout)
         self.reference = reference
         self.plugin_rm_exit = plugin_rm_exit
         self.holders = holders
+        self.disabled = disabled
 
     async def run(self, command, *args, **kwargs):
         self.commands.append(command)
@@ -771,6 +773,11 @@ class InstalledPluginSSHClient(RecordingSSHClient):
             return SimpleNamespace(stdout=self.reference + "\n", stderr="", exit_status=0)
         if command.startswith("/usr/bin/docker ps -aq --filter volume="):
             return SimpleNamespace(stdout=self.holders, stderr="", exit_status=0)
+        if command.startswith("/usr/bin/docker plugin enable "):
+            self.disabled = False
+        if command.startswith("/usr/bin/docker volume rm ") and self.disabled:
+            self.plugin_rm_exit = 1
+            return SimpleNamespace(stdout="", stderr="driver s3fs-celium-volume-safe is disabled", exit_status=1)
         if command.startswith("/usr/bin/docker plugin rm "):
             stderr = "plugin s3fs-celium-volume-safe is in use" if self.plugin_rm_exit else ""
             return SimpleNamespace(stdout="", stderr=stderr, exit_status=self.plugin_rm_exit)
@@ -812,8 +819,9 @@ async def test_an_instance_of_another_build_is_removed_with_its_volume_or_the_re
     )
 
     # no container references the volume; its handle goes first, then the instance it held in use
-    assert ssh_client.commands[1:5] == [
+    assert ssh_client.commands[1:6] == [
         "/usr/bin/docker ps -aq --filter volume=celium-volume-safe",
+        "/usr/bin/docker plugin enable s3fs-celium-volume-safe",
         "/usr/bin/docker volume rm celium-volume-safe",
         "/usr/bin/docker plugin disable s3fs-celium-volume-safe -f",
         "/usr/bin/docker plugin rm s3fs-celium-volume-safe",
@@ -825,6 +833,25 @@ async def test_an_instance_of_another_build_is_removed_with_its_volume_or_the_re
         assert is_success is False and "could not be removed" in message and "in use" in message
         assert not installed
         stream_logs.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_an_instance_of_another_build_left_disabled_is_still_replaced(docker_service, monkeypatch):
+    # review on #2397: the old instance was force-disabled with its volume kept; Docker refused `volume rm` on the
+    # disabled driver, so `plugin rm` failed and the rental stopped before the install
+    ssh_client = InstalledPluginSSHClient("docker.io/mochoa/s3fs-volume-plugin:latest", disabled=True)
+    monkeypatch.setattr(docker_service, "execute_and_stream_logs", AsyncMock(return_value=(True, "")))
+
+    is_success, message = await docker_service.create_s3fs_volume(
+        ssh_client=ssh_client,
+        log_extra={},
+        volume_info=_s3fs_volume_info(),
+        log_tag="tag",
+        sysbox_subuid_base=None,
+    )
+
+    assert is_success is True, message
+    assert any("plugin install" in command for command in ssh_client.commands)
 
 
 @pytest.mark.asyncio

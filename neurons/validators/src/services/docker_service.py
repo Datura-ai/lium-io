@@ -8265,7 +8265,9 @@ class DockerService:
         if holders.exit_status != 0 or (holders.stdout or "").strip():
             return None
         # its volume handle keeps the instance in use, so `plugin rm` fails until the handle is gone; the data is in the
-        # bucket
+        # bucket. Docker cannot remove a volume whose driver is disabled, so the instance is enabled first (a no-op
+        # error when it already is)
+        await ssh_client.run(f"/usr/bin/docker plugin enable {plugin_alias}")
         await ssh_client.run(f"/usr/bin/docker volume rm {volume_name}")
         await ssh_client.run(f"/usr/bin/docker plugin disable {plugin_alias} -f")
         removed = await ssh_client.run(f"/usr/bin/docker plugin rm {plugin_alias}")
