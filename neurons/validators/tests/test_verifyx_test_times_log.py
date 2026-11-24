@@ -16,7 +16,10 @@ def test_network_speeds_line_carries_the_time_of_each_verifyx_test():
     response_data = {
         "memory_execution": {"execution_time_ms": 41_000},
         "storage_execution": {"execution_time_ms": 23_000},
-        "network_execution": {"execution_time_ms": 88_000, "download": {"time_ms": 34_000}},
+        "network_execution": {
+            "execution_time_ms": 88_000,
+            "download": {"time_ms": 0, "size": 425_000_000, "speed_mbps": 100.0},
+        },
     }
 
     # Act
@@ -27,7 +30,7 @@ def test_network_speeds_line_carries_the_time_of_each_verifyx_test():
         41_000,
         23_000,
         88_000,
-        34_000,
+        34_000,  # 425 MB at 100 Mbps; the library's own time_ms is always 0
     )
 
 

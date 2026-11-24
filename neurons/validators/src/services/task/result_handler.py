@@ -121,7 +121,7 @@ class ResultHandler:
                     "score": context.score,
                     "job_score": context.job_score,
                     "job_batch_id": miner_info.job_batch_id,
-                    # counted from the executor task's start, as its 780 s timeout is
+                    # counted from the executor task's start, as the per-node task limit is
                     "pipeline_elapsed_s": round(time.monotonic() - context.started_at_monotonic, 1),
                 },
             )

@@ -880,7 +880,8 @@ class Pipeline:
             try:
                 ran_checks, current_ctx = await self._run_step_surviving_a_dropped_session(step, current_ctx)
             except asyncio.CancelledError:
-                # the task's timeout drops the executor without a result; this names the step it was cut in
+                # any cancellation inside a step (the per-node or whole-miner limit, shutdown) names the step it
+                # cut; a cancellation outside the steps (connect, context build, result handling) writes nothing
                 step_check_ids = [chk.check_id for chk in step.checks] if parallel else [step.check_id]
                 logger.warning(
                     _m(

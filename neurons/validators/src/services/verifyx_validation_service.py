@@ -1148,11 +1148,18 @@ def _format_mbps(value: object) -> str:
 def _verifyx_test_times_ms(response_data: dict) -> dict:
     # how long each VerifyX test ran on the executor; a time it did not report is None
     network_execution = response_data.get("network_execution") or {}
+    download = network_execution.get("download") or {}
+    size, speed_mbps = download.get("size"), download.get("speed_mbps")
     return {
         "memory_ms": (response_data.get("memory_execution") or {}).get("execution_time_ms"),
         "storage_ms": (response_data.get("storage_execution") or {}).get("execution_time_ms"),
         "network_ms": network_execution.get("execution_time_ms"),
-        "package_ms": (network_execution.get("download") or {}).get("time_ms"),
+        # the library always reports the download's `time_ms` as 0; its speed is size * 8 / 1e6 / seconds
+        "package_ms": (
+            round(size * 8 / (speed_mbps * 1000))
+            if _is_positive_number(size) and _is_positive_number(speed_mbps)
+            else None
+        ),
     }
 
 
