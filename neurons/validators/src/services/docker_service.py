@@ -1836,6 +1836,11 @@ _RESTORE_BRING_UP_TIMEOUT_SECONDS = 300
 _KEPT_COPY_TIMEOUT_SECONDS = 900
 
 
+def _seconds_left(deadline: float) -> int:
+    # a host-side `timeout 0` means no limit, so never below one second
+    return max(1, math.floor(deadline - time.monotonic()))
+
+
 class KeptContainersNotRemoved(RuntimeError):
     """The pod's kept containers were found but `docker rm -fv` failed: they stay until a delete removes them."""
 
@@ -2046,10 +2051,10 @@ class _EditSwap:
     async def __aenter__(self) -> "_EditSwap":
         return self
 
-    async def _run(self, command: str) -> asyncssh.SSHCompletedProcess:
+    async def _run(self, command: str, timeout: float | None = None) -> asyncssh.SSHCompletedProcess:
         # a wedged dockerd can hang `docker stop`/`kill`/`inspect` forever (a reboot hung until the
         # connector pod was replaced): the host ends each command (exit 124), the validator bounds the rest
-        return await _run_with_host_timeout(self.ssh_client, command, _PARK_COMMAND_TIMEOUT_SECONDS)
+        return await _run_with_host_timeout(self.ssh_client, command, timeout or _PARK_COMMAND_TIMEOUT_SECONDS)
 
     async def park(self) -> str | None:
         """Rename the running container aside and stop it. None when there is nothing to park."""
@@ -2276,14 +2281,17 @@ class _EditSwap:
         """DinD (sysbox) pods often fail the first `docker stop` while a retry seconds later works (prod 15-21 Oct
         2026: 12 park failures on 10 hosts, all on dind-lium1). Kill it once; True when Docker reports it stopped within _PARK_KILL_WAIT_SECONDS."""
         killed = await self._run(f"/usr/bin/docker kill {shlex.quote(parked)}")
-        is_stopped = await self._docker_reports_stopped(parked)
+        # every wait after the kill shares one budget: a delete waits CANCELLED_CREATE_ABORT_TIMEOUT_SECONDS for
+        # the edit it cancels, so a slow dockerd must not stretch the park past it (DAH-7025 review)
+        deadline = time.monotonic() + _PARK_KILL_WAIT_SECONDS
         direct = None
-        if not is_stopped and _DOCKER_COULD_NOT_KILL_PHRASES[1] in (killed.stderr or "").lower():
-            # dockerd lost the exit event (F-1633): kill init + shim directly, as the delete path does (DAH-2991)
-            direct = (await self._run(DockerCommand.kill_container_processes(parked))).stdout or ""
-            if "init=alive" not in direct:
-                # init is dead: a big sysbox pod's teardown can outlast a single read, so wait as after the kill
-                is_stopped = await self._docker_reports_stopped(parked)
+        if _DOCKER_COULD_NOT_KILL_PHRASES[1] in (killed.stderr or "").lower():
+            # dockerd lost the exit event (F-1633), so waiting for it to report one first waits for nothing:
+            # kill init + shim directly now, as the delete path does (DAH-2991)
+            direct = (await self._run(DockerCommand.kill_container_processes(parked), _seconds_left(deadline))).stdout or ""
+        # init=alive needs no wait: a big sysbox pod's teardown can outlast a single read, a live init cannot
+        is_stopped = "init=alive" not in (direct or "") and await self._docker_reports_stopped(parked, deadline)
+        if direct is not None:
             # the host's fault (counted against the node) only when the process itself outlived SIGKILL: a teardown
             # dockerd has not finished yet is not a wedge, and its retry parks (DAH-7025)
             self.unkillable = "init=alive" in direct or ("init=gone" not in direct and not is_stopped)
@@ -2304,11 +2312,15 @@ class _EditSwap:
         )
         return is_stopped
 
-    async def _docker_reports_stopped(self, parked: str) -> bool:
-        """Re-read the container's state every _PARK_KILL_SETTLE_SECONDS for up to _PARK_KILL_WAIT_SECONDS."""
+    async def _docker_reports_stopped(self, parked: str, deadline: float) -> bool:
+        """Re-read the container's state every _PARK_KILL_SETTLE_SECONDS until the deadline; each read ends by it."""
         for _ in range(max(1, _PARK_KILL_WAIT_SECONDS // max(_PARK_KILL_SETTLE_SECONDS, 1))):
             await asyncio.sleep(_PARK_KILL_SETTLE_SECONDS)
-            running = await self._run(f"/usr/bin/docker inspect -f '{{{{.State.Running}}}}' {shlex.quote(parked)}")
+            if time.monotonic() >= deadline:
+                break
+            running = await self._run(
+                f"/usr/bin/docker inspect -f '{{{{.State.Running}}}}' {shlex.quote(parked)}", _seconds_left(deadline)
+            )
             if running.exit_status == 0 and (running.stdout or "").strip() == "false":
                 return True
         return False

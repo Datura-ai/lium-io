@@ -523,6 +523,47 @@ async def test_only_an_init_that_outlives_sigkill_is_unkillable(svc, monkeypatch
         svc._run_rental_docker_create_with_port_retry.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+async def test_a_slow_dockerd_keeps_the_park_within_one_wait(svc, monkeypatch):
+    # DAH-7025 review: each State.Running read answered 36 s late, so a delete waiting for the edit it cancelled gave up first
+    clock = [0.0]
+    monkeypatch.setattr("services.docker_service.time", SimpleNamespace(time=lambda: _PARKED_AT, monotonic=lambda: clock[0]))
+    monkeypatch.setattr("services.docker_service._PARK_KILL_SETTLE_SECONDS", 0)
+    payload = _edit_payload()
+    ssh = _ssh_recording(stop_exit=1)
+    inner_run, inner_open = ssh.run, ssh.create_process
+    direct_kill = DockerCommand.kill_container_processes(_kept(payload))
+    host_timeouts = []
+
+    async def no_exit_event(cmd, *args, **kwargs):
+        if cmd.startswith("/usr/bin/docker kill"):
+            ssh.commands.append(cmd)
+            return _ssh_result(exit_status=1, stderr="cannot kill container: tried to kill container, but did not receive an exit event")
+        if cmd == direct_kill:
+            ssh.commands.append(cmd)
+            return _ssh_result(stdout="killed pid=4242 shim=4241 init=gone\n")
+        return await inner_run(cmd, *args, **kwargs)
+
+    async def opened(command: str):
+        inner = shlex.split(command)[-1] if command.startswith("timeout ") else command
+        if inner == direct_kill or "{{.State.Running}}" in inner:
+            host_timeouts.append(int(shlex.split(command)[3]))
+        if "{{.State.Running}}" in inner:
+            clock[0] += 12  # dockerd answers each read late, still "running"
+        return await inner_open(command)
+
+    ssh.run = no_exit_event
+    ssh.create_process = opened
+    _patch_happy(svc, monkeypatch, ssh)
+
+    result = await _run(svc, payload)
+
+    # the direct kill comes first, then reads that each end by the one 30 s budget; none starts past it
+    # (the last entry is the park's own final read before it decides whether to rename back)
+    assert host_timeouts == [30, 30, 18, 6, 60]
+    assert isinstance(result, FailedContainerRequest) and result.failure_step == "park_current_container"
+
+
 def test_the_direct_kill_reads_a_killed_init_as_gone():
     # the script's own /proc reading, on a real process: the pid lookup stands in for docker inspect
     import subprocess
@@ -1347,7 +1388,8 @@ async def test_a_failed_edit_brings_a_kept_container_back_unmounted(
     # not running (or not renamed): it is stopped under its kept name, and the next (successful) edit keeps it
     assert _docker(ssh.commands, "rename")[1:] == ([f"/usr/bin/docker rename {kept} {name}"] if status == "running" and not start_error else [])
     if stop_wedged:
-        assert killed_directly == [DockerCommand.kill_container_processes(kept)]
+        # the park's stop and this one: a lost exit event goes straight to the direct kill, each time
+        assert killed_directly == [DockerCommand.kill_container_processes(kept)] * 2
         assert ssh.commands[-1] == f"/usr/bin/docker inspect -f '{{{{.State.Running}}}}' {kept}"
     else:
         assert ssh.commands[-1] == f"/usr/bin/docker stop -t 10 {kept}"
