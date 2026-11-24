@@ -12,7 +12,7 @@ import aiohttp
 from asyncssh import SSHKey
 import asyncssh
 import bittensor
-from clients.subtensor_client import SubtensorClient
+from clients.validator_portal_api import first_owner_hotkeys_read, portal_owner_hotkeys
 from datura.requests.miner_requests import (
     AcceptSSHKeyRequest,
     ExecutorSSHInfo,
@@ -28,7 +28,6 @@ from datura.requests.validator_requests import (
     SSHPubKeySubmitRequest,
     GetPodLogsRequest,
     AuthenticationPayload,
-    fresh_upload_nonce,
     ssh_pubkey_signing_blob,
 )
 from fastapi import Depends
@@ -39,6 +38,7 @@ from payload_models.payloads import (
     ContainerBaseRequest,
     ContainerCreateRequest,
     ContainerDeleteRequest,
+    ContainerStartRequest,
     ContainerStopRequest,
     AddSshPublicKeyRequest,
     RemoveSshPublicKeysRequest,
@@ -71,9 +71,11 @@ from protocol.vc_protocol.validator_requests import bound_pod_states, chunk_pod_
 from services.attestation_service import AttestationService
 from services.docker_service import (
     DockerService,
+    _cleanup_to_completion,
     create_steps_after_reply,
     customer_creates,
     executor_key,
+    half_started_stop_retry,
     inflight_creates,
 )
 from services.executor_image_policy import ExpectedImageSnapshot
@@ -103,12 +105,25 @@ from services.storage_operations import (
     supports_workspace_field,
 )
 from services.storage_operations import upload_secrets_file
+from services.upload_nonce import upload_nonce_for_miner
 
 logger = logging.getLogger(__name__)
 
-# I-78: bittensor packs a.b.c into axon_info.version as a*1000**2 + b*1000 + c. 10.5.0 is what
-# miner-v1.003+ announces; the upload nonce field shipped in miner-v1.002 (fbfbde79, DAH-2338).
-MIN_DATED_NONCE_MINER_AXON_VERSION = 10_005_000
+# key removals waiting for a pod's background stop retry, kept referenced until they finish
+_KEY_REMOVALS_AFTER_STOP_RETRY: set[asyncio.Task] = set()
+
+
+async def _remove_ssh_key_after_stop_retry(stop_retry: asyncio.Task, remove_ssh_key: Awaitable[bool]) -> bool:
+    """A failed start's background stop retry reconnects with the request's key: the key goes once that retry is done,
+    and at once if this wait is cancelled, so it never outlives the request's steps."""
+    try:
+        await asyncio.wait({stop_retry})
+    except asyncio.CancelledError:
+        await _cleanup_to_completion(remove_ssh_key)
+        raise
+    return await remove_ssh_key
+
+
 # rows the wave builds from the miner's answer alone, without checking the node (DAH-6596)
 MINER_ANSWER_REASON_CODES = frozenset(
     {AvailabilityErrorCode.EXECUTOR_UNREACHABLE_BY_MINER, AvailabilityErrorCode.RENTED_EXECUTOR_NOT_LISTED}
@@ -649,28 +664,6 @@ class MinerService:
     def _normalize_public_key(public_key: bytes | str) -> str:
         return public_key.decode("utf-8") if isinstance(public_key, bytes) else public_key
 
-    def _upload_nonce_for_miner(self, miner_hotkey: str) -> str | None:
-        """A dated nonce for an SSH-key upload, so a captured signature goes stale (I-78).
-
-        Only for a miner proven to relay the nonce field: the central miner, or an axon announcing
-        bittensor 10.5.0+. Older miners drop the field and the upload fails, so they get none.
-        """
-        subtensor = SubtensorClient.get_instance()
-        if miner_hotkey in subtensor.hotkeys_routed_via_central_miner:
-            return fresh_upload_nonce()
-        # in-memory metagraph snapshot only: no chain read on the upload path
-        neuron = next((n for n in subtensor.miners if n.hotkey == miner_hotkey), None)
-        axon_version = getattr(neuron.axon_info, "version", None) if neuron is not None else None
-        if axon_version and axon_version >= MIN_DATED_NONCE_MINER_AXON_VERSION:
-            return fresh_upload_nonce()
-        logger.info(
-            _m(
-                "dated_upload_nonce_skipped",
-                extra=get_extra_info({"miner_hotkey": miner_hotkey, "axon_version": axon_version}),
-            )
-        )
-        return None
-
     def _sign_validator_pubkey(
         self,
         keypair: bittensor.Keypair,
@@ -686,6 +679,15 @@ class MinerService:
         """
         pubkey = self._normalize_public_key(public_key)
         return f"0x{keypair.sign(ssh_pubkey_signing_blob(pubkey, nonce, miner_hotkey)).hex()}"
+
+    def _owner_hotkey_signatures(
+        self, keypair: bittensor.Keypair, public_key: bytes | str, nonce: str | None, miner_hotkey: str
+    ) -> dict[str, str] | None:
+        """DAH-6740: the miner-bound signature for each other hotkey of the listing owner, None when there is none."""
+        hotkeys = portal_owner_hotkeys(miner_hotkey)
+        if not hotkeys:
+            return None
+        return {h: self._sign_validator_pubkey(keypair, public_key, nonce=nonce, miner_hotkey=h) for h in sorted(hotkeys)}
 
     @for_payload_miner
     async def request_job_to_miner(
@@ -1178,7 +1180,7 @@ class MinerService:
 
         A miner that reached none of its nodes is down itself (its own network, a restart), not its
         nodes: that wave writes none of these rows, so one miner-side blip does not mark every node
-        down (Pixel, 19 Oct). Manual rentals are left out, as the miner cannot reach them anyway. The
+        down (Pixel, 19 Oct). A node that answered with a refusal (``refused_executors``) was reached. Manual rentals are left out, as the miner cannot reach them anyway. The
         zero-executor wave then fails as before.
         """
         if (
@@ -1191,7 +1193,9 @@ class MinerService:
         reached = {str(executor.uuid).lower() for executor in msg.executors}
         manual = {str(uuid).lower() for uuid in ((rented_data and rented_data.manual_rental_executors) or {})}
         reachable = set(known) - manual
-        if reachable and not reached & reachable:
+        # a node that answered with a refusal was reached: the miner is up even when no node took the key
+        refused = {str(uuid).lower(): str(text)[:200] for uuid, text in (msg.refused_executors or {}).items()}
+        if reachable and not (reached | refused.keys()) & reachable:
             if log:
                 logger.warning(
                     _m(
@@ -1216,7 +1220,7 @@ class MinerService:
             if executor_uuid in skip:
                 continue
             event = build_executor_unreachable_by_miner_event(
-                executor_uuid=executor_uuid, miner_hotkey=payload.miner_hotkey
+                executor_uuid=executor_uuid, miner_hotkey=payload.miner_hotkey, refusal=refused.get(executor_uuid)
             )
             log_text = _m(
                 event.event,
@@ -1492,6 +1496,7 @@ class MinerService:
                             else None
                         ),
                         "host_runtime_fault": result.host_runtime_fault,
+                        "rented_pod_faults": result.rented_pod_faults,
                         "check_started_at": (
                             result.check_started_at.isoformat() if result.check_started_at else None
                         ),
@@ -1520,8 +1525,7 @@ class MinerService:
             # only a passed spec moves the backend to these UUIDs; a failed one must not hide the recovery
             if result.is_successful and (gpu_uuids := _gpu_uuids(result)):
                 self.published_gpu_uuids[str(result.executor_info.uuid).lower()] = set(gpu_uuids)
-            if settings.POD_STATES_REPORT_ENABLED:
-                await self._publish_pod_states_report(result, miner_hotkey=miner_hotkey, default_extra=default_extra)
+            await self._publish_pod_states_report(result, miner_hotkey=miner_hotkey, default_extra=default_extra)
 
     @staticmethod
     def _pod_states_capped_for_spec(result: JobResult, default_extra: dict) -> list[dict] | None:
@@ -1531,12 +1535,7 @@ class MinerService:
         if len(bounded) < len(result.pod_states):
             logger.warning(
                 _m(
-                    "pod_states over the spec's bound"
-                    + (
-                        "; every state goes in the PodStatesReport chunks"
-                        if settings.POD_STATES_REPORT_ENABLED
-                        else "; the observed states past it are cut until the reaped queue drains"
-                    ),
+                    "pod_states over the spec's bound; every state goes in the PodStatesReport chunks",
                     extra=get_extra_info(
                         {
                             **default_extra,
@@ -1638,6 +1637,17 @@ class MinerService:
                 msg=headline,
                 detail=detail,
                 error_type=FailedContainerErrorTypes.ContainerStopFailed,
+                error_code=error_code,
+            )
+        elif isinstance(payload, ContainerStartRequest):
+            return FailedContainerRequest(
+                miner_hotkey=payload.miner_hotkey,
+                executor_id=payload.executor_id,
+                pod_id=payload.pod_id,
+                workload_kind=payload.workload_kind,
+                msg=headline,
+                detail=detail,
+                error_type=FailedContainerErrorTypes.ContainerStartFailed,
                 error_code=error_code,
             )
         elif isinstance(payload, AddSshPublicKeyRequest):
@@ -2261,15 +2271,19 @@ class MinerService:
             # G3 — every wave carries a challenge that executors must echo in TDX
             # report_data[32:64] / GPU evidence. The nonce is covered by
             # validator_signature so it cannot be stripped or swapped.
-            nonce_hex = self._upload_nonce_for_miner(payload.miner_hotkey)
+            nonce_hex = upload_nonce_for_miner(payload.miner_hotkey)
             attestation_nonce = await self.attestation_service.maybe_issue_nonce(nonce_hex)
 
             # Prepare request
+            await first_owner_hotkeys_read()  # DAH-6740: never sign against the empty map of a restart
             ssh_request = SSHPubKeySubmitRequest(
                 public_key=public_key,
                 validator_signature=self._sign_validator_pubkey(my_key, public_key, nonce=nonce_hex),
                 validator_miner_signature=self._sign_validator_pubkey(
                     my_key, public_key, nonce=nonce_hex, miner_hotkey=payload.miner_hotkey
+                ),
+                owner_hotkey_signatures=self._owner_hotkey_signatures(
+                    my_key, public_key, nonce_hex, payload.miner_hotkey
                 ),
                 miner_hotkey=payload.miner_hotkey,
                 executor_id=executor_id,
@@ -2545,12 +2559,16 @@ class MinerService:
             # Generate SSH key and send it to miner
             private_key, public_key = self.ssh_service.generate_ssh_key(my_key.ss58_address)
 
-            upload_nonce = self._upload_nonce_for_miner(payload.miner_hotkey)
+            upload_nonce = upload_nonce_for_miner(payload.miner_hotkey)
+            await first_owner_hotkeys_read()  # DAH-6740: never sign against the empty map of a restart
             ssh_request = SSHPubKeySubmitRequest(
                 public_key=public_key,
                 validator_signature=self._sign_validator_pubkey(my_key, public_key, nonce=upload_nonce),
                 validator_miner_signature=self._sign_validator_pubkey(
                     my_key, public_key, nonce=upload_nonce, miner_hotkey=payload.miner_hotkey
+                ),
+                owner_hotkey_signatures=self._owner_hotkey_signatures(
+                    my_key, public_key, upload_nonce, payload.miner_hotkey
                 ),
                 executor_id=payload.executor_id,
                 is_rental_request=isinstance(payload, ContainerCreateRequest),
@@ -2728,6 +2746,8 @@ class MinerService:
                 elif isinstance(payload, ContainerStopRequest):
                     # DAH-5510: the platform stops a moved pod's old container on the node it left
                     result = await docker_service.stop_container(payload, executor, my_key, private_key.decode("utf-8"))
+                elif isinstance(payload, ContainerStartRequest):
+                    result = await docker_service.start_container(payload, executor, my_key, private_key.decode("utf-8"))
                 elif isinstance(payload, AddSshPublicKeyRequest):
                     logger.info(
                         _m(
@@ -2780,6 +2800,10 @@ class MinerService:
                         executor_id=payload.executor_id,
                         log_extra=default_extra,
                     )
+                    # a failed start's (or edit undo's) background stop retry reconnects with this key
+                    stop_retry = half_started_stop_retry(executor.uuid, payload.pod_id)
+                    if stop_retry is not None:
+                        remove_ssh_key = _remove_ssh_key_after_stop_retry(stop_retry, remove_ssh_key)
                     if isinstance(payload, ContainerCreateRequest):
                         # DAH-3980: a create's reply does not wait for the miner
                         create_steps_after_reply.start(
@@ -2787,6 +2811,11 @@ class MinerService:
                             executor_key(payload),
                             self._log_ssh_key_removal_after_reply(remove_ssh_key, default_extra),
                         )
+                    elif stop_retry is not None:
+                        # the reply does not wait out the retry's backoff
+                        removal = asyncio.create_task(self._log_ssh_key_removal_after_reply(remove_ssh_key, default_extra))
+                        _KEY_REMOVALS_AFTER_STOP_RETRY.add(removal)
+                        removal.add_done_callback(_KEY_REMOVALS_AFTER_STOP_RETRY.discard)
                     else:
                         await remove_ssh_key
 
@@ -2877,7 +2906,7 @@ class MinerService:
                     pod_id=payload.pod_id,
                     executor_id=payload.executor_id,
                     container_name=payload.container_name,
-                    msg=log_text.to_full_string(),
+                    msg=str(log_text),
                 )
 
             msg = _parse_miner_response(response_data)
@@ -2909,7 +2938,7 @@ class MinerService:
                     pod_id=payload.pod_id,
                     executor_id=payload.executor_id,
                     container_name=payload.container_name,
-                    msg=log_text.to_full_string(),
+                    msg=str(log_text),
                 )
 
             else:
@@ -2924,7 +2953,7 @@ class MinerService:
                     pod_id=payload.pod_id,
                     executor_id=payload.executor_id,
                     container_name=payload.container_name,
-                    msg=log_text.to_full_string(),
+                    msg=str(log_text),
                 )
 
         except Exception as e:
@@ -2938,7 +2967,7 @@ class MinerService:
                 miner_hotkey=payload.miner_hotkey,
                 executor_id=payload.executor_id,
                 container_name=payload.container_name,
-                msg=log_text.to_full_string(),
+                msg=str(log_text),
             )
 
     async def _add_debug_ssh_key(self, payload: AddDebugSshKeyRequest) -> DebugSshKeyAdded:
@@ -2952,16 +2981,21 @@ class MinerService:
         }
 
         try:
+            # DAH-6740: never sign against the empty map of a restart; wait before the 10 s auth headers are made
+            await first_owner_hotkeys_read()
             base_url = f"http://{payload.miner_address}:{payload.miner_port}"
             headers = self._generate_auth_headers(my_key, payload.miner_hotkey)
             headers["Content-Type"] = "application/json"
-            
-            upload_nonce = self._upload_nonce_for_miner(payload.miner_hotkey)
+
+            upload_nonce = upload_nonce_for_miner(payload.miner_hotkey)
             ssh_request = SSHPubKeySubmitRequest(
                 public_key=payload.public_key,
                 validator_signature=self._sign_validator_pubkey(my_key, payload.public_key, nonce=upload_nonce),
                 validator_miner_signature=self._sign_validator_pubkey(
                     my_key, payload.public_key, nonce=upload_nonce, miner_hotkey=payload.miner_hotkey
+                ),
+                owner_hotkey_signatures=self._owner_hotkey_signatures(
+                    my_key, payload.public_key, upload_nonce, payload.miner_hotkey
                 ),
                 executor_id=payload.executor_id,
                 is_rental_request=False,
@@ -2995,7 +3029,7 @@ class MinerService:
                 return FailedAddDebugSshKey(
                     miner_hotkey=payload.miner_hotkey,
                     executor_id=payload.executor_id,
-                    msg=log_text.to_full_string(),
+                    msg=str(log_text),
                 )
 
             msg = _parse_miner_response(response_data)
@@ -3035,7 +3069,7 @@ class MinerService:
                     return FailedAddDebugSshKey(
                         miner_hotkey=payload.miner_hotkey,
                         executor_id=payload.executor_id,
-                        msg=log_text.to_full_string(),
+                        msg=str(log_text),
                     )
 
                 logger.info(
@@ -3064,7 +3098,7 @@ class MinerService:
                 return FailedAddDebugSshKey(
                     miner_hotkey=payload.miner_hotkey,
                     executor_id=payload.executor_id,
-                    msg=log_text.to_full_string(),
+                    msg=str(log_text),
                 )
 
         except Exception as e:
@@ -3077,7 +3111,7 @@ class MinerService:
             return FailedAddDebugSshKey(
                 miner_hotkey=payload.miner_hotkey,
                 executor_id=payload.executor_id,
-                msg=log_text.to_full_string(),
+                msg=str(log_text),
             )
 
 MinerServiceDep = Annotated[MinerService, Depends(MinerService)]

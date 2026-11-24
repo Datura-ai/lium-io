@@ -106,7 +106,8 @@ class FakeApiClient:
         self.container_states = None
         self.inspect_container_error = None
         self.events = []
-        self.pruned_images = False
+        self.repo_tags = []
+        self.removed_images = []
         self.created_volumes = []
         self.removed_volumes = []
         self.networks = {}  # name -> what inspect_network returns
@@ -148,7 +149,7 @@ class FakeApiClient:
             raise self.inspect_image_error
         if image in self.missing_images:
             raise ImageNotFound("missing image")
-        return {"Id": "image-id", "RepoDigests": self.repo_digests}
+        return {"Id": "image-id", "RepoDigests": self.repo_digests, "RepoTags": self.repo_tags}
 
     def inspect_distribution(self, image, auth_config=None):
         self.distribution_calls.append({"image": image, "auth_config": auth_config})
@@ -192,8 +193,8 @@ class FakeApiClient:
             return self.container_states[0]
         return {"State": {"Running": True, "Restarting": False}}
 
-    def prune_images(self):
-        self.pruned_images = True
+    def remove_image(self, image):
+        self.removed_images.append(image)
         return {"ImagesDeleted": []}
 
     def create_volume(self, **kwargs):
@@ -1228,7 +1229,7 @@ def test_stdin_exec_spec_builders_keep_values_out_of_argv():
 
 
 @pytest.mark.asyncio
-async def test_delete_helpers_call_sdk_volume_and_prune_apis():
+async def test_delete_helpers_call_sdk_volume_apis():
     api_client = FakeApiClient()
     client = RentalDockerSdkClient(api_client)
 
@@ -1239,7 +1240,6 @@ async def test_delete_helpers_call_sdk_volume_and_prune_apis():
         timeout=133,
         labels=FILLER_VOLUME_LABELS,
     )
-    await client.prune_images()
     await client.remove_volume(volume_name="volume_test", force=True)
 
     assert api_client.created_volumes == [
@@ -1252,8 +1252,17 @@ async def test_delete_helpers_call_sdk_volume_and_prune_apis():
         }
     ]
     assert api_client.timeout == 60
-    assert api_client.pruned_images is True
     assert api_client.removed_volumes == [("volume_test", {"force": True})]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("repo_tags", "expect_removed"), [([], True), (["daturaai/pytorch:latest"], False)])
+async def test_an_image_is_removed_by_id_only_once_no_tag_names_it(repo_tags, expect_removed):
+    api_client = FakeApiClient()
+    api_client.repo_tags = repo_tags
+
+    assert await RentalDockerSdkClient(api_client).remove_image_if_untagged(image_id="sha256:pod") is expect_removed
+    assert api_client.removed_images == (["sha256:pod"] if expect_removed else [])
 
 
 @pytest.mark.asyncio
@@ -1724,6 +1733,18 @@ def test_rental_ssh_adapter_hands_paramiko_a_socket_to_the_pinned_address(tmp_pa
         listener.close()
 
 
+@pytest.mark.asyncio
+async def test_container_identity_is_id_and_start_time_and_none_once_the_container_is_gone():
+    api_client = Mock()
+    api_client.inspect_container = Mock(return_value={"Id": "cid", "State": {"StartedAt": "t1"}})
+    client = RentalDockerSdkClient(api_client)
+
+    assert await client.container_identity(container_name="pod_x") == "cid@t1"
+
+    api_client.inspect_container = Mock(side_effect=NotFound("gone"))
+    assert await client.container_identity(container_name="pod_x") is None
+
+
 def _run_key_append(spec, env=None) -> subprocess.CompletedProcess:
     return subprocess.run(list(spec.argv), input=spec.stdin, capture_output=True, text=True, env=env)
 
@@ -1816,6 +1837,52 @@ def test_authorized_keys_append_runs_under_busybox_ash(tmp_path):
     assert target.read_text() == "k1\n"
 
 
+def test_rental_ssh_adapter_failed_reconnect_reads_as_a_transport_not_reopened(monkeypatch, tmp_path):
+    """A call's retry finds the SSH session dead and cannot connect again: through the retry's own wrappers this
+    is the node not answering (ssh_connect), not the call's step."""
+    import paramiko
+    from urllib3._collections import RecentlyUsedContainer
+
+    key_path = tmp_path / "id_executor"
+    known_hosts_path = tmp_path / "known_hosts"
+    key_path.write_text("PRIVATE KEY")
+    known_hosts_path.write_text("[192.0.2.10]:2222 ssh-ed25519 AAAATESTKEY\n")
+
+    class FakeSSHClient:
+        def load_host_keys(self, path):
+            pass
+
+        def set_missing_host_key_policy(self, policy):
+            pass
+
+        def connect(self, **params):
+            raise TimeoutError("timed out")
+
+        def get_transport(self):
+            return None
+
+    monkeypatch.setattr(paramiko, "SSHClient", FakeSSHClient)
+    adapter_class = _build_rental_ssh_http_adapter_class(key_path=key_path, known_hosts_path=known_hosts_path)
+    adapter = adapter_class.__new__(adapter_class)
+    adapter._create_paramiko_client("ssh://root@192.0.2.10:2222")
+    adapter.pools = RecentlyUsedContainer(1)
+    adapter.ssh_host = "192.0.2.10"
+    adapter._connect_deferred = False
+
+    with pytest.raises(rental_docker_sdk.RentalDockerReconnectFailed) as raised:
+        adapter.get_connection("http+docker://ssh/v1.43/images/create")
+
+    # as the retry raises it: the pull's wrapper, then the retry's transport error over it
+    try:
+        try:
+            raise rental_docker_sdk.RentalDockerOperationError("Docker SDK pull failed") from raised.value
+        except rental_docker_sdk.RentalDockerOperationError as wrapped:
+            raise rental_docker_sdk.RentalDockerTransportError("pull failed once more after re-opening") from wrapped
+    except rental_docker_sdk.RentalDockerTransportError as retried:
+        assert rental_docker_sdk.is_rental_docker_transport_error(raised.value)
+        assert rental_docker_sdk.is_transport_not_reopened(retried)
+
+
 @pytest.mark.skipif(shutil.which("flock") is None, reason="flock not installed")
 @pytest.mark.parametrize("remove", [False, True])
 def test_authorized_keys_edit_waits_for_the_other_edit_and_never_writes_past_it(tmp_path, monkeypatch, remove):
@@ -1896,3 +1963,13 @@ def test_authorized_keys_edit_takes_the_lock_with_a_flock_that_has_no_wait_optio
 
     assert completed.returncode == 0, completed.stderr
     assert target.read_text() == ("k2\n" if remove else "k1\nk2\nk1\n")
+
+
+# --- DAH-6302: a CPU share of 0 never means no CPU limit ---
+
+
+@pytest.mark.parametrize(("cpu_count", "nano_cpus"), [(0, 1_000_000_000), (3, 3_000_000_000), (None, None)])
+def test_a_cpu_share_that_rounded_down_to_0_gets_one_core_not_no_limit(cpu_count, nano_cpus):
+    spec = ContainerRunSpec(image="registry.example/app:tag", name="pod_test", cpu_count=cpu_count)
+
+    assert rental_docker_sdk._build_host_config_kwargs(spec).get("nano_cpus") == nano_cpus

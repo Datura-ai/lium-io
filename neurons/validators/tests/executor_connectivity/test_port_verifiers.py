@@ -1,4 +1,5 @@
 import asyncio
+import re
 
 import pytest
 
@@ -31,6 +32,68 @@ async def test_semi_batch_fails_a_chunk_that_does_not_answer_in_time(mocker):
     assert failed == ports[:10]
     assert successful == ports[10:]
 
+
+@pytest.mark.asyncio
+async def test_semi_batch_publishes_a_mapped_port_on_the_host_port_the_router_forwards_to(mocker):
+    # port_mappings: the router forwards external 40000 to host port 9000, where a rental pod binds
+    ports = [PortPair(9000, 40000)]
+    runner = mocker.Mock()
+    runner.run = mocker.AsyncMock(return_value=CONTAINER_STARTED)
+    runner.cleanup = mocker.AsyncMock()
+    port_tester = mocker.Mock()
+    port_tester.test_many = mocker.AsyncMock(side_effect=lambda _s, _h, chunk, *_a: (chunk, []))
+
+    await SemiBatchVerifier(port_tester, runner).verify(ports, ssh_client=mocker.Mock(), host="1.2.3.4")
+
+    assert runner.run.await_args.args[3] == "-p 9000:9000"
+
+
+
+@pytest.mark.asyncio
+async def test_semi_batch_one_busy_host_port_fails_only_itself(mocker):
+    # review: a rental started after selection holds host port 9003; docker refused its whole chunk and the
+    # cycle kept one verified port of eleven
+    ports = [PortPair(9000 + i, 40000 + i) for i in range(11)]
+
+    async def run(_ssh, _name, _script, publish_flags, _timeout):
+        if "-p 9003:" in publish_flags:
+            return ContainerStartResult(
+                ok=False,
+                container_id=None,
+                status="docker: Error response from daemon: driver failed programming external connectivity on "
+                "endpoint port_test_pub_x: Bind for 0.0.0.0:9003 failed: port is already allocated.",
+            )
+        return CONTAINER_STARTED
+
+    runner = mocker.Mock()
+    runner.run = mocker.AsyncMock(side_effect=run)
+    runner.cleanup = mocker.AsyncMock()
+    port_tester = mocker.Mock()
+    port_tester.test_many = mocker.AsyncMock(side_effect=lambda _s, _h, chunk, *_a: (chunk, []))
+
+    successful, failed = await SemiBatchVerifier(port_tester, runner).verify(
+        ports, ssh_client=mocker.Mock(), host="1.2.3.4"
+    )
+
+    assert failed == [ports[3]]
+    assert set(successful) == set(ports) - {ports[3]} and len(successful) == 10
+
+
+@pytest.mark.asyncio
+async def test_semi_batch_a_start_failure_naming_no_chunk_port_fails_the_chunk(mocker):
+    ports = [PortPair(9000 + i, 9000 + i) for i in range(3)]
+    runner = mocker.Mock()
+    runner.run = mocker.AsyncMock(
+        return_value=ContainerStartResult(ok=False, container_id=None, status="Bind for 0.0.0.0:9500 failed")
+    )
+    port_tester = mocker.Mock()
+
+    successful, failed = await SemiBatchVerifier(port_tester, runner).verify(
+        ports, ssh_client=mocker.Mock(), host="1.2.3.4"
+    )
+
+    assert (successful, failed) == ([], ports)
+    assert runner.run.await_count == 1
 
 @pytest.mark.asyncio
 async def test_fallback_stops_when_a_container_start_hangs(mocker):
@@ -118,7 +181,9 @@ async def test_dind_start_is_killed_on_the_node_before_the_container_is_removed(
 
     assert result.success is False
     assert commands[0].startswith(f"timeout -s KILL {dind_probe.DIND_RUN_TIMEOUT_SECONDS} /usr/bin/docker run ")
-    assert "docker rm -fv container_x_9000" in commands[-1]
+    assert re.search(r"docker rm -fv container_x_9000_[0-9a-f]{8}$", commands[-1])
+    # the name the run created is the one removed
+    assert re.search(r"--name (container_x_9000_[0-9a-f]{8}) ", commands[0]).group(1) in commands[-1]
 
 
 @pytest.mark.asyncio
@@ -472,3 +537,28 @@ async def test_batch_keeps_verified_ports_when_cleanup_passes_the_attempt_timeou
     assert result.successful == ports[:7]
     assert verifier.runner.run.await_count == 1  # no second attempt, no fallback tier
     assert len(cleanup_calls) == 1  # the batch container is removed once, after the attempt
+
+
+@pytest.mark.asyncio
+async def test_two_probes_on_one_port_never_share_a_container_name(mocker):
+    # a second probe on the same host and port (another validator or lane) removed a live probe's container by its
+    # shared name, so the first probe's sshd "never answered" and its log read said "No such container"
+    from services.executor_connectivity import dind_probe
+
+    names = []
+
+    async def run(cmd):
+        if "docker run" in cmd:
+            names.append(re.search(r"--name (\S+) ", cmd).group(1))
+            return mocker.Mock(exit_status=125, stdout="", stderr="refused")
+        return mocker.Mock(exit_status=0, stdout="", stderr="")
+
+    ssh_service = mocker.Mock()
+    ssh_service.generate_keypair = mocker.Mock(return_value=("private", "public"))
+    for _ in range(2):
+        await dind_probe.DindVerifier(ssh_service).verify(
+            PortPair(9000, 9000), ssh_client=mocker.Mock(run=run), host="1.2.3.4", container_name_prefix="container_x", sysbox=False
+        )
+
+    assert len(names) == 2 and names[0] != names[1]
+    assert all(name.startswith("container_x_9000_") for name in names)  # rentals still clear probes by the prefix

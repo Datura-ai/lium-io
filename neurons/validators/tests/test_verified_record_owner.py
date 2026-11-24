@@ -1,7 +1,7 @@
-"""DAH-4272: the verified record (count, spec, GPU anchor, broken mark) is per (miner hotkey, executor id).
+"""DAH-4272: the verified record (count, spec, GPU anchor) is per (miner hotkey, executor id).
 
 An executor id is self-declared and unique only per hotkey (the backend's uq_miner_executor), so a hotkey that
-lists another's executor id writes, resets and marks only its own record.
+lists another's executor id writes and resets only its own record.
 """
 
 import asyncio
@@ -15,7 +15,6 @@ from fakeredis.aioredis import FakeRedis
 from neurons.validators.src.services.task import pipeline_factory as pipeline_factory_module
 from neurons.validators.src.services.task.pipeline_factory import PipelineFactory
 from services.redis_service import (
-    GPU_ANCHOR_BROKEN_KEY,
     RESET_VERIFIED_JOB_CHANNEL,
     VERIFIED_JOB_COUNT_KEY,
     RedisService,
@@ -36,15 +35,14 @@ def service():
 
 
 @pytest.mark.asyncio
-async def test_a_reset_and_anchor_mark_by_another_hotkey_leave_the_record_alone(service):
+async def test_a_reset_by_another_hotkey_leaves_the_record_alone(service):
     await service.set_verified_job_info(RUNNING_HOTKEY, B8717923, prev_info={}, success=True, spec="B300:8", uuids="GPU-a")
     honest = await service.get_verified_job_info(RUNNING_HOTKEY, B8717923)
 
-    await service.clear_verified_job_info(OTHER_HOTKEY, B8717923, prev_info={}, anchor_broken=True)
+    await service.clear_verified_job_info(OTHER_HOTKEY, B8717923, prev_info={})
 
     assert await service.get_verified_job_info(RUNNING_HOTKEY, B8717923) == honest
-    assert GPU_ANCHOR_BROKEN_KEY not in honest
-    assert (await service.get_verified_job_info(OTHER_HOTKEY, B8717923))[GPU_ANCHOR_BROKEN_KEY] is True
+    assert (await service.get_verified_job_info(OTHER_HOTKEY, B8717923))["count"] == 0
     channel, published = service.publish.await_args.args
     assert (channel, published["miner_hotkey"], published["executor_uuid"]) == (
         RESET_VERIFIED_JOB_CHANNEL, OTHER_HOTKEY, B8717923
@@ -53,7 +51,7 @@ async def test_a_reset_and_anchor_mark_by_another_hotkey_leave_the_record_alone(
 
 @pytest.mark.asyncio
 async def test_a_record_from_before_the_release_moves_only_to_the_listed_owner(service):
-    legacy = {"count": 7, "failed": 0, "spec": "B300:8", "uuids": "GPU-a", GPU_ANCHOR_BROKEN_KEY: True}
+    legacy = {"count": 7, "failed": 0, "spec": "B300:8", "uuids": "GPU-a", "anchor_broken": True}
     await service.redis.hset(VERIFIED_JOB_COUNT_KEY, B8717923, json.dumps(legacy))
 
     assert await service.get_verified_job_info(OTHER_HOTKEY, B8717923, listed_owner_hotkey=RUNNING_HOTKEY) == {}
@@ -66,7 +64,8 @@ async def test_a_record_from_before_the_release_moves_only_to_the_listed_owner(s
     await service.set_verified_job_info(RUNNING_HOTKEY, B8717923, prev_info=prev, success=True)
 
     written = json.loads(await service.redis.hget(VERIFIED_JOB_COUNT_KEY, f"{RUNNING_HOTKEY}:{B8717923}"))
-    assert written == {**legacy, "count": 8}
+    # DAH-6645: the retired anchor_broken mark of an old record is dropped on the next write
+    assert written == {"count": 8, "failed": 0, "spec": "B300:8", "uuids": "GPU-a"}
     assert await service.get_verified_job_info(RUNNING_HOTKEY, B8717923) == written
 
 

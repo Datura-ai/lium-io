@@ -150,6 +150,186 @@ async def test_send_pubkey_to_executor_relays_the_miner_bound_signature(executor
         assert "miner_hotkey" not in sent and "validator_miner_signature" not in sent
 
 
+def _identity_answer(session, hotkey: str | None, status: int = 200):
+    """Make the mock session's GET /miner-identity answer `hotkey`, echoing the request's nonce."""
+
+    def get(url, params=None, timeout=None, allow_redirects=True):
+        assert url.endswith("/miner-identity")
+        assert allow_redirects is False  # a node's redirect is never followed
+        answer = {"miner_hotkey": hotkey, "nonce": params["nonce"]} if hotkey else {}
+        ctx = MagicMock()
+        ctx.__aenter__ = AsyncMock(return_value=_response(status, json.dumps(answer).encode()))
+        ctx.__aexit__ = AsyncMock(return_value=None)
+        return ctx
+
+    session.get = MagicMock(side_effect=get)
+
+
+def _post_answers(session, *answers):
+    """POST /upload_ssh_key answers these responses in turn; session.sent keeps a copy of each body as sent."""
+    ctx = MagicMock()
+    ctx.__aenter__ = AsyncMock(side_effect=list(answers))
+    ctx.__aexit__ = AsyncMock(return_value=None)
+    session.sent = []
+
+    def post(url, json=None, timeout=None, allow_redirects=True):
+        assert allow_redirects is False  # a node's redirect is never followed
+        session.sent.append(dict(json))
+        return ctx
+
+    session.post = MagicMock(side_effect=post)
+
+
+@pytest.fixture(autouse=True)
+def _no_known_identities():
+    es._executor_own_hotkeys.clear()
+    yield
+    es._executor_own_hotkeys.clear()
+
+
+@pytest.mark.asyncio
+async def test_a_big_owner_map_reaches_the_executor_as_its_one_entry(executor_service, test_executor):
+    """DAH-6740: 2,000 owner hotkeys (~370 KiB of signatures, past the executor's 256 KiB body limit) relay as one entry,
+    and the upload never waits on the identity read."""
+    signatures = {f"5Owner{i:05d}" + "x" * 41: "0x" + "ab" * 64 for i in range(2000)}
+    assert len(json.dumps(signatures)) > 256 * 1024
+    own = sorted(signatures)[1234]
+    mock_session = _make_mock_session()
+    with patch("services.executor_service.aiohttp.ClientSession", return_value=mock_session):
+        _identity_answer(mock_session, own)
+        # identity not known yet: the upload goes at once without an owner entry, the read runs beside it
+        await executor_service.send_pubkey_to_executor(test_executor, _SSH_KEY, "0xaa", owner_hotkey_signatures=signatures)
+        assert "owner_hotkey_signatures" not in mock_session.post.call_args.kwargs["json"]
+        await asyncio.gather(*es._identity_reads)
+
+        # learned: later uploads carry just that entry with no further read
+        mock_session.get.reset_mock()
+        await executor_service.send_pubkey_to_executor(test_executor, _SSH_KEY, "0xaa", owner_hotkey_signatures=signatures)
+        sent = mock_session.post.call_args.kwargs["json"]
+        assert sent["owner_hotkey_signatures"] == {own: signatures[own]}
+        assert len(json.dumps(sent)) < 256 * 1024
+        assert not mock_session.get.called
+
+        # no owner map: no identity read at all
+        es._executor_own_hotkeys.clear()
+        await executor_service.send_pubkey_to_executor(test_executor, _SSH_KEY, "0xaa")
+        assert not mock_session.get.called
+        assert "owner_hotkey_signatures" not in mock_session.post.call_args.kwargs["json"]
+
+
+@pytest.mark.asyncio
+async def test_a_slow_identity_read_never_holds_a_listing_bound_upload(executor_service, test_executor):
+    """The upload answers while /miner-identity is still hanging; the read finishes on its own afterwards."""
+    release = asyncio.Event()
+    session = _make_mock_session()
+
+    def hanging_get(url, params=None, timeout=None, allow_redirects=True):
+        async def wait():
+            await release.wait()
+            raise asyncio.TimeoutError()
+
+        ctx = MagicMock()
+        ctx.__aenter__ = AsyncMock(side_effect=wait)
+        ctx.__aexit__ = AsyncMock(return_value=None)
+        return ctx
+
+    session.get = MagicMock(side_effect=hanging_get)
+    _post_answers(session, _response(200, _SSH_ANSWER))
+    with patch("services.executor_service.aiohttp.ClientSession", return_value=session):
+        info = await asyncio.wait_for(
+            executor_service.send_pubkey_to_executor(
+                test_executor, _SSH_KEY, "0xaa", owner_hotkey_signatures={"5Owner": "0xcc"}
+            ),
+            timeout=1,
+        )
+        assert info is not None and session.post.call_count == 1
+        release.set()
+        await asyncio.gather(*es._identity_reads)
+    assert str(test_executor.uuid) not in es._executor_own_hotkeys
+
+
+@pytest.mark.asyncio
+async def test_a_binding_refusal_retries_with_the_executors_one_entry(executor_service, test_executor):
+    """A 403 makes the miner read the executor's hotkey and retry once with that entry; a hotkey outside the owner
+    set (or a second 403) ends the upload."""
+    signatures = {"5OwnerA": "0xaa01", "5OwnerB": "0xbb02"}
+    refused = lambda: _response(403, b'{"detail":"SSH key was not issued for this miner"}')  # noqa: E731
+    session = _make_mock_session()
+    with patch("services.executor_service.aiohttp.ClientSession", return_value=session), \
+            patch("services.executor_service._learn_own_hotkey_later"):
+        _identity_answer(session, "5OwnerB")
+        _post_answers(session, refused(), _response(200, _SSH_ANSWER))
+        info = await executor_service.send_pubkey_to_executor(test_executor, _SSH_KEY, "0xaa", owner_hotkey_signatures=signatures)
+        assert info is not None and session.post.call_count == 2
+        first, second = session.sent
+        assert "owner_hotkey_signatures" not in first
+        assert second["owner_hotkey_signatures"] == {"5OwnerB": "0xbb02"}
+
+        # the learned entry refused again, then a hotkey outside the owner set: no second retry either way
+        for hotkey in ("5OwnerB", "5Elsewhere"):
+            _identity_answer(session, hotkey)
+            _post_answers(session, refused(), refused())
+            assert await executor_service.send_pubkey_to_executor(
+                test_executor, _SSH_KEY, "0xaa", owner_hotkey_signatures=signatures
+            ) is None
+            assert session.post.call_count == 1 and session.get.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_a_refusal_on_the_last_attempt_still_sends_the_signed_retry(executor_service, test_executor):
+    """Two dropped uploads, then a binding refusal on the third: the one-entry retry is its own step and is sent."""
+    signatures = {"5OwnerA": "0xaa01", "5OwnerB": "0xbb02"}
+    refused = _response(403, b'{"detail":"SSH key was not issued for this miner"}')
+    session = _make_mock_session()
+    with patch("services.executor_service.aiohttp.ClientSession", return_value=session), \
+            patch("services.executor_service._learn_own_hotkey_later"), \
+            patch("services.executor_service.asyncio.sleep", AsyncMock()):
+        _identity_answer(session, "5OwnerB")
+        _post_answers(session, asyncio.TimeoutError(), asyncio.TimeoutError(), refused, _response(200, _SSH_ANSWER))
+        info = await executor_service.send_pubkey_to_executor(
+            test_executor, _SSH_KEY, "0xaa", owner_hotkey_signatures=signatures, deadline=time.monotonic() + 60
+        )
+    assert info is not None and session.post.call_count == es.UPLOAD_SSH_KEY_ATTEMPTS + 1
+    assert session.sent[-1]["owner_hotkey_signatures"] == {"5OwnerB": "0xbb02"}
+
+
+@pytest.mark.asyncio
+async def test_a_failed_identity_read_after_a_refusal_is_read_again_within_the_deadline(executor_service, test_executor):
+    """A 503 from /miner-identity after a refusal is read again while time remains; with no time left it gives up."""
+    signatures = {"5OwnerA": "0xaa01", "5OwnerB": "0xbb02"}
+    refused = lambda: _response(403, b'{"detail":"SSH key was not issued for this miner"}')  # noqa: E731
+    session = _make_mock_session()
+    answers = iter([None, "5OwnerB"])
+
+    def flaky_get(url, params=None, timeout=None, allow_redirects=True):
+        hotkey = next(answers)
+        body = json.dumps({"miner_hotkey": hotkey, "nonce": params["nonce"]} if hotkey else {}).encode()
+        ctx = MagicMock()
+        ctx.__aenter__ = AsyncMock(return_value=_response(200 if hotkey else 503, body))
+        ctx.__aexit__ = AsyncMock(return_value=None)
+        return ctx
+
+    with patch("services.executor_service.aiohttp.ClientSession", return_value=session), \
+            patch("services.executor_service._learn_own_hotkey_later"), \
+            patch("services.executor_service.asyncio.sleep", AsyncMock()):
+        session.get = MagicMock(side_effect=flaky_get)
+        _post_answers(session, refused(), _response(200, _SSH_ANSWER))
+        info = await executor_service.send_pubkey_to_executor(
+            test_executor, _SSH_KEY, "0xaa", owner_hotkey_signatures=signatures, deadline=time.monotonic() + 60
+        )
+        assert info is not None and session.get.call_count == 2
+        assert session.sent[-1]["owner_hotkey_signatures"] == {"5OwnerB": "0xbb02"}
+
+        # too little time for another read plus the retry: one read, then the upload ends
+        es._executor_own_hotkeys.clear()
+        _identity_answer(session, None, status=503)
+        _post_answers(session, refused())
+        assert await executor_service.send_pubkey_to_executor(
+            test_executor, _SSH_KEY, "0xaa", owner_hotkey_signatures=signatures, deadline=time.monotonic() + 5
+        ) is None
+        assert session.get.call_count == 1 and session.post.call_count == 1
+
+
 @pytest.mark.parametrize(
     "status, body_error, expected_posts, accepted",
     [
@@ -534,6 +714,33 @@ async def test_central_miner_lists_each_node_with_its_registered_host_key_from_o
 
 
 @pytest.mark.asyncio
+async def test_central_miner_gives_a_validator_nothing_of_a_miner_whose_nodes_are_assigned_elsewhere(executor_service):
+    """Central mode accepts any signed X-Miner-Hotkey; what the request reaches is the portal's list of that miner's
+    nodes assigned to the SIGNING validator. A validator naming a miner whose nodes it was not assigned acts on none."""
+    from clients.miner_portal_api import MinerPortalAPI
+
+    others_nodes = [
+        {"id": str(uuid4()), "validator_hotkey": "assigned-validator", "executor_ip_address": "node.example.com",
+         "executor_ip_port": "8001"},
+    ]
+    es.settings.CENTRAL_MODE = True
+    es.settings.RENTAL_REQUEST_HOOK = None
+    executor_service.send_pubkey_to_executor = AsyncMock()
+    executor_service.remove_pubkey_from_executor = AsyncMock()
+
+    with patch.object(MinerPortalAPI, "fetch_executors", AsyncMock(return_value=others_nodes)):
+        assert await executor_service.get_executors_for_validator("signing-validator", "other-miner") == []
+        registration = await executor_service.register_pubkey("signing-validator", "other-miner", _SSH_KEY.encode(), "0xaa")
+        await executor_service.deregister_pubkey("signing-validator", "other-miner", _SSH_KEY.encode(), "0xaa")
+        with pytest.raises(Exception, match="not found executor"):
+            await executor_service.get_pod_logs("signing-validator", "other-miner", others_nodes[0]["id"], "c")
+
+    assert registration.accepted == []
+    executor_service.send_pubkey_to_executor.assert_not_awaited()
+    executor_service.remove_pubkey_from_executor.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_standalone_miner_sends_no_expected_host_key(executor_service, test_executor):
     from datura.requests.miner_requests import ExecutorSSHInfo
 
@@ -545,3 +752,25 @@ async def test_standalone_miner_sends_no_expected_host_key(executor_service, tes
     ))
     registration = await executor_service.register_pubkey("v", "m", _SSH_KEY.encode(), "0xaa")
     assert registration.accepted[0].expected_ssh_host_key is None
+
+
+@pytest.mark.asyncio
+async def test_register_pubkey_relays_the_answer_of_a_node_that_refused_the_key(executor_service, test_executor):
+    """22 Nov: a node with its clock off answered 401 "Stale upload nonce" 14 times and the validator said "could not
+    reach". The miner now names the refusal, so the validator can tell a reachable node that said no from a dead one."""
+    mock_session = _make_mock_session()
+    refusal = _response(401, b'{"detail":"Stale upload nonce"}')
+    mock_session.post.return_value.__aenter__ = AsyncMock(return_value=refusal)
+    es.settings.RENTAL_REQUEST_HOOK = None
+    executor_service.get_executors_for_validator = AsyncMock(return_value=[test_executor])
+
+    with patch("services.executor_service.aiohttp.ClientSession", return_value=mock_session):
+        registration = await executor_service.register_pubkey("v", "m", _SSH_KEY.encode(), "0xaa")
+
+    assert registration.accepted == []
+    assert registration.refused == {str(test_executor.uuid): "HTTP 401: Stale upload nonce"}
+
+
+def test_a_refusal_that_is_no_fastapi_error_is_its_body_cut_short():
+    assert es._refusal_text(500, "Internal\n  Server Error") == "HTTP 500: Internal Server Error"
+    assert len(es._refusal_text(502, "x" * 5000)) == es.MAX_REFUSAL_CHARS

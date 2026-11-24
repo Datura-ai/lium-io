@@ -1,6 +1,5 @@
 import logging
 import pathlib
-from datetime import datetime
 from enum import Enum
 from typing import TYPE_CHECKING, Literal
 
@@ -158,10 +157,6 @@ class Settings(BaseSettings):
     PORTION_FOR_UPTIME: float = 1
     UPTIME_REQUIRED_MINUTES: int = 60 * 24 * 14 # 14 days
 
-    PORTION_FOR_SYSBOX: float = 0.2
-    PORTION_FOR_SYSBOX_UNRENTED: float = 1
-    PORTION_FOR_SYSBOX_RENTED: float = 1
-    SYSBOX_RENTED_CUTOFF: datetime = datetime(2026, 4, 3, 12, 0, 0)
     # DAH-3597: first-miss grace for a DinD probe that never reached its container; the rule is
     # in PortConnectivityCheck, the TTL bounds the window between two misses.
     DIND_PROBE_FIRST_MISS_GRACE: bool = Field(env="DIND_PROBE_FIRST_MISS_GRACE", default=False)
@@ -247,10 +242,6 @@ class Settings(BaseSettings):
     # just-started collector) are counted per node and logged as INSPECTOR_BLIND_STREAK from this
     # many on.
     INSPECTOR_BLIND_STREAK_LIMIT: int = Field(env="INSPECTOR_BLIND_STREAK_LIMIT", default=5)
-    # On: the Inspector check fails from that cycle until the sensor reports again. Off by default.
-    INSPECTOR_BLIND_STREAK_ENFORCEMENT_ENABLED: bool = Field(
-        env="INSPECTOR_BLIND_STREAK_ENFORCEMENT_ENABLED", default=False
-    )
     # On a libinspector.so hash mismatch a RENTED executor, during the rental, curls
     # INSPECTOR_LIBRARY_FETCH_URL once into a temp file beside /usr/lib/libinspector.so, and the
     # file replaces the library (one rename) only if its sha256 is the validator's own. This is a
@@ -264,10 +255,6 @@ class Settings(BaseSettings):
         default="https://raw.githubusercontent.com/Datura-ai/lium-io/main/neurons/executor/libinspector.so",
         description="Raw GitHub URL the executor curls when the libinspector.so refresh is on and the hash does not match",
     )
-    # DAH-5301: a reboot resets a hung pod GPU while the pod is stopped. Off = shadow: the hung GPU query runs and
-    # the validator logs the hung GPUs, why, and whether it would reset or refuse; nothing on the host changes and
-    # the backend gets no warning.
-    HUNG_GPU_RESET_ON_REBOOT_ENABLED: bool = Field(env="HUNG_GPU_RESET_ON_REBOOT_ENABLED", default=False)
     # Emergency switch for new volumes only; existing recorded drivers remain usable.
     LOOPBACK_PLUGIN_V2_ENABLED: bool = Field(env="LOOPBACK_PLUGIN_V2_ENABLED", default=True)
     # DAH-5101: new size-limited volumes go on vloopback:v3 (direct I/O loop, no host page cache of
@@ -346,7 +333,8 @@ class Settings(BaseSettings):
     VALIDATOR_LIUMD_SHADOW: bool = Field(env="VALIDATOR_LIUMD_SHADOW", default=False)
     # Use the full machine-scrape document returned by the same early `liumd run` instead of
     # running the Python machine scrape. Off: Python remains authoritative and the early run is
-    # only compared in the shadow.
+    # only compared in the shadow. On: a liumd document that cannot be read (unavailable, empty,
+    # malformed or timed out) falls back to the Python scrape for that node.
     VALIDATOR_LIUMD_SPECS: bool = Field(env="VALIDATOR_LIUMD_SPECS", default=False)
     # Prod repair path: fetch the liumd manifest from lium-io main and replace a missing/stale
     # /usr/local/bin/liumd only after the manifest sha256 matches.
@@ -369,19 +357,19 @@ class Settings(BaseSettings):
     # Executor UUIDs are miner-chosen, so an entry matches only that miner's executor at that SSH
     # endpoint. Empty = none.
     LIUMD_SHADOW_RESERVED_EXECUTORS: str = Field(env="LIUMD_SHADOW_RESERVED_EXECUTORS", default="")
+    # DAH-6804: the boot-time layer reset (nvidia_docker_sysbox_setup.sh --install-layer-reset) on Sysbox hosts whose
+    # unit is missing or older than the setup script's, on hosts with no rental. off (default) = install nothing;
+    # allowlist = install on SYSBOX_LAYER_RESET_INSTALL_HOTKEYS (comma-separated miner hotkeys) only; all = every host.
+    # A host change is rolled out gradually (the v1.151 host sysctl change reached every host at once and was rolled back).
+    SYSBOX_LAYER_RESET_INSTALL: Literal["off", "allowlist", "all"] = Field(
+        env="SYSBOX_LAYER_RESET_INSTALL", default="off"
+    )
+    SYSBOX_LAYER_RESET_INSTALL_HOTKEYS: str = Field(env="SYSBOX_LAYER_RESET_INSTALL_HOTKEYS", default="")
     # The shadow can run only the fact steps while the Python path still owns VerifyX and matmul.
     # Flip this on when liumd's GPU checks are the thing being compared again.
     LIUMD_SHADOW_GPU_STEPS_ENABLED: bool = Field(
         env="LIUMD_SHADOW_GPU_STEPS_ENABLED", default=False
     )
-    # DAH-3338: send every container state a cycle saw on a node to the backend as PodStatesReport
-    # chunks (256 states each) after the cycle's spec, so a node with 256 rented pods still reports
-    # its reaped orphans the same cycle. The spec keeps a bounded copy either way. Turn on once the
-    # backend accepts the message (lium-platform#312); a backend without it logs and drops each
-    # report. Off: the spec is the only carrier, with a floor of REAPED_POD_STATES_FLOOR slots for
-    # reaped ids; on a node with more than 224 rented pods the last rented pods' states are cut
-    # until the queue drains.
-    POD_STATES_REPORT_ENABLED: bool = Field(env="POD_STATES_REPORT_ENABLED", default=False)
     # DAH-2671 spec-truth checks. Each pair follows the shadow-first pattern:
     # CHECK_ENABLED is the master switch — shadow mode computes the signal and emits the event/log
     # but returns passed=True and never changes score; ENFORCEMENT (only effective while
@@ -391,10 +379,6 @@ class Settings(BaseSettings):
     #
     # Item 1 — surface the kernel (procfs) GPU verdict the validator already computes and throws
     # away, and refuse the spoofable nvidia-smi XML fallback when it disagrees with the kernel map.
-    # DAH-4891: fail a node whose kernel GPU list is read through a foreign mount over
-    # /proc/driver/nvidia/gpus (KERNEL_GPU_VIEW_OVERLAID). Off: the finding is only recorded on the
-    # banned_provider event (kernel_gpu_foreign_mounts). On only once the honest mount patterns are excluded.
-    KERNEL_GPU_OVERLAY_ENFORCEMENT_ENABLED: bool = Field(env="KERNEL_GPU_OVERLAY_ENFORCEMENT_ENABLED", default=False)
     # Cross-check the reported GPU count and UUIDs against the kernel's GPU list
     # (/proc/driver/nvidia/gpus, the same read the ban checks make). CHECK_ENABLED evaluates and
     # logs a verdict every validation (check_id gpu.validate.kernel_count); a kernel list that is
@@ -441,13 +425,6 @@ class Settings(BaseSettings):
         env="RENTED_POD_WATCH_NO_BANNER_RETRY_TIMEOUT_SECONDS", default=20.0, gt=0
     )
     RENTED_POD_WATCH_NO_BANNER_MISSES: int = Field(env="RENTED_POD_WATCH_NO_BANNER_MISSES", default=10, ge=1)
-    # A probed rented node the cycle has no result for (the miner timed out, failed, or left it out)
-    # is reported as EXECUTOR_RESULT_MISSING with only its observations. Off until the backend that
-    # stores such a report as evidence only (lium-platform) is deployed:
-    # an older backend would score it as a failed validation.
-    RENTED_POD_SSH_RESULT_MISSING_REPORT_ENABLED: bool = Field(
-        env="RENTED_POD_SSH_RESULT_MISSING_REPORT_ENABLED", default=False
-    )
     # A rented node whose scrape, run in the already-running executor, finds the GPU runtime
     # dead on the host (NVML: driver not loaded, GPU lost, GPU requires reset, GPU not found; or zero
     # cards) is reset the way POD_NOT_RUNNING and GPU_MISSING are: verified job cleared, so the backend
@@ -485,20 +462,6 @@ class Settings(BaseSettings):
     # a foreign GPU workload takes the card. CHECK observes and logs; ENFORCEMENT zeroes the
     # score. Enforcement defaults off: a provider's own nginx also burns CPU, so the floors
     # need a shadow week over the live fleet before the first payout is cut.
-    # DAH-3457 (owner, 13 Sep 2026): a listed node keeps one fixed set of GPU UUIDs (the anchor). Off = a changed
-    # set is GPU_UUID_CHANGED (verification reset, the anchor is kept) and the event's what_we_saw carries the
-    # would-be hard decision; a missing or added card is GPU_UUID_CHANGED too now that the fingerprint check
-    # runs before the spec check (the count change made it SPEC_CHANGED). On = a strict subset of the anchor is GPU_MISSING (score 0
-    # this cycle, the node returns when the full set is back); any UUID outside the anchor marks the node
-    # "anchor broken": score 0 on every later cycle under this executor id, no re-verification; the provider
-    # re-registers the node to list a different set. Off again = the mark stays in the record but is ignored.
-    # Flip after reading a week of the warn-mode rows.
-    GPU_ANCHOR_HARD_ENABLED: bool = Field(env="GPU_ANCHOR_HARD_ENABLED", default=False)
-    # SpecFloorCheck (DAH-6343): off, a node with specs below the floors is logged with its findings only. Turned on
-    # by a separate PR once real cases show no false positives.
-    SPEC_FLOOR_ENFORCEMENT_ENABLED: bool = Field(env="SPEC_FLOOR_ENFORCEMENT_ENABLED", default=False)
-    # DockerCpuCheck: when disabled, a node whose Docker daemon sees fewer CPUs than the machine is logged only.
-    DOCKER_CPU_MISMATCH_ENFORCEMENT_ENABLED: bool = Field(env="DOCKER_CPU_MISMATCH_ENFORCEMENT_ENABLED", default=False)
     PROVIDER_SIDE_LOAD_ENFORCEMENT_ENABLED: bool = Field(
         env="PROVIDER_SIDE_LOAD_ENFORCEMENT_ENABLED", default=False
     )
@@ -528,12 +491,6 @@ class Settings(BaseSettings):
     # review of prod logs). CHECK is on (milliseconds of copy per card; a probe that cannot start is UNKNOWN,
     # never a fault).
     PINNED_MEMORY_PROBE_CHECK_ENABLED: bool = Field(env="PINNED_MEMORY_PROBE_CHECK_ENABLED", default=True)
-    # A fault probe with no verdict passes. Five such cycles in a row on one node are logged
-    # (GPU_FAULT_PROBE_UNKNOWN_STREAK); with this on they are judged like a fault, which fails the
-    # node. Off by default.
-    GPU_FAULT_PROBE_UNKNOWN_STREAK_ENFORCEMENT_ENABLED: bool = Field(
-        env="GPU_FAULT_PROBE_UNKNOWN_STREAK_ENFORCEMENT_ENABLED", default=False
-    )
     # DAH-3436: the synthetic rental probe. On an idle node (no renter pod, no filler) the validator
     # rents the node from itself once per RENTAL_PROBE_INTERVAL_HOURS: it starts the default renter
     # image through the same create_container path a renter's pod takes, with a probe-owned SSH key
@@ -550,13 +507,9 @@ class Settings(BaseSettings):
     RENTAL_PROBE_INTERVAL_HOURS: float = Field(env="RENTAL_PROBE_INTERVAL_HOURS", default=6.0, gt=0)
     RENTAL_PROBE_SSH_DEADLINE_SECONDS: int = Field(env="RENTAL_PROBE_SSH_DEADLINE_SECONDS", default=90, gt=0)
     # A node whose containers cannot reach the internet passed every check. CHECK runs the rental probe's
-    # `egress` step, which resolves and fetches pypi.org inside its renter container; ENFORCEMENT fails the
-    # probe on it with NO_OUTBOUND_INTERNET (score 0). Slow still passes. Enforcement is off by default
-    # until its log-only window is reviewed. Decider: taiberium; backup jam6099.
+    # `egress` step, which resolves and fetches pypi.org inside its renter container, and fails the
+    # probe on it with NO_OUTBOUND_INTERNET (score 0). Slow still passes. Decider: taiberium; backup jam6099.
     NO_OUTBOUND_INTERNET_CHECK_ENABLED: bool = Field(env="NO_OUTBOUND_INTERNET_CHECK_ENABLED", default=True)
-    NO_OUTBOUND_INTERNET_ENFORCEMENT_ENABLED: bool = Field(
-        env="NO_OUTBOUND_INTERNET_ENFORCEMENT_ENABLED", default=False
-    )
     # ticket-0361: a node failed 16 rents in 24 h, every one a template it did not have cached; its
     # dockerd pulls through the mirror docker.m.daocloud.io, whose DNS lookup times out, while cached
     # templates start fine. RegistryPullCheck removes and pulls a digest-pinned hello-world through the
@@ -654,10 +607,6 @@ class Settings(BaseSettings):
     # validation and every OUTDATED executor earns 0. Off until nodes auto-update again
     # (DAH-3419): with Watchtower stalled, 99 executors earned 0 for it in one hour on 11 Sep.
     EXECUTOR_IMAGE_CHECK_ENFORCE: bool = Field(env="EXECUTOR_IMAGE_CHECK_ENFORCE", default=False)
-    # DAH-5936: an executor digest absent from EXECUTOR_IMAGE_REF's repository is logged as an unofficial build
-    # every cycle (EXECUTOR_BUILD lines). Off (default): no consequence, the node is judged as OUTDATED is.
-    # On: UNOFFICIAL fails an idle node, and a rented one keeps its rental at score 0, out of both incentive pools.
-    EXECUTOR_IMAGE_UNOFFICIAL_ENFORCE: bool = Field(env="EXECUTOR_IMAGE_UNOFFICIAL_ENFORCE", default=False)
     # DAH-3405: for this many validation cycles, counting the one in which the registry digest of
     # EXECUTOR_IMAGE_REF was seen to change, an executor that fails the way a watchtower restart
     # makes it fail (SSH gone, scrape failed, ports missing, image not yet the new one) gets no
@@ -684,15 +633,6 @@ class Settings(BaseSettings):
     # and the per-executor job-result dump after scoring; asyncssh and sqlalchemy keep their own levels.
     LOG_LEVEL: str = Field(env="LOG_LEVEL", default="INFO", description="Root log level (DEBUG, INFO, WARNING, ...)")
 
-    # DAH-2786 — GPU power cap revert gate. When True, an unrented executor whose host put the
-    # GPU power limit back while a Lium idle job was running, often enough inside the window,
-    # loses the unrented rental incentive while staying active. Ships in shadow mode: unlike
-    # DAH-2715 this gate reads provider behaviour rather than a capability, so the prod numbers
-    # are read first. Set to True to enforce.
-    ENABLE_UNRENTED_POWER_CAP_REVERT_LIMIT: bool = Field(
-        env="ENABLE_UNRENTED_POWER_CAP_REVERT_LIMIT", default=False
-    )
-
     # DAH-4299: whether an idle provider-chosen spot node is paid is decided as for a secure node
     # (its GPU model is in the unrented program and every idle-pool gate passes), not by whether a
     # Lium filler runs on it: a filler Lium did not start is Lium's doing (Fish). Provider-caused
@@ -717,14 +657,6 @@ class Settings(BaseSettings):
     SECURE_FILLER_REVENUE_MIN_GPU_HOURS: float = Field(
         env="SECURE_FILLER_REVENUE_MIN_GPU_HOURS", default=24.0
     )
-
-    # True: a run below the port floor fails INSUFFICIENT_PORTS (the verdict PortCountCheck gives an
-    # unrented node) when every pod in the batch-start rented list is stale: not running and its
-    # rental closed (STALE_POD_NOT_RUNNING). One running pod, one still-active rental, or a pod whose
-    # state cannot be read keeps the rented exemption. False: the run completes and its events say
-    # the node is hidden. It stops idle pay on those nodes, so it stays off until the validator owner
-    # turns it on.
-    ENFORCE_PORT_FLOOR_ON_STALE_POD: bool = Field(env="ENFORCE_PORT_FLOOR_ON_STALE_POD", default=False)
 
     # collateral_deposited keeps its meaning for the backend's provider statistics and the support board:
     # the miner's associated EVM address owns the executor on this contract and its collateral covers
@@ -783,13 +715,6 @@ class Settings(BaseSettings):
     # Optional comma-separated allowlist of NRAS `hwmodel` claims (e.g. "GH100 A01 GSP BROM").
     # Empty = no hwmodel constraint. Substring-prefix match per entry.
     GPU_ATTESTATION_ALLOWED_HWMODELS: str = Field(env="GPU_ATTESTATION_ALLOWED_HWMODELS", default="")
-
-    # N3 — rental host-key policy. Off preserves today's behavior (a non-attestation
-    # error while building the policy falls back to unpinned SSH). On = fail closed:
-    # no host-key policy ⇒ no rental SSH.
-    ENABLE_RENTAL_HOSTKEY_FAIL_CLOSED: bool = Field(
-        env="ENABLE_RENTAL_HOSTKEY_FAIL_CLOSED", default=False
-    )
 
     # G2 — monotonic version floor for the measured compose (runner) releases.
     # Whitelisted compose hashes carry a version; hashes below the floor are rejected
@@ -978,16 +903,28 @@ class Settings(BaseSettings):
         ),
     )
     RENTAL_HOST_RAM_RESERVE_GB: int = Field(
-        env="RENTAL_HOST_RAM_RESERVE_GB", default=4, ge=0,
+        env="RENTAL_HOST_RAM_RESERVE_GB", default=8, ge=0,
         description=(
-            "RAM kept back for the host (sshd, dockerd, the executor) when a rental arrives with no "
-            "memory limit: the container gets host MemTotal minus max(this, "
-            "RENTAL_HOST_RAM_RESERVE_PERCENT), so a renter cannot exhaust the host's memory."
+            "RAM kept back for the host's own use outside the rental's cgroup (sshd, dockerd, the "
+            "executor, NVIDIA driver memory): the container's limit is at most (host MemTotal minus "
+            "max(this, RENTAL_HOST_RAM_RESERVE_PERCENT)) times its GPU share, so a renter at its limit "
+            "cannot starve the host. The backend lists pod RAM with the same figures."
         ),
     )
     RENTAL_HOST_RAM_RESERVE_PERCENT: float = Field(
-        env="RENTAL_HOST_RAM_RESERVE_PERCENT", default=3.0, ge=0, lt=100,
-        description="Percent of host RAM kept back, see RENTAL_HOST_RAM_RESERVE_GB (3 %, as the backend: DAH-5206).",
+        env="RENTAL_HOST_RAM_RESERVE_PERCENT", default=10.0, ge=0, lt=100,
+        description=(
+            "Percent of host RAM kept back, see RENTAL_HOST_RAM_RESERVE_GB (10 %, as the backend: an idle "
+            "376 GiB host used 14 GiB outside the rental's cgroup, more than the former 3 %)."
+        ),
+    )
+    RENTAL_LOG_MAX_SIZE: str = Field(
+        env="RENTAL_LOG_MAX_SIZE", default="100m",
+        description="json-file max-size of a rental container's log, so its stdout cannot fill the host disk.",
+    )
+    RENTAL_LOG_MAX_FILE: int = Field(
+        env="RENTAL_LOG_MAX_FILE", default=3, gt=0,
+        description="json-file max-file of a rental container's log (see RENTAL_LOG_MAX_SIZE).",
     )
     CUSTOM_DOCKERFILE_DIND_READY_TIMEOUT_SECONDS: int = Field(
         env="CUSTOM_DOCKERFILE_DIND_READY_TIMEOUT_SECONDS", default=60, gt=0,

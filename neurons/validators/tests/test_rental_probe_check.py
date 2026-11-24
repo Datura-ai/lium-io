@@ -73,13 +73,11 @@ def probe_settings(
     interval_hours: float = 6.0,
     deadline: int = 1,
     egress_check: bool = False,
-    egress_enforced: bool = False,
 ):
     with patch("neurons.validators.src.services.task.checks.rental_probe.settings") as s:
         s.RENTAL_PROBE_INTERVAL_HOURS = interval_hours
         s.RENTAL_PROBE_SSH_DEADLINE_SECONDS = deadline
         s.NO_OUTBOUND_INTERNET_CHECK_ENABLED = egress_check
-        s.NO_OUTBOUND_INTERNET_ENFORCEMENT_ENABLED = egress_enforced
         s.JOB_TIME_OUT = 60 * 15
         yield s
 
@@ -859,9 +857,9 @@ async def test_create_payload_is_what_a_renter_gets():
     assert private_key == ctx.executor_ssh_private_key_encrypted
     assert payload.docker_image == IMAGE.image_ref
     assert payload.gpu_uuids == ["GPU-aaaa", "GPU-bbbb"]
-    # the backend's whole-node limit (64 GiB less the 4 GiB reserve), so create_container never takes
+    # the backend's whole-node limit (64 GiB less the 8 GiB reserve), so create_container never takes
     # the no-memory-limit path that reads the host's /dev/nvidia* count
-    assert payload.memory_gb == 60
+    assert payload.memory_gb == 56
     assert (
         payload.ships_sshd is True and payload.is_sysbox is True and payload.enable_jupyter is False
     )
@@ -1577,7 +1575,8 @@ def test_the_probe_runs_last_before_scoring_and_never_in_dry_run():
     """Regression: the probe is placed before the port or rented checks it depends on, or the dry-run
     pipeline (staging, DRY_RUN=true) starts creating containers on providers' nodes."""
     ids = [type(check).__name__ for check in pipeline_factory.PipelineFactory.build_checks()]
-    assert ids.index("RentalProbeCheck") == ids.index("RentalVerificationCheck") + 1
+    # DAH-5933: the rental verification moved ahead of VerifyX; the probe stays after every GPU check
+    assert ids.index("RentalProbeCheck") == ids.index("CachedTemplateVerificationCheck") + 1
     # DAH-5320: only the shadow idle disk write sits between the probe and scoring
     assert ids.index("RentalProbeCheck") == ids.index("IdleDiskWriteCheck") - 1
     # DAH-5462: then VerifyX's cold-sample retry, in the time every other check left
@@ -1681,7 +1680,7 @@ async def test_a_transient_egress_miss_is_re_run_and_the_re_run_decides():
     redis = FakeRedis()
     ctx, _, _ = make_probe_context(redis=redis)
     with (
-        probe_settings(egress_check=True, egress_enforced=True),
+        probe_settings(egress_check=True),
         renter_path(egress_stdout=[EGRESS_NO_ANSWER, EGRESS_OK]) as seen,
     ):
         result = await RentalProbeCheck().run(ctx)
@@ -1701,7 +1700,7 @@ async def test_egress_failure_fails_the_probe_with_no_outbound_internet_when_enf
     redis = FakeRedis()
     ctx, _, _ = make_probe_context(redis=redis)
     with (
-        probe_settings(egress_check=True, egress_enforced=True),
+        probe_settings(egress_check=True),
         renter_path(egress_stdout=egress_stdout) as seen,
     ):
         result = await RentalProbeCheck().run(ctx)
@@ -1716,40 +1715,16 @@ async def test_egress_failure_fails_the_probe_with_no_outbound_internet_when_enf
 
 
 @pytest.mark.asyncio
-async def test_egress_failure_only_logs_while_enforcement_is_off():
-    """Regression: the egress step hides hosts before anyone read the shadow rows, or the failure is not
-    recorded at all."""
-    redis = FakeRedis()
-    ctx, _, _ = make_probe_context(redis=redis)
-    with probe_settings(egress_check=True), renter_path(egress_stdout=EGRESS_DNS_FAIL):
-        result = await RentalProbeCheck().run(ctx)
-    assert result.passed and result.event.reason_code == Msg.PROBE_OK.reason
-    assert _steps(result)[STEP_EGRESS]["ok"] is False
-    assert "dns_failed" in _steps(result)[STEP_EGRESS]["detail"]
-    assert redis.standing_failure() is None
-
-
-@pytest.mark.asyncio
 async def test_egress_step_without_a_reading_records_nothing():
     """Regression: an image without curl or wget (no reading) fails the node as if it had no internet."""
     ctx, _, _ = make_probe_context()
     with (
-        probe_settings(egress_check=True, egress_enforced=True),
+        probe_settings(egress_check=True),
         renter_path(egress_stdout="lium_egress dns=ok\nlium_egress tool=none http=000\n"),
     ):
         result = await RentalProbeCheck().run(ctx)
     assert result.passed and result.event.reason_code == Msg.PROBE_OK.reason
     assert STEP_EGRESS not in _steps(result)
-
-
-@pytest.mark.asyncio
-async def test_a_standing_egress_failure_is_dropped_once_enforcement_is_off():
-    """Regression: switching NO_OUTBOUND_INTERNET_ENFORCEMENT_ENABLED off leaves nodes failing on the
-    egress step they failed while it was on, until a probe passes."""
-    ctx, _, _ = make_probe_context(redis=FakeRedis(failed_step=STEP_EGRESS), image_present=False)
-    with probe_settings(egress_check=True):
-        result = await RentalProbeCheck().run(ctx)
-    assert result.passed and result.event.reason_code == Msg.SKIPPED.reason
 
 
 @pytest.mark.asyncio

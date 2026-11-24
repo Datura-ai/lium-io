@@ -307,8 +307,9 @@ async def test_a_node_back_from_a_dropout_is_not_listed_until_the_load_test_has_
 
 
 @pytest.mark.asyncio
-async def test_a_post_rental_recheck_still_proceeds_on_a_skip(context_factory):
-    """Only the dropout marker blocks on a skip; an ordinary post-rental recheck keeps its behaviour."""
+async def test_a_post_rental_recheck_still_proceeds_on_no_verdict(context_factory):
+    """Only the dropout marker blocks on no verdict (here a filler it may not remove); an ordinary post-rental
+    recheck proceeds."""
     redis = FakeRedis()
     redis.store[RECHECK_KEY] = json.dumps({"source": "gpu.validate.memory_health"})
     ctx, _, _ = _hold_then_load_test_pipeline(context_factory, redis, all_cards=None, probe=probe_stdout("ok"))
@@ -316,7 +317,7 @@ async def test_a_post_rental_recheck_still_proceeds_on_a_skip(context_factory):
     with patch.object(post_rental_gpu_recheck, "get_filler_only_container", return_value={"id": "filler"}):
         result = await PostRentalGpuRecheckCheck().run(ctx)
 
-    assert result.passed and result.event.reason_code == RecheckMsg.FILLER_SKIPPED.reason
+    assert result.passed and result.event.reason_code == RecheckMsg.INCONCLUSIVE.reason
     assert availability_errors([result.event]) == []
 
 
