@@ -24,7 +24,13 @@ description: >-
   output, e2e, is true when any package is or when e2e/ itself changed: the e2e stack builds
   every neuron, so it runs whenever one of them could have changed and skips (green, via
   tests-ok) on a PR that touches none. A file under a neuron's own tests/ directory does not select
-  e2e: the stack runs e2e/tests, never those.
+  e2e, and neither do the files the stack never builds or runs: a neuron's tests/ directory, the
+  vendored liumd/ binary (the image installs and runs it, but the shadow that uses it is off in e2e;
+  tests/test_liumd_binary_manifest.py hashes both files and runs liumd-amd64 version, so liumd/ also
+  selects validators), dstacktee/ (CVM apps), validators/external_prober/ (the deploy-side lambda),
+  validators/src/preflight/ (its own image), the compose and Dockerfile.runner deployment manifests,
+  the docker_build.sh / docker_publish.sh pair, .env templates and the provider-host settings
+  (sysbox .deb, daemon.json, config.toml, run_jupyter.sh).
 
 outputs:
   validators:
@@ -37,6 +43,9 @@ outputs:
     value: ${{ steps.route.outputs.protocol }}
   e2e:
     value: ${{ steps.route.outputs.e2e }}
+  shards:
+    # JSON list of e2e shards this diff selects: ["cycle-protocol", "rental"], one of them, or []
+    value: ${{ steps.route.outputs.shards }}
   approved:
     # "true" on a PR with an approving review (each reviewer's latest approve/request-changes counts), and on any
     # non-PR event; test.yml runs the package jobs and e2e-gate only then (DAH-5832)
@@ -54,8 +63,9 @@ runs:
           const SHARED = ['datura/', '.github/'];
           // a change to the wire package also runs the validator's compatibility test against it;
           // a change under dstacktee/ (the measured CVM files and dstack.py) runs the validator's
-          // compose-hash whitelist test (tests/test_tdx_compose_hash_whitelist.py, DAH-3602)
-          const ALSO = { validators: ['lium_protocol/', 'neurons/executor/dstacktee/'] };
+          // compose-hash whitelist test (tests/test_tdx_compose_hash_whitelist.py, DAH-3602);
+          // a re-pin under liumd/ runs the manifest tests (tests/test_liumd_binary_manifest.py)
+          const ALSO = { validators: ['lium_protocol/', 'neurons/executor/dstacktee/', 'neurons/executor/liumd/'] };
           const isDoc = f => /\.md$|(^|\/)\.gitignore$|^docs\//.test(f);
           const touches = (files, pkg, prefix) =>
             files.some(f => f.startsWith(prefix)) || files.some(f => SHARED.some(s => f.startsWith(s)))
@@ -117,8 +127,20 @@ runs:
           }
 
           const rows = [];
-          // the stack never runs a neuron's own tests/, so a change there alone does not select e2e
-          const e2eFiles = files && files.filter(f => !/^neurons\/[^/]+\/tests\//.test(f));
+          // a change that only touches one of these cannot be exercised by the stack, so it does not select e2e
+          const STACK_IRRELEVANT = [
+            /^neurons\/[^/]+\/tests\//,
+            /^neurons\/executor\/liumd\//,
+            /^neurons\/executor\/dstacktee\//,
+            /^neurons\/validators\/external_prober\//,
+            /^neurons\/validators\/src\/preflight\//,
+            /^neurons\/[^/]+\/docker-compose.*\.ya?ml$/,
+            /^neurons\/[^/]+\/\.env(\.dev)?\.template$/,
+            /^neurons\/[^/]+\/docker(_runner)?_(build|publish)\.sh$/,
+            /^neurons\/[^/]+\/Dockerfile\.runner$/,
+            /^neurons\/executor\/(sysbox-ce-.*\.deb|daemon\.json|config\.toml|run_jupyter\.sh)$/,
+          ];
+          const e2eFiles = files && files.filter(f => !STACK_IRRELEVANT.some(rx => rx.test(f)));
           let anyPackage = false;
           for (const [pkg, prefix] of Object.entries(PACKAGES)) {
             const changed = files ? touches(files, pkg, prefix) : true;
@@ -129,7 +151,17 @@ runs:
           // the e2e stack is built from every package: it runs when any of them did, or when e2e/ itself changed
           const e2e = anyPackage || (e2eFiles ? touches(e2eFiles, 'e2e', 'e2e/') : true);
           core.setOutput('e2e', e2e);
-          rows.push(['e2e', e2e ? 'changed' : 'unchanged', why]);
+          // both suites drive all three services, so only an e2e test file narrows the shard set; the shared
+          // helper files and every runtime path select both
+          let shards = null;
+          for (const f of e2eFiles || []) {
+            if (/^e2e\/tests\/(cycle|protocol)\//.test(f)) (shards = shards || new Set()).add('cycle-protocol');
+            else if (/^e2e\/tests\/rental\//.test(f)) (shards = shards || new Set()).add('rental');
+            else { shards = new Set(['cycle-protocol', 'rental']); break; }
+          }
+          const selected = e2e ? [...(shards || new Set(['cycle-protocol', 'rental']))] : [];
+          core.setOutput('shards', JSON.stringify(selected));
+          rows.push(['e2e', e2e ? `changed (${selected.join(', ')})` : 'unchanged', why]);
           core.setOutput('approved', approved);
           rows.push(['approved', String(approved), approved ? 'package jobs and e2e-gate run' : 'lint only until a review approves']);
           core.summary
