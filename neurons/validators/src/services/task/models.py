@@ -63,6 +63,10 @@ class JobResult(BaseModel):
     # executor is then scored whole-box; set and below gpu_count on a split node, the incentive
     # engine scores the free GPUs in the unrented pool.
     rented_gpu_count: int | None = None
+    # DAH-5933: the pod ids of the node's own rental in the snapshot this result was scored with, sorted; [] = scored
+    # idle, None = not known (kept before this field, or a verdict the snapshot's rental does not match). A kept result
+    # stands in for a later cycle only for this exact rental state (executor_rollout.rental_state_unchanged).
+    rental_pod_ids: list[str] | None = None
     # DAH-2467: the free remainder of a partially rented split node. It is always rated at the
     # minimum-split tier and rate, never as a bundle of its own size.
     is_split_remainder: bool = False
@@ -104,6 +108,8 @@ class JobResult(BaseModel):
     pod_ssh: list[PodSshObservation] | None = None
     # DAH-5651: ContextState.host_runtime_fault, this cycle's DinD test container on the host never answered
     host_runtime_fault: bool = False
+    # ContextState.rented_pod_faults: {pod_id: [host-side fault codes]} for the rented pods this cycle judged
+    rented_pod_faults: dict[str, list[str]] | None = None
     # DAH-6784: Context.idle_checks_passed of the pipeline run; None from a path that ran no checks
     idle_checks_passed: list[str] | None = None
     # True only when this cycle opened the shell with known_hosts pinned to executor_info.ssh_host_key,

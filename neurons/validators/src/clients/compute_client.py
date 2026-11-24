@@ -531,6 +531,7 @@ class ComputeClient:
                             pod_states=data.get("pod_states"),
                             pod_ssh=data.get("pod_ssh"),
                             host_runtime_fault=data.get("host_runtime_fault"),
+                            rented_pod_faults=data.get("rented_pod_faults"),
                             idle_checks_passed=data.get("idle_checks_passed"),
                             check_started_at=data.get("check_started_at"),
                             ssh_host_key=data.get("ssh_host_key"),

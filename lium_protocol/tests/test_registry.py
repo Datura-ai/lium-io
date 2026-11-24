@@ -46,7 +46,7 @@ def test_a_refused_message_never_carries_the_input_into_the_error() -> None:
 
 
 def test_an_idle_only_reset_keeps_its_mark_through_a_round_trip() -> None:
-    # 2.21.0: a consumer that parses through VALIDATOR_MESSAGES tells an idle-only reset from an unconditional one
+    # 2.19.0: a consumer that parses through VALIDATOR_MESSAGES tells an idle-only reset from an unconditional one
     from lium_protocol.validator_to_backend import VALIDATOR_MESSAGES, ResetVerifiedJobRequest
 
     sent = ResetVerifiedJobRequest(validator_hotkey="v", miner_hotkey="m", executor_uuid="e", unrented_only=True)
@@ -59,7 +59,7 @@ def test_an_idle_only_reset_keeps_its_mark_through_a_round_trip() -> None:
 
 
 def test_the_idle_only_checks_that_passed_keep_their_ids_through_a_round_trip() -> None:
-    # 2.21.0: the backend lifts a hold an idle-only check left only when that check's id is listed
+    # 2.19.0: the backend lifts a hold an idle-only check left only when that check's id is listed
     from lium_protocol.recorded import recorded
     from lium_protocol.validator_to_backend import VALIDATOR_MESSAGES, ExecutorSpecRequest
 

@@ -327,6 +327,10 @@ class ExecutorSpecRequest(ValidatorMessage):
     # This cycle's DinD test container started on the host and its sshd never answered (a failing container
     # runtime). None from a publisher that predates the field.
     host_runtime_fault: bool | None = None
+    # 2.17.0: the rented pods this cycle's pod checks judged, by pod id, each with the host-side fault codes found on
+    # it (`RENTED_POD_PROC_FUSE_DISCONNECTED`); [] = judged and clean. A pod not listed was not judged. None = no check
+    # judged a pod, or a publisher that predates the field.
+    rented_pod_faults: dict[str, list[str]] | None = pydantic.Field(default=None, max_length=POD_STATES_MAX_ITEMS)
     # The check_ids of the checks that can reset a node idle-only (`ResetVerifiedJobRequest.unrented_only`) that this
     # cycle ran in full on the node and passed; a skipped run, or a pass reached without that check's own probe, is not
     # listed. [] when none did; None from a validator that does not send it.
@@ -381,7 +385,7 @@ class ResetVerifiedJobRequest(ValidatorMessage):
     miner_hotkey: str
     executor_uuid: str
     reason: ResetVerifiedJobReason = ResetVerifiedJobReason.DEFAULT
-    # 2.21.0: the check meant the reset for an idle node only; the backend applies it only while no customer pod runs
+    # 2.19.0: the check meant the reset for an idle node only; the backend applies it only while no customer pod runs
     # on the node. False (an older validator) = applied as before; an older backend ignores the field.
     unrented_only: bool = False
 

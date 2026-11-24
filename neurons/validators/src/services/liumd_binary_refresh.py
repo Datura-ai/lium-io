@@ -12,6 +12,7 @@ from typing import Any
 from urllib.parse import urljoin
 
 import aiohttp
+from services.liumd_exec_client import liumd_paths_sh
 
 from core.config import settings
 
@@ -20,7 +21,8 @@ TARGET_ARCH = {"x86_64": "x86_64", "aarch64": "aarch64"}
 FILE_BY_ARCH = {"x86_64": "liumd-amd64", "aarch64": "liumd-arm64"}
 LIUMD_FILE_RX = re.compile(r"^liumd-(amd64|arm64)$")
 SHA256_RX = re.compile(r"^[0-9a-f]{64}$")
-TMP_BINARY = "/tmp/liumd.binary.fetch"
+# Beside the install target, so a non-root user never meets another user's leftover in /tmp.
+TMP_BINARY = '"$t.fetch"'
 
 MANIFEST_TIMEOUT_SECONDS = 10
 MAX_MANIFEST_BYTES = 64 * 1024
@@ -70,7 +72,7 @@ async def _run(ctx: Any, command: str, timeout: int) -> Any:
 
 
 async def _read_version(ctx: Any) -> LiumdVersion:
-    result = await _run(ctx, f"{shlex.quote(settings.LIUMD_BINARY_PATH)} version", 15)
+    result = await _run(ctx, f'{liumd_paths_sh()}"$b" version', 15)
     if not result.success:
         if getattr(result, "error_type", None) is not None:
             return LiumdVersion(None, None, checked=False)
@@ -150,9 +152,11 @@ def _manifest_entry(manifest: dict[str, Any], arch: str) -> tuple[str, str] | No
 
 async def _download(ctx: Any, url: str, max_time: int) -> tuple[str | None, str | None]:
     command = (
-        f"curl -fsSL --max-time {max_time} -o {shlex.quote(TMP_BINARY)} {shlex.quote(url)}; "
+        f"{liumd_paths_sh()}"
+        f'mkdir -p "$(dirname "$t")"; '
+        f"curl -fsSL --max-time {max_time} -o {TMP_BINARY} {shlex.quote(url)}; "
         f"rc=$?; echo RC:$rc; "
-        f"if [ -f {shlex.quote(TMP_BINARY)} ]; then sha256sum {shlex.quote(TMP_BINARY)}; fi"
+        f"if [ -f {TMP_BINARY} ]; then sha256sum {TMP_BINARY}; fi"
     )
     result = await _run(ctx, command, max_time + 10)
     stdout = result.stdout or ""
@@ -250,7 +254,7 @@ async def _ensure(ctx: Any, budget: float, started: float) -> LiumdRefresh:
 
         install = await _run(
             ctx,
-            f"install -m 0755 {shlex.quote(TMP_BINARY)} {shlex.quote(settings.LIUMD_BINARY_PATH)}",
+            f'{liumd_paths_sh()}install -m 0755 {TMP_BINARY} "$t" && rm -f {TMP_BINARY}',
             30,
         )
         if not install.success:
@@ -332,14 +336,21 @@ async def _refresh_from_answer(
         url = urljoin(settings.LIUMD_BINARY_MANIFEST_URL, filename)
         fetched_sha, error = await _download(ctx, url, max(1, int(remaining)))
         if fetched_sha is None:
-            return LiumdRefresh(False, build_sha, error or "download failed")
+            return LiumdRefresh(
+                False, build_sha, error or "download failed", skipped=bool(build_sha)
+            )
         if fetched_sha != expected_sha:
-            return LiumdRefresh(False, build_sha, "downloaded sha256 does not match manifest")
+            return LiumdRefresh(
+                False,
+                build_sha,
+                "downloaded sha256 does not match manifest",
+                skipped=bool(build_sha),
+            )
 
         install = await _run(
             ctx,
-            f"install -m 0755 {shlex.quote(TMP_BINARY)} {shlex.quote(settings.LIUMD_BINARY_PATH)}"
-            f" && sha256sum {shlex.quote(settings.LIUMD_BINARY_PATH)}",
+            f'{liumd_paths_sh()}install -m 0755 {TMP_BINARY} "$t" && rm -f {TMP_BINARY}'
+            ' && sha256sum "$t"',
             30,
         )
         if not install.success:
@@ -347,6 +358,7 @@ async def _refresh_from_answer(
                 False,
                 build_sha,
                 (install.stderr or install.stdout or "install failed")[-300:],
+                skipped=bool(build_sha),
             )
         installed_sha = None
         for line in (install.stdout or "").splitlines():
@@ -358,7 +370,12 @@ async def _refresh_from_answer(
             ):
                 installed_sha = parts[0]
         if installed_sha != expected_sha:
-            return LiumdRefresh(False, build_sha, "installed binary sha256 does not match manifest")
+            return LiumdRefresh(
+                False,
+                build_sha,
+                "installed binary sha256 does not match manifest",
+                skipped=bool(build_sha),
+            )
         return LiumdRefresh(True, expected_build, changed=True)
     except Exception as exc:  # noqa: BLE001 - a repair failure is reported to the caller
         return LiumdRefresh(False, build_sha, f"{type(exc).__name__}: {exc}"[:300])

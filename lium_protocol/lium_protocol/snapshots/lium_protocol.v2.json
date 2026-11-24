@@ -2615,6 +2615,25 @@
           "default": null,
           "title": "Queue Depth"
         },
+        "rented_pod_faults": {
+          "anyOf": [
+            {
+              "additionalProperties": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "maxProperties": 256,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Rented Pod Faults"
+        },
         "score": {
           "anyOf": [
             {
@@ -6646,7 +6665,7 @@
       "$ref": "#/$defs/RentedExecutorsResponse"
     }
   },
-  "protocol_version": "2.21.0",
+  "protocol_version": "2.19.0",
   "socket_replies": {
     "RentedMachineResponse": {
       "$ref": "#/$defs/RentedMachineResponse"

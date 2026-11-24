@@ -95,6 +95,14 @@ class BackendRejected(Exception):
         self.status = status
 
 
+class HealthCheckTimedOut(Exception):
+    """The executor health check got no answer within its wait: no API error, the wait ran out."""
+
+    def __init__(self, timeout: float):
+        super().__init__(f"no answer within {timeout} s")
+        self.timeout = timeout
+
+
 class BackendClient:
     """HTTP client with session pooling and validator signature headers."""
 
@@ -599,6 +607,9 @@ class BackendClient:
 
         Returns:
             ExecutorHealthCheckResponse if successful, None otherwise
+
+        Raises:
+            HealthCheckTimedOut: no answer within `timeout`, so the caller can tell its own wait from an API error.
         """
         validator_hotkey = self.keypair.ss58_address
         path = f"/validator/{validator_hotkey}/executor-health-check"
@@ -643,7 +654,8 @@ class BackendClient:
                     path,
                     ExecutorHealthCheckResponse,
                     json_data=json_data,
-                    timeout=timeout,
+                    # past the wait below, so a timeout is always this wait's own and never read as a failed request
+                    timeout=timeout + 5,
                 ),
                 timeout,
             )
@@ -651,7 +663,7 @@ class BackendClient:
             logger.error(
                 _m("Executor health check timeout", extra=get_extra_info({"path": path, "timeout": timeout}))
             )
-            return None
+            raise HealthCheckTimedOut(timeout) from None
 
     async def report_verification_started(
         self, *, job_batch_id: str, miner_hotkey: str, executor_uuids: list[str], started_at: datetime

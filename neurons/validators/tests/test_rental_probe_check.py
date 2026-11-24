@@ -1575,7 +1575,8 @@ def test_the_probe_runs_last_before_scoring_and_never_in_dry_run():
     """Regression: the probe is placed before the port or rented checks it depends on, or the dry-run
     pipeline (staging, DRY_RUN=true) starts creating containers on providers' nodes."""
     ids = [type(check).__name__ for check in pipeline_factory.PipelineFactory.build_checks()]
-    assert ids.index("RentalProbeCheck") == ids.index("RentalVerificationCheck") + 1
+    # DAH-5933: the rental verification moved ahead of VerifyX; the probe stays after every GPU check
+    assert ids.index("RentalProbeCheck") == ids.index("CachedTemplateVerificationCheck") + 1
     # DAH-5320: only the shadow idle disk write sits between the probe and scoring
     assert ids.index("RentalProbeCheck") == ids.index("IdleDiskWriteCheck") - 1
     # DAH-5462: then VerifyX's cold-sample retry, in the time every other check left

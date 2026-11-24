@@ -165,17 +165,19 @@ def mount_probe_volume():
 def disable_plugin(plugin_id):
     # the backend's health check may hold a volume on the plugin for a moment: retry. Short tries that
     # stop before the validator's deadline, so a hung daemon still leaves this reason on stderr even
-    # when the lock wait ate the probe's reserve
-    for _ in range(DISABLE_TRIES):
-        try_seconds = min(DISABLE_TRY_SECONDS, validator_deadline - START_SECONDS - time.monotonic())
+    # when the lock wait ate the probe's reserve. The pause before a retry counts against the deadline
+    # like the try: a pause after the last try that fits would run past it and lose this reason
+    for attempt in range(DISABLE_TRIES):
+        pause = 1 if attempt else 0
+        try_seconds = min(DISABLE_TRY_SECONDS, validator_deadline - START_SECONDS - time.monotonic() - pause)
         if try_seconds < 1:
             break
+        time.sleep(pause)
         try:
             if run_docker("plugin", "disable", plugin_id, timeout=try_seconds).returncode == 0:
                 return
         except subprocess.TimeoutExpired:
             pass
-        time.sleep(1)
     raise RuntimeError("the plugin could not be disabled")
 
 def read_saved_config(plugin_id):
