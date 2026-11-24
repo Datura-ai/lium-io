@@ -125,6 +125,8 @@ ORIGINAL_KEYS = {
     # DAH-5059: kB per container name (writable layer + its anonymous volumes) and per volume name
     'hard_disk_by_container': "by_container",
     'hard_disk_by_volume': "by_volume",
+    # DAH-6981: containers with a volume no read could size this scrape (their size is unknown, not partial)
+    'hard_disk_unsized_containers': "unsized_containers",
     'data_os': "os",
     'data_kernel': "kernel",
     'kernel_scrape_error': "kernel_scrape_error",
@@ -192,7 +194,10 @@ ORIGINAL_KEYS = {
     'data_executor_pid_mode': "executor_pid_mode",
     'data_needrestart_guard_scrape_error': "needrestart_guard_scrape_error",
     'data_needrestart_guard_unguarded': "needrestart_guard_unguarded",
+    'data_needrestart_guard_reason': "needrestart_guard_reason",
     'data_needrestart_guard': "needrestart_guard",
+    'data_sysbox_layer_reset_version': "sysbox_layer_reset_version",
+    'data_sysbox_layer_reset_scrape_error': "sysbox_layer_reset_scrape_error",
     'data_nvidiactl_owner_uid': "nvidiactl_owner_uid",
     'data_power_cap_probe_error': "power_cap_probe_error",
     # DAH-2922: GPU interconnect summary (nvidia-smi topo). The scrape
@@ -366,6 +371,7 @@ class FileEncryptService:
             'hard_disk_engy_cache_used_gb': "",
             'hard_disk_by_container': "",
             'hard_disk_by_volume': "",
+            'hard_disk_unsized_containers': "",
             'data_os': "",
             'data_kernel': "",
             'kernel_scrape_error': "",
@@ -437,7 +443,10 @@ class FileEncryptService:
             'data_executor_pid_mode': "",
             'data_needrestart_guard_scrape_error': "",
             'data_needrestart_guard_unguarded': "",
+            'data_needrestart_guard_reason': "",
             'data_needrestart_guard': "",
+            'data_sysbox_layer_reset_version': "",
+            'data_sysbox_layer_reset_scrape_error': "",
             'data_nvidiactl_owner_uid': "",
             'data_power_cap_probe_error': "",
             # DAH-2922 - longer keys before the key they extend (prefix rule above)

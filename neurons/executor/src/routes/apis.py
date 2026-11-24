@@ -39,6 +39,7 @@ from dependencies.auth import (
     verify_container_logs_signature,
     verify_signature,
 )
+from services.validator_trust_service import validator_trust
 from services.local_verify_service import (
     BusyError,
     LocalVerifyService,
@@ -284,6 +285,24 @@ def _accepted_miner_hotkeys() -> set[str]:
     )
 
 
+def _owner_set_signed(payload: UploadSShKeyPayload, own_hotkey: str) -> bool:
+    """DAH-6740: the validator also signed this key for this node's own hotkey as one of the listing owner's.
+
+    Only the own hotkey counts here: the pool hotkey is accepted by every pool node, so signing it for an own-key
+    listing would bind the key to nothing. The validator (and the backend's health check, on the validator's word) signs
+    only the hotkeys the portal itself names for the listing's owner, never what a miner reports, and an upload needs
+    this node's own or the central miner's auth (MinerMiddleware).
+    """
+    signature = (payload.owner_hotkey_signatures or {}).get(own_hotkey)
+    if not own_hotkey or not signature:
+        return False
+    try:
+        blob = ssh_pubkey_signing_blob(payload.public_key, payload.nonce, own_hotkey)
+        return match_validator_hotkey(blob, signature) is not None
+    except Exception:
+        return False
+
+
 def _check_miner_binding(payload: UploadSShKeyPayload) -> None:
     """Check the validator issued this key for this executor's own miner hotkey or the pool's.
 
@@ -305,6 +324,8 @@ def _check_miner_binding(payload: UploadSShKeyPayload) -> None:
             miner_binding = "mismatch"
         else:
             return
+    if _owner_set_signed(payload, own_hotkey):
+        return
     enforced = settings.REQUIRE_MINER_BOUND_SSH_KEY
     logger.warning(
         _m(
@@ -448,6 +469,8 @@ async def get_version():
         "version": _get_version(),
         "capabilities": [LOCAL_VERIFY_CAPABILITY],
         "local_verify_port": settings.INTERNAL_PORT,
+        # DAH-6590: the validator address and revision this node trusts, so a switch is measured per node
+        "validator_trust": validator_trust.report(),
     }
 
 
@@ -646,7 +669,7 @@ async def local_verify(request: Request):
         result.deadline_hit,
         {name: step.status for name, step in result.steps.items()},
     )
-    return result.model_dump(by_alias=True)
+    return {**result.model_dump(by_alias=True), "validator_trust": validator_trust.report()}
 
 
 _expected_digest_cache = ExpectedDigestCache()

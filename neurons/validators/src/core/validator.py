@@ -452,7 +452,9 @@ class Validator:
                 executor_image_snapshot = build_expected_image_snapshot(executor_digest)
 
                 # Fetch all rented executors from backend API
-                rented_executors = await self.backend_client.get_all_rented_executors()
+                rented_executors = await self.backend_client.get_all_rented_executors(
+                    cycle_snapshot_block=job_block
+                )
                 if rented_executors is None:
                     logger.error(
                         _m(
@@ -489,6 +491,8 @@ class Validator:
                         rollout_earlier_digests=tuple(filter(None, map(normalize_sha256_digest, earlier))),
                     )
 
+                wave_started_at = time.monotonic()
+                wave_cpu_started_at = time.process_time()
                 logger.info(
                     _m(
                         "[sync] Send jobs to miners",
@@ -686,7 +690,7 @@ class Validator:
                     # DAH-6564: one cycle-end read of the rented list, shared by the carry and the rental-change rule
                     rented_at_end = await self.rented_at_cycle_end(all_job_results)
                     await self.carry_scores_over_renter_gpu_resets(
-                        all_job_results, rented_executors, miner_coldkeys, rented_at_end
+                        all_job_results, rented_executors, miner_coldkeys, rented_at_end, job_block=job_block
                     )
                     total_gpu_model_count_map = settle_cycle_results(
                         all_job_results,
@@ -720,7 +724,7 @@ class Validator:
                     all_job_results, withheld_results = await self.withhold_verdicts_for_rollout(
                         all_job_results, job_block, job_batch_id, rollout_window, rented_executors, rented_at_end
                     )
-                    await remember_rented_scored_results(all_job_results, self.redis_service)
+                    await remember_rented_scored_results(all_job_results, self.redis_service, job_block=job_block)
 
                     # DAH-2622: a miner whose machine passed validation must keep its UID even
                     # when it earned nothing this cycle. Overwrite, never accumulate. A miner with a
@@ -777,8 +781,8 @@ class Validator:
                                 exc_info=True,
                             )
 
-                    # PHASE 2: Calculate final weights with burning logic per cycle
-                    miners = await self.subtensor_client.get_miners()
+                    # PHASE 2: Calculate final weights with burning logic per cycle, over the miners this cycle
+                    # asked: a list refreshed meanwhile would drop a hotkey whose node rows the cycle still reports
 
                     # Current subnet epoch for the referral feed's staleness guard. This MUST use
                     # the SAME numbering as the backend feed's epoch_index — see
@@ -925,6 +929,10 @@ class Validator:
                                     "failed_executors": incentive.failed_executors,
                                     "withheld_executors": len(withheld_results),
                                     "completed_cycles_since_start": self.completed_cycles_since_start,
+                                    "wave_duration_seconds": round(time.monotonic() - wave_started_at, 1),
+                                    "miners": len(miners),
+                                    "timed_out_miners": len(pending),
+                                    "wave_cpu_seconds": round(time.process_time() - wave_cpu_started_at, 1),
                                 }
                             ),
                         ),
@@ -1589,15 +1597,24 @@ class Validator:
         rented_executors: RentedExecutorsResponse | None,
         miner_coldkeys: dict[str, str | None],
         rented_now: RentedExecutorsResponse | None,
+        *,
+        job_block: int,
     ) -> None:
-        """DAH-4658: only a node the backend still lists as rented carries its score: at the cycle end (`rented_now`),
-        or in this cycle's snapshot when the backend did not answer."""
+        """DAH-4658: only a node the backend still lists as rented carries its score over a GPU reset: at the cycle end
+        (`rented_now`), or in this cycle's snapshot when the backend did not answer. DAH-5933: a no-task-time hold carries
+        an idle node's too, and only on the cycle-end read itself."""
         if not has_renter_gpu_reset_holds(all_job_results):
             return
         rented = rented_now or rented_executors
         rented_executor_ids = {str(executor_id).lower() for executor_id in rented.executors} if rented else set()
         await carry_renter_gpu_reset_results(
-            all_job_results, self.redis_service, rented_executor_ids, rented_executors, miner_coldkeys
+            all_job_results,
+            self.redis_service,
+            rented_executor_ids,
+            rented_executors,
+            miner_coldkeys,
+            rented_now,
+            job_block=job_block,
         )
 
     async def rented_at_cycle_end(

@@ -33,6 +33,7 @@ from core.docker_utils import (
     ALPINE_HELPER_IMAGE,
     ContainerDeathDiagnostics,
     DockerCommand,
+    bound_host_port,
     collect_container_death_diagnostics,
     df_available_bytes,
     df_command,
@@ -151,10 +152,12 @@ from services.gpu_clocks import (
 from services.gpu_reset import RECENT_RENTER_GPU_RESET_SECONDS, GpuResetReport, reset_pod_gpus
 from services.gpu_wedge import cure_wedged_gpus, query_wedged_gpu_uuids
 from services.hung_gpu_reset import HungGpuResult, reset_hung_pod_gpus
+from services.host_memory_guard import TIMEOUT_SECONDS as HOST_MEMORY_GUARD_TIMEOUT_SECONDS
 from services.host_memory_guard import apply_host_memory_guard
 from services.image_flatten import (
     FLATTEN_NO_DISK_RENTER_SENTENCE,
     FLATTEN_SIZING_SLACK_BYTES,
+    FlattenLockTimedOut,
     FlattenMeasureFailed,
     ImageFlattenNoDisk,
     flatten_copy_bytes,
@@ -438,13 +441,6 @@ _LISTENING_PORTS_COMMAND = (
 )
 # docker ps prints a published block as a range: `0.0.0.0:20040-20049->20040-20049/tcp`
 _PUBLISHED_HOST_PORT_RE = re.compile(r":(\d{1,5})(?:-(\d{1,5}))?->[\d-]+/tcp")
-# dockerd's two bind refusals name the host address the bind was for:
-#   `failed to bind host port for 0.0.0.0:9101:172.17.0.2:22/tcp: address already in use`
-#   `failed to bind host port 0.0.0.0:9030/tcp: address already in use`
-#   `Bind for 0.0.0.0:9101 failed: port is already allocated`
-_BOUND_HOST_PORT_RE = re.compile(
-    r"(?:Bind for|failed to bind host port(?: for)?) (?:\[[0-9a-fA-F:.]{0,45}\]|[0-9.]{1,15}):(\d{1,5})(?![0-9])"
-)
 
 
 class RentalPortCollisionError(RuntimeError):
@@ -478,11 +474,7 @@ def port_collision_error_class(exc: BaseException) -> str | None:
 
 def _bound_host_port_from_error(exc: BaseException) -> int | None:
     """The host port dockerd could not bind, read from its refusal text; None when the text has none."""
-    match = _BOUND_HOST_PORT_RE.search(str(exc))
-    if match is None:
-        return None
-    port = int(match.group(1))
-    return port if 0 < port <= 65535 else None
+    return bound_host_port(str(exc))
 
 
 def _spare_port_pairs(
@@ -583,6 +575,16 @@ _DOCKER_VOLUME_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 # below it the renter is short-changed, so the create fails and the backend's rent retry moves the pod to another node
 RENTAL_VOLUME_MIN_SHARE_OF_ORDER = 0.95
 RENTAL_DISK_SHORT_STEP = "rental_disk_short"
+# The fail-closed host reads, named apart from the old `host_pid_max`/`host_ram_kib`/`host_gpu_count` steps: those also
+# failed when an early probe held a one-session sshd, so the backend counts only these as the node's own miss
+# (review on lium-platform#3256).
+HOST_READ_PID_MAX_STEP = "host_read_pid_max"
+HOST_READ_RAM_KIB_STEP = "host_read_ram_kib"
+HOST_READ_GPU_COUNT_STEP = "host_read_gpu_count"
+# the host memory guard that ends the host reads; its step only names a channel it may still hold
+HOST_MEMORY_GUARD_STEP = "host_memory_guard"
+# each fail-closed host read, on the validator side: its open, then its command
+_HOST_READ_TIMEOUT_SECONDS = 15
 # DAH-5260: `docker volume rm` of the 1561 GB kimi-k3 cache unlinks ~1.5 TB; ext4 frees ~180 GB/s of
 # extents (22 GB in 0.12 s measured), so ~10 s. The bound only stops a wedged dockerd holding the create.
 CACHE_VOLUME_REMOVE_TIMEOUT_SECONDS = 600
@@ -1311,11 +1313,21 @@ def sysbox_many_layers_sentence(exc: Exception) -> str | None:
     return None
 
 
+# flatten_wait: the backend tells the renter to wait only on the lock timeout; any other failure (the command
+# crashing, the SSH link dropping) is the node failing the step, so the renter is told to pick another node
+FLATTEN_LOCK_TIMEOUT_STEP_DETAIL = "an image copy on the node held its disk lock past the wait"
+FLATTEN_WAIT_FAILED_STEP_DETAIL = "the node failed the disk lock wait"
+
+
 def failure_step_detail(exc: BaseException, current_step: str | None) -> str | None:
-    """Volume steps return the daemon reason via volume_step_detail. Other steps return
-    DEAD_DOCKER_SSH_SESSION_HINT on a dead Docker SSH session, else None."""
+    """Volume steps return the daemon reason via volume_step_detail; flatten_wait says whether its lock timed out.
+    Other steps return DEAD_DOCKER_SSH_SESSION_HINT on a dead Docker SSH session, else None."""
     if current_step in VOLUME_STEP_NAMES:
         return volume_step_detail(exc)
+    if current_step == "flatten_wait":
+        if isinstance(exc, FlattenLockTimedOut):
+            return FLATTEN_LOCK_TIMEOUT_STEP_DETAIL
+        return FLATTEN_WAIT_FAILED_STEP_DETAIL
     if isinstance(exc, CustomBuildFailed):
         return None
     if _is_dead_docker_ssh_session(exc):
@@ -1885,9 +1897,12 @@ def _layer_data_check(
         '$0 == "diff-failed" {f=1} ($1 == "A" || $1 == "C") && index(substr($0, 3), p) == 1 {k=1} '
         f'END {{if (!f && !k) print "{_DROP_MARK}"}}'
     )
+    # A readable upper dir decides either way: docker diff walks the whole layer (minutes on a DinD pod) and holds the
+    # container meanwhile, so the next docker inspect of the park timed out too and every reboot of the pod failed
     shortcut = (
-        f"{_layer_upper_scope(name, plaintext_path, upper_dir)} && [ -d \"$x\" ] "
-        "&& f=$(find \"$x\" -mindepth 1 \\( -type f -o -type l \\) $w -print -quit 2>/dev/null) && [ -z \"$f\" ] && { echo " + _DROP_MARK + "; exit 0; }; "
+        f"{_layer_upper_scope(name, plaintext_path, upper_dir)} && {{ [ -d \"$x\" ] || {{ echo {_DROP_MARK}; exit 0; }}; "
+        "f=$(find \"$x\" -mindepth 1 \\( -type f -o -type l \\) $w -print -quit 2>/dev/null) "
+        "&& { [ -n \"$f\" ] || echo " + _DROP_MARK + "; exit 0; }; }; "
     )
     return (
         f"m=$(/usr/bin/docker inspect -f '{{{{range .Mounts}}}}{{{{println .Destination}}}}{{{{end}}}}' {name}) || exit 1; "
@@ -1906,13 +1921,25 @@ def _layer_upper_scope(name: str, plaintext_path: str, upper_dir: str | None) ->
         "awk '$5 == \"/\" {for (i = 7; i < NF; i++) if ($i == \"-\") {n = split($(i + 3), o, \",\"); "
         "for (j = 1; j <= n; j++) if (o[j] ~ /^upperdir=/) print substr(o[j], 10); exit}}' \"/proc/$p/mountinfo\""
     )
+    # a sysbox (DinD) pod on the containerd store shows its root as a bind mount with no upperdir: the host's mount
+    # table holds the overlay the store mounted for its rootfs, at a mount point named after the container's full id
+    host_mount_upper = (
+        "[ -n \"$k\" ] && "
+        "awk -v k=\"/$k\" 'substr($5, length($5) - length(k) + 1) == k {for (i = 7; i < NF; i++) if ($i == \"-\") "
+        "{n = split($(i + 3), o, \",\"); for (j = 1; j <= n; j++) if (o[j] ~ /^upperdir=/) {print substr(o[j], 10); "
+        "exit}}}' /proc/1/mountinfo"
+    )
     given = f"u={shlex.quote(upper_dir)}; d=$(v \"$u\")" if upper_dir else "false"
     return (
         'v() { [ -n "$1" ] || return 1; [ -d "/proc/1/root$1" ] && { echo "/proc/1/root$1"; return 0; }; '
         '[ -d "$1" ] && echo "$1"; }; '
-        f"c=$(/usr/bin/docker inspect -f '{{{{.State.Pid}}}} {{{{.GraphDriver.Data.UpperDir}}}}' {name} 2>/dev/null) "
-        f"&& p=\"${{c%% *}}\" && u=\"${{c#* }}\" "
-        f"&& {{ d=$(v \"$u\") || {{ u=$({root_mount_upper} 2>/dev/null) && d=$(v \"$u\"); }} || {{ {given}; }}; }} "
+        f"c=$(/usr/bin/docker inspect -f '{{{{.State.Pid}}}} {{{{.Id}}}}' {name} 2>/dev/null) "
+        f"&& p=\"${{c%% *}}\" && k=\"${{c#* }}\" "
+        # Docker 29's default API omits GraphDriver and a template naming it fails: read it on its own, may be empty
+        f"&& {{ u=$(/usr/bin/docker inspect -f '{{{{with .GraphDriver}}}}{{{{.Data.UpperDir}}}}{{{{end}}}}' {name} "
+        "2>/dev/null) || u=; } "
+        f"&& {{ d=$(v \"$u\") || {{ u=$({root_mount_upper} 2>/dev/null) && d=$(v \"$u\"); }} "
+        f"|| {{ u=$({host_mount_upper} 2>/dev/null) && d=$(v \"$u\"); }} || {{ {given}; }}; }} "
         f"&& echo \"upper $u\" && x=\"$d\"{upper_under} "
         # one window per recorded start, cut short by a later start of Docker's own: its files are the renter's
         f"&& {{ i=$(/usr/bin/docker inspect -f '{{{{.Id}}}} {{{{.State.StartedAt}}}}' {name} 2>/dev/null); "
@@ -2110,12 +2137,18 @@ class _EditSwap:
         for leftover in list(kept):
             # every edit parks under the kept name, so a clean one is an earlier edit's copy whose removal failed
             if await self._layer_safe_to_remove(ids_by_name.get(leftover) or leftover, already_kept=True):
-                removed = await self._run(f"/usr/bin/docker rm -fv {shlex.quote(ids_by_name.get(leftover) or leftover)}")
-                if removed.exit_status != 0:
-                    # a clean copy Docker will not remove: parking another under a new name would pile them up
-                    raise Exception(
-                        f"[park_current_container] a clean container from an earlier edit ({leftover}) could not be "
-                        f"removed: {(removed.stderr or '').strip() or f'exit {removed.exit_status}'}; the pod was left as it was"
+                # Detached: removing a DinD pod's layer outlasts the command timeout (exit 124 failed every reboot of the
+                # pod, 19 Nov), and this park takes a new kept name, so nothing waits on it. A copy Docker still refuses
+                # is listed and removed again by the next edit, and by the pod's delete.
+                started = await self._run(
+                    f"nohup /usr/bin/docker rm -fv {shlex.quote(ids_by_name.get(leftover) or leftover)} >/dev/null 2>&1 &"
+                )
+                if started.exit_status != 0:
+                    logger.warning(
+                        _m(
+                            "Removal of a clean container from an earlier edit could not be started; the next edit retries",
+                            extra=get_extra_info({**self.default_extra, "leftover": leftover, "exit": started.exit_status}),
+                        )
                     )
                 kept.remove(leftover)
         # the layer, not the current mount state: a copy written unmounted and since remounted is still kept.
@@ -2329,7 +2362,7 @@ class _EditSwap:
                 if removed.exit_status != 0:
                     logger.warning(
                         _m(
-                            "Parked container could not be removed after edit; the next edit removes it or stops",
+                            "Parked container could not be removed after edit; the next edit removes it",
                             extra=get_extra_info({**self.default_extra, "parked": self.parked_name, "error": (removed.stderr or "").strip()}),
                         )
                     )
@@ -2977,6 +3010,15 @@ def _half_started_stop_slot(executor_info: ExecutorSSHInfo, pod_id: str) -> str:
     return f"{executor_info.uuid}:{pod_id}"
 
 
+# job_batch_id -> the cycle's one read of the executors with a pending half-started stop (the last few cycles: the
+# wave and the express lane's runs overlap)
+_HALF_STARTED_STOP_EXECUTORS_READS: dict[str, asyncio.Future] = {}
+_HALF_STARTED_STOP_EXECUTORS_READS_KEPT = 4
+# this process's one backfill of the pending set from the indexes (records an earlier release wrote without a set
+# entry); redone only after a failure
+_HALF_STARTED_STOP_BACKFILL: asyncio.Future | None = None
+
+
 def _half_started_stop_field(pod_id: str, container_id: str) -> str:
     """One record (and one background retry) per container: a start of another container of the pod neither ends nor
     replaces it."""
@@ -3182,6 +3224,10 @@ async def recovery_parked(pod_id: str) -> bool | None:
     if await _unmarked_recovery_stop_known(pod_id):
         return True
     return False if _UNMARKED_RECOVERY_STOPS_LOADED else None
+
+
+# failed-bootstrap diagnostics in flight, held so they are not collected before they log
+_BOOTSTRAP_DIAGNOSTICS: set[asyncio.Task] = set()
 
 
 def _retry_recovery_mark_in_background(
@@ -3906,7 +3952,6 @@ class DockerService:
                 flatten_lease=flatten_lease,
                 pod_id=pod_id,
             )
-            await apply_host_memory_guard(ssh_client, default_extra)
             return container_id
         finally:
             for lease in flatten_lease:
@@ -4571,7 +4616,7 @@ class DockerService:
             ulimits=self._memlock_ulimit_for(devices, memory_gb),
             devices=devices,
             device_requests=gpu_devices.device_requests,
-            cpu_count=cpu_count,
+            cpu_count=self._rental_cpu_count(cpu_count),
             memory_gb=memory_gb,
             memory_swap_gb=memory_gb if swap_off else None,
             oom_score_adj=settings.RENTAL_CONTAINER_OOM_SCORE_ADJ if swap_off else None,
@@ -4582,6 +4627,9 @@ class DockerService:
             ),
             pids_limit=self._rental_pids_limit(cpu_count, host_pid_max),
             shm_size=custom_options.shm_size,
+            # Docker's json-file log is unbounded by default and sits outside --storage-opt, so a
+            # pod printing to stdout could fill the host disk under the Docker root
+            log_opts={"max-size": settings.RENTAL_LOG_MAX_SIZE, "max-file": str(settings.RENTAL_LOG_MAX_FILE)},
             entrypoint=custom_options.entrypoint,
             network=RENTAL_NETWORK_NAME,
             labels={LIUM_POD_ID_LABEL: payload.pod_id},
@@ -4686,14 +4734,14 @@ class DockerService:
 
         Lets `_rental_pids_limit` keep the rental container's pids cap below the host's global PID
         ceiling so a tenant fork bomb cannot starve sshd/dockerd on a low-pid_max host. Bounded:
-        the caller refuses the rental on a miss. The read is a bare `cat` of a /proc file bounded by asyncssh's own
-        `timeout`; it deliberately does not shell out to `timeout`, whose absence would otherwise
-        turn into a miss and fail the read.
+        the caller refuses the rental on a miss. The read is a bare `cat` of a /proc file bounded on the validator
+        side; it deliberately does not shell out to `timeout`, whose absence would otherwise turn into a miss and
+        fail the read. A timed-out read closes its channel before it returns, so the host's only SSH session
+        (MaxSessions=1) is free for the next command; when that close is not confirmed it raises
+        SshSessionMayStillBeTakenError and the create stops before any host side effect (review on lium-io#2364).
         """
         try:
-            res = await ssh_client.run(
-                "cat /proc/sys/kernel/pid_max", check=False, timeout=15
-            )
+            res = await _run_closing_channel_on_timeout(ssh_client, "cat /proc/sys/kernel/pid_max", _HOST_READ_TIMEOUT_SECONDS)
         except (asyncssh.Error, asyncio.TimeoutError, OSError) as e:
             why = f"read failed: {type(e).__name__}"
         else:
@@ -4711,10 +4759,23 @@ class DockerService:
         logger.warning(_m(f"Host kernel.pid_max could not be read: {why}"))
         return None
 
+    @staticmethod
+    def _rental_cpu_count(cpu_count: int | None) -> int | None:
+        """The rental's --cpus: exactly the count the backend sent for this pod (DAH-5951).
+
+        The backend is the one source: it holds the host's reserved core back (rentable_cpu_count) before it
+        lists the node and before it sizes the pod, so the listing and the pod cannot disagree. A count
+        above the host's CPUs is refused by Docker at create, so a malformed count fails the rental closed.
+        No per-pod cap (None: the validator's own probe pod, a legacy row) stays uncapped, as before."""
+        if cpu_count is None:
+            return None
+        # a 1-GPU slice of a small host rounds down to 0 cores, and 0 means no --cpus (the whole host)
+        return max(cpu_count, 1)
+
     async def _read_host_ram_kib(self, ssh_client) -> int | None:
         """The executor host's MemTotal in KiB, or None when unreadable. Same bounded read as pid_max."""
         try:
-            res = await ssh_client.run("cat /proc/meminfo", check=False, timeout=15)
+            res = await _run_closing_channel_on_timeout(ssh_client, "cat /proc/meminfo", _HOST_READ_TIMEOUT_SECONDS)
         except (asyncssh.Error, asyncio.TimeoutError, OSError):
             return None
         if getattr(res, "exit_status", 1) != 0:
@@ -4736,8 +4797,8 @@ class DockerService:
         share of host RAM; the caller refuses the rental on a miss so the fallback is never larger than
         the renter's share of the host."""
         try:
-            res = await ssh_client.run(
-                "ls -1d /dev/nvidia[0-9]* 2>/dev/null | wc -l", check=False, timeout=15
+            res = await _run_closing_channel_on_timeout(
+                ssh_client, "ls -1d /dev/nvidia[0-9]* 2>/dev/null | wc -l", _HOST_READ_TIMEOUT_SECONDS
             )
         except (asyncssh.Error, asyncio.TimeoutError, OSError):
             return None
@@ -5011,8 +5072,7 @@ class DockerService:
     ) -> asyncssh.SSHKnownHosts | None:
         """Single chokepoint for every rental-path SSH host-key policy.
 
-        N3 (CVM attestation gap remediation): with ENABLE_RENTAL_HOSTKEY_FAIL_CLOSED
-        an unexpected error here fails closed — no host-key policy means no rental
+        N3 (CVM attestation gap remediation): an unexpected error here fails closed — no host-key policy means no rental
         SSH — instead of silently falling back to unpinned SSH. Rental-path
         freshness rides the most recent validation-cycle attestation; no nonce is
         minted here by design.
@@ -5025,24 +5085,16 @@ class DockerService:
         except AttestationError:
             raise
         except Exception as exc:
-            if settings.ENABLE_RENTAL_HOSTKEY_FAIL_CLOSED:
-                logger.warning(
-                    _m(
-                        "Unable to prepare known_hosts policy — failing closed (no rental SSH)",
-                        extra=get_extra_info({**log_context, "error": str(exc)}),
-                    )
-                )
-                raise AttestationError(
-                    f"Unable to prepare host-key policy for executor "
-                    f"{executor.address}:{executor.port}; refusing unpinned rental SSH"
-                ) from exc
             logger.warning(
                 _m(
-                    "Unable to prepare known_hosts policy",
+                    "Unable to prepare known_hosts policy — failing closed (no rental SSH)",
                     extra=get_extra_info({**log_context, "error": str(exc)}),
                 )
             )
-            return None
+            raise AttestationError(
+                f"Unable to prepare host-key policy for executor "
+                f"{executor.address}:{executor.port}; refusing unpinned rental SSH"
+            ) from exc
 
     async def _skip_probe_held_ports(self, executor_id: str, available_ports: dict, required_port_count: int) -> dict:
         """The backend's free ports less those a running port check holds, unless too few would be left."""
@@ -7228,9 +7280,10 @@ class DockerService:
         try:
             # Bounded like the nvidia-smi query it carries (a hung driver must not stall the rent);
             # asyncio.TimeoutError lands in the except below → None → the per-command path.
-            result = await ssh_client.run(command, check=False, timeout=_PRERUN_HOST_PROBE_TIMEOUT_SECONDS)
+            result = await _run_closing_channel_on_timeout(ssh_client, command, _PRERUN_HOST_PROBE_TIMEOUT_SECONDS)
             probe = parse_prerun_host_probe(result.stdout or "", with_power=with_power, with_label=with_label)
-        except asyncio.CancelledError:
+        except (asyncio.CancelledError, SshSessionMayStillBeTakenError):
+            # a channel that may still hold the host's only session stops the create
             raise
         except Exception as exc:
             logger.warning(
@@ -9940,10 +9993,14 @@ class DockerService:
         ssh_client: asyncssh.SSHClientConnection,
         payload: ContainerCreateRequest,
         default_extra: dict,
+        settle_early_probes: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         """Tear this create down when its own delete has already reported the pod gone (DAH-2728)."""
         if not inflight_creates.is_cancelled(payload.pod_id):
             return
+        if settle_early_probes is not None:
+            # the cleanup's commands need the session a started early probe may hold (MaxSessions=1)
+            await settle_early_probes()
 
         container_name = self.get_container_name(payload)
         logger.warning(
@@ -9977,6 +10034,7 @@ class DockerService:
         default_extra: dict,
         step: Awaitable[Any],
         on_cancel: Callable[[], Awaitable[Any]] | None = None,
+        settle_early_probes: Callable[[], Awaitable[None]] | None = None,
     ) -> Any:
         """Run a long create step (image pull, custom build, its export), but stop it as soon as this
         pod's delete cancels the create.
@@ -10003,7 +10061,7 @@ class DockerService:
                 with contextlib.suppress(Exception):
                     await on_cancel()
             await asyncio.wait({step_task})
-            await self._abort_if_cancelled_by_delete(ssh_client, payload, default_extra)
+            await self._abort_if_cancelled_by_delete(ssh_client, payload, default_extra, settle_early_probes)
         return await step_task
 
     def _explain_container_killed_during_bootstrap(
@@ -10561,31 +10619,105 @@ class DockerService:
                         )
                     )
 
+            host_limits_read: asyncio.Task[tuple[int | None, int | None, int | None]] | None = None
+            # set once the first delete check passed: a create cancelled before it cleans up with no probe started
+            first_delete_check_passed = asyncio.Event()
+
+            def pid_max_refused(host_pid_max: int | None) -> bool:
+                return settings.RENTAL_PIDS_LIMIT_PER_CPU > 0 and (
+                    host_pid_max is None
+                    or host_pid_max - settings.RENTAL_PIDS_LIMIT_HOST_MARGIN < _MIN_RENTAL_PIDS_LIMIT
+                )
+
+            host_read_step = HOST_READ_PID_MAX_STEP  # the read in progress, named if its channel stays taken
+
+            async def read_host_limits(
+                connected_ssh_client: asyncssh.SSHClientConnection,
+            ) -> tuple[int | None, int | None, int | None]:
+                nonlocal host_read_step
+                # one after another on the session; the GPU count only sizes a split rental's share of the RAM read
+                pid_max = await self._read_host_pid_max(connected_ssh_client)
+                if pid_max_refused(pid_max):
+                    # the create refuses at the PID guard anyway: open no further channel a stalled host may never grant
+                    return pid_max, None, None
+                host_read_step = HOST_READ_RAM_KIB_STEP
+                ram_kib = await self._read_host_ram_kib(connected_ssh_client)
+                gpu_count = None
+                if ram_kib is not None and payload.gpu_uuids:
+                    host_read_step = HOST_READ_GPU_COUNT_STEP
+                    gpu_count = await self._read_host_gpu_count(connected_ssh_client)
+                # DAH-6379/6916: host-level MemoryMin before any container of this create starts, so a new pod
+                # cannot starve the host services during its readiness wait. Here it overlaps the Docker connect
+                # and, on this session's serial channel, no other step. Logs what it could not apply; a timed-out
+                # guard frees its channel like the reads, and one whose close is not confirmed stops the create
+                host_read_step = HOST_MEMORY_GUARD_STEP
+                await apply_host_memory_guard(
+                    connected_ssh_client,
+                    default_extra,
+                    run=lambda script: _run_closing_channel_on_timeout(
+                        connected_ssh_client, script, HOST_MEMORY_GUARD_TIMEOUT_SECONDS
+                    ),
+                    reraise=(SshSessionMayStillBeTakenError,),
+                )
+                return pid_max, ram_kib, gpu_count
+
+            async def after_host_limits_read(
+                probe: Callable[[], Awaitable[AnswerWithOwnDuration]],
+            ) -> AnswerWithOwnDuration:
+                assert host_limits_read is not None
+                # waiting does not cancel the shared reads when this probe is cancelled
+                await asyncio.wait([host_limits_read])
+                if host_limits_read.cancelled() or host_limits_read.exception() is not None:
+                    # the create fails at the reads' own step; the probes only run after reads that succeeded
+                    raise asyncio.CancelledError
+                await first_delete_check_passed.wait()
+                return await probe()
+
+            async def settle_early_probes() -> None:
+                # wait, never cancel: a started probe frees its channel, or reports the session taken, only as it ends
+                started = [task for task in (early_host_probe, early_volume_probe) if task is not None]
+                if started:
+                    await asyncio.wait(started)
+                for task in started:
+                    if not task.cancelled() and isinstance(task.exception(), SshSessionMayStillBeTakenError):
+                        # no cleanup command and no power restore on a session the probe may still hold
+                        raise task.exception()
+
             def start_early_probes(connected_ssh_client: asyncssh.SSHClientConnection) -> None:
-                nonlocal early_host_probe, early_volume_probe
+                nonlocal early_host_probe, early_volume_probe, host_limits_read
+                # The fail-closed host reads run first and the early probes only once they end: on an sshd with
+                # MaxSessions=1 a probe holding the session refused the read's channel, and the create failed as the
+                # node's own miss (review on lium-platform#3256). Started here, the reads still overlap the Docker
+                # connect, and the probes start a few short reads later.
+                host_limits_read = asyncio.create_task(read_host_limits(connected_ssh_client))
+                connections.callback(host_limits_read.cancel)
                 if not early_probes_allowed:
                     return
                 early_host_probe = asyncio.create_task(
-                    _with_own_duration(
-                        self.probe_prerun_host(
-                            connected_ssh_client,
-                            docker_image=payload.docker_image,
-                            with_power=probe_with_power,
-                            miner_hotkey=payload.miner_hotkey,
-                            log_extra=default_extra,
-                            with_label=probe_with_label,
-                        ),
-                        ProfilerStepName.PRERUN_HOST_PROBE_PARALLEL,
+                    after_host_limits_read(
+                        lambda: _with_own_duration(
+                            self.probe_prerun_host(
+                                connected_ssh_client,
+                                docker_image=payload.docker_image,
+                                with_power=probe_with_power,
+                                miner_hotkey=payload.miner_hotkey,
+                                log_extra=default_extra,
+                                with_label=probe_with_label,
+                            ),
+                            ProfilerStepName.PRERUN_HOST_PROBE_PARALLEL,
+                        )
                     )
                 )
                 connections.callback(early_host_probe.cancel)
                 if wants_volume_probe:
                     early_volume_probe = asyncio.create_task(
-                        _with_own_duration(
-                            self.probe_volume_host(
-                                connected_ssh_client, with_df=measures_host, log_extra=default_extra
-                            ),
-                            ProfilerStepName.VOLUME_HOST_PROBE_PARALLEL,
+                        after_host_limits_read(
+                            lambda: _with_own_duration(
+                                self.probe_volume_host(
+                                    connected_ssh_client, with_df=measures_host, log_extra=default_extra
+                                ),
+                                ProfilerStepName.VOLUME_HOST_PROBE_PARALLEL,
+                            )
                         )
                     )
                     connections.callback(early_volume_probe.cancel)
@@ -10644,9 +10776,21 @@ class DockerService:
                 profilers.append(ProfilerStep.since(ProfilerStepName.SSH_CONNECTION_ESTABLISHED, prev_timestamp))
                 prev_timestamp = now_ms()
 
+                # The bounded host reads end, each with its channel closed, before anything else uses this
+                # session: on an sshd with MaxSessions=1 a cancelled filler's cleanup below would otherwise get no
+                # channel, leave the filler running and then lift its power cap (review on lium-io#2364). A read
+                # whose channel close is not confirmed stops the create here, before any host side effect.
+                assert host_limits_read is not None  # started as soon as the SSH session was up
+                try:
+                    host_pid_max, host_ram_kib, read_host_gpu_count = await host_limits_read
+                except SshSessionMayStillBeTakenError:
+                    current_step = host_read_step
+                    raise
+
                 # DAH-2728: cheapest place to notice the delete — the image pull/build below is
                 # where a cancelled create spends its minutes, and nothing is on the host yet.
                 await self._abort_if_cancelled_by_delete(ssh_client, payload, default_extra)
+                first_delete_check_passed.set()
 
                 # Read the host's real limits and decide fail-closed BEFORE any host side-effect —
                 # the edit-swap park, the stale-container/filler cleanup (an irreversible rm), the
@@ -10659,9 +10803,8 @@ class DockerService:
                 # even the floored cgroup cap would not reserve RENTAL_PIDS_LIMIT_HOST_MARGIN for the
                 # host's own tasks. No fixed fallback is safe on a host whose real pid_max is lower, so
                 # a tenant fork bomb would starve sshd/dockerd and take the executor offline mid-rental.
-                host_pid_max = await self._read_host_pid_max(ssh_client)
                 if settings.RENTAL_PIDS_LIMIT_PER_CPU > 0:
-                    current_step = "host_pid_max"
+                    current_step = HOST_READ_PID_MAX_STEP
                     if host_pid_max is None:
                         raise RuntimeError(
                             "host kernel.pid_max could not be read; refusing to start a rental without a safe pids limit"
@@ -10679,8 +10822,7 @@ class DockerService:
                 # rental sent without a memory limit", not "legacy" — a miss refuses: under host
                 # contention, the exact condition that delays this SSH probe, an unlimited rental lets
                 # the renter exhaust host RAM and OOM the executor/sshd.
-                current_step = "host_ram_kib"
-                host_ram_kib = await self._read_host_ram_kib(ssh_client)
+                current_step = HOST_READ_RAM_KIB_STEP
                 rental_gpu_share = 1.0
                 if not payload.memory_gb and host_ram_kib is None:
                     raise RuntimeError(
@@ -10692,8 +10834,8 @@ class DockerService:
                 # rentals keep share 1.0. A miss refuses a limitless rental; a sent limit keeps the
                 # host-wide clamp.
                 if host_ram_kib is not None and payload.gpu_uuids:
-                    current_step = "host_gpu_count"
-                    host_gpu_count = await self._read_host_gpu_count(ssh_client)
+                    current_step = HOST_READ_GPU_COUNT_STEP
+                    host_gpu_count = read_host_gpu_count
                     if host_gpu_count and len(payload.gpu_uuids) <= host_gpu_count:
                         rental_gpu_share = len(payload.gpu_uuids) / host_gpu_count
                     elif not payload.memory_gb:
@@ -10701,22 +10843,6 @@ class DockerService:
                             "host GPU count could not be read or is below the rented GPU count; "
                             "refusing to start a split rental sent without a memory limit"
                         )
-
-                # DAH-3980 overlaps the filler's irreversible rm with the image inspect/pull. It must not
-                # precede the fail-closed reads above: a probe that then refused (a transient /proc read, or
-                # MaxSessions=1 denying its channel while the removal held the session) would reject the rental
-                # after the filler was already gone, stranding the host. So the removal starts only now, once the
-                # host reads have succeeded, and still runs beside the image inspect/pull below.
-                if removes_fillers_at_ssh_connect:
-                    filler_removal_at_ssh_connect = asyncio.create_task(
-                        self.remove_fillers_at_ssh_connect(
-                            ssh_client,
-                            default_extra,
-                            self.get_container_name(payload),
-                            payload.active_volume_names,
-                        )
-                    )
-                    connections.push_async_callback(settle_filler_removal_at_ssh_connect)
 
                 # No logout counterpart below: the SDK login is a POST /auth to the executor's
                 # Docker daemon and the credential stays in this validator's client, so nothing is
@@ -10801,6 +10927,27 @@ class DockerService:
                             )
                     profilers.append(ProfilerStep.since(ProfilerStepName.DOCKER_IMAGE_INSPECT, prev_timestamp))
                     prev_timestamp = now_ms()
+
+                # DAH-3980 overlaps the filler's irreversible rm with the rest of the create. The rm starts only once
+                # every probe that can still fail the create has passed: the fail-closed host reads above, and the
+                # prerun probe. With the image present the early probe is that probe (settled below); a pull re-runs
+                # the probe afterwards, so a create that pulls leaves the fillers to the cleanup step after it.
+                # Otherwise a refused probe would reject the rental with the filler already gone (review on
+                # lium-io#2364).
+                if removes_fillers_at_ssh_connect and image_present:
+                    current_step = "prerun_host_probe"
+                    await settle_early_probes()
+                    # the wait above can outlast the first check: a delete that arrived meanwhile keeps the filler
+                    await self._abort_if_cancelled_by_delete(ssh_client, payload, default_extra)
+                    filler_removal_at_ssh_connect = asyncio.create_task(
+                        self.remove_fillers_at_ssh_connect(
+                            ssh_client,
+                            default_extra,
+                            self.get_container_name(payload),
+                            payload.active_volume_names,
+                        )
+                    )
+                    connections.push_async_callback(settle_filler_removal_at_ssh_connect)
 
                 skip_login = not has_credentials or image_present
                 if skip_login:
@@ -10926,6 +11073,7 @@ class DockerService:
                                     image=payload.docker_image,
                                 ),
                                 on_cancel=lambda: docker_client.aclose(),
+                                settle_early_probes=settle_early_probes,
                             )
                         except _CreateCancelledByDelete:
                             raise
@@ -11015,6 +11163,39 @@ class DockerService:
                     "LIUM_VOLUME_PATH": local_volume_path,
                 }
 
+                # DAH-3257: one SSH command reads every host listing the steps down to `docker run`
+                # need (containers, volumes, mounted volumes, GPU minor map, device nodes, power
+                # state, the image's encryption label). Each consumer takes the probe in place of
+                # its own listing command; every removal and write below still runs as before.
+                # None (the probe failed) leaves every consumer on its own commands. It runs before an edit
+                # parks the current container: a probe that stops the create (its channel may still hold the
+                # host's only session) then leaves that container running, with nothing to undo.
+                host_probe: PrerunHostProbe | None = None
+                current_step = "prerun_host_probe"
+                if early_host_probe is not None and image_present:
+                    host_probe, early_host_probe_step = await early_host_probe
+                    profilers.append(early_host_probe_step)
+                else:
+                    # a pull discards the early probe; on a one-session host it may still hold the channel, so it
+                    # ends (or stops the create on an unconfirmed close) before this probe opens another
+                    await settle_early_probes()
+                    host_probe = await self.probe_prerun_host(
+                        ssh_client,
+                        docker_image=payload.docker_image,
+                        # A PEARL filler caps its GPUs with live nvidia-smi queries of its own
+                        # (apply_filler_gpu_power_limits) and never reads the probe's power state.
+                        with_power=probe_with_power,
+                        miner_hotkey=payload.miner_hotkey,
+                        log_extra=default_extra,
+                        with_label=probe_with_label,
+                    )
+                # The probe is a snapshot. Once a step below removes a container or a volume, the
+                # container/volume listings are stale (a removed volume would still read as present,
+                # a removed container as still mounting its volume), so the later sweeps go back to
+                # their own commands. The GPU, power and image-label sections are unaffected by a
+                # docker removal and stay in use.
+                docker_listing_probe: PrerunHostProbe | None = host_probe
+
                 container_name = self.get_container_name(payload)
                 created_local_volume = False
                 protected_volume_names = set(payload.active_volume_names or [])
@@ -11052,7 +11233,7 @@ class DockerService:
                             )
                         )
                     # a delete that landed during the wait must find the pod as it was, not parked
-                    await self._abort_if_cancelled_by_delete(ssh_client, payload, default_extra)
+                    await self._abort_if_cancelled_by_delete(ssh_client, payload, default_extra, settle_early_probes)
                     try:
                         parked_name = await edit_swap.park()
                     except _UnkillableParkedContainer:
@@ -11061,35 +11242,11 @@ class DockerService:
                         raise
                     if parked_name:
                         protected_container_names.append(parked_name)
+                    # the park, and the earlier edit's removals waited for above, changed the container listing
+                    docker_listing_probe = None
 
-                # DAH-3257: one SSH command reads every host listing the steps down to `docker run`
-                # need (containers, volumes, mounted volumes, GPU minor map, device nodes, power
-                # state, the image's encryption label). Each consumer takes the probe in place of
-                # its own listing command; every removal and write below still runs as before.
-                # None (the probe failed) leaves every consumer on its own commands.
-                host_probe: PrerunHostProbe | None = None
-                current_step = "prerun_host_probe"
-                if early_host_probe is not None and image_present:
-                    host_probe, early_host_probe_step = await early_host_probe
-                    profilers.append(early_host_probe_step)
-                else:
-                    host_probe = await self.probe_prerun_host(
-                        ssh_client,
-                        docker_image=payload.docker_image,
-                        # A PEARL filler caps its GPUs with live nvidia-smi queries of its own
-                        # (apply_filler_gpu_power_limits) and never reads the probe's power state.
-                        with_power=probe_with_power,
-                        miner_hotkey=payload.miner_hotkey,
-                        log_extra=default_extra,
-                        with_label=probe_with_label,
-                    )
-                # The probe is a snapshot. Once a step below removes a container or a volume, the
-                # container/volume listings are stale (a removed volume would still read as present,
-                # a removed container as still mounting its volume), so the later sweeps go back to
-                # their own commands. The GPU, power and image-label sections are unaffected by a
-                # docker removal and stay in use.
-                docker_listing_probe: PrerunHostProbe | None = host_probe
-
+                # the cleanup is irreversible: a delete that landed during the probes or the park stops the create here
+                await self._abort_if_cancelled_by_delete(ssh_client, payload, default_extra, settle_early_probes)
                 current_step = "container_cleanup"
                 # DAH-1524: the GC below (force-removing stale pod_/filler_
                 # containers + their volumes that aren't in active_*) stays on the
@@ -11699,7 +11856,7 @@ class DockerService:
                     await self._reset_leftover_clock_locks_before_create(ssh_client, payload, default_extra)
                     current_step = "docker_run"
                     # DAH-2728: last look before the host ports get bound.
-                    await self._abort_if_cancelled_by_delete(ssh_client, payload, default_extra)
+                    await self._abort_if_cancelled_by_delete(ssh_client, payload, default_extra, settle_early_probes)
                     await self.stream_log("Creating docker container", "success", log_tag)
                     # No await between this check and the hand-off to the Docker thread, which checks
                     # again right before the create: a customer create may register while the run
@@ -11736,7 +11893,7 @@ class DockerService:
                             else None
                         ),
                         before_flatten_retry=lambda: self._abort_if_cancelled_by_delete(
-                            ssh_client, payload, default_extra
+                            ssh_client, payload, default_extra, settle_early_probes
                         ),
                         flatten_beside_other_create=lambda: customer_creates.others_running(payload),
                     )
@@ -12142,7 +12299,7 @@ class DockerService:
 
                     # DAH-2728: last call before the pod is cached as rented — a delete that landed
                     # during the run or the bootstrap above is holding ports it could not see.
-                    await self._abort_if_cancelled_by_delete(ssh_client, payload, default_extra)
+                    await self._abort_if_cancelled_by_delete(ssh_client, payload, default_extra, settle_early_probes)
 
                     current_step = "finalize"
                     await self._cache_rented_pod_best_effort(
@@ -12199,7 +12356,7 @@ class DockerService:
                         # Our own delete (cancel-on-delete) is the first suspect and raises
                         # _CreateCancelledByDelete here; otherwise the failure names the kill
                         # it was, not the exec it broke.
-                        await self._abort_if_cancelled_by_delete(ssh_client, payload, default_extra)
+                        await self._abort_if_cancelled_by_delete(ssh_client, payload, default_extra, settle_early_probes)
                         gone_cause = container_gone_cause(post_run_exc.state)
                         if gone_cause == "exited":
                             # The image's own command ended: not a kill, the step keeps its name.
@@ -13114,10 +13271,10 @@ class DockerService:
         container_name, identity, recorded_at, plaintext_path = recorded
         slot = _half_started_stop_slot(executor_info, pod_id)
         try:
-            # one write: a lost reply leaves the field either set and indexed or absent, never a record the check misses
+            # one MULTI/EXEC with its pending-set entry: both or neither, never a record the check misses
             await asyncio.wait_for(
-                self.redis_service.hset(
-                    f"{HALF_STARTED_STOP_INDEX_PREFIX}{executor_info.uuid}",
+                self.redis_service.mark_half_started_stop(
+                    executor_info.uuid,
                     _half_started_stop_field(pod_id, identity.partition("@")[0]),
                     json.dumps(
                         {
@@ -13144,8 +13301,8 @@ class DockerService:
         slot = _half_started_stop_slot(executor_info, pod_id)
         try:
             await asyncio.wait_for(
-                self.redis_service.hdel(
-                    f"{HALF_STARTED_STOP_INDEX_PREFIX}{executor_info.uuid}", _half_started_stop_field(pod_id, container_id)
+                self.redis_service.forget_half_started_stop(
+                    executor_info.uuid, _half_started_stop_field(pod_id, container_id)
                 ),
                 timeout=_STOPPED_BY_RECOVERY_MARK_TIMEOUT_SEC,
             )
@@ -13370,13 +13527,59 @@ class DockerService:
         await self._forget_half_started_stop(executor_info, pod_id, recorded_id, extra)
         return True
 
+    async def _half_started_stop_executors(self, job_batch_id: str | None) -> frozenset[str] | None:
+        """The executors with a pending half-started stop, read once per cycle (job_batch_id) for all of its node
+        checks; None (every node reads its own index) until this process has backfilled the set, which this starts.
+        Per process, not a stored marker: a record an earlier release wrote (no set entry) before this process started,
+        rollback included, is in the set before the set is trusted."""
+        global _HALF_STARTED_STOP_BACKFILL
+        backfill = _HALF_STARTED_STOP_BACKFILL
+        if backfill is None or (backfill.done() and (backfill.cancelled() or backfill.exception() is not None)):
+            backfill = _HALF_STARTED_STOP_BACKFILL = asyncio.ensure_future(
+                self.redis_service.backfill_half_started_stop_executors()
+            )
+        if not backfill.done():
+            return None
+        read = _HALF_STARTED_STOP_EXECUTORS_READS.get(job_batch_id) if job_batch_id else None
+        if read is None:
+            read = asyncio.ensure_future(
+                asyncio.wait_for(
+                    self.redis_service.half_started_stop_executors(), timeout=_STOPPED_BY_RECOVERY_MARK_TIMEOUT_SEC
+                )
+            )
+            if job_batch_id:
+                _HALF_STARTED_STOP_EXECUTORS_READS[job_batch_id] = read
+                while len(_HALF_STARTED_STOP_EXECUTORS_READS) > _HALF_STARTED_STOP_EXECUTORS_READS_KEPT:
+                    _HALF_STARTED_STOP_EXECUTORS_READS.pop(next(iter(_HALF_STARTED_STOP_EXECUTORS_READS)))
+
+                def drop_failed(done: asyncio.Future) -> None:
+                    # a failed read is not kept for the cycle: the next node check reads again
+                    if (done.cancelled() or done.exception() is not None) and (
+                        _HALF_STARTED_STOP_EXECUTORS_READS.get(job_batch_id) is done
+                    ):
+                        _HALF_STARTED_STOP_EXECUTORS_READS.pop(job_batch_id)
+
+                read.add_done_callback(drop_failed)
+        # shielded: one node check's deadline does not cancel the read the cycle's other checks share
+        return await asyncio.shield(read)
+
     async def retry_pending_half_started_stops(
         self, *, executor_info: ExecutorSSHInfo, private_key: str | None, default_extra: dict[str, Any]
     ) -> None:
         """Retry every pending stop on this executor, whatever the node's current rental: a pod deleted or reassigned
         since its failed start is no longer listed, but its old run may still write without its mount."""
+        flagged = await self._half_started_stop_executors(default_extra.get("job_batch_id"))
+        if flagged is not None and executor_info.uuid not in flagged:
+            return
         index = f"{HALF_STARTED_STOP_INDEX_PREFIX}{executor_info.uuid}"
         pending = await asyncio.wait_for(self.redis_service.hgetall(index), timeout=_STOPPED_BY_RECOVERY_MARK_TIMEOUT_SEC)
+        if flagged is not None and not pending:
+            # a stale entry (its last record dropped while the backfill added it): one read, then it is gone
+            await asyncio.wait_for(
+                self.redis_service.forget_half_started_stop(executor_info.uuid, None),
+                timeout=_STOPPED_BY_RECOVERY_MARK_TIMEOUT_SEC,
+            )
+            return
         # all at once, each under its own pod lock: one slow stop cannot use up the check's budget for the others
         fields = [member.decode() if isinstance(member, bytes) else str(member) for member in pending or {}]
         await asyncio.gather(
@@ -13534,14 +13737,11 @@ class DockerService:
                     timeout=30,
                 )
         if not ssh_bootstrap_ok:
-            logger.warning(
-                _m(
-                    "Docker container started but SSH bootstrap did not complete cleanly",
-                    extra=get_extra_info(
-                        {**default_extra, "container_name": container_name}
-                    ),
-                )
-            )
+            # read off this start's time: the start (and a remount) already took, and a caller's deadline cutting a
+            # slow read would count as a failed start, which stops a remounted pod
+            task = asyncio.create_task(self._log_failed_bootstrap(ssh_client, container_name, default_extra))
+            _BOOTSTRAP_DIAGNOSTICS.add(task)
+            task.add_done_callback(_BOOTSTRAP_DIAGNOSTICS.discard)
         logger.info(
             _m(
                 "Started Docker Container",
@@ -14295,17 +14495,37 @@ class DockerService:
         ]
         return repaired[0] if repaired else None
 
+    async def _log_failed_bootstrap(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        container_name: str,
+        default_extra: dict[str, Any],
+    ) -> None:
+        # a bootstrap killed under us (exit 137) is most often the container itself dying or restarting: its
+        # State and restart count are the only record of why, the host being the provider's. Not its log tail: the
+        # renter's workload keeps running and whatever it prints is the renter's, not the validator log's
+        diagnostics = await self._bounded_death_diagnostics(ssh_client, container_name, read_logs=False)
+        logger.warning(
+            _m(
+                "Docker container started but SSH bootstrap did not complete cleanly",
+                extra=get_extra_info(
+                    {**default_extra, "container_name": container_name, **diagnostics.to_log_fields()}
+                ),
+            )
+        )
+
     async def _bounded_death_diagnostics(
         self,
         ssh_client: asyncssh.SSHClientConnection,
         container_name: str,
+        read_logs: bool = True,
     ) -> ContainerDeathDiagnostics:
         # a hung `docker logs` on the miner's host must not hold back the recovery's verdict or stop;
         # the state read before the hang is kept, so a dead container is not taken for a recovery
         diagnostics = ContainerDeathDiagnostics()
         try:
             return await asyncio.wait_for(
-                collect_container_death_diagnostics(ssh_client, container_name, diagnostics),
+                collect_container_death_diagnostics(ssh_client, container_name, diagnostics, read_logs=read_logs),
                 timeout=_VLOOPBACK_REPAIR_COMMAND_TIMEOUT_SEC,
             )
         except TimeoutError:
@@ -14789,9 +15009,9 @@ class DockerService:
     async def _reset_leftover_clock_locks_before_create(
         self, ssh_client, payload: ContainerCreateRequest, default_extra: dict
     ) -> None:
-        """DAH-4663: a GPU whose clock lock outlived its pod (teardown -rgc failed) is reset before anyone starts
-        on it. A GPU with a lock record that still cannot be reset fails the create (its record stays for the next
-        try); anything else here is best-effort and never blocks the rental."""
+        """DAH-4663: a GPU whose clock lock outlived its pod (teardown -rgc failed), or that someone else locked, is
+        reset before anyone starts on it. A GPU that still cannot be reset fails the create (a record stays for the
+        next try); anything else here is best-effort and never blocks the rental."""
         # DAH-4663 (review): after a renter's clock lock in flight on this pod (a reboot), so its -lgc never lands
         # after this reset dropped its record. Only around this step, so a delete still cancels the create at once.
         async with pod_gpu_operation_locks.hold(
@@ -14817,8 +15037,8 @@ class DockerService:
                 )
                 return
         if still_locked:
-            # never hand a renter the previous renter's locked clocks
-            raise RuntimeError(f"GPU clocks a previous rental locked could not be reset: {', '.join(still_locked)}")
+            # never hand a renter locked clocks, whoever locked them
+            raise RuntimeError(f"GPU clocks could not be reset to default: {', '.join(still_locked)}")
 
     async def delete_container(
         self,
@@ -15298,24 +15518,13 @@ class DockerService:
                 if inflight_creates.is_cancelled(payload.pod_id):
                     logger.info(_m("Cancelled by its delete: no hung GPU reset", extra=get_extra_info(default_extra)))
                     return None
-                shadow = not settings.HUNG_GPU_RESET_ON_REBOOT_ENABLED
                 result = await reset_hung_pod_gpus(
                     SSHCommandRunner(ssh_client, max_retries=0),
                     list(payload.gpu_uuids),
                     resetting=lambda: self._hold_gpu_reset_pending_mark(payload, default_extra),
-                    shadow=shadow,
                 )
         except Exception as exc:
             logger.warning(_m("Hung GPU check on reboot failed", extra=get_extra_info({**default_extra, "error": repr(exc)})))
-            return None
-        if shadow:
-            if result.hung_uuids:
-                logger.warning(
-                    _m(
-                        "Hung pod GPU found on reboot (shadow: no reset)",
-                        extra=get_extra_info({**default_extra, "hung": result.hung_uuids, "detail": result.detail}),
-                    )
-                )
             return None
         if result.warning is None:
             return None
@@ -15534,14 +15743,7 @@ class DockerService:
             workload_kind=payload.workload_kind,
             request_id=payload.request_id,
             ok=report.ok,
-            # GpusLostOnHost is not on the wire yet: the backend drops the whole frame on an unknown error_code and the
-            # renter's reset hangs until timeout; a separate task adds the wire code and removes this swap after
-            # lium-platform accepts GpusLostOnHost
-            error_code=(
-                GpuResetErrorCode.ResetNotSupported
-                if report.error_code == GpuResetErrorCode.GpusLostOnHost
-                else report.error_code
-            ),
+            error_code=report.error_code,
             container_restarted=report.container_restarted,
             gpus=report.gpus,
             detail=report.detail,

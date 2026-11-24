@@ -32,6 +32,7 @@ import requests
 
 from core.config import VALIDATOR_HOTKEYS_SS58, settings
 from dependencies.auth import match_validator_hotkey
+from services.validator_trust_service import validator_trust
 
 logger = logging.getLogger(__name__)
 
@@ -72,12 +73,11 @@ def verify_signed_digest(payload: dict[str, Any], now: int | None = None) -> str
         now = int(datetime.now(UTC).timestamp())
     if abs(timestamp - now) > TIMESTAMP_MAX_SKEW_SECONDS:
         raise ValueError(f"digest response timestamp out of range (now={now}, ts={timestamp})")
-    # DAH-3394: the executor trusts two validator hotkeys during the rotation (current, next);
-    # match_validator_hotkey is the one list every validator-signature check reads.
+    # match_validator_hotkey is the one list every validator-signature check reads (DAH-3394, DAH-6590)
     if match_validator_hotkey(f"{digest}:{timestamp}", signature) is None:
         raise ValueError(
-            "digest response signature is not from a configured validator hotkey "
-            f"({', '.join(VALIDATOR_HOTKEYS_SS58)})"
+            "digest response signature is not from a trusted validator hotkey "
+            f"({', '.join(validator_trust.hotkeys(VALIDATOR_HOTKEYS_SS58))})"
         )
     return digest
 

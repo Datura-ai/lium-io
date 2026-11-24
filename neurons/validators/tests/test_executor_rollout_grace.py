@@ -453,3 +453,16 @@ async def test_a_rollback_to_an_earlier_release_drops_it_from_the_earlier_list()
     assert window.digest == OLD
     assert window.previous_digest == NEWER
     assert window.earlier_reading_current(J0 + 2 * BPC) == (NEW,)
+
+
+def test_a_withheld_verdict_log_says_whether_the_node_was_rented(caplog) -> None:
+    # Arrange
+    rented = _failed("node-3", "RENTED_EXECUTOR_NOT_LISTED", observed_digest=OLD).model_copy(update={"is_rented": True})
+
+    # Act
+    with caplog.at_level("WARNING", logger="services.executor_rollout"):
+        withhold_rollout_verdicts({"miner-a": [rented]}, _open_window(), J1)
+
+    # Assert
+    [record] = [r for r in caplog.records if "[rollout-grace]" in r.getMessage()]
+    assert record.msg.extra["is_rented"] is True
