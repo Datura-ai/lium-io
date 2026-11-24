@@ -526,6 +526,7 @@ def withhold_rollout_verdicts(
                         "job_block": job_block,
                         "reason_code": reason,
                         "observed_digest": _observed_digest(result),
+                        "is_rented": result.is_rented,
                         **window.as_extra(),
                     },
                 )
