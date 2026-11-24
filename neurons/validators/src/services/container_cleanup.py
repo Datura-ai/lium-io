@@ -18,6 +18,7 @@ from services.const import (
     ENGY_CACHE_VOLUME_PREFIX,
     CACHE_SWEEP_CONTAINER_NAME,
     PARKED_SUFFIXES,
+    is_cache_volume_name,
     unparked_name,
     FILLER_CACHE_VOLUME_PREFIXES,
     FILLER_CONTAINER_GRACE_MINUTES,
@@ -120,7 +121,7 @@ async def evict_cache_volumes_oldest_first(
     volume_names: list[str],
     run_removal: Callable[[str], Awaitable[object]],
     has_room: Callable[[], Awaitable[bool]],
-    evict_first_prefix: str | tuple[str, ...] | None = None,
+    evict_first_prefix: tuple[str, ...] | None = None,
     volume_remove: Callable[[str], str] = DockerCommand.volume_remove,
     keep_image: str | None = None,
 ) -> None:
@@ -706,7 +707,7 @@ class ContainerCleanup:
         return sorted(
             name
             for name in (line.strip() for line in (result.stdout or "").splitlines())
-            if name.startswith(name_prefixes)
+            if is_cache_volume_name(name, name_prefixes)
         )
 
     async def sweep_abandoned_download_temporaries(

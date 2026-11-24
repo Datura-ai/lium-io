@@ -83,6 +83,7 @@ from services.const import (
     EDIT_PARKED_SUFFIX,
     PARKED_SUFFIXES,
     RECOVERY_STOPPED_SUFFIX,
+    is_cache_volume_name,
     unparked_name,
     KEPT_UNMOUNTED_PREFIX,
     LIUM_POD_ID_LABEL,
@@ -93,6 +94,7 @@ from services.const import (
     DPHN_CACHE_LISTING_FLOOR_GB,
     DPHN_CACHE_SIZE_GB,
     ENGY_CACHE_VOLUME_PREFIX,
+    JOB_CACHE_VOLUME_NAME,
     JOB_CACHE_VOLUME_PREFIX,
     FILLER_CACHE_MAX_FREE_DISK_SHARE,
     FILLER_RUN_VOLUME_GB_BESIDE_ENGY_CACHE,
@@ -530,7 +532,6 @@ def _parse_listening_ports(output: str) -> set[int]:
 
 _DPHN_CACHE_EMPTY_KB = 1024
 _ENGY_CACHE_SIZE_IN_NAME = re.compile(rf"^{ENGY_CACHE_VOLUME_PREFIX}hf_(\d+)gb_")
-_JOB_CACHE_SIZE_IN_NAME = re.compile(rf"^{JOB_CACHE_VOLUME_PREFIX}(\d+)gb_")
 
 
 def _cache_download_gb(volume_name: str) -> float:
@@ -538,7 +539,7 @@ def _cache_download_gb(volume_name: str) -> float:
     # never afforded, rather than assumed to be DPHN's 40 GB. A provider job's cache (job_cache_<N>gb_...)
     # is charged its whole limit: the job can fill it.
     if volume_name.startswith(JOB_CACHE_VOLUME_PREFIX):
-        match = _JOB_CACHE_SIZE_IN_NAME.match(volume_name)
+        match = JOB_CACHE_VOLUME_NAME.match(volume_name)
     elif volume_name.startswith(ENGY_CACHE_VOLUME_PREFIX):
         match = _ENGY_CACHE_SIZE_IN_NAME.match(volume_name)
     else:
@@ -6747,6 +6748,9 @@ class DockerService:
         A Dolphin volume's own size is not known (DPHN_CACHE_SIZE_GB is the whole set), so it is not ready only
         when empty, as the reclaim's wipe leaves it (DAH-5664): then the set's whole download is charged.
 
+        A provider job's cache (DAH-6406) is charged what it can still grow by; one over the size in its name is
+        REMOVED here, so the run starts it empty, and charged its whole size (_remove_oversized_job_cache_and_get_gb_to_charge).
+
         Measured in a helper container that mounts the volume by name (the SSH session lands inside the executor
         container, where the volume's host path does not exist). A checkpoint is a few hundred large files, so
         `du` is quick. An unmeasurable Engy cache reads as complete: mounting what exists costs nothing, as before.
@@ -6869,7 +6873,7 @@ class DockerService:
         return sorted(
             name
             for name in names
-            if name.startswith(name_prefixes) and name not in keep_names and _is_safe_docker_volume_name(name)
+            if is_cache_volume_name(name, name_prefixes) and name not in keep_names and _is_safe_docker_volume_name(name)
         )
 
     async def sweep_stale_cache_volumes(
@@ -6888,13 +6892,16 @@ class DockerService:
 
         Returns the volumes it asked docker to remove (empty when nothing was swept).
         """
-        if payload.workload_kind != WorkloadKind.FILLER:
+        if payload.workload_kind != WorkloadKind.FILLER or not payload.cache_volumes:
+            # No cache requested -> this is version GC with nothing to compare against, NOT a reclaim.
+            # Deleting here would thrash: the backend denies the cache to a node whose free disk sits
+            # under its threshold, but a node's free disk is LOWER precisely because the cache is
+            # already downloaded — so deny would delete it, free disk would rise back over the
+            # threshold, the next cycle would grant it again, and the node would re-download ~37 GB
+            # every cycle. A provider job's cache is kept the same way (DAH-6406): beside a rental the
+            # backend sends the job no cache. Reclaiming a cache the node can no longer afford is the
+            # rental/disk-pressure path's job, where the decision is made against real free space.
             return []
-        # No cache requested -> no own family, so only a provider job's leftover cache is swept below (the
-        # backend asks for a job's cache whenever the job has one). Lium's caches are NOT swept here: the backend
-        # denies them to a node whose free disk sits under its threshold, which is LOWER precisely because the
-        # cache is downloaded, so deleting would free disk, re-grant the cache and re-download ~37 GB every cycle.
-        # Reclaiming a cache the node can no longer afford is the rental/disk-pressure path's job.
         # A live filler SIBLING holds this node's cache and docker cannot remove an in-use volume, so
         # the listing round-trip would be a no-op. The run being created is already STARTING in the
         # backend by the time it builds this request, so its OWN container name is in the list too —
@@ -6906,7 +6913,7 @@ class DockerService:
         ):
             return []
 
-        keep_names: set[str] = {cache_volume.name for cache_volume in payload.cache_volumes or []}
+        keep_names: set[str] = {cache_volume.name for cache_volume in payload.cache_volumes}
         cache_prefixes_to_sweep: tuple[str, ...] = self._cache_volume_families(sorted(keep_names))
         if (
             ENGY_CACHE_VOLUME_PREFIX in cache_prefixes_to_sweep

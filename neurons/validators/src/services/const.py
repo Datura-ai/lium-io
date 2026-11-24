@@ -351,7 +351,16 @@ ENGY_CACHE_VOLUME_PREFIX = "engy_cache_"
 # the name is the provider's limit: an existing one over it is emptied at the next launch. Like the Lium caches it
 # is created only when the node can afford it, swept when the job asks for another, and evicted for a rental.
 JOB_CACHE_VOLUME_PREFIX = "job_cache_"
+# the backend's whole name (build_job_cache_volume): a provider's own volume that only starts with the prefix is theirs
+JOB_CACHE_VOLUME_NAME = re.compile(rf"^{JOB_CACHE_VOLUME_PREFIX}(\d+)gb_[0-9a-f]{{12}}$")
 FILLER_CACHE_VOLUME_PREFIXES = (DPHN_CACHE_VOLUME_PREFIX, ENGY_CACHE_VOLUME_PREFIX, JOB_CACHE_VOLUME_PREFIX)
+
+
+def is_cache_volume_name(name: str, prefixes: tuple[str, ...]) -> bool:
+    """A cache volume of these families; a job cache only by its whole name, so no sweep removes a provider's volume."""
+    if not name.startswith(prefixes):
+        return False
+    return not name.startswith(JOB_CACHE_VOLUME_PREFIX) or JOB_CACHE_VOLUME_NAME.match(name) is not None
 # DAH-2475: what one node's DPHN cache costs on disk, and how much room the node must keep free after
 # downloading it. The floor mirrors the backend's EXECUTORS_FILTER_MIN_GB — below it the node drops out
 # of the rental listing, where neither renters nor fillers can reach it — and the margin is headroom

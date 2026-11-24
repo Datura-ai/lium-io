@@ -214,9 +214,24 @@ async def test_a_lium_filler_create_sweeps_a_provider_jobs_leftover_cache_and_a_
 
 
 @pytest.mark.asyncio
-async def test_a_cacheless_filler_create_sweeps_only_a_provider_jobs_leftover_cache(docker_service):
+async def test_a_cacheless_create_beside_a_rental_keeps_the_provider_jobs_cache(docker_service):
+    # beside a rental the backend sends the job no cache; its cache stays on disk like the Dolphin cache
     ssh_client = FakeSshClient(["dphn_cache_hf_old", "engy_cache_hf_x", "job_cache_200gb_0123456789ab", "volume_pod"])
-    payload = _make_payload(workload_kind=WorkloadKind.FILLER, cache_volumes=None)
+    payload = _make_payload(
+        workload_kind=WorkloadKind.FILLER, cache_volumes=None, active_container_names=["pod_rental", "filler_pod"]
+    )
+
+    assert await docker_service.sweep_stale_cache_volumes(ssh_client, payload, {}) == []
+    assert ssh_client.commands == []
+
+
+@pytest.mark.asyncio
+async def test_a_providers_own_volume_that_only_starts_like_a_job_cache_is_never_swept(docker_service):
+    engy = [CacheVolume(name="engy_cache_hf_new", target="/c")]
+    ssh_client = FakeSshClient(
+        ["engy_cache_hf_new", "job_cache_mydata", "job_cache_200gb_0123456789ab_x", "job_cache_200gb_0123456789ab"]
+    )
+    payload = _make_payload(workload_kind=WorkloadKind.FILLER, cache_volumes=engy)
 
     assert await docker_service.sweep_stale_cache_volumes(ssh_client, payload, {}) == ["job_cache_200gb_0123456789ab"]
 

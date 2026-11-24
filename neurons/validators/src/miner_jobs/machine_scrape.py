@@ -688,8 +688,9 @@ VLOOPBACK_HOST_DATA_DIR_NAMES = ("vloopback-v2", "vloopback-v3")
 # DAH-5045: the Engy checkpoint cache, reported for its download progress. DAH-5260: unlike the Dolphin cache
 # it reads as free disk, since a customer create removes it when the renter needs the space.
 ENGY_CACHE_VOLUME_PREFIX = "engy_cache_"
-# a provider's own Custom Docker job cache reads as free disk for the same reason: a rental removes it
-JOB_CACHE_VOLUME_PREFIX = "job_cache_"
+# a provider's own Custom Docker job cache reads as free disk for the same reason: a rental removes it. Only by the
+# backend's whole name (job_cache_<N>gb_<12 hex>): another volume named like it is the provider's own
+JOB_CACHE_VOLUME_NAME = re.compile(r"^job_cache_(\d+)gb_[0-9a-f]{12}$")
 # the label a filler create puts on its own run volume (services/rental_docker_sdk.py FILLER_VOLUME_LABELS)
 FILLER_VOLUME_LABEL_KEY = "io.lium.workload"
 FILLER_VOLUME_LABEL_VALUE = "filler"
@@ -883,6 +884,17 @@ def cache_volume_bytes(df, prefixes):
     )
 
 
+def job_cache_bytes(df):
+    # never credited above the size in its name (DAH-6406)
+    total = 0
+    for volume in df.get("Volumes") or []:
+        match = JOB_CACHE_VOLUME_NAME.match(str(volume.get("Name") or ""))
+        if match:
+            size = max(int((volume.get("UsageData") or {}).get("Size") or 0), 0)
+            total += min(size, int(match.group(1)) * 10**9)
+    return total
+
+
 def get_docker_disk_usage():
     # what actually filled the disk, split by kind, in kB to match the other hard_disk fields
     df = docker_api_get("/system/df")
@@ -907,7 +919,7 @@ def get_docker_disk_usage():
         if volume.get("Name")
     }
     volumes += get_vloopback_volume_bytes(docker_root_dir, False, by_volume) - filler_run_volumes
-    job_cache = cache_volume_bytes(df, JOB_CACHE_VOLUME_PREFIX)
+    job_cache = job_cache_bytes(df)
     volumes -= engy_cache + job_cache
     volumes += get_dmcrypt_volume_bytes(docker_root_dir, by_volume)
     containers += get_container_log_bytes(docker_root_dir)

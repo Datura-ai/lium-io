@@ -42,7 +42,8 @@ DISK_HELPERS = {
     "get_docker_disk_usage",
     "cache_volume_bytes",
     "ENGY_CACHE_VOLUME_PREFIX",
-    "JOB_CACHE_VOLUME_PREFIX",
+    "JOB_CACHE_VOLUME_NAME",
+    "job_cache_bytes",
     "FILLER_VOLUME_LABEL_KEY",
     "FILLER_VOLUME_LABEL_VALUE",
     "release_filler_cache",
@@ -676,6 +677,29 @@ def test_a_provider_job_cache_is_reported_as_free_disk(scrape: dict) -> None:
     assert (hard_disk["hard_disk_used"], hard_disk["hard_disk_free"]) == (850 * 1024**2, 3150 * 1024**2)
     assert hard_disk["hard_disk_volumes"] == 0
     assert hard_disk["hard_disk_engy_cache_used_gb"] == 0
+
+
+def test_a_provider_job_cache_is_credited_as_free_disk_up_to_the_size_in_its_name_only(scrape: dict) -> None:
+    _stub_docker_api(
+        scrape,
+        {
+            "/system/df": {
+                "LayersSize": 0,
+                "Containers": [],
+                "Volumes": [
+                    {"Name": "job_cache_200gb_0123456789ab", "UsageData": {"Size": 250 * 1024**3}},
+                    {"Name": "job_cache_mydata", "UsageData": {"Size": 100 * 1024**3}},
+                ],
+            },
+            "/info": {"DockerRootDir": "/var/lib/docker"},
+            "/volumes": {"Volumes": []},
+        },
+    )
+    hard_disk = {"hard_disk_total": 4000 * 1024**2, "hard_disk_used": 1000 * 1024**2, "hard_disk_free": 3000 * 1024**2}
+
+    hard_disk.update(scrape["get_docker_disk_usage"]())
+
+    assert hard_disk["filler_released_kb"] == 200 * 10**9 // 1024
 
 
 def test_a_fillers_own_run_volume_is_reported_as_free_disk(scrape: dict, monkeypatch) -> None:
