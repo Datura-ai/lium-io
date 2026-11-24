@@ -10507,6 +10507,7 @@ class DockerService:
                 payload.pod_id,
                 command_id=payload.command_id,
                 synthetic_probe=synthetic_probe,
+                filler=payload.workload_kind == WorkloadKind.FILLER,
             )
 
             current_step = "ssh_key_import"

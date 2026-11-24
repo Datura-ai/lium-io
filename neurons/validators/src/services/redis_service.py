@@ -35,6 +35,8 @@ PENDING_PODS_PREFIX = "pending_pods_prefix"
 # VerifyX cold retry sees a create whose pending-pod marker came and went between two of its reads
 CREATE_STARTED_AT_PREFIX = "create_started_at"
 CREATE_STARTED_AT_TTL_SECONDS = 900
+# set on the pending-pod entry of a renter's create (not a filler's, a probe's or a GPU operation's)
+PENDING_RENTER_CREATE = "renter"
 GPU_RESET_PENDING_KIND = "gpu_reset"
 # DAH-4663: a renter's own GPU clock lock in progress (a second lock, reset or create is declined meanwhile)
 GPU_CLOCKS_PENDING_KIND = "gpu_clocks"
@@ -112,19 +114,6 @@ SSHD_BOOTSTRAP_FAILED_TTL_SECONDS = 6 * 3600
 
 def create_started_at_key(miner_hotkey: str, executor_id: str) -> str:
     return f"{CREATE_STARTED_AT_PREFIX}:{miner_hotkey}:{executor_id}"
-
-
-# a renter's create, from the connector's receipt of it until it fails: the GPU and network tests stop for it.
-# A hash per node, one field per pod (value = its expiry time): each create sets and clears only its own field.
-RENT_REQUESTED_PREFIX = "rent_requested"
-# A run that began before the create lasts at most JOB_TIME_OUT, so it is stopped or over by then; one minute more
-# covers the poll. Longer would skip the next cycle, whose rented list already carries the pod, for nothing. A mark a
-# crash left behind ends with it.
-RENT_REQUESTED_TTL_SECONDS = settings.JOB_TIME_OUT + 60
-
-
-def rent_requested_key(miner_hotkey: str, executor_id: str) -> str:
-    return f"{RENT_REQUESTED_PREFIX}:{miner_hotkey}:{executor_id}"
 
 
 # VerifyX runs the validator cut off and could not clean up: hash of run_dir -> epoch, reaped before the next run
@@ -1100,10 +1089,16 @@ class RedisService:
         gpu_uuids: list[str] | None = None,
         command_id: str = "",
         synthetic_probe: bool = False,
+        filler: bool = False,
     ):
         now = int(time.time())
+        # a renter's pod being created: the validation cycle on the node stops its GPU and network tests for it
+        # (RentedMidCycleCheck); the validator's own probe, a filler and a GPU reset or clock operation are not one
+        renter = kind is None and not synthetic_probe and not filler
 
         item: dict = {"time": now, "pod_id": pod_id}
+        if renter:
+            item[PENDING_RENTER_CREATE] = True
         if kind:
             # DAH-4658: "gpu_reset" marks a renter's own GPU reset, which the rented GPU checks skip
             item["kind"] = kind
@@ -1115,9 +1110,9 @@ class RedisService:
         def stamp() -> RedisWrites:
             # read at each try: a retry after a newer create's EXEC must not write an older time over its stamp
             writes = RedisWrites()
-            if kind is None and not synthetic_probe:
-                # only a rental create stamps: the validator's own rental probe and a GPU reset or clock operation
-                # keep their marker but leave no stamp, since neither is a rental being created
+            if renter:
+                # only a renter's create stamps: the validator's own rental probe, a filler and a GPU reset or clock
+                # operation keep their marker but leave no stamp, since none is a rental being created
                 writes.set(
                     create_started_at_key(miner_hotkey, executor_id), str(time.time()), ex=CREATE_STARTED_AT_TTL_SECONDS
                 )
@@ -1137,16 +1132,6 @@ class RedisService:
         await self._update_pending_pods(miner_hotkey, executor_id, lambda pending_pods: [*pending_pods, item], stamp)
         if superseded is not None and _saved_command_id(superseded) != command_id:
             await self.remove_unacked_container_created(pod_id, superseded)
-
-    async def mark_rent_requested(self, miner_hotkey: str, executor_id: str, pod_id: str) -> None:
-        """One hash field per create (pod id -> expiry time), so creates on one node never share or overwrite a mark."""
-        key = rent_requested_key(miner_hotkey, executor_id)
-        await self.hset(key, pod_id, repr(time.time() + RENT_REQUESTED_TTL_SECONDS))
-        await self.expire(key, RENT_REQUESTED_TTL_SECONDS)
-
-    async def clear_rent_requested(self, miner_hotkey: str, executor_id: str, pod_id: str) -> None:
-        """Only this pod's mark, in one HDEL: another create's mark on the node stays whenever this runs."""
-        await self.hdel(rent_requested_key(miner_hotkey, executor_id), pod_id)
 
     async def remove_pending_pod(
         self, miner_hotkey: str, executor_id: str, pod_id: str, command_id: str = "", kind: str | None = None

@@ -868,7 +868,7 @@ class Pipeline:
     ) -> tuple[list[_RanCheck], Context, str | None]:
         """Run the step; one with `stops_on_rent` is cancelled once a renter's create marks the node, and the pod is
         returned. A cancelled step's own cleanup (the remote matmul kill) runs before this returns."""
-        from .checks.rented_mid_cycle import rent_requested_since_cycle_start  # the checks import this module
+        from .checks.rented_mid_cycle import rent_since_cycle_start  # the checks import this module
 
         task = asyncio.ensure_future(self._run_step_surviving_a_dropped_session(step, ctx))
         try:
@@ -876,7 +876,7 @@ class Pipeline:
                 done, _ = await asyncio.wait({task}, timeout=RENT_POLL_SECONDS)
                 if done:
                     break
-                pod = await rent_requested_since_cycle_start(ctx)
+                pod = await rent_since_cycle_start(ctx)
                 if pod:
                     await _cancel_until_done(task)
                     return [], ctx, pod

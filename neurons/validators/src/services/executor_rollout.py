@@ -797,24 +797,8 @@ async def carry_renter_gpu_reset_results(
         for index, held in enumerate(results):
             if not _held_for_renter_gpu_reset(held):
                 continue
-            # a run stopped for a renter's create carries whether or not the create then succeeds
-            rented_mid_cycle = held.failure_reason_code == _RENTED_MID_CYCLE
-            listed_rented = str(held.executor_info.uuid).lower() in rented_executor_ids
-            if not rented_mid_cycle and not listed_rented:
-                continue
-            previous = await _last_scored_result(redis_service, miner_hotkey, held)
+            previous = await _result_to_carry(redis_service, miner_hotkey, held, rented_executor_ids)
             if previous is None:
-                continue
-            # an idle score stands only for a node rented mid-cycle; the other holds keep carrying rented scores only
-            if not previous.is_rented and not rented_mid_cycle:
-                continue
-            # a rented score stands only for a node the backend lists as rented: a create that failed on a node
-            # idle at cycle start must not carry the rental of the cycle before
-            if previous.is_rented and not listed_rented:
-                continue
-            # a run stopped for a create spends the kept result: a later stopped run (the create failed or the pod
-            # was deleted) is withheld instead of re-carrying the same score until the key expires
-            if rented_mid_cycle and not await _spend_last_scored_result(redis_service, miner_hotkey, held):
                 continue
             results[index] = previous.model_copy(
                 update={
@@ -899,6 +883,32 @@ async def _last_scored_result(
             )
         )
         return None
+
+
+async def _result_to_carry(
+    redis_service: RedisService, miner_hotkey: str, held: JobResult, rented_executor_ids: set[str]
+) -> JobResult | None:
+    """The kept result `carry_renter_gpu_reset_results` puts in place of the held one, or None (it stays held)."""
+    # a run stopped for a renter's create carries whether or not the create then succeeds
+    rented_mid_cycle = held.failure_reason_code == _RENTED_MID_CYCLE
+    listed_rented = str(held.executor_info.uuid).lower() in rented_executor_ids
+    if not rented_mid_cycle and not listed_rented:
+        return None
+    previous = await _last_scored_result(redis_service, miner_hotkey, held)
+    if previous is None:
+        return None
+    # an idle score stands only for a node rented mid-cycle; the other holds keep carrying rented scores only
+    if not previous.is_rented and not rented_mid_cycle:
+        return None
+    # a rented score stands only for a node the backend lists as rented: a create that failed on a node
+    # idle at cycle start must not carry the rental of the cycle before
+    if previous.is_rented and not listed_rented:
+        return None
+    # a run stopped for a create spends the kept result: a later stopped run (the create failed or the pod
+    # was deleted) is withheld instead of re-carrying the same score until the key expires
+    if rented_mid_cycle and not await _spend_last_scored_result(redis_service, miner_hotkey, held):
+        return None
+    return previous
 
 
 async def _spend_last_scored_result(redis_service: RedisService, miner_hotkey: str, held: JobResult) -> bool:
