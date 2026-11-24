@@ -1268,11 +1268,11 @@ def get_needrestart_guard(host_root="/proc/1/root"):
     return ("partial" if unguarded else "present"), unguarded, unproven
 
 
-def vloopback_plugin_data_dirs(docker_root_dir):
+def vloopback_plugin_data_dirs(docker_root_dir, unusable=None):
     # each installed vloopback plugin's DATA_DIR as docker reports it, as a host path seen from here. DATA_DIR
     # is a path inside the plugin: under a bind mount (the v2/v3 plugins mount the host's / at /srv) it is on
     # the host, otherwise it is in the plugin's own rootfs. Read, not guessed: a plugin set to any other dir
-    # (by hand, or another release) is found too.
+    # (by hand, or another release) is found too. unusable: a list to fill with why each other plugin was skipped.
     data_dirs = []
     for plugin in docker_api_get("/plugins") or []:
         if not (plugin.get("Name") or "").startswith(VLOOPBACK_DRIVER_PREFIX):
@@ -1281,6 +1281,8 @@ def vloopback_plugin_data_dirs(docker_root_dir):
         env = dict(entry.split("=", 1) for entry in settings.get("Env") or [] if "=" in entry)
         data_dir = env.get("DATA_DIR") or ""
         if not data_dir.startswith("/"):
+            if unusable is not None:
+                unusable.append(f"{plugin.get('Name')} DATA_DIR={data_dir!r}")
             continue
         host_dir, matched = None, -1
         for mount in settings.get("Mounts") or []:
@@ -1293,6 +1295,8 @@ def vloopback_plugin_data_dirs(docker_root_dir):
         # a DATA_DIR the plugin has never written (or a mount source gone from the host) holds no volume
         if os.path.isdir(f"/proc/1/root{host_dir}"):
             data_dirs.append(f"/proc/1/root{host_dir}")
+        elif unusable is not None:
+            unusable.append(f"{plugin.get('Name')} DATA_DIR={data_dir} -> {host_dir} (absent)")
     return data_dirs
 
 
@@ -1313,11 +1317,17 @@ def get_vloopback_volume_bytes(docker_root_dir, filler_only=False, sizes=None):
     if not names:
         return 0
 
-    data_dirs = vloopback_plugin_data_dirs(docker_root_dir)
+    unusable = []
+    data_dirs = vloopback_plugin_data_dirs(docker_root_dir, unusable)
     if not data_dirs:
         # every volume would be counted as 0 and the breakdown would silently under-report by
-        # terabytes; fail like the rest of the docker half so the miss lands in an error key
-        raise RuntimeError(f"docker reports no existing vloopback plugin DATA_DIR for {len(names)} volumes")
+        # terabytes; fail like the rest of the docker half so the miss lands in an error key. The error names
+        # the volumes' drivers and what docker reported for each plugin, so the cause shows without the host.
+        drivers = sorted({volume.get("Driver") for volume in volumes if volume.get("Name") in names})
+        raise RuntimeError(
+            f"docker reports no existing vloopback plugin DATA_DIR for {len(names)} volumes"
+            f" (drivers {', '.join(drivers)}; plugins: {'; '.join(unusable) or 'none installed'})"
+        )
 
     total = 0
     mount_points = None

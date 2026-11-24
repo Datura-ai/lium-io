@@ -633,18 +633,24 @@ def test_vloopback_volume_missing_its_backing_file_is_skipped(scrape: dict, monk
 
 
 @pytest.mark.parametrize(
-    "plugins",
+    "plugins, reported",
     [
-        [],
-        [{"Id": "x", "Name": "vloopback:latest", "Settings": {"Env": ["LOG_LEVEL=2"]}}],
-        [{"Id": "x", "Name": "vloopback:latest", "Settings": {"Env": ["DATA_DIR=relative"]}}],
-        [_plugin("y", "other-driver:latest", "/srv/var/lib/other")],
+        ([], "(drivers vloopback; plugins: none installed)"),
+        ([{"Id": "x", "Name": "vloopback:latest", "Settings": {"Env": ["LOG_LEVEL=2"]}}], "plugins: vloopback:latest DATA_DIR='')"),
+        (
+            [{"Id": "x", "Name": "vloopback:latest", "Settings": {"Env": ["DATA_DIR=relative"]}}],
+            "plugins: vloopback:latest DATA_DIR='relative')",
+        ),
+        ([_plugin("y", "other-driver:latest", "/srv/var/lib/other")], "plugins: none installed)"),
         # reported, but the directory is not on the host
-        [V2_PLUGIN],
+        (
+            [V2_PLUGIN],
+            "plugins: vloopback:v2 DATA_DIR=/srv/var/lib/docker/vloopback-v2 -> /var/lib/docker/vloopback-v2 (absent))",
+        ),
     ],
     ids=["no-plugin", "no-data-dir", "relative-data-dir", "only-another-driver", "data-dir-absent"],
 )
-def test_missing_plugin_data_dir_raises_instead_of_reporting_zero(scrape: dict, monkeypatch, plugins) -> None:
+def test_missing_plugin_data_dir_raises_instead_of_reporting_zero(scrape: dict, monkeypatch, plugins, reported) -> None:
     # Arrange — docker reports no vloopback plugin DATA_DIR, so every volume would be counted as 0.
     # That is a structural miss, not a single unmaterialised volume: reporting 0 TB of volumes
     # reads as "the disk is free", so it has to surface as an error key instead.
@@ -652,7 +658,8 @@ def test_missing_plugin_data_dir_raises_instead_of_reporting_zero(scrape: dict, 
     monkeypatch.setitem(scrape, "os", SimpleNamespace(path=SimpleNamespace(join=os.path.join, isdir=lambda path: False)))
 
     # Act / Assert
-    with pytest.raises(RuntimeError):
+    # Assert — the error names the volumes' drivers and what docker reported, so the cause shows without the host
+    with pytest.raises(RuntimeError, match=re.escape(reported)):
         scrape["get_vloopback_volume_bytes"]("/var/lib/docker")
 
 
