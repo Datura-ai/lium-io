@@ -90,13 +90,15 @@ def updater_run(calls):
 @pytest.mark.parametrize(
     "script, old, new, args",
     [
-        (EXECUTOR, "nickfedor/watchtower", "daturaai/lium-watchtower:1.2.3", ""),
-        (EXECUTOR, "containrrr/watchtower:latest", "daturaai/lium-watchtower:1.2.3", ""),
-        (EXECUTOR, "daturaai/lium-watchtower:1.1.0-staging", "daturaai/lium-watchtower:1.2.3-staging", ""),
+        (EXECUTOR, "nickfedor/watchtower", "daturaai/lium-watchtower:1.2.4", ""),
+        (EXECUTOR, "containrrr/watchtower:latest", "daturaai/lium-watchtower:1.2.4", ""),
+        (EXECUTOR, "daturaai/lium-watchtower:1.1.0-staging", "daturaai/lium-watchtower:1.2.4-staging", ""),
         # DAH-5053: 1.2.2 is the first amd64+arm64 build; a 1.2.1 updater is replaced
-        (EXECUTOR, "daturaai/lium-watchtower:1.2.1", "daturaai/lium-watchtower:1.2.3", ""),
+        (EXECUTOR, "daturaai/lium-watchtower:1.2.1", "daturaai/lium-watchtower:1.2.4", ""),
         # DAH-5942: 1.2.3 never runs a runner that compose only created; a 1.2.2 updater is replaced
-        (EXECUTOR, "daturaai/lium-watchtower:1.2.2", "daturaai/lium-watchtower:1.2.3", ""),
+        (EXECUTOR, "daturaai/lium-watchtower:1.2.2", "daturaai/lium-watchtower:1.2.4", ""),
+        # DAH-6836: 1.2.4 trusts the validator named in the subnet owner's signed message; a 1.2.3 updater is replaced
+        (EXECUTOR, "daturaai/lium-watchtower:1.2.3", "daturaai/lium-watchtower:1.2.4", ""),
         (MINER, "containrrr/watchtower:latest", NICKFEDOR, " --interval 60 --cleanup --label-enable"),
         (MINER, "nickfedor/watchtower", NICKFEDOR, " --interval 60 --cleanup --label-enable"),
     ],
@@ -117,9 +119,9 @@ def test_an_old_updater_is_replaced_before_the_stack_starts(tmp_path, script, ol
 @pytest.mark.parametrize(
     "staging, current, want",
     [
-        ("1", "nickfedor/watchtower", "daturaai/lium-watchtower:1.2.3-staging"),
-        ("1", "daturaai/lium-watchtower:1.2.3", "daturaai/lium-watchtower:1.2.3-staging"),
-        ("", "nickfedor/watchtower", "daturaai/lium-watchtower:1.2.3"),
+        ("1", "nickfedor/watchtower", "daturaai/lium-watchtower:1.2.4-staging"),
+        ("1", "daturaai/lium-watchtower:1.2.4", "daturaai/lium-watchtower:1.2.4-staging"),
+        ("", "nickfedor/watchtower", "daturaai/lium-watchtower:1.2.4"),
     ],
 )
 def test_a_dev_runner_installs_the_staging_updater_whatever_its_stack_runs(tmp_path, staging, current, want):
@@ -130,7 +132,7 @@ def test_a_dev_runner_installs_the_staging_updater_whatever_its_stack_runs(tmp_p
 
 @pytest.mark.parametrize(
     "script, current",
-    [(EXECUTOR, "daturaai/lium-watchtower:1.2.3"), (EXECUTOR, "daturaai/lium-watchtower:1.2.3-staging"), (MINER, NICKFEDOR)],
+    [(EXECUTOR, "daturaai/lium-watchtower:1.2.4"), (EXECUTOR, "daturaai/lium-watchtower:1.2.4-staging"), (MINER, NICKFEDOR)],
 )
 def test_a_current_updater_is_left_alone(tmp_path, script, current):
     _, calls = run(tmp_path, script, STUB_UPDATER_IMAGE=current)

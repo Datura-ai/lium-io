@@ -259,20 +259,6 @@ async def test_a_card_that_times_out_while_another_finishes_fails_the_recheck(co
 
 
 @pytest.mark.asyncio
-async def test_a_filler_cycle_renews_the_marker(context_factory):
-    runner, validation = FakeRunner(), FakeValidation()
-    ctx = _idle_ctx(context_factory, runner, validation)
-
-    with patch.object(module, "get_filler_only_container", return_value={"id": "filler"}):
-        result = await PostRentalGpuRecheckCheck().run(ctx)
-
-    assert result.passed and result.event.reason_code == Msg.FILLER_SKIPPED.reason
-    assert runner.calls == [] and validation.calls == 0
-    assert ctx.services.redis.ttl.get(KEY) is None
-    assert json.loads(ctx.services.redis.store[KEY])["filler_skips"] == 1
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "ps_stdout, rm_stdout, marked",
     [
@@ -283,7 +269,7 @@ async def test_a_filler_cycle_renews_the_marker(context_factory):
         pytest.param("", "filler_run-1\n", False, id="stopped-before-removal"),
     ],
 )
-async def test_a_node_that_always_runs_a_filler_is_probed_after_the_skip_limit(
+async def test_a_filler_is_removed_and_the_cards_probed_on_the_first_cycle(
     context_factory, ps_stdout, rm_stdout, marked
 ):
     filler = "filler_run-1"
@@ -294,7 +280,7 @@ async def test_a_node_that_always_runs_a_filler_is_probed_after_the_skip_limit(
         SimpleNamespace(exit_status=0, stdout=rm_stdout, stderr=""),
     ]
     services = build_services(validation=validation)
-    services.redis.store[KEY] = json.dumps({**MARKER, "filler_skips": module.FILLER_SKIP_LIMIT})
+    services.redis.store[KEY] = json.dumps(MARKER)
     uuid = default_executor().uuid
     ctx = context_factory(
         services=services,
@@ -325,7 +311,7 @@ async def test_a_node_that_always_runs_a_filler_is_probed_after_the_skip_limit(
 async def test_a_filler_that_cannot_be_removed_is_inconclusive_not_a_failure(context_factory):
     runner, validation = FakeRunner(probe_stdout("ok")), FakeValidation(_all_cards("", ""))
     services = build_services(validation=validation)
-    services.redis.store[KEY] = json.dumps({**MARKER, "filler_skips": module.FILLER_SKIP_LIMIT})
+    services.redis.store[KEY] = json.dumps(MARKER)
     uuid = default_executor().uuid
     ctx = context_factory(
         services=services,
@@ -340,13 +326,15 @@ async def test_a_filler_that_cannot_be_removed_is_inconclusive_not_a_failure(con
         ),
         runner=runner,
     )
+    # a TTL an older validator set: the refresh drops it (DAH-6355)
+    services.redis.ttl[KEY] = 3 * 24 * 3600
 
     with patch.object(module, "get_filler_only_container", return_value={"id": "filler"}):
         result = await PostRentalGpuRecheckCheck().run(ctx)
 
     assert result.passed and result.event.reason_code == Msg.INCONCLUSIVE.reason
     assert runner.calls == [] and validation.calls == 0
-    assert KEY in ctx.services.redis.store
+    assert ctx.services.redis.ttl.get(KEY) is None
 
 
 # --- placement ----------------------------------------------------------------------------------------------

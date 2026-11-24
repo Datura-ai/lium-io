@@ -235,6 +235,9 @@ class ContextState:
     # DAH-5651: this cycle's DinD test container was started on the host and never answered, so the host's
     # container runtime is failing; reaches the backend as ExecutorSpecRequest.host_runtime_fault
     host_runtime_fault: bool = False
+    # the rented pods this cycle's pod checks judged, by pod id, each with its host-side fault codes ([] = clean);
+    # None = no check judged a pod. Reaches the backend as ExecutorSpecRequest.rented_pod_faults
+    rented_pod_faults: dict[str, list[str]] | None = None
     # this cycle's outside reading was "blocked" (already recorded): a re-probe in the same cycle never adds a miss
     external_probe_blocked: bool = False
     # DAH-3338: per rented pod, the container state this cycle saw (TenantEnforcementCheck) and
@@ -343,9 +346,6 @@ class Context(BaseModel):
     # False only once ProviderSideLoadCheck sees provider-side CPU/disk above the floors under
     # enforcement; the score gate lives in calculate_scores for the same reason as above.
     provider_side_load_passed: bool = True
-    # False only once InspectorRentedCheck counts a blind streak at the limit under enforcement;
-    # the score gate lives in calculate_scores for the same reason as above.
-    inspector_blind_streak_passed: bool = True
     # False only once RentedPodResourcesCheck sees a pinned cpuset or a cut CPU quota under
     # enforcement; the score gate lives in calculate_scores for the same reason as above.
     rented_pod_resources_passed: bool = True
@@ -368,9 +368,6 @@ class Context(BaseModel):
     # False once HardwareIdentityCheck has a finding; non-fatal on a live rental, so the score
     # gate lives in calculate_scores.
     hardware_identity_passed: bool = True
-    # False only once InspectorRentedCheck reads the sensor's verdict of a host write into a
-    # rented pod under enforcement.
-    inspector_host_write_passed: bool = True
     # False only once BannedProviderCheck finds the kernel GPU view overlaid; the check is
     # non-fatal on a live rental, so the score gate lives in calculate_scores.
     kernel_gpu_view_passed: bool = True

@@ -8,6 +8,7 @@ next create reset the lock; the thermal-throttle check spares a locked GPU only 
 
 import asyncio
 import json
+import logging
 import os
 import re
 import time
@@ -64,6 +65,8 @@ class FakeHost:
         if "--query-gpu=clocks.gr" in cmd:
             return make_command_result(True, "1410")
         if " -rgc " in cmd:  # the batched resets: "<uuid> <exit>" per GPU, then "<uuid> <flag> <exit>" per -rac/-rmc
+            if self.rgc_exit is None:  # the whole call times out: the runner answers -1, no output
+                return make_command_result(False, "", exit_code=-1)
             lines = [f"{u} {self.rgc_exit}" for u in _reset_uuids(cmd)]
             if self.app_mem_exit is not None:
                 resets = re.findall(r"nvidia-smi -i (\S+) (-rac|-rmc) ", cmd)
@@ -207,7 +210,9 @@ async def test_a_completed_refusal_runs_no_reset_and_never_locks_the_gpu_out(lgc
 
     assert not report.ok and not any(" -rgc " in c for c in host.commands)
     assert not any(k.startswith("gpu_clock_lock:") for k in redis.store)
-    assert await reset_leftover_clock_locks(host, redis, [U[0], U[1]]) == [], "rentals on it go on"
+    # no clock control here (3, 4): rentals on it go on; any other failed reset may hide a lock, so it refuses
+    expected = [] if lgc_exit in (3, 4) else [U[0], U[1]]
+    assert await reset_leftover_clock_locks(host, redis, [U[0], U[1]]) == expected
 
 
 @pytest.mark.asyncio
@@ -238,10 +243,10 @@ async def test_a_lock_whose_answer_was_lost_and_whose_reset_failed_keeps_its_rec
 
 @pytest.mark.asyncio
 async def test_no_supported_clocks_fails_without_running_lgc_and_leaves_no_lock_record():
-    host = FakeHost(supported="", rgc_exit=1)
+    host = FakeHost(supported="", rgc_exit=3)
     report, redis = await _lock(host)
     assert not report.ok and not any(" -lgc" in c for c in host.commands)
-    # nothing was changed, so nothing for a create to refuse on, even where -rgc is unsupported too
+    # nothing was changed, so nothing for a create to refuse on, even where -rgc is unsupported too (exit 3)
     assert not any(k.startswith("gpu_clock_lock:") for k in redis.store)
     assert await reset_pod_clock_locks(host, redis, "pod1", "hk", "ex") == 0
     assert await reset_leftover_clock_locks(host, redis, [U[0], U[1]]) == []
@@ -575,13 +580,23 @@ async def test_teardown_without_a_lock_costs_no_ssh_and_a_whole_node_create_chec
 
 
 @pytest.mark.asyncio
-async def test_a_create_reset_answers_only_the_recorded_gpus_it_could_not_reset_and_keeps_their_records():
-    host, redis = FakeHost(rgc_exit=1), FakeRedis()
+@pytest.mark.parametrize(
+    "rgc_exit, unrecorded_counts",
+    [(3, False), (4, False), (1, True), ("unknown", True)],
+    ids=["not-supported", "insufficient-permissions", "failed", "no-answer"],
+)
+async def test_a_create_reset_answers_every_gpu_it_could_not_reset_unless_it_has_no_clock_control(
+    caplog, rgc_exit, unrecorded_counts
+):
+    host, redis = FakeHost(rgc_exit=rgc_exit), FakeRedis()
     redis.store[f"gpu_clock_lock:{U[0]}"] = json.dumps({"pod_id": "old"})
 
-    # U[1] has no record: a GPU without -rgc support, never locked here, does not count
-    assert await reset_leftover_clock_locks(host, redis, [U[0], U[1]]) == [U[0]]
+    # U[1] has no record: a lock set outside Lium may still hold its clocks, unless the GPU has no clock control here
+    expected = [U[0], U[1]] if unrecorded_counts else [U[0]]
+    with caplog.at_level(logging.WARNING):
+        assert await reset_leftover_clock_locks(host, redis, [U[0], U[1]]) == expected
     assert f"gpu_clock_lock:{U[0]}" in redis.store, "kept for the next try"
+    assert f"gpu_clock_action=rgc_failed gpu={U[1]} recorded=false" in caplog.text, "every unrecorded failure is logged"
 
 
 @pytest.mark.asyncio
@@ -607,6 +622,17 @@ async def test_a_create_reset_whose_ssh_call_fails_answers_every_recorded_gpu():
     host.run = AsyncMock(side_effect=OSError("connection lost"))
 
     assert await reset_leftover_clock_locks(host, redis, [U[0], U[1]]) == [U[1]]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("recorded", "expected"), [([], []), ([U[1]], [U[1]])], ids=["no-records", "one-record"])
+async def test_a_create_reset_batch_that_times_out_answers_only_the_recorded_gpus(recorded, expected):
+    host, redis = FakeHost(rgc_exit=None), FakeRedis()
+    for uuid in recorded:
+        redis.store[f"gpu_clock_lock:{uuid}"] = json.dumps({"pod_id": "old"})
+
+    # no "<uuid> <exit>" line at all is no verdict on any GPU: with no records the create goes on to Docker
+    assert await reset_leftover_clock_locks(host, redis, [U[0], U[1]]) == expected
 
 
 @pytest.mark.asyncio
@@ -948,23 +974,20 @@ async def test_a_reboots_hung_gpu_reset_waits_for_a_gpu_operation_in_flight(monk
     assert not ds.pod_gpu_operation_locks._locks
 
 
-@pytest.mark.parametrize("enabled", [False, True])
 @pytest.mark.asyncio
-async def test_the_reboot_hung_gpu_reset_flag(monkeypatch, enabled):
-    # DAH-5301: off = shadow (logged, no warning to the backend); on = the reset and its warning
+async def test_a_reboot_resets_a_hung_gpu_and_returns_its_warning(monkeypatch):
+    # DAH-5301: the reset and its warning to the backend
     import services.docker_service as ds
     from services.hung_gpu_reset import HungGpuResult
 
     service, _gates, _started = _service_with_gated_steps([])
     service.redis_service = None
     monkeypatch.setattr(ds, "SSHCommandRunner", lambda *_a, **_k: None)
-    monkeypatch.setattr(ds.settings, "HUNG_GPU_RESET_ON_REBOOT_ENABLED", enabled)
-    warning = ds.ContainerWarningCode.HungGpuReset if enabled else None
-    reset = AsyncMock(return_value=HungGpuResult(["gpu-0"], warning, "would reset"))
+    warning = ds.ContainerWarningCode.HungGpuReset
+    reset = AsyncMock(return_value=HungGpuResult(["gpu-0"], warning, "reset"))
     monkeypatch.setattr(ds, "reset_hung_pod_gpus", reset)
 
     assert await service._reset_hung_gpus_before_run(None, _create_payload(), {}) == warning
-    assert reset.await_args.kwargs["shadow"] is not enabled
 
 
 @pytest.mark.asyncio

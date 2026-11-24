@@ -3,11 +3,14 @@
 import logging
 import shlex
 from unittest.mock import AsyncMock, MagicMock, Mock
+
+from ssh_channel_double import create_process_answering_through
 from uuid import uuid4
 
 import pytest
 import services.docker_service as ds_module
 from payload_models.payloads import ContainerCreateRequest, FailedContainerErrorCodes, WorkloadKind
+from services.attestation_service import HostPolicyResult
 from services.prerun_host_probe import DOCKER_PS_ALL_NAMES_IDS_CMD, DOCKER_VOLUME_LS_NAME_DRIVER_CMD
 from services.rental_docker_sdk import (
     FILLER_VOLUME_LABELS,
@@ -50,6 +53,7 @@ def _create_over_a_host(svc, monkeypatch, container_names, unmounted_vloopback=(
     }
     ssh_client = AsyncMock()
     ssh_client.run.side_effect = lambda cmd, *args, **kwargs: Mock(exit_status=0, stdout=answers.get(cmd, ""))
+    ssh_client.create_process = create_process_answering_through(ssh_client.run)
     docker_api = Mock(inspect_network=Mock(return_value={"Driver": "bridge", "Options": RENTAL_NETWORK_OPTIONS}))
     docker_api.create_container.return_value = {"Id": "filler-container"}
     docker_api.containers.return_value = []
@@ -87,7 +91,7 @@ def _removed_names(ssh_client) -> list[str]:
 
 @pytest.fixture
 def svc() -> ds_module.DockerService:
-    return ds_module.DockerService(ssh_service=Mock(), redis_service=Mock(mget=AsyncMock(side_effect=lambda keys: [None] * len(keys)), set=AsyncMock(), write_atomically=AsyncMock(), get_rented_machine=AsyncMock(return_value=None), rented_machines_synced=AsyncMock(return_value=True)), attestation_service=Mock())
+    return ds_module.DockerService(ssh_service=Mock(), redis_service=Mock(mget=AsyncMock(side_effect=lambda keys: [None] * len(keys)), set=AsyncMock(), write_atomically=AsyncMock(), get_rented_machine=AsyncMock(return_value=None), rented_machines_synced=AsyncMock(return_value=True)), attestation_service=Mock(prepare_host_policy=AsyncMock(return_value=HostPolicyResult())))
 
 
 @pytest.mark.parametrize(

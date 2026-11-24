@@ -28,3 +28,26 @@ def _stub_out_the_chain() -> None:
 
 
 _stub_out_the_chain()
+
+
+def _admit_the_seeded_executor() -> None:
+    """The validator dials only public node addresses (services.node_host, DAH-6782). The stack's executor sits on the
+    compose network at E2E_EXECUTOR_IP (a private address by design), so exactly that address is let through, for
+    this tester process only; every other private, loopback or link-local literal is still refused as in production."""
+    import os
+
+    import services.node_host as node_host
+
+    if getattr(node_host, "_e2e_admitted", None):
+        return
+    seeded, check = os.environ["E2E_EXECUTOR_IP"], node_host._check_literal
+
+    def check_literal(host: str, port: int) -> None:
+        if host.strip("[]") != seeded:
+            check(host, port)
+
+    node_host._check_literal = check_literal
+    node_host._e2e_admitted = seeded
+
+
+_admit_the_seeded_executor()

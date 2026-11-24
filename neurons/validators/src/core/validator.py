@@ -452,7 +452,9 @@ class Validator:
                 executor_image_snapshot = build_expected_image_snapshot(executor_digest)
 
                 # Fetch all rented executors from backend API
-                rented_executors = await self.backend_client.get_all_rented_executors()
+                rented_executors = await self.backend_client.get_all_rented_executors(
+                    cycle_snapshot_block=job_block
+                )
                 if rented_executors is None:
                     logger.error(
                         _m(
@@ -777,8 +779,8 @@ class Validator:
                                 exc_info=True,
                             )
 
-                    # PHASE 2: Calculate final weights with burning logic per cycle
-                    miners = await self.subtensor_client.get_miners()
+                    # PHASE 2: Calculate final weights with burning logic per cycle, over the miners this cycle
+                    # asked: a list refreshed meanwhile would drop a hotkey whose node rows the cycle still reports
 
                     # Current subnet epoch for the referral feed's staleness guard. This MUST use
                     # the SAME numbering as the backend feed's epoch_index — see
