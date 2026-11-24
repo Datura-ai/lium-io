@@ -757,17 +757,20 @@ async def test_create_s3fs_volume_retries_a_failed_plugin_install(
 
 
 class InstalledPluginSSHClient(RecordingSSHClient):
-    # answers `plugin inspect` with the installed instance's reference, `plugin rm` with plugin_rm_exit, every other
-    # command with `stdout`
-    def __init__(self, reference: str, stdout: str = "", plugin_rm_exit: int = 0):
+    # answers `plugin inspect` with the installed instance's reference, `docker ps` with the containers holding the
+    # volume, `plugin rm` with plugin_rm_exit, every other command with `stdout`
+    def __init__(self, reference: str, stdout: str = "", plugin_rm_exit: int = 0, holders: str = ""):
         super().__init__(stdout=stdout)
         self.reference = reference
         self.plugin_rm_exit = plugin_rm_exit
+        self.holders = holders
 
     async def run(self, command, *args, **kwargs):
         self.commands.append(command)
         if "plugin inspect --format '{{.PluginReference}}'" in command:
             return SimpleNamespace(stdout=self.reference + "\n", stderr="", exit_status=0)
+        if command.startswith("/usr/bin/docker ps -aq --filter volume="):
+            return SimpleNamespace(stdout=self.holders, stderr="", exit_status=0)
         if command.startswith("/usr/bin/docker plugin rm "):
             stderr = "plugin s3fs-celium-volume-safe is in use" if self.plugin_rm_exit else ""
             return SimpleNamespace(stdout="", stderr=stderr, exit_status=self.plugin_rm_exit)
@@ -808,8 +811,9 @@ async def test_an_instance_of_another_build_is_removed_with_its_volume_or_the_re
         sysbox_subuid_base=None,
     )
 
-    # the volume handle goes first, then the instance it held in use
-    assert ssh_client.commands[1:4] == [
+    # no container references the volume; its handle goes first, then the instance it held in use
+    assert ssh_client.commands[1:5] == [
+        "/usr/bin/docker ps -aq --filter volume=celium-volume-safe",
         "/usr/bin/docker volume rm celium-volume-safe",
         "/usr/bin/docker plugin disable s3fs-celium-volume-safe -f",
         "/usr/bin/docker plugin rm s3fs-celium-volume-safe",
@@ -821,6 +825,28 @@ async def test_an_instance_of_another_build_is_removed_with_its_volume_or_the_re
         assert is_success is False and "could not be removed" in message and "in use" in message
         assert not installed
         stream_logs.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_an_instance_of_another_build_stays_while_a_container_references_its_volume(docker_service, monkeypatch):
+    # review on #2397: an edit/reboot parks the pod's stopped container, which keeps the volume; `plugin rm` then
+    # failed after `disable -f` and the pod came back without its Volume
+    ssh_client = InstalledPluginSSHClient("docker.io/mochoa/s3fs-volume-plugin:latest", holders="0123456789ab\n")
+    monkeypatch.setattr(docker_service, "execute_and_stream_logs", AsyncMock(return_value=(True, "")))
+
+    is_success, _ = await docker_service.create_s3fs_volume(
+        ssh_client=ssh_client,
+        log_extra={},
+        volume_info=_s3fs_volume_info(),
+        log_tag="tag",
+        sysbox_subuid_base=None,
+    )
+
+    assert is_success is True
+    assert "/usr/bin/docker volume rm celium-volume-safe" not in ssh_client.commands
+    assert "/usr/bin/docker plugin rm s3fs-celium-volume-safe" not in ssh_client.commands
+    # the instance is only reconfigured and comes back enabled, as for one of our build
+    assert ssh_client.commands[-1] == "/usr/bin/docker plugin enable s3fs-celium-volume-safe"
 
 
 @pytest.mark.asyncio

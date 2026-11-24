@@ -8258,8 +8258,14 @@ class DockerService:
         reference = (installed.stdout or "").strip() if installed.exit_status == 0 else ""
         if not reference or _s3fs_plugin_is_current(reference):
             return None
+        # a container that references the volume, running or stopped (an edit/reboot parks the pod's one), keeps the
+        # instance in use: disabling it would leave that pod without its Volume, so the old build serves it until no
+        # container references the volume. An unreadable list counts as held
+        holders = await ssh_client.run(f"/usr/bin/docker ps -aq --filter volume={shlex.quote(volume_name)}")
+        if holders.exit_status != 0 or (holders.stdout or "").strip():
+            return None
         # its volume handle keeps the instance in use, so `plugin rm` fails until the handle is gone; the data is in the
-        # bucket. A handle a running pod still mounts stays, and so does the instance: the rental fails below
+        # bucket
         await ssh_client.run(f"/usr/bin/docker volume rm {volume_name}")
         await ssh_client.run(f"/usr/bin/docker plugin disable {plugin_alias} -f")
         removed = await ssh_client.run(f"/usr/bin/docker plugin rm {plugin_alias}")
