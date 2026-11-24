@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock
 import pytest
 from helpers import build_context_config, build_services, build_state, make_context
 from services.liumd_binary_refresh import LiumdRefresh
+from services.liumd_exec_client import LiumdRefusal
 from services.local_verify_client import LocalVerifyAnswer, LocalVerifyUnavailable
 from services.task import liumd_shadow
 from services.task.checks import machine_spec_scrape
@@ -152,6 +153,23 @@ async def test_a_failed_python_fallback_reports_the_liumd_reason(monkeypatch):
     assert result.event.what_we_saw["delivery"] == "stdin"
     assert result.event.what_we_saw["liumd_fallback_reason"] == "binary_refresh_failed"
     assert len(runner.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_liumd_refusal_keeps_its_error_and_detail_as_the_fallback_reason(monkeypatch):
+    _liumd_on(monkeypatch)
+    refusal = LiumdRefusal(
+        exit_status=3, error="docker_unavailable", detail="cannot reach the docker daemon",
+        echoed=True, round_trip_ms=15,
+    )
+    _start_reading(monkeypatch, refusal)
+    runner = DummySSHCommandRunner(result=make_command_result(success=True, stdout=FERNET_TOKEN))
+
+    result = await MachineSpecScrapeCheck().run(_ctx(runner))
+
+    assert result.passed is True
+    assert result.event.what_we_saw["liumd_fallback_reason"] == "docker_unavailable"
+    assert result.event.what_we_saw["liumd_fallback_detail"] == "cannot reach the docker daemon"
 
 
 @pytest.mark.asyncio
