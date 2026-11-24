@@ -2,17 +2,13 @@ import asyncio
 import time
 import uuid
 from datetime import UTC, datetime
-from typing import Awaitable, NamedTuple, Optional, TypeVar
+from typing import Optional
 
 import asyncssh
 from pydantic import BaseModel
 
 # error_type when ssh.run returned but the host sent neither an exit status nor an exit signal
 NO_EXIT_STATUS = "no_exit_status"
-
-T = TypeVar("T")
-# a remote kill (or kill of a step's remote processes) sent while a step is cancelled
-REMOTE_KILL_TIMEOUT_SECONDS = 10
 
 
 class SSHCommandResult(BaseModel):
@@ -55,9 +51,7 @@ class SSHCommandRunner:
             start = datetime.now(UTC)
             t0 = time.perf_counter()
             try:
-                # asyncio.timeout, not wait_for: on 3.11 wait_for drops a cancel that lands as the command completes
-                async with asyncio.timeout(timeout):
-                    result = await self.ssh.run(cmd, input=stdin_text)
+                result = await asyncio.wait_for(self.ssh.run(cmd, input=stdin_text), timeout=timeout)
                 dt = int((time.perf_counter() - t0) * 1000)
                 stdout = str(result.stdout) or ""
                 stderr = str(result.stderr) or ""
@@ -152,50 +146,3 @@ class SSHCommandRunner:
                 )
 
         raise last_exc or RuntimeError(f"Unknown SSH error for cmd: {cmd}")
-
-
-class PidTagged(NamedTuple):
-    command: str
-    kill_command: str
-
-
-def pid_tagged(cmd: str) -> PidTagged:
-    """`cmd` wrapped so its remote shell, a session leader under sshd, records its PID, and the command that kills
-    that PID's group, only while the PID still runs this command (a reused PID is spared), as kill_remote_verifyx does.
-    """
-    tag = f"lium-probe-{uuid.uuid4().hex}"
-    pid_file = f"/tmp/{tag}.pid"
-    wrapped = f"echo $$ > {pid_file}; {cmd}; rc=$?; rm -f {pid_file}; exit $rc"
-    kill = (
-        f'p=$(cat {pid_file} 2>/dev/null); [ -n "$p" ] && grep -q {tag} /proc/"$p"/cmdline 2>/dev/null '
-        f'&& kill -KILL -"$p" "$p" 2>/dev/null; rm -f {pid_file}'
-    )
-    return PidTagged(command=wrapped, kill_command=kill)
-
-
-async def run_killed_on_cancel(
-    runner: SSHCommandRunner, cmd: str, *, seconds: int, stdin_text: str | None = None
-) -> SSHCommandResult:
-    """`runner.run(cmd)` once; cancelled (a rent landed), its remote process group is killed before the cancel goes on."""
-    tagged = pid_tagged(cmd)
-    try:
-        return await runner.run(tagged.command, timeout=seconds, retryable=False, stdin_text=stdin_text)
-    except asyncio.CancelledError:
-        await run_to_end(runner.run(tagged.kill_command, timeout=REMOTE_KILL_TIMEOUT_SECONDS, retryable=False))
-        raise
-
-
-async def run_to_end(aw: Awaitable[T]) -> T:
-    """Await `aw` (a step's cleanup) to its end through any number of cancels, then re-raise the cancel if one came,
-    else return its result: the pipeline re-cancels a step until it ends, and every remote kill or cleanup a step runs
-    while cancelled goes through here so it still finishes before the caller closes the session."""
-    task = asyncio.ensure_future(aw)
-    cancelled = False
-    while not task.done():
-        try:
-            await asyncio.wait({task})
-        except asyncio.CancelledError:
-            cancelled = True
-    if cancelled:
-        raise asyncio.CancelledError()
-    return task.result()

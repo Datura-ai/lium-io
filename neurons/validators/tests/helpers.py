@@ -466,36 +466,3 @@ async def no_host_start_lock(*args):
     """DockerService._hold_pod_start_host_lock for doubles that model no host shell: the host lock is tested on its
     own with a real shell (test_docker_service: the fenced stop and its hold command)."""
     yield
-
-
-class HeldCleanup:
-    """A cleanup (a remote kill, a removal, a lock release) that runs until the test lets it end."""
-
-    def __init__(self):
-        self.started = asyncio.Event()
-        self.release = asyncio.Event()
-        self.finished = False
-
-    async def run(self, *_args, **_kwargs):
-        self.started.set()
-        await self.release.wait()
-        self.finished = True
-
-
-async def assert_cleanup_outlasts_a_repeat_cancel(task: asyncio.Future, cleanup: HeldCleanup) -> None:
-    """Cancel `task`, cancel it again while its cleanup runs (the pipeline re-cancels a step until it ends), and
-    check it ends cancelled only after the cleanup finished: the caller closes the SSH session right after."""
-    task.cancel()
-    await asyncio.wait_for(cleanup.started.wait(), 5)
-    task.cancel()
-    for _ in range(20):
-        await asyncio.sleep(0)
-    assert not task.done(), "the step ended while its cleanup was still running"
-    cleanup.release.set()
-    try:
-        await asyncio.wait_for(task, 5)
-    except asyncio.CancelledError:
-        pass
-    else:
-        raise AssertionError("the step did not end cancelled")
-    assert cleanup.finished

@@ -18,7 +18,6 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 import services.matrix_validation_service as mvs
-from tests.helpers import HeldCleanup, assert_cleanup_outlasts_a_repeat_cancel
 
 
 @pytest.fixture
@@ -304,14 +303,16 @@ async def test_cancelling_the_lane_mid_matmul_kills_the_remote_process(service_w
 
 @pytest.mark.asyncio
 async def test_a_second_cancel_does_not_stop_the_kill(service_with_mock_wrapper):
-    """The kill runs to its end: cancelling the lane again while pkill is in flight neither stops the kill nor
-    lets the lane end before it (the session closes right after)."""
+    """The kill is shielded: cancelling the lane again while pkill is in flight still lets it finish."""
     svc, _ = service_with_mock_wrapper
-    matmul_started, kill = asyncio.Event(), HeldCleanup()
+    matmul_started, kill_started, release_kill = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    kill_finished = asyncio.Event()
 
     async def run(command, **_kwargs):
         if "pkill" in command:
-            await kill.run()
+            kill_started.set()
+            await release_kill.wait()
+            kill_finished.set()
             return SimpleNamespace(stdout="", stderr="")
         matmul_started.set()
         await asyncio.Event().wait()
@@ -325,5 +326,11 @@ async def test_a_second_cancel_does_not_stop_the_kill(service_with_mock_wrapper)
         )
     )
     await matmul_started.wait()
+    lane.cancel()
+    await kill_started.wait()
+    lane.cancel()
 
-    await assert_cleanup_outlasts_a_repeat_cancel(lane, kill)
+    with pytest.raises(asyncio.CancelledError):
+        await lane
+    release_kill.set()
+    await asyncio.wait_for(kill_finished.wait(), timeout=1)

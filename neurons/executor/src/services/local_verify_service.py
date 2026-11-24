@@ -491,15 +491,7 @@ class LocalVerifyService:
 
         deadline_hit = False
         if tasks:
-            try:
-                done, pending = await asyncio.wait(tasks, timeout=deadline)
-            except asyncio.CancelledError:
-                # cancelled from outside (the validator closed the request): asyncio.wait leaves its tasks running,
-                # so the steps are cancelled here and their subprocesses killed before the suite lock is released
-                for task in tasks:
-                    task.cancel()
-                await asyncio.gather(*tasks, return_exceptions=True)
-                raise
+            done, pending = await asyncio.wait(tasks, timeout=deadline)
             if pending:
                 deadline_hit = True
                 for task in pending:

@@ -50,8 +50,6 @@ from protocol.vc_protocol.compute_requests import (
 
 from services.ssh_service import SSHService
 from tests.helpers import (
-    HeldCleanup,
-    assert_cleanup_outlasts_a_repeat_cancel,
     build_context_config,
     build_services,
     build_state,
@@ -835,33 +833,6 @@ async def test_the_create_lock_is_released_when_the_create_is_cut_short():
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
-    assert redis.create_lock_events == ["acquired", "released"]
-
-
-@pytest.mark.asyncio
-async def test_a_repeat_cancel_waits_for_the_create_lock_release():
-    """Review: the pipeline cancels a step again until it ends; the create lock's release still finishes first, so
-    a renter's create never waits out the lock's TTL behind a cancelled probe."""
-
-    class HangingDocker(FakeDocker):
-        async def create_container(self, payload, executor_info, keypair, private_key, **_):
-            self.create_calls.append(payload)
-            await asyncio.sleep(30)
-
-    release = HeldCleanup()
-
-    class HeldReleaseLock(FakeCreateLock):
-        async def release(self):
-            await release.run()
-            await super().release()
-
-    ctx, docker, redis = make_probe_context(docker=HangingDocker())
-    redis.executor_create_lock = lambda executor_id: HeldReleaseLock(redis)
-    with probe_settings(), renter_path():
-        task = asyncio.ensure_future(RentalProbeCheck().run(ctx))
-        while not docker.create_calls:
-            await asyncio.sleep(0.005)
-        await assert_cleanup_outlasts_a_repeat_cancel(task, release)
     assert redis.create_lock_events == ["acquired", "released"]
 
 

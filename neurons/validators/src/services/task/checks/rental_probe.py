@@ -37,7 +37,6 @@ from ..messages import NO_OUTBOUND_INTERNET_REMEDIATION, OutboundInternetMessage
 from ..messages import RentalProbeMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
-from ..runner import run_to_end
 from .outbound_internet import EGRESS_PROBE_SCRIPT, parse_egress_probe
 from .rental_owner import rental_of_this_node
 from .ssh_identification import SSH_ID_LINE_MAX, is_ssh2_identification, read_ssh_identification
@@ -339,7 +338,7 @@ class RentalProbeCheck:
                 create_deadline=create_deadline,
             )
         finally:
-            await run_to_end(gate.create_lock.release(ctx))
+            await gate.create_lock.release(ctx)
         # `steps` is the pipeline's own per-check duration summary on the run's last event
         # (summarize_steps); the probe's records need their own key to survive it.
         what = {
@@ -1093,7 +1092,7 @@ async def _step_container_start(
         outcome.inconclusive_reason = "create_container raised"
         return None
     finally:
-        await run_to_end(create_lock.release(ctx))
+        await asyncio.shield(create_lock.release(ctx))
 
     if not isinstance(result, ContainerCreated):
         detail, create_step = _failure_detail(result)
@@ -1254,7 +1253,17 @@ async def _step_teardown(
     (the first one, or a second) interrupts only this wait, never the settle, and is re-raised once
     the settle is done so the run still ends as cancelled.
     """
-    await run_to_end(_settle(ctx, outcome, created=created, pod_id=pod_id, log_extra=log_extra))
+    settle = asyncio.ensure_future(
+        _settle(ctx, outcome, created=created, pod_id=pod_id, log_extra=log_extra)
+    )
+    cancelled = False
+    while not settle.done():
+        try:
+            await asyncio.shield(settle)
+        except asyncio.CancelledError:
+            cancelled = True
+    if cancelled:
+        raise asyncio.CancelledError()
 
 
 # Passed probes' teardowns still running: the loop keeps only a weak reference to a task.

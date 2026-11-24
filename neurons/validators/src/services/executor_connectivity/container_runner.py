@@ -1,17 +1,9 @@
 import asyncio
-import logging
 
-import asyncssh
 from asyncssh import SSHClientConnection
 
 from core.docker_utils import DockerCommand
-from core.utils import _m
 from services.executor_connectivity.models import ContainerStartResult
-
-logger = logging.getLogger(__name__)
-
-# docker rm of a stopped netcat container takes well under a second on a healthy daemon
-CLEANUP_TIMEOUT_SECONDS = 30
 
 
 class ContainerRunner:
@@ -71,9 +63,5 @@ class ContainerRunner:
         )
 
     async def cleanup(self, ssh_client: SSHClientConnection, name: str):
-        """Remove container, bounded: on a stuck docker daemon the removal gives up and the stale-container sweep of
-        a later cycle removes it, so no cleanup holds the miner's task past JOB_TIME_OUT."""
-        try:
-            await ssh_client.run(DockerCommand.remove_with_volumes(name), timeout=CLEANUP_TIMEOUT_SECONDS)
-        except (TimeoutError, asyncssh.TimeoutError):
-            logger.warning(_m("Port-check container removal timed out", extra={"container_name": name}))
+        """Remove container."""
+        await ssh_client.run(DockerCommand.remove_with_volumes(name))

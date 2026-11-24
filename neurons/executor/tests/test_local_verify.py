@@ -9,8 +9,6 @@ publishing one host port of the renting range.
 from __future__ import annotations
 
 import asyncio
-import json
-import os
 import secrets
 import sys
 import textwrap
@@ -65,8 +63,6 @@ FAKE_VERIFYX = textwrap.dedent(
     p = argparse.ArgumentParser()
     p.add_argument("--seed"); p.add_argument("--cipher_text")
     a = p.parse_args()
-    if os.environ.get("FAKE_PID_DIR"):
-        open(os.path.join(os.environ["FAKE_PID_DIR"], "verifyx.pid"), "w").write(str(os.getpid()))
     time.sleep(float(os.environ.get("FAKE_SLEEP", "0")))
     print(("ab" * 40) + a.cipher_text)
     """
@@ -276,73 +272,3 @@ def test_a_script_runs_in_the_home_dir_like_an_ssh_session():
     result = asyncio.run(lvs.run_script([sys.executable, "-c", "import os; print(os.getcwd())"], timeout=10))
 
     assert result.stdout.strip() == str(Path.home())
-
-
-async def _running_verifyx_pid(pid_dir: Path) -> int:
-    pid_file = pid_dir / "verifyx.pid"
-    for _ in range(200):
-        if pid_file.exists() and pid_file.read_text():
-            return int(pid_file.read_text())
-        await asyncio.sleep(0.05)
-    raise AssertionError("the fake VerifyX never started")
-
-
-def _alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    return True
-
-
-def test_a_closed_request_stops_the_suite_and_kills_its_running_gpu_subprocess(
-    validator_keypair, monkeypatch, fake_scripts, fake_docker, tmp_path
-):
-    # review on lium-io#2069: the validator stops a run for a renter's create and drops the tunnel; the executor's
-    # VerifyX ran on to its end. Starlette does not cancel a handler on a disconnect.
-    monkeypatch.setenv("FAKE_SLEEP", "30")
-    monkeypatch.setenv("FAKE_PID_DIR", str(tmp_path))
-    app = _app(validator_keypair, monkeypatch)
-    body = json.dumps(_signed(_body(), validator_keypair)).encode()
-    scope = {
-        "type": "http",
-        "asgi": {"version": "3.0"},
-        "http_version": "1.1",
-        "method": "POST",
-        "scheme": "http",
-        "path": "/verify",
-        "raw_path": b"/verify",
-        "query_string": b"",
-        "root_path": "",
-        "headers": [(b"content-type", b"application/json"), (b"content-length", str(len(body)).encode())],
-        "client": ("127.0.0.1", 51234),
-        "server": ("127.0.0.1", 8000),
-    }
-
-    async def scenario() -> tuple[bool, list[dict], bool]:
-        closed = asyncio.Event()
-        messages = [{"type": "http.request", "body": body, "more_body": False}]
-        sent: list[dict] = []
-
-        async def receive():
-            if messages:
-                return messages.pop(0)
-            await closed.wait()
-            return {"type": "http.disconnect"}
-
-        async def send(message):
-            sent.append(message)
-
-        served = asyncio.ensure_future(app(scope, receive, send))
-        pid = await _running_verifyx_pid(tmp_path)
-        closed.set()
-        await asyncio.wait_for(served, 10)
-        # read inside the loop: asyncio.run's exit would cancel a step left running and hide it
-        return _alive(pid), sent, apis_module._get_local_verify_service().busy
-
-    alive, sent, busy = asyncio.run(scenario())
-
-    assert not alive
-    assert sent[0]["status"] == 499
-    assert not busy
-

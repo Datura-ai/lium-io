@@ -17,7 +17,6 @@ from unittest.mock import MagicMock
 import pytest
 
 import services.matrix_validation_service as mvs
-from tests.helpers import HeldCleanup, assert_cleanup_outlasts_a_repeat_cancel
 
 
 @pytest.fixture
@@ -457,8 +456,6 @@ async def test_a_cancelled_all_cards_run_kills_the_remote_matmuls_and_stays_canc
         if cmd.startswith("pkill"):
             kills.append(cmd)
             return SimpleNamespace(exit_status=0, stdout="", stderr="")
-        if "kill -KILL" in cmd:  # the per-card kill _run_cards sends first on a cancel
-            return SimpleNamespace(exit_status=0, stdout="", stderr="")
         started.set()
         await asyncio.sleep(3600)
 
@@ -469,28 +466,3 @@ async def test_a_cancelled_all_cards_run_kills_the_remote_matmuls_and_stays_canc
     with pytest.raises(asyncio.CancelledError):
         await task
     assert len(kills) == 1
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("held", ["per_card_kill", "pkill"])
-async def test_a_repeat_cancel_waits_for_the_all_cards_kills(svc, monkeypatch, held):
-    """Review: a repeat cancel while a kill still ran let the run end and the session close under the kill, so a
-    card's matmul kept running beside the renter's pod. Each kill (the per-card one, then the pkill) runs to its end."""
-    import asyncio
-
-    _flags(monkeypatch, enforce=True)
-    started, kill = asyncio.Event(), HeldCleanup()
-
-    async def run(cmd, *args, **kwargs):
-        is_pkill = cmd.startswith("pkill")
-        if is_pkill or "kill -KILL" in cmd:
-            if is_pkill == (held == "pkill"):
-                await kill.run()
-            return SimpleNamespace(exit_status=0, stdout="", stderr="")
-        started.set()
-        await asyncio.sleep(3600)
-
-    task = asyncio.create_task(svc.probe_all_claimed_cards(SimpleNamespace(run=run), _executor(), {}, _spec(8)))
-    await started.wait()
-
-    await assert_cleanup_outlasts_a_repeat_cancel(task, kill)

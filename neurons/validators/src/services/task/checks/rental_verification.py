@@ -31,7 +31,6 @@ from ...loopback_plugin_setup import current_loopback_plugin_alias
 from ..messages import MessageTemplate, render_message
 from ..messages import RentalVerificationMessages as Msg
 from ..pipeline import CheckResult, Context
-from ..runner import run_to_end
 from .cpu_truth import advertised_cpu_count
 from .rental_owner import rental_of_this_node
 from .task_time import task_seconds_left
@@ -414,11 +413,9 @@ class RentalVerificationCheck:
             # DAH-1991: force-remove the health_check_* probe the backend just
             # spawned so it cannot race a subsequent rental on this executor.
             try:
-                await run_to_end(
-                    asyncio.wait_for(
-                        ctx.services.container_cleanup.force_remove_health_checks(ctx.ssh, ctx.executor.uuid),
-                        timeout=max(1, min(_CLEANUP_TIMEOUT_SECONDS, task_seconds_left(ctx) - _RESULT_RESERVE_SECONDS)),
-                    )
+                await asyncio.wait_for(
+                    ctx.services.container_cleanup.force_remove_health_checks(ctx.ssh, ctx.executor.uuid),
+                    timeout=max(1, min(_CLEANUP_TIMEOUT_SECONDS, task_seconds_left(ctx) - _RESULT_RESERVE_SECONDS)),
                 )
             except TimeoutError:
                 pass  # best effort: the 15-min stale sweep removes a probe left behind

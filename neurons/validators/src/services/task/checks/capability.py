@@ -58,8 +58,6 @@ class CapabilityCheck:
     """
 
     check_id = "gpu.validate.capability"
-    # a renter's create on the node stops it mid-run (Pipeline._run_step_cancelled_on_rent)
-    stops_on_rent = True
     fatal = True
 
     async def run(self, ctx: Context) -> CheckResult:

@@ -9,7 +9,6 @@ from typing import Any
 from ..messages import GpuFaultProbeMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
-from ..runner import run_killed_on_cancel
 from .capability import get_filler_only_container
 
 # The probe runs on the executor's own interpreter, standard library only, and ships over stdin the way
@@ -90,8 +89,6 @@ class GpuFaultProbeCheck:
     """
 
     check_id = "gpu.validate.fault_probe"
-    # a renter's create on the node stops it mid-run (Pipeline._run_step_cancelled_on_rent)
-    stops_on_rent = True
     # a replay that is also a no-verdict would count this cycle's unknown streak twice
     replays_after_session_drop = False
     fatal = True
@@ -117,7 +114,9 @@ class GpuFaultProbeCheck:
         if self.is_post_rental_recheck:
             # the recheck after a rental: a card that hangs its kernels every cycle must not list again
             command += " --hang-in-kernels-is-fault"
-        run = await run_killed_on_cancel(ctx.runner, command, seconds=PROBE_TIMEOUT_SECONDS, stdin_text=probe_source())
+        run = await ctx.runner.run(
+            command, timeout=PROBE_TIMEOUT_SECONDS, retryable=False, stdin_text=probe_source()
+        )
         report = _parse_report(run.stdout)
         what: dict[str, Any] = {
             "executor_uuid": ctx.executor.uuid,

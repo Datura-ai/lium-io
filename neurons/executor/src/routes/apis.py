@@ -18,7 +18,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec, ed25519, padding, rsa
 from datura.requests.validator_requests import ssh_pubkey_signing_blob, upload_nonce_issued_at
 from fastapi import APIRouter, Depends, Query, Header, HTTPException, Request
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import StreamingResponse
 from pydantic import ValidationError
 from services.miner_service import MinerService
 from services.ssh_service import check_authorized_key
@@ -632,26 +632,6 @@ async def _admit_verify_intent(request: Request) -> VerifyIntent:
     return intent
 
 
-async def _until_disconnected(request: Request) -> None:
-    while (await request.receive())["type"] != "http.disconnect":
-        pass
-
-
-async def _run_unless_disconnected(request: Request, run_suite):
-    """The suite's result, or None once the validator closes the request first: Starlette does not cancel a handler
-    on a disconnect, so without this the suite (and its GPU subprocess) runs on after the validator stopped the run,
-    for a renter's create on the node too. Cancelled, the suite kills its subprocesses (`run_script`)."""
-    run = asyncio.ensure_future(run_suite)
-    gone = asyncio.ensure_future(_until_disconnected(request))
-    try:
-        await asyncio.wait({run, gone}, return_when=asyncio.FIRST_COMPLETED)
-    finally:
-        for task in (run, gone):
-            task.cancel()
-        await asyncio.gather(run, gone, return_exceptions=True)
-    return None if run.cancelled() else run.result()
-
-
 @apis_router.post("/verify")
 async def local_verify(request: Request):
     """Run the verification suite locally from one validator-signed intent (liumd phase 1).
@@ -679,13 +659,9 @@ async def local_verify(request: Request):
         raise HTTPException(status_code=409, detail="Intent refused: nonce already used")
 
     try:
-        result = await _run_unless_disconnected(request, service.run(intent))
+        result = await service.run(intent)
     except BusyError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
-    if result is None:
-        logger.info("local verify stopped: the validator closed the request nonce=%s", intent.nonce)
-        # nobody reads it: the connection is gone
-        return Response(status_code=499)
     logger.info(
         "local verify done nonce=%s elapsed_ms=%d deadline_hit=%s steps=%s",
         intent.nonce,

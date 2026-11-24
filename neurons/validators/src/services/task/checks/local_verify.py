@@ -112,8 +112,6 @@ class _NothingToSend(Exception):
 
 class LocalVerifyCheck:
     check_id = "executor.local_verify"
-    # a renter's create on the node stops it mid-run (Pipeline._run_step_cancelled_on_rent)
-    stops_on_rent = True
     fatal = False
 
     def __init__(self, client_factory=None):

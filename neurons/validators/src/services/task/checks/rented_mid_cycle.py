@@ -59,7 +59,7 @@ class RentedMidCycleCheck:
     """Right before the GPU and network tests: a renter's create since cycle start ends the run with no verdict.
 
     The previous result stands, as for a renter GPU reset: the pod is still starting, so it is not judged here.
-    While the tests run, `Pipeline` polls the same marks and stops them (`stops_on_rent`).
+    A test already running is not stopped: it is read again only before the next one starts.
     """
 
     check_id = "executor.validate.rented_mid_cycle"

@@ -651,26 +651,3 @@ async def test_a_host_start_failing_during_the_outside_removal_does_not_cut_the_
         await verifier._attempt(TEN, "a" * 32, "port_test_aaaaaaaa", mocker.Mock(), "1.2.3.4", ContainerStartWatch())
 
     assert cleaned == ["port_test_out_aaaaaaaa"]  # removed before attempt 2 publishes the same ports
-
-
-@pytest.mark.asyncio
-async def test_a_repeat_cancel_waits_for_the_outside_listeners_removal(mocker):
-    """Review: the pipeline cancels a step again until it ends; the outside listener's removal still finishes before
-    the step ends and the session closes, so the container cannot hold the ports beside a renter's pod."""
-    from tests.helpers import HeldCleanup, assert_cleanup_outlasts_a_repeat_cancel
-
-    removal, started = HeldCleanup(), asyncio.Event()
-
-    async def start(*_args, **_kwargs):
-        started.set()
-        await asyncio.sleep(3600)
-
-    verifier, _ = _verifier(mocker, lambda sample: sample)
-    verifier.runner.run = start
-    verifier.runner.cleanup = removal.run
-    task = asyncio.ensure_future(
-        verifier._outside_reading(PORTS, "a" * 32, mocker.Mock(), "1.2.3.4", {}, ContainerStartWatch())
-    )
-    await started.wait()
-
-    await assert_cleanup_outlasts_a_repeat_cancel(task, removal)

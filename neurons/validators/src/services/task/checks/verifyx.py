@@ -31,7 +31,6 @@ from services.verifyx_validation_service import (
 
 from ..messages import VerifyXMessages as Msg, render_message, shown
 from ..pipeline import CheckResult, Context
-from ..runner import run_to_end
 from .disk_space import DiskSpaceCheck
 from .rental_probe import has_standing_failure
 from .network_ema import compute_ema
@@ -248,8 +247,6 @@ class VerifyXCheck:
     """
 
     check_id = "gpu.validate.verifyx"
-    # a renter's create on the node stops it mid-run (Pipeline._run_step_cancelled_on_rent)
-    stops_on_rent = True
     # a replay would advance this cycle's counters a second time
     replays_after_session_drop = False
     fatal = True
@@ -1047,9 +1044,6 @@ def hold_verifyx_ema(ctx: Context, specs: dict[str, Any]) -> dict[str, Any]:
     return {**specs, "network": held}
 
 
-async def _kill_or_remember_run(ctx: Context, run_dir: str) -> None:
-    if not await ctx.services.verifyx.kill_remote_verifyx(ctx.services.shell, run_dir, ctx.default_extra):
-        await _remember_stale_run(ctx, run_dir)
 async def _verifyx_within(ctx: Context, specs: dict, sizing: dict, budget: float):
     """DAH-5933: the first sample cut at `budget`; None when the cut came first. A cut-off run, or one whose SSH
     call failed, is killed on the host as the cold retry's is, or kept for the next run to reap."""
@@ -1073,9 +1067,10 @@ async def _verifyx_within(ctx: Context, specs: dict, sizing: dict, budget: float
     except TimeoutError:
         pass
     finally:
-        if result is None or (result.diagnostics or {}).get("transport_error") is not None:
-            # a run cancelled for a renter's create too: the kill ends before the step does
-            await run_to_end(_kill_or_remember_run(ctx, run_dir))
+        if (result is None or (result.diagnostics or {}).get("transport_error") is not None) and not (
+            await verifyx_service.kill_remote_verifyx(ctx.services.shell, run_dir, ctx.default_extra)
+        ):
+            await _remember_stale_run(ctx, run_dir)
     return result
 
 
@@ -1261,16 +1256,14 @@ class VerifyXColdRetryCheck:
         finally:
             probe.cancel()
             watch.cancel()
-
-            async def cut_off() -> None:
-                await asyncio.gather(probe, watch, return_exceptions=True)
-                # Cut off (deadline, SSH timeout, lost connection, rental, outer cancel): the remote run may live on.
-                if (retry is None or transport_error is not None) and not (
-                    await verifyx_service.kill_remote_verifyx(ctx.services.shell, run_dir, ctx.default_extra)
-                ):
-                    await _remember_stale_run(ctx, run_dir)
-
-            await run_to_end(cut_off())
+            await asyncio.gather(probe, watch, return_exceptions=True)
+            # Cut off (deadline, SSH timeout, lost connection, rental, outer cancel): the remote run may live on.
+            if (retry is None or transport_error is not None) and not (
+                await verifyx_service.kill_remote_verifyx(
+                    ctx.services.shell, run_dir, ctx.default_extra
+                )
+            ):
+                await _remember_stale_run(ctx, run_dir)
         if busy is not None:
             logger.info(
                 _m(
