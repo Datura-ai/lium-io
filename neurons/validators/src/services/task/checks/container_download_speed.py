@@ -280,7 +280,8 @@ class ContainerDownloadSpeedCheck:
             failures = failing_on_rentals = 0
         measured_mbps = [r.mbps for r in readings if r.mbps is not None]
         recent_best = state.recent_best
-        if measured_mbps:
+        # the listing's figure is what a pod gets: a reading off the rentals network (the fallback) is not one
+        if measured_mbps and on_rentals:
             recent_best = [*recent_best, (max(measured_mbps), now)][-MEDIAN_OF:]
         state = _State(
             at=now,

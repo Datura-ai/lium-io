@@ -399,3 +399,17 @@ async def test_no_figure_before_the_first_measured_reading():
         res = await ContainerDownloadSpeedCheck().run(ctx)
     assert res.event.reason_code == Msg.UNMEASURED.reason
     assert module.SPECS_KEY not in res.updates.get("state", ctx.state).specs
+
+
+async def test_a_reading_off_the_rentals_network_is_not_the_listed_figure():
+    # review: a node with no rental yet measures on the default bridge, a path the verdict does not enforce on; that
+    # reading is not what a pod gets, so it never becomes the in-pod figure
+    fast_on_bridge = FAST.replace(RENTALS, BRIDGE)
+    with flags() as clock:
+        ctx, _, _ = make_ctx(fast_on_bridge, FAST)
+        check = ContainerDownloadSpeedCheck()
+        first = await check.run(ctx)
+        assert module.SPECS_KEY not in first.updates.get("state", ctx.state).specs
+        clock.now += 6 * 3600
+        second = await check.run(ctx)
+    assert second.updates["state"].specs[module.SPECS_KEY] == pytest.approx(CAP_BYTES * 8 / 1e6, abs=0.1)

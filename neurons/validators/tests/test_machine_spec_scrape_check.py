@@ -715,6 +715,18 @@ async def test_a_provider_reported_split_disk_is_dropped(context_factory):
     assert "split_disk" not in result.updates["state"].specs
 
 
+@pytest.mark.asyncio
+async def test_a_provider_reported_in_pod_download_figure_is_dropped(context_factory):
+    # DAH-6239: the in-pod download figure is the validator's own reading; a scrape-sent one must not reach the
+    # listing on a cycle the download check skips
+    result = await _scrape_ok_event_for(
+        context_factory, {"container_download_mbps": 9999.0, "container_download_measured_at": 1.0}
+    )
+
+    specs = result.updates["state"].specs
+    assert "container_download_mbps" not in specs and "container_download_measured_at" not in specs
+
+
 # Which side failed, from what the scrape run returned. Host side needs an exit status from the
 # host; without one the code is undetermined (lium-platform#714 bills a running pod only through a
 # failure no host fault can produce, and none of these qualifies).

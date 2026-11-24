@@ -88,7 +88,7 @@ The VerifyX speed test runs on the host network. A renter's container goes throu
 
 A node whose container downloads are too slow or cannot connect in two readings in a row (the second 30 min after the first), both on the `lium-rentals` network, fails: `CONTAINER_DOWNLOAD_SLOW` (score 0, until a reading passes). A streak with a default-bridge reading is only logged as `CONTAINER_DOWNLOAD_SLOW_OBSERVED`. An endpoint the validator cannot reach either, an HTTP error or a container that did not start is no verdict.
 
-Every cycle that reads a node's last reading also sends `container_download_mbps` in the specs: the median of the last 5 readings' fastest endpoint (Mbps), with `container_download_measured_at` (epoch seconds of the newest). The renter listing shows it as the in-pod download speed next to the host-side figure (DAH-6239).
+Every cycle that reads a node's last reading also sends `container_download_mbps` in the specs: the median of the last 5 readings' fastest endpoint (Mbps) among readings taken on the rentals network a pod runs on, with `container_download_measured_at` (epoch seconds of the newest). The renter listing shows it as the in-pod download speed next to the host-side figure.
 
 Code: `src/services/task/checks/container_download_speed.py`.
 
