@@ -31,6 +31,7 @@ from services.redis_service import (
 
 from ...const import MIN_POD_PORT_COUNT, POD_CONTAINER_PREFIX
 from ...node_host import open_public_connection, public_host_sock
+from ..availability import failed_check_event
 from ..messages import NO_OUTBOUND_INTERNET_REMEDIATION, OutboundInternetMessages
 from ..messages import RentalProbeMessages as Msg
 from ..messages import render_message
@@ -514,15 +515,20 @@ class RentalProbeCheck:
             # (REASONS_THAT_HIDE_AT_ONCE) until its first pass. Unreadable: no score, and the backend keeps
             # the node's stored listing state (REASONS_THAT_KEEP_STORED), so an unproven node is not listed
             # by it and a proven one is not hidden by a Redis read failure.
+            event = render_message(
+                Msg.NOT_YET_PROVEN if standing is _NEVER_PASSED else Msg.PROOF_UNREADABLE,
+                ctx=ctx,
+                check_id=self.check_id,
+                what={"executor_uuid": ctx.executor.uuid, "no_verdict_this_cycle": no_verdict},
+            )
+            # the hold travels with this result, not with where the run happens to end: an unproven node stays
+            # hidden whatever the run reports after it (network figures included)
+            hold = failed_check_event(False, [event]) if standing is _NEVER_PASSED else None
             return CheckResult(
                 passed=False,
-                event=render_message(
-                    Msg.NOT_YET_PROVEN if standing is _NEVER_PASSED else Msg.PROOF_UNREADABLE,
-                    ctx=ctx,
-                    check_id=self.check_id,
-                    what={"executor_uuid": ctx.executor.uuid, "no_verdict_this_cycle": no_verdict},
-                ),
+                event=event,
                 updates={"score": 0.0, "job_score": 0.0},
+                extra_events=[hold] if hold else [],
             )
         what: dict[str, Any] = {
             "executor_uuid": ctx.executor.uuid,

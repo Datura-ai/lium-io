@@ -26,6 +26,7 @@ from neurons.validators.src.services.task.checks.rental_probe import (
     RentalProbeCheck,
 )
 from neurons.validators.src.services.task.messages import RentalProbeMessages as Msg
+from neurons.validators.src.services.task.messages import render_message
 from neurons.validators.src.services.task.availability import run_availability_errors
 from neurons.validators.src.services.task.pipeline import (
     Pipeline,
@@ -1938,9 +1939,14 @@ async def test_a_node_no_probe_has_passed_on_is_not_listed_by_a_cycle_without_a_
     assert redis.standing_failure() is None and not redis.stamped()
     assert docker.create_calls == []
     # hidden at once (DAH-7044 review): a zero score alone leaves a node the backend holds listed
-    errors = run_availability_errors(False, [result.event])
+    errors = run_availability_errors(False, [*result.extra_events, result.event])
     assert [e["reason_code"] for e in errors] == ["VERIFICATION_FAILED"]
     assert errors[0]["what_we_saw"]["failed_reason"] == Msg.NOT_YET_PROVEN.reason
+    # the hold is the result's own, not inferred from the run's last event: events reported after it (a passing
+    # check, network figures) leave it in place
+    later = render_message(Msg.SKIPPED, ctx=ctx, check_id="executor.validate.later", what={})
+    errors = run_availability_errors(False, [*result.extra_events, result.event, later])
+    assert [e["reason_code"] for e in errors] == ["VERIFICATION_FAILED"]
 
 
 @pytest.mark.asyncio
