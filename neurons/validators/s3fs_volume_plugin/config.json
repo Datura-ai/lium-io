@@ -1,0 +1,52 @@
+{
+    "description": "S3FS volume plugin (upstream driver, Ubuntu 24.04 s3fs)",
+    "documentation": "https://github.com/Datura-ai/lium-io/tree/main/neurons/validators/s3fs_volume_plugin",
+    "entrypoint": [
+        "/usr/bin/tini",
+        "--",
+        "/s3fs-volume-plugin"
+    ],
+    "env": [
+        {
+            "name": "AWSACCESSKEYID",
+            "settable": [
+                "value"
+            ],
+            "value": ""
+        },
+        {
+            "name": "AWSSECRETACCESSKEY",
+            "settable": [
+                "value"
+            ],
+            "value": ""
+        },
+        {
+            "name": "DEFAULT_S3FSOPTS",
+            "settable": [
+                "value"
+            ],
+            "value": "nomultipart,use_path_request_style"
+        }
+    ],
+    "network": {
+        "type": "host"
+    },
+    "propagatedMount": "/var/lib/docker-volumes",
+    "interface": {
+        "types": [
+            "docker.volumedriver/1.0"
+        ],
+        "socket": "s3fs.sock"
+    },
+    "linux": {
+        "capabilities": [
+            "CAP_SYS_ADMIN"
+        ],
+        "devices": [
+            {
+                "path": "/dev/fuse"
+            }
+        ]
+    }
+}
