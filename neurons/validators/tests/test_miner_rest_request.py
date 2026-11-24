@@ -122,7 +122,8 @@ async def test_a_malformed_configured_origin_breaks_no_other_request(monkeypatch
     monkeypatch.setattr(
         settings,
         "CONFIGURED_MINER_ORIGINS",
-        "miner.example.net:abc, miner.example.net:\u00b2, good.example.net:9000, :1, x:0, y:70000, z:80/path, a@192.0.2.1:80",
+        "miner.example.net:abc, miner.example.net:\u00b2, good.example.net:9000, :1, x:0, y:70000, z:80/path, a@192.0.2.1:80, "
+        "b.example.net:8000/, c.example.net:8_000, d.example.net:80?, e.example.net:80#, f.example.net:+80",
     )
     assert settings.configured_miner_origins() == {("good.example.net", 9000)}
 

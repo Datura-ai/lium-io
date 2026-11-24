@@ -1,6 +1,7 @@
 import functools
 import logging
 import pathlib
+import re
 from enum import Enum
 from typing import TYPE_CHECKING, Literal
 
@@ -23,6 +24,9 @@ from lium_core.shared_config import DEFAULT_SHARED_CONFIG, SharedConfigClient
 
 logger = logging.getLogger(__name__)
 
+# host:port as written, checked before yarl normalizes it: yarl drops a trailing '/' and reads '8_000' as a port
+_ORIGIN_ENTRY = re.compile(r"(\[[0-9A-Fa-f:.]+\]|[^\s/?#@\[\]:]+):[0-9]+")
+
 
 @functools.lru_cache(maxsize=4)
 def _parse_miner_origins(value: str) -> frozenset[tuple[str, int]]:
@@ -38,13 +42,11 @@ def _parse_miner_origins(value: str) -> frozenset[tuple[str, int]]:
         # parsed as the request URL is (miner_service compares yarl's host and port), so an entry matches however its
         # host is written (case, IPv6 form) and only an ASCII port in range is one: str.isdigit() also accepts '²'
         try:
-            url = yarl.URL(f"http://{entry}")
-            origin = (url.host, url.explicit_port)
-            # nothing but host:port: a path, query, fragment or userinfo ('x@192.0.2.1:80') is a malformed entry
-            bare = url.raw_path in ("", "/") and not (url.query_string or url.fragment or url.user or url.password)
+            url = yarl.URL(f"http://{entry}") if _ORIGIN_ENTRY.fullmatch(entry) else None
+            origin = url and (url.host, url.explicit_port)
         except ValueError:
-            origin, bare = None, False
-        if origin and origin[0] and origin[1] and bare:
+            origin = None
+        if origin and origin[0] and origin[1]:
             origins.add(origin)
         else:
             logger.warning("CONFIGURED_MINER_ORIGINS entry %r is not host:port; skipped", entry)
