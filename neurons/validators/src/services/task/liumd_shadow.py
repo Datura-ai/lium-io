@@ -337,12 +337,19 @@ def evaluate_evidence(evidence: Any, claimed_count: Any) -> dict[str, Any]:
     document = _as_dict(evidence)
     gpus = document.get("gpus")
     claimed = _as_int(claimed_count)
+    executor_reasons = [
+        reason[:160]
+        for reason in (document.get("reasons") or [])
+        if isinstance(reason, str)
+    ][:10]
     judged: dict[str, Any] = {
         "present": False,
         "claimed_count": claimed,
         "evidence_count": 0,
         "first_result_spread_ms": None,
         "wall_clock_ms": None,
+        "executor_would_fail": document.get("would_fail") is True,
+        "executor_reasons": executor_reasons,
         "reasons": [],
         "would_fail": False,
     }
@@ -381,6 +388,11 @@ def evaluate_evidence(evidence: Any, claimed_count: Any) -> dict[str, Any]:
     def add(reason: str) -> None:
         if reason not in reasons:
             reasons.append(reason)
+
+    if judged["executor_would_fail"]:
+        add("executor_would_fail")
+    for reason in executor_reasons:
+        add(reason)
 
     if claimed is not None and len(cards) < claimed:
         add("missing_card")
@@ -454,6 +466,8 @@ def _log_evidence(ctx: Context, judged: dict[str, Any]) -> None:
                         "address": ctx.executor.address,
                         "claimed_count": judged["claimed_count"],
                         "evidence_count": judged["evidence_count"],
+                        "executor_would_fail": judged["executor_would_fail"],
+                        "executor_reasons": judged["executor_reasons"],
                         "reasons": judged["reasons"],
                         "would_fail": judged["would_fail"],
                         "first_result_spread_ms": judged["first_result_spread_ms"],

@@ -1300,6 +1300,20 @@ def test_a_clean_evidence_document_has_no_would_fail():
     assert judged["wall_clock_ms"] == 2377
 
 
+def test_executor_would_fail_reasons_are_carried_into_the_shadow_verdict():
+    document = _evidence(_evidence_card())
+    document["would_fail"] = True
+    document["reasons"] = ["card 7 is claimed but has no ok matmul result"]
+
+    judged = evaluate_evidence(document, 1)
+
+    assert judged["executor_would_fail"] is True
+    assert judged["executor_reasons"] == ["card 7 is claimed but has no ok matmul result"]
+    assert "executor_would_fail" in judged["reasons"]
+    assert "card 7 is claimed but has no ok matmul result" in judged["reasons"]
+    assert judged["would_fail"] is True
+
+
 def test_a_single_card_run_without_a_timing_sample_is_not_a_wall_clock_failure():
     card = _evidence_card()
     card.pop("timing")
