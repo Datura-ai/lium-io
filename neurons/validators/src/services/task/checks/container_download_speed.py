@@ -419,7 +419,10 @@ class ContainerDownloadSpeedCheck:
         # an endpoint left unmeasured (ours, or the endpoint's) and no failure: no verdict
         return Judgement(
             is_failing=False,
-            has_no_verdict=any(r.mbps is None for r in readings),
+            has_no_verdict=any(
+                r.mbps is None and (enforced or r.endpoint not in _UPLOAD_NAMES or r.error not in NODE_SIDE_ERRORS)
+                for r in readings
+            ),
             would_fail=() if enforced else tuple(bad),
         )
 

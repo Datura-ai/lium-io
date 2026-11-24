@@ -447,7 +447,7 @@ async def test_the_fleet_comparison_result_is_logged(caplog):
             caplog.clear()
             with caplog.at_level("INFO"):
                 res = await ContainerDownloadSpeedCheck().run(ctx)
-            expected = Msg.OK if stdout is PYPI_ONLY_SLOW else Msg.UNMEASURED
+            expected = Msg.OK  # a reset upload is a node-side reading, judged like a slow one
             assert res.passed and res.event.reason_code == expected.reason
             assert json.loads(next(iter(redis.store.values())))["failures_in_a_row"] == 0
             logged = next(r for r in caplog.records if "CONTAINER_DOWNLOAD_SPEED" in r.getMessage())
