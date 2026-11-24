@@ -25,7 +25,7 @@ from payload_models.payloads import (
 from core.config import settings
 from core.utils import _m, get_extra_info
 from services.container_cleanup import retained_volume_pod_ids
-from services.nvidia_devices import GPU_DEVICE_NODES_CMD, PROC_GPU_INFO_CMD, _parse_uuid_minor_csv
+from services.nvidia_devices import PROC_GPU_INFO_CMD, _parse_uuid_minor_csv
 from services.redis_service import (
     RENTAL_PROBE_FAILED_PREFIX,
     RENTAL_PROBE_OK_PREFIX,
@@ -118,19 +118,25 @@ _DEVICE_NODES_MARK = "--gpu-device-nodes--"
 _GPU_MINORS_MARK = "--gpu-minors--"
 _MIG_MODE_MARK = "--gpu-mig-mode--"
 _CUDA_COUNT_MARK = "--cuda-device-count--"
-# prints the count, `error <rc>` when the driver refuses, nothing when the image has no python3 or libcuda
+# each GPU device node with its device number (hex major:minor): a card is counted by the number it opens,
+# not by the node's name
+_DEVICE_NODES_CMD = 'for f in /dev/nvidia[0-9]*; do [ -c "$f" ] && stat -Lc "%n %t:%T" "$f"; done 2>/dev/null; true'
+_NVIDIA_MAJOR = 195
+_NO_LIBCUDA = "libcuda.so.1 not found"
+# prints the count, or `error <why>` when libcuda.so.1 cannot be loaded or the driver refuses
 _CUDA_COUNT_PY = (
     "import ctypes\n"
     "try:\n"
     "    cuda = ctypes.CDLL('libcuda.so.1')\n"
     "except OSError:\n"
+    f"    print('error {_NO_LIBCUDA}')\n"
     "    raise SystemExit(0)\n"
     "n = ctypes.c_int(0)\n"
     "rc = cuda.cuInit(0) or cuda.cuDeviceGetCount(ctypes.byref(n))\n"
     "print(n.value if rc == 0 else f'error {rc}')\n"
 )
 GPU_LIST_COMMAND = (
-    f"nvidia-smi -L; rc=$?; echo {_DEVICE_NODES_MARK}; {GPU_DEVICE_NODES_CMD}; "
+    f"nvidia-smi -L; rc=$?; echo {_DEVICE_NODES_MARK}; {_DEVICE_NODES_CMD}; "
     f"echo {_GPU_MINORS_MARK}; {PROC_GPU_INFO_CMD}; "
     f"echo {_MIG_MODE_MARK}; nvidia-smi --query-gpu=mig.mode.current --format=csv,noheader 2>/dev/null; "
     # counted with the image's CUDA_VISIBLE_DEVICES unset: an image default narrows nothing a renter can't undo
@@ -1650,7 +1656,11 @@ def _usable_gpus(output: str) -> _UsableGpus:
     nodes_text, _, rest = rest.partition(_GPU_MINORS_MARK)
     minors_text, _, rest = rest.partition(_MIG_MODE_MARK)
     mig_text, cuda_mark, cuda_text = rest.partition(_CUDA_COUNT_MARK)
-    node_minors = {int(m) for m in re.findall(r"^/dev/nvidia(\d+)$", nodes_text, re.MULTILINE)}
+    node_minors = {
+        int(minor, 16)
+        for major, minor in re.findall(r"^/dev/nvidia\d+ ([0-9a-f]+):([0-9a-f]+)$", nodes_text, re.MULTILINE)
+        if int(major, 16) == _NVIDIA_MAJOR
+    }
     kernel_minors = _parse_uuid_minor_csv(minors_text)
     smi_uuids = re.findall(r"\(UUID: (GPU-[0-9a-fA-F-]+)\)", smi_text)
     unknown = 0
@@ -1664,11 +1674,13 @@ def _usable_gpus(output: str) -> _UsableGpus:
     if not cuda_mark:
         # the command prints every mark, the CUDA one last: without it the output was cut short
         return _UsableGpus(usable, None, None, unknown, cut_short=True)
-    if re.search(r"^\s*Enabled\s*$", mig_text, re.MULTILINE):
-        # CUDA enumerates MIG instances, not cards, so its count says nothing per card; the device nodes decide
-        return _UsableGpus(usable, None, None, unknown)
-    # empty (no python3 or no libcuda.so.1 in the image): no CUDA reading, the device nodes alone decide
     cuda = cuda_text.strip().splitlines()[-1].strip() if cuda_text.strip() else ""
+    if cuda == f"error {_NO_LIBCUDA}":
+        # no renter process can use a GPU without the driver library, whatever the device nodes say
+        return _UsableGpus(usable, None, _NO_LIBCUDA, unknown)
+    if re.search(r"^\s*Enabled\s*$", mig_text, re.MULTILINE):
+        # CUDA enumerates MIG instances, not cards
+        return _UsableGpus(usable, None, None, unknown)
     if cuda.isdigit():
         return _UsableGpus(usable, int(cuda), None, unknown)
     return _UsableGpus(usable, None, cuda[:80] or None, unknown)

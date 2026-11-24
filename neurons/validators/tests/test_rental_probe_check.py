@@ -7,6 +7,8 @@ so most regressions here are of the "rents when it must not" or "penalises when 
 from __future__ import annotations
 
 import asyncio
+import subprocess
+import sys
 import time
 from contextlib import contextmanager
 from dataclasses import replace
@@ -71,6 +73,7 @@ def gpu_list_output(
     listing: str = SMI_TWO_GPUS_LISTING,
     *,
     nodes: tuple[int, ...] = (0, 1),
+    aliases: tuple[tuple[int, int], ...] = (),
     minors: tuple[tuple[str, int], ...] = (("GPU-aaaa", 0), ("GPU-bbbb", 1)),
     cuda: str = "2",
     mig: tuple[str, ...] = ("Disabled", "Disabled"),
@@ -79,7 +82,9 @@ def gpu_list_output(
     return (
         listing
         + "--gpu-device-nodes--\n"
-        + "".join(f"/dev/nvidia{n}\n" for n in nodes)
+        # the probe prints each node with its device number (hex major:minor); an alias names one card twice
+        + "".join(f"/dev/nvidia{n} c3:{n:x}\n" for n in nodes)
+        + "".join(f"/dev/nvidia{n} c3:{minor:x}\n" for n, minor in aliases)
         + "--gpu-minors--\n"
         + "".join(f"{u}, {m}\n" for u, m in minors)
         + "--gpu-mig-mode--\n"
@@ -1974,7 +1979,7 @@ def test_gpu_count_step_lets_the_device_nodes_decide_on_mig_cards():
 
 
 def test_gpu_count_without_a_cuda_reading_is_decided_by_the_device_nodes():
-    """An image without python3 or libcuda.so.1 prints nothing under the CUDA mark: no CUDA reading is
+    """An image without python3 prints nothing under the CUDA mark: no CUDA reading is
     no pass by itself; the device nodes of the listed cards still decide."""
     eight = tuple((f"GPU-{i}", i) for i in range(8))
     listing = "".join(f"GPU {i}: NVIDIA H100 (UUID: GPU-{i})\n" for i in range(8))
@@ -2111,6 +2116,30 @@ def test_gpu_count_fails_output_cut_short_before_the_cuda_section():
     )
     assert "CUDA failed to start" not in detail
     assert _gpu_step(full.partition("--gpu-mig-mode--")[0]).failed_step == STEP_GPU_COUNT
+
+
+def test_gpu_count_fails_when_libcuda_cannot_be_loaded():
+    """The CUDA script itself, run with libcuda.so.1 unloadable, must print a reading that fails the step,
+    MIG or not: no renter process can use a GPU without it."""
+    script = "import ctypes\ndef refuse(*a, **k):\n    raise OSError\nctypes.CDLL = refuse\n" + module._CUDA_COUNT_PY
+    printed = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, check=True).stdout
+    for mig in (("Disabled", "Disabled"), ("Enabled", "Enabled")):
+        outcome = _gpu_step(gpu_list_output(cuda=printed.strip(), mig=mig))
+        assert outcome.failed_step == STEP_GPU_COUNT
+        assert "CUDA failed to start (libcuda.so.1 not found)" in outcome.steps[-1].detail
+
+
+def test_gpu_count_counts_device_nodes_by_device_number_not_name():
+    """Two node names for one card are one usable GPU; a node that is not an NVIDIA device is none."""
+    assert "stat -Lc" in module.GPU_LIST_COMMAND
+    assert _gpu_step(gpu_list_output(minors=(), cuda="")).failed_step is None
+    aliased = _gpu_step(gpu_list_output(nodes=(0,), aliases=((1, 0),), minors=(), cuda=""))
+    assert aliased.failed_step == STEP_GPU_COUNT
+    assert "1 usable GPU device node(s)" in aliased.steps[-1].detail
+    other = gpu_list_output(nodes=(0,), minors=(), cuda="").replace(
+        "--gpu-minors--", "/dev/nvidia1 1:3\n--gpu-minors--"
+    )
+    assert _gpu_step(other).failed_step == STEP_GPU_COUNT
 
 
 def test_gpu_count_reads_cuda_with_the_image_cuda_visible_devices_unset():
