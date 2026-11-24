@@ -10,7 +10,9 @@ VerifyX) are prepared again the way their checks prepare them, sent in one signe
 the run's events. VerifyX's verdict is `verifyx_verdict`, the check's own pass/fail including the
 download-EMA floor, read against the stored EMA; the capture is judged with `record_tally=False`, so
 the shadow writes no EMA, state or network-gate tally. The outcome is one `[liumd_shadow] comparison`
-log line. Nothing is returned to the caller, stored, or scored.
+log line. When `VALIDATOR_LIUMD_EVIDENCE_MODE` is `shadow` and the answer carries an `evidence`
+document, the validator computes its own read of it and logs one `[liumd_evidence] shadow` line per
+node beside the comparison. Nothing is returned to the caller, stored, or scored.
 
 It runs only on the executors listed in `LIUMD_SHADOW_RESERVED_EXECUTORS` (each matched on miner
 hotkey, executor UUID, address and SSH port; empty by default, `all` for every executor), never on
@@ -69,6 +71,15 @@ from .pipeline import Context
 logger = logging.getLogger(__name__)
 
 LIUMD_SHADOW_EVENT = "[liumd_shadow] comparison"
+EVIDENCE_SHADOW_EVENT = "[liumd_evidence] shadow"
+# The validator's own thresholds on the evidence document; only ever logged (shadow).
+EVIDENCE_SPREAD_FAIL_MS = 5000
+EVIDENCE_WALL_CLOCK_MIN_MS = 150
+EVIDENCE_SOURCE_FIELDS: dict[str, tuple[str, ...]] = {
+    "nvml": ("uuid", "pci", "model", "vram_mb"),
+    "proc": ("uuid", "pci", "model"),
+}
+EVIDENCE_SYSFS_VENDOR = "0x10de"
 # `MinerService` runs each executor task under `wait_for(..., JOB_TIME_OUT - 120)`; the express
 # lane allows the whole JOB_TIME_OUT, so the tighter one bounds both.
 TASK_TIMEOUT_MARGIN_SECONDS = 120
@@ -272,6 +283,7 @@ async def run_liumd_shadow(
             "reason": "internal_error",
             "detail": f"{type(exc).__name__}: {exc}"[:DETAIL_MAX_CHARS],
         }
+    evidence = record.pop("_evidence", None) if isinstance(record, dict) else None
     try:
         logger.info(
             _m(
@@ -281,11 +293,175 @@ async def run_liumd_shadow(
         )
     except Exception:  # noqa: BLE001
         pass
+    if evidence is not None:
+        _log_evidence(ctx, evidence)
     return record
 
 
 def _skipped(reason: str, **fields: Any) -> dict[str, Any]:
     return {"outcome": "skipped", "reason": reason, **fields}
+
+
+def _as_dict(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def _as_int(value: Any) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _as_text(value: Any) -> str | None:
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
+
+
+def _field_agrees(field: str, declared: Any, reported: Any) -> bool:
+    """A source agrees with the card's declared field; a value either side did not report is not
+    a mismatch."""
+    if field == "vram_mb":
+        left, right = _as_int(declared), _as_int(reported)
+        return left is None or right is None or left == right
+    left, right = _as_text(declared), _as_text(reported)
+    return left is None or right is None or left.lower() == right.lower()
+
+
+def _has_duplicates(values: list[str | None]) -> bool:
+    present = [value.lower() for value in values if value]
+    return len(present) != len(set(present))
+
+
+def evaluate_evidence(evidence: Any, claimed_count: Any) -> dict[str, Any]:
+    """The validator's own verdict on the executor's evidence document: hard mismatches against the
+    claim, duplicate cards, and the liumd timing floors. Defensive: junk reads as no evidence."""
+    document = _as_dict(evidence)
+    gpus = document.get("gpus")
+    claimed = _as_int(claimed_count)
+    judged: dict[str, Any] = {
+        "present": False,
+        "claimed_count": claimed,
+        "evidence_count": 0,
+        "first_result_spread_ms": None,
+        "wall_clock_ms": None,
+        "reasons": [],
+        "would_fail": False,
+    }
+    if not isinstance(gpus, list):
+        return judged
+    cards = [_as_dict(card) for card in gpus if isinstance(card, dict)]
+    timings = [_as_dict(card.get("timing")) for card in cards]
+    firsts = [
+        value
+        for value in (_as_int(t.get("first_result_at_ms")) for t in timings)
+        if value is not None
+    ]
+    spread = max(firsts) - min(firsts) if len(firsts) > 1 else None
+    timing = _as_dict(document.get("timing"))
+    wall = _as_int(timing.get("wall_clock_ms"))
+    if wall is None:
+        starts = [
+            value
+            for value in (_as_int(t.get("started_at_ms")) for t in timings)
+            if value is not None
+        ]
+        finishes = [
+            value
+            for value in (_as_int(t.get("finished_at_ms")) for t in timings)
+            if value is not None
+        ]
+        if starts and finishes and max(finishes) >= min(starts):
+            wall = max(finishes) - min(starts)
+    if spread is None:
+        spread = _as_int(timing.get("first_result_spread_ms"))
+
+    reasons: list[str] = []
+
+    def add(reason: str) -> None:
+        if reason not in reasons:
+            reasons.append(reason)
+
+    if claimed is not None and len(cards) < claimed:
+        add("missing_card")
+    if claimed is not None and len(cards) > claimed:
+        add("extra_card")
+    if _has_duplicates([_as_text(card.get("uuid")) for card in cards]):
+        add("duplicate_uuid")
+    if _has_duplicates([_as_text(card.get("pci")) for card in cards]):
+        add("duplicate_pci")
+    for card in cards:
+        sources = _as_dict(card.get("sources"))
+        for name, fields in EVIDENCE_SOURCE_FIELDS.items():
+            source = _as_dict(sources.get(name))
+            for field in fields:
+                if not _field_agrees(field, card.get(field), source.get(field)):
+                    label = "vram" if field == "vram_mb" else field
+                    add(f"{name}_{label}_mismatch")
+        vendor = _as_text(_as_dict(sources.get("sysfs")).get("vendor"))
+        if vendor is not None and vendor.lower() != EVIDENCE_SYSFS_VENDOR:
+            add("sysfs_vendor_mismatch")
+    if spread is not None and spread > EVIDENCE_SPREAD_FAIL_MS:
+        add(f"spread_over_{EVIDENCE_SPREAD_FAIL_MS}ms")
+    if wall is not None and wall < EVIDENCE_WALL_CLOCK_MIN_MS:
+        add("wall_clock_too_short")
+
+    judged.update(
+        present=True,
+        evidence_count=len(cards),
+        first_result_spread_ms=spread,
+        wall_clock_ms=wall,
+        reasons=reasons,
+        would_fail=bool(reasons),
+    )
+    return judged
+
+
+def _claimed_gpu_count(ctx: Context) -> int | None:
+    count = _as_int(ctx.state.gpu_count)
+    if count is not None:
+        return count
+    return _as_int(_as_dict(_as_dict(ctx.state.specs).get("gpu")).get("count"))
+
+
+def _evidence_record(
+    ctx: Context, answer: LocalVerifyAnswer, facts_answer: LocalVerifyAnswer | None
+) -> dict[str, Any] | None:
+    """The evidence verdict for the shadow line, or None when shadow does not read evidence here."""
+    if settings.VALIDATOR_LIUMD_EVIDENCE_MODE != "shadow":
+        return None
+    evidence = answer.evidence or (facts_answer.evidence if facts_answer is not None else {})
+    if not isinstance(evidence, dict) or not evidence:
+        return None
+    try:
+        judged = evaluate_evidence(evidence, _claimed_gpu_count(ctx))
+    except Exception:  # noqa: BLE001 — malformed evidence never reaches the node's result
+        return None
+    return {**judged, "mode": settings.VALIDATOR_LIUMD_EVIDENCE_MODE}
+
+
+def _log_evidence(ctx: Context, judged: dict[str, Any]) -> None:
+    try:
+        logger.info(
+            _m(
+                EVIDENCE_SHADOW_EVENT,
+                extra=get_extra_info(
+                    {
+                        **ctx.default_extra,
+                        "transport": "liumd_evidence",
+                        "executor_uuid": ctx.executor.uuid,
+                        "address": ctx.executor.address,
+                        "claimed_count": judged["claimed_count"],
+                        "evidence_count": judged["evidence_count"],
+                        "reasons": judged["reasons"],
+                        "would_fail": judged["would_fail"],
+                        "first_result_spread_ms": judged["first_result_spread_ms"],
+                        "wall_clock_ms": judged["wall_clock_ms"],
+                        "mode": judged["mode"],
+                    }
+                ),
+            )
+        )
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _today_fields(today: TodayStep) -> dict[str, Any]:
@@ -456,9 +632,13 @@ async def _compare(
             }
         if not isinstance(facts_answer, LocalVerifyAnswer):
             facts_answer = answer
-        return _judged(
+        record = _judged(
             ctx, answer, today, steps, matmul_challenge, verifyx_challenge, extra, facts_answer
         )
+        evidence = _evidence_record(ctx, answer, facts_answer)
+        if evidence is not None:
+            record["_evidence"] = evidence
+        return record
     finally:
         if matmul_challenge is not None:
             matmul_challenge.close()

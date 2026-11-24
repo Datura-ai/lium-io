@@ -33,8 +33,10 @@ from services.task import service as task_service_module
 from services.task.checks import verifyx as verifyx_check
 from services.task.checks.verifyx import VerifyXCheck, VerifyXColdRetryCheck
 from services.task.liumd_shadow import (
+    EVIDENCE_SHADOW_EVENT,
     LIUMD_SHADOW_EVENT,
     TodayStep,
+    evaluate_evidence,
     run_liumd_shadow,
     start_facts_after_scrape,
     today_verdicts,
@@ -137,6 +139,7 @@ class FakeLiumd:
         deadline_hit=False,
         facts=None,
         specs=None,
+        evidence=None,
     ):
         self.matmul = matmul  # a dict replacing the matmul step's reply
         self.deadline_hit = deadline_hit  # the document-wide flag: any step reached the deadline
@@ -145,6 +148,7 @@ class FakeLiumd:
         self.result = result
         self.facts = facts or {}
         self.specs = specs or {}
+        self.evidence = evidence  # the GPU evidence document, when the fake executor sends one
         self.intents: list[dict] = []
         self.timeouts: list[float] = []
 
@@ -192,6 +196,8 @@ class FakeLiumd:
             "steps": steps,
             "specs": self.specs,
         }
+        if self.evidence is not None:
+            raw["evidence"] = self.evidence
         return parse_answer(raw, intent=intent, round_trip_ms=92_000)
 
 
@@ -1227,6 +1233,204 @@ async def test_refusals_and_unavailability_are_logged_outcomes(
     record = await _shadow(ctx, FakeLiumd(result=gone))
     assert (record["outcome"], record["reason"]) == ("unavailable", "not_supported")
     ctx.services.validation.wrapper.free.assert_called_once_with("ptr")
+
+
+# --- the GPU evidence document ---------------------------------------------------------------
+
+
+def _evidence_card(
+    index=0,
+    *,
+    uuid="GPU-1",
+    pci="0000:31:00.0",
+    model="NVIDIA L4",
+    vram_mb=22565,
+    started=0,
+    first=100,
+    finished=2377,
+):
+    return {
+        "index": index,
+        "uuid": uuid,
+        "pci": pci,
+        "model": model,
+        "vram_mb": vram_mb,
+        "driver": "595.112.07",
+        "timing": {
+            "started_at_ms": started,
+            "first_result_at_ms": first,
+            "finished_at_ms": finished,
+            "ms": finished - started,
+        },
+        "sources": {
+            "nvml": {
+                "status": "agree",
+                "uuid": uuid,
+                "pci": pci,
+                "model": model,
+                "vram_mb": vram_mb,
+                "error": None,
+            },
+            "proc": {"status": "ok", "uuid": uuid, "pci": pci, "model": model, "irq": "0"},
+            "sysfs": {"status": "ok", "vendor": "0x10de", "device": "0x27b8"},
+            "gpusig": None,
+        },
+        "mismatches": [],
+    }
+
+
+def _evidence(*cards, wall=2377):
+    return {
+        "schema": "lium.evidence/1",
+        "mode": "shadow",
+        "run_id": "run-1",
+        "gpus": list(cards),
+        "timing": {"worker_count": 1, "first_result_spread_ms": None, "wall_clock_ms": wall},
+        "would_fail": False,
+        "reasons": [],
+    }
+
+
+def test_a_clean_evidence_document_has_no_would_fail():
+    judged = evaluate_evidence(_evidence(_evidence_card()), 1)
+
+    assert (judged["present"], judged["claimed_count"], judged["evidence_count"]) == (True, 1, 1)
+    assert judged["reasons"] == [] and judged["would_fail"] is False
+    assert judged["first_result_spread_ms"] is None
+    assert judged["wall_clock_ms"] == 2377
+
+
+def test_a_claimed_card_with_no_result_is_a_reason():
+    judged = evaluate_evidence(_evidence(_evidence_card()), 2)
+
+    assert judged["evidence_count"] == 1
+    assert "missing_card" in judged["reasons"] and judged["would_fail"] is True
+
+
+def test_a_duplicate_uuid_or_pci_is_a_reason():
+    same_uuid = _evidence(
+        _evidence_card(0, uuid="GPU-1"), _evidence_card(1, uuid="GPU-1", pci="0000:32:00.0")
+    )
+    assert "duplicate_uuid" in evaluate_evidence(same_uuid, 2)["reasons"]
+
+    same_pci = _evidence(
+        _evidence_card(0, uuid="GPU-1", pci="0000:31:00.0"),
+        _evidence_card(1, uuid="GPU-2", pci="0000:31:00.0"),
+    )
+    judged = evaluate_evidence(same_pci, 2)
+    assert "duplicate_pci" in judged["reasons"] and judged["would_fail"] is True
+
+
+def test_a_source_that_disagrees_with_the_card_is_a_reason():
+    card = _evidence_card()
+    card["sources"]["nvml"]["uuid"] = "GPU-OTHER"
+    assert "nvml_uuid_mismatch" in evaluate_evidence(_evidence(card), 1)["reasons"]
+
+    card = _evidence_card()
+    card["sources"]["nvml"]["vram_mb"] = 1024
+    assert "nvml_vram_mismatch" in evaluate_evidence(_evidence(card), 1)["reasons"]
+
+    card = _evidence_card()
+    card["sources"]["proc"]["pci"] = "0000:99:00.0"
+    assert "proc_pci_mismatch" in evaluate_evidence(_evidence(card), 1)["reasons"]
+
+    card = _evidence_card()
+    card["sources"]["proc"]["model"] = "NVIDIA H100"
+    judged = evaluate_evidence(_evidence(card), 1)
+    assert "proc_model_mismatch" in judged["reasons"] and judged["would_fail"] is True
+
+
+def test_a_first_result_spread_over_five_seconds_is_a_reason():
+    cards = [
+        _evidence_card(0, first=1_000),
+        _evidence_card(1, uuid="GPU-2", pci="0000:32:00.0", first=6_001),
+    ]
+
+    judged = evaluate_evidence(_evidence(*cards, wall=10_000), 2)
+
+    assert judged["first_result_spread_ms"] == 5_001
+    assert "spread_over_5000ms" in judged["reasons"] and judged["would_fail"] is True
+
+
+def test_a_wall_clock_under_150ms_is_a_reason():
+    judged = evaluate_evidence(_evidence(_evidence_card(), wall=149), 1)
+
+    assert judged["wall_clock_ms"] == 149
+    assert "wall_clock_too_short" in judged["reasons"] and judged["would_fail"] is True
+
+
+@pytest.mark.parametrize("value", [None, "junk", 7, [], {"gpus": "nope"}, {"gpus": None}])
+def test_malformed_evidence_is_ignored_not_fatal(value):
+    judged = evaluate_evidence(value, 1)
+
+    assert judged["reasons"] == [] and judged["would_fail"] is False
+
+
+@pytest.mark.asyncio
+async def test_shadow_logs_one_evidence_line_and_keeps_the_verdict(
+    keypair, monkeypatch, verifyx_service, gpu_steps, caplog
+):
+    monkeypatch.setattr(settings, "VALIDATOR_LIUMD_EVIDENCE_MODE", "shadow")
+    fake = FakeLiumd(evidence=_evidence(_evidence_card()))
+
+    with caplog.at_level(logging.INFO, logger=liumd_shadow.__name__):
+        record = await _shadow(_ctx(keypair, monkeypatch, verifyx_service), fake)
+
+    assert record["outcome"] == "compared" and record["agree"] is True
+    assert "_evidence" not in record
+    [line] = [r for r in caplog.records if r.getMessage() == EVIDENCE_SHADOW_EVENT]
+    extra = line.msg.extra
+    assert extra["executor_uuid"] == UUID and extra["address"] == "10.0.0.5"
+    assert (extra["claimed_count"], extra["evidence_count"]) == (1, 1)
+    assert extra["reasons"] == [] and extra["would_fail"] is False
+    assert extra["first_result_spread_ms"] is None and extra["wall_clock_ms"] == 2377
+    assert extra["mode"] == "shadow" and extra["transport"] == "liumd_evidence"
+
+
+@pytest.mark.asyncio
+async def test_evidence_that_would_fail_never_changes_the_result(
+    keypair, monkeypatch, verifyx_service, gpu_steps, caplog
+):
+    monkeypatch.setattr(settings, "VALIDATOR_LIUMD_EVIDENCE_MODE", "shadow")
+    fake = FakeLiumd(evidence=_evidence(_evidence_card(), wall=149))
+
+    with caplog.at_level(logging.INFO, logger=liumd_shadow.__name__):
+        record = await _shadow(_ctx(keypair, monkeypatch, verifyx_service), fake)
+
+    assert record["outcome"] == "compared" and record["agree"] is True
+    [line] = [r for r in caplog.records if r.getMessage() == EVIDENCE_SHADOW_EVENT]
+    assert line.msg.extra["would_fail"] is True
+    assert "wall_clock_too_short" in line.msg.extra["reasons"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["off", "warn", "enforce"])
+async def test_only_shadow_reads_evidence(
+    keypair, monkeypatch, verifyx_service, gpu_steps, caplog, mode
+):
+    monkeypatch.setattr(settings, "VALIDATOR_LIUMD_EVIDENCE_MODE", mode)
+    fake = FakeLiumd(evidence=_evidence(_evidence_card()))
+
+    with caplog.at_level(logging.INFO, logger=liumd_shadow.__name__):
+        record = await _shadow(_ctx(keypair, monkeypatch, verifyx_service), fake)
+
+    assert record["outcome"] == "compared"
+    assert not [r for r in caplog.records if r.getMessage() == EVIDENCE_SHADOW_EVENT]
+
+
+@pytest.mark.asyncio
+async def test_malformed_evidence_never_breaks_the_comparison(
+    keypair, monkeypatch, verifyx_service, gpu_steps, caplog
+):
+    monkeypatch.setattr(settings, "VALIDATOR_LIUMD_EVIDENCE_MODE", "shadow")
+    fake = FakeLiumd(evidence={"gpus": "nope"})
+
+    with caplog.at_level(logging.INFO, logger=liumd_shadow.__name__):
+        record = await _shadow(_ctx(keypair, monkeypatch, verifyx_service), fake)
+
+    assert record["outcome"] == "compared" and record["agree"] is True
+    [line] = [r for r in caplog.records if r.getMessage() == EVIDENCE_SHADOW_EVENT]
+    assert line.msg.extra["reasons"] == [] and line.msg.extra["would_fail"] is False
 
 
 # --- scoring: identical with the flag on and off ----------------------------------------------

@@ -366,6 +366,13 @@ class Settings(BaseSettings):
     # `[liumd_shadow] comparison` line per node (per-step verdicts, agreement, durations). Nothing
     # it finds is scored or stored: the result is built before it starts. Off: nothing new runs.
     VALIDATOR_LIUMD_SHADOW: bool = Field(env="VALIDATOR_LIUMD_SHADOW", default=False)
+    # DAH-2834: the liumd GPU evidence document (`evidence` on the executor's `/verify` answer).
+    # Only `shadow` acts: the validator computes its own verdict from the evidence and the claim and
+    # logs one `[liumd_evidence]` line per node. `off` reads nothing; `warn` and `enforce` are
+    # accepted but behave as off until they are implemented. Nothing here ever changes a score.
+    VALIDATOR_LIUMD_EVIDENCE_MODE: Literal["off", "shadow", "warn", "enforce"] = Field(
+        env="VALIDATOR_LIUMD_EVIDENCE_MODE", default="off"
+    )
     # Use the full machine-scrape document returned by the same early `liumd run` instead of
     # running the Python machine scrape. Off: Python remains authoritative and the early run is
     # only compared in the shadow. On: a liumd document that cannot be read (unavailable, empty,
