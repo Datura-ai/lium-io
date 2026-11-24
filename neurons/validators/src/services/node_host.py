@@ -192,6 +192,7 @@ class _QuotaSlotExecutor:
         return future
 
 
+TEMP_DEV_NODE_NETWORK = ipaddress.ip_network("10.0.0.0/16")
 NAT64_PREFIX = ipaddress.ip_network("64:ff9b::/96")  # RFC 6052 well-known prefix: the IPv4 address in the last 32 bits
 
 
@@ -201,6 +202,8 @@ def is_public_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
     multicast, IPv6 site-local (fec0::/10) and the other reserved ranges are not public. Same rule as the miner's
     services/node_address.py."""
     ip = getattr(ip, "ipv4_mapped", None) or ip
+    if ip.version == 4 and ip in TEMP_DEV_NODE_NETWORK:  # DAH-5101 temp-dev copy only, never merged: the GPU node sits in the VPC
+        return True
     if ip.version == 6 and ip in NAT64_PREFIX:
         ip = ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF)
     return ip.is_global and not ip.is_multicast and not ip.is_reserved and not getattr(ip, "is_site_local", False)
