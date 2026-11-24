@@ -110,7 +110,8 @@ _SSHD_BANNER_TIMEOUT_SECONDS = 5
 _SSH_LOGIN_TIMEOUT_SECONDS = 30
 # waits between login attempts; the last value repeats until the deadline
 _SSH_LOGIN_BACKOFF_SECONDS = (1.0, 2.0, 4.0, 8.0)
-_NVIDIA_SMI_TIMEOUT_SECONDS = 30
+# the whole GPU check in the container (two nvidia-smi calls, the device nodes, the CUDA device count), not one call
+_GPU_CHECK_TIMEOUT_SECONDS = 60
 # NVML lists every card the driver knows, so `nvidia-smi -L` can name a card whose /dev/nvidiaN was never
 # handed to the container; the renter gets only the cards it can open. The same session also prints the
 # container's GPU device nodes, the kernel minors of its listed cards and the CUDA device count.
@@ -1175,7 +1176,7 @@ def _step_gpu_count(ctx: Context, outcome: _ProbeOutcome, login: _Login) -> None
     expected = _expected_gpu_count(ctx)
     if login.command_error is not None:
         gpu_ok = False
-        detail = f"nvidia-smi -L did not run over the SSH session: {login.command_error}"
+        detail = f"the GPU check in the container {login.command_error}"
     else:
         smi = login.result
         smi_out = (smi.stdout or "").partition(_DEVICE_NODES_MARK)[0]
@@ -1566,14 +1567,18 @@ async def _login_and_list_gpus(
     try:
         async with conn:
             login.result = await conn.run(
-                GPU_LIST_COMMAND, check=False, timeout=_NVIDIA_SMI_TIMEOUT_SECONDS
+                GPU_LIST_COMMAND, check=False, timeout=_GPU_CHECK_TIMEOUT_SECONDS
             )
             login.command_seconds = time.perf_counter() - command_started
             if egress:
                 await _run_egress_script_rerun_once_on_no_egress(conn, login)
     except (TimeoutError, asyncssh.Error, OSError) as exc:
         if not login.egress_attempted:
-            login.command_error = repr(exc)
+            login.command_error = (
+                f"did not finish within {_GPU_CHECK_TIMEOUT_SECONDS} s"
+                if isinstance(exc, TimeoutError)
+                else f"did not run over the SSH session: {exc!r}"
+            )
         elif login.egress_result is None and login.egress_error is None:
             login.egress_error = repr(exc)
     if not login.command_seconds:

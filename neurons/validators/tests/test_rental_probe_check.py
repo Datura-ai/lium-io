@@ -1210,7 +1210,17 @@ async def test_gpu_count_mismatch_fails_at_gpu_count():
         step for step in result.event.what_we_saw["probe_steps"] if step["step"] == STEP_SSH_LOGIN
     )
     assert login["ok"] is True
-    assert "nvidia-smi -L did not run" in result.event.what_we_saw["probe_steps"][-2]["detail"]
+    assert "the GPU check in the container did not run over the SSH session" in (
+        result.event.what_we_saw["probe_steps"][-2]["detail"]
+    )
+
+    # review: a timeout names the GPU check as a whole and its limit, not `nvidia-smi -L`
+    ctx, docker, _ = make_probe_context()
+    with probe_settings(), renter_path(command_error=asyncssh.TimeoutError(None, None, None, None, None, None, "", "")):
+        result = await RentalProbeCheck().run(ctx)
+    assert result.passed is False and result.event.what_we_saw["failed_step"] == STEP_GPU_COUNT
+    detail = result.event.what_we_saw["probe_steps"][-2]["detail"]
+    assert detail == "the GPU check in the container did not finish within 60 s" and "nvidia-smi -L" not in detail
 
 
 @pytest.mark.asyncio
@@ -2149,3 +2159,8 @@ def test_gpu_count_reads_cuda_with_the_image_cuda_visible_devices_unset():
     assert module.GPU_LIST_COMMAND.index("--gpu-mig-mode--") < module.GPU_LIST_COMMAND.index(
         "--cuda-device-count--"
     )
+
+
+def test_the_gpu_check_has_time_for_all_its_calls():
+    # review: the step runs two nvidia-smi calls, the device-node listing and cuInit over every card under one limit
+    assert module._GPU_CHECK_TIMEOUT_SECONDS == 60
