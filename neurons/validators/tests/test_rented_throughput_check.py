@@ -550,14 +550,27 @@ async def test_validator_side_fetch_errors_stay_no_verdict():
 
 
 # an upload the receiver refuses (HTTP 429) measured nothing: no verdict, never a pass
-@pytest.mark.parametrize("enforced", [True, False])
-async def test_an_upload_the_receiver_refuses_is_no_verdict(enforced):
+async def test_an_upload_the_receiver_refuses_is_no_verdict():
     refused = RENTALS + line("pypi", CAP_BYTES, 1.0, 0) + line("hf", CAP_BYTES, 1.0, 0)
     refused += line("cf_up", 0, 0.1, 1, "wget: server returned error: HTTP/1.1 429 Too Many Requests")
-    with flags(enforced=enforced):
+    with flags():
         ctx = make_ctx(snaps() + disk() + refused)[0]
         _, net, _ = await RentedThroughputCheck()._measure_and_judge(ctx)
     assert net == "none"
+
+
+# record-only, the rented reading sends no upload and keeps the cycle budget it had without one (lio#2411)
+@pytest.mark.parametrize("enforced", [True, False])
+async def test_the_rented_upload_and_its_time_come_only_with_the_enforced_rule(enforced):
+    downloads = RENTALS + line("pypi", CAP_BYTES, 1.0, 0) + line("hf", CAP_BYTES, 1.0, 0)
+    with flags(enforced=enforced):
+        ctx = make_ctx(snaps() + disk() + downloads)[0]
+        _, net, _ = await RentedThroughputCheck()._measure_and_judge(ctx)
+        assert module.min_task_seconds_left() == module.MIN_TASK_SECONDS_LEFT + (module.UPLOAD_SECONDS if enforced else 0)
+        command = throughput_command(False, ["c"])
+    assert ("upl cf_up" in command) is enforced
+    # enforced, the missing upload line is a probe that died early; record-only nothing was asked of it
+    assert net == ("inconclusive" if enforced else "pass")
 
 
 # a fetch cut mid-transfer (BusyBox wget's premature-EOF exit 1) is the node's when the validator reaches the endpoint

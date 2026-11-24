@@ -29,6 +29,7 @@ from ..messages import render_message, rented_throughput_remediation
 from ..pipeline import CheckResult, Context
 from ..runner import SSHCommandResult
 from .container_download_speed import (
+    _DOWNLOAD_SCRIPT,
     _FETCH_SCRIPT,
     _TIMEOUT_EXITS,
     _UPLOAD_NAMES,
@@ -45,12 +46,26 @@ logger = logging.getLogger(__name__)
 DISK_PROBE_BYTES = 256 * 1024 * 1024
 DISK_TIMEOUT_SECONDS = 60
 # the 2 s busy window, the disk-pressure reading (2 s snapshots, syncfs poll cap), the disk probe (direct, then
-# buffered), both fetches, the upload and a second container start
-COMMAND_TIMEOUT_SECONDS = 300 + SNAPSHOT_SECONDS + SYNCFS_POLL_SECONDS
+# buffered), both fetches and a second container start
+COMMAND_TIMEOUT_SECONDS = 270 + SNAPSHOT_SECONDS + SYNCFS_POLL_SECONDS
+# the upload's own fetch time; it runs only while the fleet rule is enforced, so record-only it costs no cycle time
+UPLOAD_SECONDS = 30
 PROBE_SKIPPED_MARKER = "lium_dp_skipped"
 # a reading needs its full command timeout plus the checks after it; started later, the task deadline cuts it off
 # and the node's whole cycle is dropped without a result (316223c6, 30 Oct 17:49Z)
 MIN_TASK_SECONDS_LEFT = COMMAND_TIMEOUT_SECONDS + 30
+
+
+def _with_upload() -> bool:
+    return bool(settings.CONTAINER_SPEED_FLEET_RULE_ENFORCED)
+
+
+def command_timeout_seconds() -> int:
+    return COMMAND_TIMEOUT_SECONDS + (UPLOAD_SECONDS if _with_upload() else 0)
+
+
+def min_task_seconds_left() -> int:
+    return MIN_TASK_SECONDS_LEFT + (UPLOAD_SECONDS if _with_upload() else 0)
 # due readings skipped for lack of cycle time, in a row, that count as a failed reading (the provider controls how long
 # the earlier checks take, so endless late cycles must not keep the score)
 LATE_SKIPS_BEFORE_VERDICT = 3
@@ -160,7 +175,7 @@ def throughput_command(
     probe = (
         download_speed_command(sysbox, _DISK_SCRIPT)
         + "; snap; "
-        + download_speed_command(sysbox, _FETCH_SCRIPT)
+        + download_speed_command(sysbox, _FETCH_SCRIPT if _with_upload() else _DOWNLOAD_SCRIPT)
         + "; snap"
     )
     if not read_pressure:
@@ -501,7 +516,7 @@ class RentedThroughputCheck:
             await self._bounded_save(ctx, key, state)
         if now < state.next_due_at():
             return self._verdict(ctx, state, probed=False)
-        if task_seconds_left(ctx) < MIN_TASK_SECONDS_LEFT:
+        if task_seconds_left(ctx) < min_task_seconds_left():
             # no reading this cycle: a standing SLOW stays, otherwise skip; still due, so the next cycle measures
             if state.failures_in_a_row >= READINGS_BEFORE_VERDICT:
                 return self._verdict(ctx, state, probed=False)
@@ -581,7 +596,7 @@ class RentedThroughputCheck:
                 read_pressure=settings.DISK_PRESSURE_CHECK_ENABLED,
                 skip_under_pressure=skip_under_pressure,
             ),
-            timeout=COMMAND_TIMEOUT_SECONDS,
+            timeout=command_timeout_seconds(),
             retryable=False,
         )
         stdout = result.stdout or ""
@@ -599,6 +614,9 @@ class RentedThroughputCheck:
                 _m("Rented throughput: unsolicited skip marker in the output", extra=get_extra_info(ctx.default_extra))
             )
         endpoints = parse_download_speed(stdout)
+        if not _with_upload():
+            # the command sent no upload, so its missing line is not a probe that died early
+            endpoints = [r for r in endpoints if r.endpoint not in _UPLOAD_NAMES]
         disk = parse_disk(stdout)
         net_mbps, disk_busy = parse_busy(stdout)
         during_net, (during_disk, during_iops) = parse_during(stdout)

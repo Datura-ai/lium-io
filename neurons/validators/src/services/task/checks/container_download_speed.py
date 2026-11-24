@@ -64,7 +64,7 @@ NODE_SIDE_ERRORS = frozenset({"dns_failed", "unreachable", "timeout", "connectio
 
 # busybox sh in alpine (the port check's helper image, already on the node). /proc/uptime is the clock: busybox
 # date has no sub-second format everywhere. Exit 0 always: the marker lines are the answer.
-_FETCH_SCRIPT = (
+_DOWNLOAD_PROBES = (
     "up() { cut -d' ' -f1 /proc/uptime; }; "
     "probe() { s=$(up); "
     f"n=$( {{ timeout {FETCH_TIMEOUT_SECONDS} wget -q -O - \"$2\" "
@@ -72,8 +72,10 @@ _FETCH_SCRIPT = (
     f'echo "{MARKER} ep=$1 bytes=$n start=$s end=$e rc=$(cat /tmp/rc 2>/dev/null)"; '
     f"echo \"{MARKER}_err ep=$1 $(head -c {_TAIL_CHARS} /tmp/e | tr '\\n' ' ')\"; }}; "
     + "; ".join(f"probe {name} {shlex.quote(url)}" for name, url in ENDPOINTS)
+)
+_UPLOAD_PROBES = (
     # wget cannot say how much of a body went out, so an upload reads CAP_BYTES on success and nothing otherwise
-    + "; upl() { head -c "
+    "; upl() { head -c "
     + str(CAP_BYTES)
     + " /dev/zero | tr '\\0' a >/tmp/u; s=$(up); "
     f"timeout {FETCH_TIMEOUT_SECONDS} wget -q -O /dev/null --post-file=/tmp/u \"$2\" 2>/tmp/e; rc=$?; e=$(up); "
@@ -81,8 +83,9 @@ _FETCH_SCRIPT = (
     f'echo "{MARKER} ep=$1 bytes=$n start=$s end=$e rc=$rc"; '
     f"echo \"{MARKER}_err ep=$1 $(head -c {_TAIL_CHARS} /tmp/e | tr '\\n' ' ')\"; }}; "
     + "; ".join(f"upl {name} {shlex.quote(url)}" for name, url in UPLOAD_ENDPOINTS)
-    + "; exit 0"
 )
+_DOWNLOAD_SCRIPT = _DOWNLOAD_PROBES + "; exit 0"
+_FETCH_SCRIPT = _DOWNLOAD_PROBES + _UPLOAD_PROBES + "; exit 0"
 
 
 def download_speed_command(sysbox: bool, script: str = _FETCH_SCRIPT) -> str:
