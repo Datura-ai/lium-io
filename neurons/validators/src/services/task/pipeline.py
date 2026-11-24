@@ -863,12 +863,12 @@ class Pipeline:
             updates["state"] = merge_state(current_ctx.state, ran.before_state, updates["state"])
         return current_ctx.model_copy(update=updates)
 
-    async def _run_step_unless_rented(
+    async def _run_step_cancelled_on_rent(
         self, step: Check | ParallelStage, ctx: Context
     ) -> tuple[list[_RanCheck], Context, str | None]:
         """Run the step; one with `stops_on_rent` is cancelled once a renter's create marks the node, and the pod is
         returned. A cancelled step's own cleanup (the remote matmul kill) runs before this returns."""
-        from .checks.rented_mid_cycle import rent_since_cycle_start  # the checks import this module
+        from .checks.rented_mid_cycle import renter_pod_created_since_cycle_start  # the checks import this module
 
         task = asyncio.ensure_future(self._run_step_surviving_a_dropped_session(step, ctx))
         try:
@@ -876,11 +876,16 @@ class Pipeline:
                 done, _ = await asyncio.wait({task}, timeout=RENT_POLL_SECONDS)
                 if done:
                     break
-                pod = await rent_since_cycle_start(ctx)
+                pod = await renter_pod_created_since_cycle_start(ctx)
                 if pod:
                     await _cancel_until_done(task)
                     return [], ctx, pod
             ran_checks, after = await task
+            # a create in the last poll interval: a failed watched step is read once more before its failure stands
+            if getattr(step, "stops_on_rent", False) and not all(ran.result.passed for ran in ran_checks):
+                pod = await renter_pod_created_since_cycle_start(ctx)
+                if pod:
+                    return [], ctx, pod
             return ran_checks, after, None
         finally:
             # this run cancelled from outside (JOB_TIME_OUT): the step goes with it, and its own cleanup (the remote
@@ -914,7 +919,7 @@ class Pipeline:
 
         for index, step in enumerate(self.checks):
             parallel = isinstance(step, ParallelStage)
-            ran_checks, current_ctx, rented_pod = await self._run_step_unless_rented(step, current_ctx)
+            ran_checks, current_ctx, rented_pod = await self._run_step_cancelled_on_rent(step, current_ctx)
             if rented_pod:
                 event = rented_since_cycle_start_event(current_ctx, rented_pod)
                 await self.sink.emit(event)

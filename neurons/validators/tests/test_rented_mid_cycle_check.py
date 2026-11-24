@@ -69,18 +69,19 @@ class NoSSH:
         raise AssertionError(f"unexpected SSH call: {command}")
 
 
-def make_ctx(marked: str | None = None, at_start: RentedExecutorsResponse = UNRENTED, redis: FakeRedis | None = None):
-    services = build_services(redis=redis or FakeRedis())
-    if marked:
-        mark(services.redis, marked)
-    return make_context(services=services, state=build_state(rented_data=at_start), ssh=NoSSH())
-
-
 def redis_service(redis: FakeRedis | None = None) -> RedisService:
     service = RedisService.__new__(RedisService)
     service.redis = redis or FakeRedis()
     service.lock = asyncio.Lock()
     return service
+
+
+def make_ctx(marked: str | None = None, at_start: RentedExecutorsResponse = UNRENTED, redis: FakeRedis | None = None):
+    # the check reads through RedisService.get_pending_pods, so the fake client sits under the real service
+    services = build_services(redis=redis_service(redis or FakeRedis()))
+    if marked:
+        mark(services.redis.redis, marked)
+    return make_context(services=services, state=build_state(rented_data=at_start), ssh=NoSSH())
 
 
 @pytest.mark.asyncio
@@ -209,7 +210,7 @@ def fast_rent_poll(monkeypatch):
 @pytest.mark.asyncio
 async def test_a_rent_during_the_gpu_and_network_tests_stops_them_with_no_verdict(staged):
     ctx = make_ctx()
-    heavy = HeavyStep(ctx.services.redis)
+    heavy = HeavyStep(ctx.services.redis.redis)
 
     ok, events, _ = await Pipeline([ParallelStage([[heavy]]) if staged else heavy], AsyncMock()).run(ctx)
 
@@ -330,7 +331,7 @@ class LosesTheFirstCancelStep(HeavyStep):
 @pytest.mark.asyncio
 async def test_a_rent_stops_a_step_that_lost_the_first_cancel(staged):
     ctx = make_ctx()
-    step = LosesTheFirstCancelStep(ctx.services.redis)
+    step = LosesTheFirstCancelStep(ctx.services.redis.redis)
 
     ok, events, _ = await asyncio.wait_for(
         Pipeline([ParallelStage([[step]]) if staged else step], AsyncMock()).run(ctx), 2
@@ -589,3 +590,74 @@ def test_the_post_rental_recheck_stops_on_a_rent():
     from services.task.checks.post_rental_gpu_recheck import PostRentalGpuRecheckCheck
 
     assert PostRentalGpuRecheckCheck.stops_on_rent
+
+
+# review 6038245162 (taiberium, 24 Nov)
+
+
+@pytest.mark.asyncio
+async def test_a_create_stamped_between_the_rented_list_read_and_the_task_start_stops_the_run():
+    """The stamp is compared with the rented list's read time, not the task start."""
+    redis = FakeRedis()
+    listed = UNRENTED.model_copy(update={"read_at": time.time() - 120})
+    ctx = make_ctx(at_start=listed, redis=redis)
+    stamp(redis, time.time() - 60)  # after the list was read, before this task started
+
+    result = await RentedMidCycleCheck().run(ctx)
+
+    assert not result.passed and result.event.reason_code == Msg.RENTED_SINCE_CYCLE_START.reason
+
+
+class FailsAsTheRentLandsStep(HeavyStep):
+    """A watched step that fails before the next rent poll, as a VerifyX run failing in the poll's last interval."""
+
+    async def run(self, ctx):
+        mark(self.redis, "pod-new")
+        return CheckResult(passed=False, event=render_message(Msg.NOT_RENTED, ctx=ctx, check_id=self.check_id, what={}))
+
+
+@pytest.mark.asyncio
+async def test_a_watched_step_that_fails_as_a_create_lands_is_read_once_more_and_gives_no_verdict(monkeypatch):
+    monkeypatch.setattr(pipeline_module, "RENT_POLL_SECONDS", 60)
+    ctx = make_ctx()
+    step = FailsAsTheRentLandsStep(ctx.services.redis.redis)
+
+    ok, events, _ = await asyncio.wait_for(Pipeline([step], AsyncMock()).run(ctx), 5)
+
+    assert not ok and events[-1].reason_code == Msg.RENTED_SINCE_CYCLE_START.reason
+
+
+def test_a_hold_for_a_create_mid_cycle_keeps_no_miner_active():
+    """A provider can start a create on his own node, so that hold earns no eligibility floor."""
+    from services.executor_rollout import session_kept_hotkeys, withhold_renter_gpu_reset_verdicts
+
+    held = _failed("executor-123", Msg.RENTED_SINCE_CYCLE_START.reason)
+    _, withheld = withhold_renter_gpu_reset_verdicts({"5Miner": [held]})
+
+    assert len(withheld) == 1 and session_kept_hotkeys(withheld) == set()
+
+
+@pytest.mark.asyncio
+async def test_the_port_check_container_removal_is_bounded_on_a_stuck_docker_daemon():
+    import asyncssh
+
+    from services.executor_connectivity.container_runner import CLEANUP_TIMEOUT_SECONDS, ContainerRunner
+
+    seen = {}
+
+    class StuckDocker:
+        async def run(self, command, **kwargs):
+            seen.update(kwargs)
+            raise asyncssh.TimeoutError(None, None, None, None, None, None, None, None)
+
+    await ContainerRunner().cleanup(StuckDocker(), "nc-test")
+
+    assert seen == {"timeout": CLEANUP_TIMEOUT_SECONDS}
+
+
+def test_pid_tagged_names_its_parts():
+    from services.task.runner import pid_tagged
+
+    tagged = pid_tagged("sleep 1")
+
+    assert "sleep 1" in tagged.command and tagged.kill_command.startswith("p=$(cat ")

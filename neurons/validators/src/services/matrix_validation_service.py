@@ -518,13 +518,13 @@ class ValidationService:
                 *(run_gated(index, challenge) for index, challenge in enumerate(challenges))
             )
         except asyncio.CancelledError:
-            from services.task.runner import run_to_end  # services.task imports this module
+            from services.task.runner import REMOTE_KILL_TIMEOUT_SECONDS, run_to_end  # services.task imports this module
 
             # a rent cancelled the recheck: one kill for every started card over ONE session, since the
             # still-running card sessions hold the rest of sshd's MaxSessions (a kill per card is refused)
             if kills:
                 try:
-                    await run_to_end(ssh_client.run("; ".join(kills), timeout=10))
+                    await run_to_end(ssh_client.run("; ".join(kills), timeout=REMOTE_KILL_TIMEOUT_SECONDS))
                 except Exception:  # noqa: BLE001 — the cancel goes on whether the kill landed or not
                     pass
             raise
@@ -549,9 +549,10 @@ class ValidationService:
         )
         from services.task.runner import pid_tagged  # services.task imports this module
 
-        command, kill = pid_tagged(command)
+        tagged = pid_tagged(command)
+        command = tagged.command
         if kills is not None:
-            kills.append(kill)  # _run_cards sends every started card's kill at once on a cancel
+            kills.append(tagged.kill_command)  # _run_cards sends every started card's kill at once on a cancel
         try:
             result = await ssh_client.run(command, timeout=MATRIX_VERIFY_TIMEOUT_SECONDS)
         except (TimeoutError, asyncssh.TimeoutError):

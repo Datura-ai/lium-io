@@ -2,7 +2,7 @@ import asyncio
 import time
 import uuid
 from datetime import UTC, datetime
-from typing import Awaitable, Optional, TypeVar
+from typing import Awaitable, NamedTuple, Optional, TypeVar
 
 import asyncssh
 from pydantic import BaseModel
@@ -11,6 +11,8 @@ from pydantic import BaseModel
 NO_EXIT_STATUS = "no_exit_status"
 
 T = TypeVar("T")
+# a remote kill (or kill of a step's remote processes) sent while a step is cancelled
+REMOTE_KILL_TIMEOUT_SECONDS = 10
 
 
 class SSHCommandResult(BaseModel):
@@ -152,7 +154,12 @@ class SSHCommandRunner:
         raise last_exc or RuntimeError(f"Unknown SSH error for cmd: {cmd}")
 
 
-def pid_tagged(cmd: str) -> tuple[str, str]:
+class PidTagged(NamedTuple):
+    command: str
+    kill_command: str
+
+
+def pid_tagged(cmd: str) -> PidTagged:
     """`cmd` wrapped so its remote shell, a session leader under sshd, records its PID, and the command that kills
     that PID's group, only while the PID still runs this command (a reused PID is spared), as kill_remote_verifyx does.
     """
@@ -163,18 +170,18 @@ def pid_tagged(cmd: str) -> tuple[str, str]:
         f'p=$(cat {pid_file} 2>/dev/null); [ -n "$p" ] && grep -q {tag} /proc/"$p"/cmdline 2>/dev/null '
         f'&& kill -KILL -"$p" "$p" 2>/dev/null; rm -f {pid_file}'
     )
-    return wrapped, kill
+    return PidTagged(command=wrapped, kill_command=kill)
 
 
 async def run_killed_on_cancel(
     runner: SSHCommandRunner, cmd: str, *, seconds: int, stdin_text: str | None = None
 ) -> SSHCommandResult:
     """`runner.run(cmd)` once; cancelled (a rent landed), its remote process group is killed before the cancel goes on."""
-    wrapped, kill = pid_tagged(cmd)
+    tagged = pid_tagged(cmd)
     try:
-        return await runner.run(wrapped, timeout=seconds, retryable=False, stdin_text=stdin_text)
+        return await runner.run(tagged.command, timeout=seconds, retryable=False, stdin_text=stdin_text)
     except asyncio.CancelledError:
-        await run_to_end(runner.run(kill, timeout=10, retryable=False))
+        await run_to_end(runner.run(tagged.kill_command, timeout=REMOTE_KILL_TIMEOUT_SECONDS, retryable=False))
         raise
 
 

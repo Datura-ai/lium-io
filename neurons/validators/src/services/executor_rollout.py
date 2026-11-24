@@ -551,7 +551,14 @@ def withhold_renter_gpu_reset_verdicts(
             if not (redis_fault or port_check_deferred or _held_for_renter_gpu_reset(result)):
                 standing_by_miner[miner_hotkey].append(result)
                 continue
-            withheld.append(WithheldVerdict(miner_hotkey=miner_hotkey, result=result))
+            # a provider can start a create on his own node, so that hold keeps no miner active (as a rental change)
+            withheld.append(
+                WithheldVerdict(
+                    miner_hotkey=miner_hotkey,
+                    result=result,
+                    keeps_miner_active=result.failure_reason_code != _RENTED_MID_CYCLE,
+                )
+            )
             logger.info(
                 _m(
                     "Verdict withheld: the validator's Redis was unavailable"
