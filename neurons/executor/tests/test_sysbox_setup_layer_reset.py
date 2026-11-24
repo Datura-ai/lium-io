@@ -637,16 +637,52 @@ def test_a_journaled_path_replaced_by_a_link_to_a_host_file_is_left_untouched(tm
     assert not os.path.exists(reset["JOURNAL"])
 
 
-def test_a_journal_under_a_data_root_behind_a_link_is_replayed(tmp_path):
+
+def _keyed_by_resolved_path(reset, fs):
+    """The fake layer's records and calls follow links the way the kernel does, after a parent directory moved."""
+    for records in (fs.modes, fs.owners, fs.xattrs):
+        for path in list(records):
+            records[os.path.realpath(path)] = records.pop(path)
+    for name in ("lstat", "lchown", "chmod", "getxattr", "setxattr"):
+        call = getattr(reset["os"], name)
+        setattr(reset["os"], name, lambda p, *a, _call=call, **kw: _call(os.path.realpath(p), *a, **kw))
+
+
+def test_a_reset_cut_off_under_a_data_root_behind_a_link_gets_the_setuid_bit_back(tmp_path):
     reset, fs = _fake_fs(tmp_path)
-    sudo = str(fs.upper / "sudo")
-    fs.modes[sudo] = stat.S_IFREG | 0o755  # stripped by the chown before the cut-off
-    os.makedirs(os.path.dirname(reset["JOURNAL"]), exist_ok=True)
-    with open(reset["JOURNAL"], "w") as f:
-        f.write(json.dumps({"p": sudo, "m": 0o4755, "c": ""}) + "\n")
     (tmp_path / "data").mkdir()
     shutil.move(str(tmp_path / "var/lib/docker"), str(tmp_path / "data/docker"))
     (tmp_path / "var/lib/docker").symlink_to(tmp_path / "data/docker")  # Docker's data-root is a link to another disk
+    _keyed_by_resolved_path(reset, fs)
+    sudo = os.path.realpath(fs.upper / "sudo")
+    real = SimpleNamespace(**vars(reset["os"]))
+
+    def cut_off(p, m):
+        if os.path.realpath(p) == sudo:
+            raise InterruptedError()
+        return real.chmod(p, m)
+
+    reset["os"].chmod = cut_off
+    with pytest.raises(InterruptedError):
+        reset["main"]()
+    reset["os"] = real
+    reset["main"]()
+    assert stat.S_IMODE(fs.modes[sudo]) == 0o4755
+    assert fs.xattrs[sudo]["security.capability"] == b"cap-bytes"
+    assert not os.path.exists(reset["JOURNAL"])
+
+
+def test_a_journaled_path_outside_the_data_root_is_replayed(tmp_path):
+    # containerd's image store keeps a pod's layer under /var/lib/containerd, outside Docker's data-root
+    reset, fs = _fake_fs(tmp_path)
+    outside = tmp_path / "var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/7/fs/sudo"
+    outside.parent.mkdir(parents=True)
+    outside.touch()
+    sudo = str(outside)
+    fs.modes[sudo], fs.owners[sudo], fs.xattrs[sudo] = stat.S_IFREG | 0o755, 0, {}  # stripped by the chown
+    os.makedirs(os.path.dirname(reset["JOURNAL"]), exist_ok=True)
+    with open(reset["JOURNAL"], "w") as f:
+        f.write(json.dumps({"p": sudo, "m": 0o4755, "c": ""}) + "\n")
     reset["replay_journal"]()
     assert stat.S_IMODE(fs.modes[sudo]) == 0o4755
     assert not os.path.exists(reset["JOURNAL"])

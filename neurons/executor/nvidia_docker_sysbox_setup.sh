@@ -429,11 +429,10 @@ def journal(entries):
         os.close(d)
 
 
-def restore(e, root, real_root):
+def restore(e):
     p = e["p"]
-    # Docker may have run since the journal was written: never follow a path a pod replaced with a link; the data
-    # root itself may sit behind one, so the path is compared below the resolved root
-    if os.path.realpath(p) != os.path.join(real_root, os.path.relpath(p, root)) or stat.S_ISLNK(os.lstat(p).st_mode):
+    # Docker may have run since the journal was written: never follow a path a pod replaced with a link
+    if os.path.realpath(p) != p or stat.S_ISLNK(os.lstat(p).st_mode):
         print(f"skipped ...{p[-80:]}: replaced since journaled", file=sys.stderr, flush=True)
         return
     os.chmod(p, e["m"])
@@ -447,15 +446,13 @@ def replay_journal():
         lines = open(JOURNAL).read().splitlines()
     except FileNotFoundError:
         return
-    root = data_root()
-    real_root = os.path.realpath(root)
     for line in lines:
         try:
             e = json.loads(line)
         except ValueError:
             continue  # torn while written: its batch had not reached any chown yet
         try:
-            restore(e, root, real_root)
+            restore(e)
         except FileNotFoundError:
             pass  # gone with its container
         # any other error fails the unit with the journal kept, so Docker stays down and the next boot retries
@@ -485,7 +482,9 @@ def shift_batch(paths, base):
                 caps = None if link else xattr(path, "security.capability")
                 todo.append((path, uid, gid, link, stat.S_IMODE(st.st_mode), caps))
         n += changed
-    entries = [{"p": p, "m": m, "c": c.hex() if c else None}
+    # journaled resolved (Docker is down now), so replay's check holds for a data root behind a link and for layers
+    # outside it (containerd's image store)
+    entries = [{"p": os.path.realpath(p), "m": m, "c": c.hex() if c else None}
                for p, _, _, link, m, c in todo if not link and (c or m & (stat.S_ISUID | stat.S_ISGID))]
     if entries:
         journal(entries)
