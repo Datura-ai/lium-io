@@ -235,6 +235,9 @@ class ContextState:
     # DAH-5651: this cycle's DinD test container was started on the host and never answered, so the host's
     # container runtime is failing; reaches the backend as ExecutorSpecRequest.host_runtime_fault
     host_runtime_fault: bool = False
+    # the rented pods this cycle's pod checks judged, by pod id, each with its host-side fault codes ([] = clean);
+    # None = no check judged a pod. Reaches the backend as ExecutorSpecRequest.rented_pod_faults
+    rented_pod_faults: dict[str, list[str]] | None = None
     # this cycle's outside reading was "blocked" (already recorded): a re-probe in the same cycle never adds a miss
     external_probe_blocked: bool = False
     # DAH-3338: per rented pod, the container state this cycle saw (TenantEnforcementCheck) and

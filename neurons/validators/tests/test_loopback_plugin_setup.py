@@ -1,12 +1,20 @@
 import asyncio
+import builtins
+import contextlib
 import fcntl
+import io
 import json
+import math
+import os
+import re
 import shlex
 import signal
 import subprocess
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -44,6 +52,24 @@ def save_state():
     os.replace(temporary_path, state_path)
 
 
+def hold(seconds):
+    # on the virtual clock (_run_on_a_virtual_clock) a call declares how long it takes instead of sleeping, and
+    # one its timeout cuts never returns, as when Python kills the client
+    budget = os.environ.get("FAKE_DOCKER_TIMEOUT")
+    if budget is None:
+        time.sleep(seconds)
+        return
+    (root / "held").write_text(str(min(seconds, float(budget))))
+    if seconds > float(budget):
+        os._exit(137)
+
+
+def wait_for_release():
+    # the concurrent-setup test releases the install once the second setup is blocked on the lock
+    while not (root / "release").exists():
+        time.sleep(0.01)
+
+
 state = json.loads(state_path.read_text())
 state["calls"].append(sys.argv[1:])
 save_state()
@@ -53,7 +79,7 @@ if sys.argv[1] == "run":
         # the daemon keeps the container once the client is killed by the script's timeout
         containers.append(sys.argv[sys.argv.index("--name") + 1])
         save_state()
-        time.sleep(30)
+        hold(30)
     sys.exit(state.get("run_exit", 0))
 if sys.argv[1] == "rm":
     if sys.argv[-1] not in containers:
@@ -96,7 +122,9 @@ if state.get(action + "_stderr"):
 if action == "install" and state.get("install_leaves_nothing"):
     sys.exit(1)
 if action == "install":
-    time.sleep(state.get("install_delay", 0))
+    if state.get("install_waits_for_release"):
+        wait_for_release()
+    hold(state.get("install_delay", 0))
     state["installed"] = True
     state["enabled"] = False
     folder = root / "plugins" / plugin_id
@@ -106,7 +134,7 @@ if action == "install":
 elif action == "enable" and not state.get("enable_exit"):
     state["enabled"] = True
 elif action == "disable" and state.get("disable_hang"):
-    time.sleep(30)
+    hold(30)
 elif action == "disable" and not state.get("disable_exit"):
     state["enabled"] = False
 elif action == "rm" and not state.get("plugin_rm_exit"):
@@ -176,6 +204,66 @@ def _plugin_calls(tmp_path: Path) -> list[list[str]]:
     return [call for call in calls if call[0] == "plugin"]
 
 
+def _run_on_a_virtual_clock(arguments: list[str], *, lock_held_seconds: float = 0) -> SimpleNamespace:
+    """Run the setup script in this process with time measured on a virtual clock (DAH-6959).
+
+    The deadline tests are about the script's budget: on real time a loaded host spends that budget starting
+    the fake docker's interpreters and the script takes another branch. Here every docker call advances the
+    clock by what it declares (hold() in the fake), a call past its timeout raises TimeoutExpired, a wait on
+    the setup lock takes lock_held_seconds, and the validator's `timeout` sends SIGTERM at the earliest moment
+    it can (the deadline less the start the script allows for), so a script that overruns says so on stderr.
+    """
+    script, argv = arguments[2], arguments[3:]
+    root = Path(argv[0]).parent
+    start_seconds = int(re.search(r"^START_SECONDS = (\d+)$", script, re.M).group(1))
+    sigterm_at = float(argv[6]) - start_seconds
+    clock = SimpleNamespace(now=0.0)
+    handlers: dict[int, Any] = {}
+
+    def advance(seconds: float) -> None:
+        if clock.now + seconds > sigterm_at and signal.SIGTERM in handlers:
+            clock.now = sigterm_at
+            handlers[signal.SIGTERM](signal.SIGTERM, None)
+        clock.now += seconds
+
+    def run(command: list[str], *, timeout: float | None = None, **_: Any) -> subprocess.CompletedProcess:
+        env = {**os.environ, "FAKE_DOCKER_TIMEOUT": str(math.inf if timeout is None else timeout)}
+        result = subprocess.run(command, capture_output=True, text=True, env=env)
+        held_file = root / "held"
+        held = float(held_file.read_text()) if held_file.exists() else 0.0
+        held_file.unlink(missing_ok=True)
+        advance(held)
+        if result.returncode == 137:
+            raise subprocess.TimeoutExpired(command, timeout)
+        return result
+
+    def flock(_lock: Any, _operation: int) -> None:
+        advance(lock_held_seconds)
+
+    fakes = {
+        "time": SimpleNamespace(monotonic=lambda: clock.now, sleep=advance),
+        "subprocess": SimpleNamespace(run=run, TimeoutExpired=subprocess.TimeoutExpired),
+        "signal": SimpleNamespace(SIGTERM=signal.SIGTERM, signal=handlers.__setitem__),
+        "fcntl": SimpleNamespace(LOCK_EX=fcntl.LOCK_EX, flock=flock),
+    }
+
+    def import_fake(name: str, *args: Any, **kwargs: Any) -> Any:
+        return fakes[name] if name in fakes else builtins.__import__(name, *args, **kwargs)
+
+    stdout, stderr = io.StringIO(), io.StringIO()
+    returncode = 0
+    real_argv = sys.argv
+    sys.argv = ["-c", *argv]
+    try:
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            exec(script, {"__name__": "__main__", "__builtins__": {**vars(builtins), "__import__": import_fake}})
+    except SystemExit as exit_:
+        returncode = exit_.code if isinstance(exit_.code, int) else 1
+    finally:
+        sys.argv = real_argv
+    return SimpleNamespace(returncode=returncode, stdout=stdout.getvalue(), stderr=stderr.getvalue(), elapsed=clock.now)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("alias", ["vloopback:v2", "vloopback:v3"])
 @pytest.mark.parametrize(
@@ -206,12 +294,7 @@ async def test_setup_verifies_download_before_enable_and_preserves_existing_plug
     arguments = _setup_arguments(tmp_path, overrides, alias)
 
     # Act
-    result = subprocess.run(
-        arguments,
-        capture_output=True,
-        text=True,
-        timeout=10,
-    )
+    result = _run_on_a_virtual_clock(arguments)
 
     # Assert: no unverified binary runs and no existing plugin or volume is removed.
     calls = _plugin_calls(tmp_path)
@@ -277,7 +360,7 @@ async def test_setup_mounts_a_probe_volume_before_handing_out_v3_and_disables_it
     # mounts (review, 30.10)
     arguments = _setup_arguments(tmp_path, overrides)
 
-    result = subprocess.run(arguments, capture_output=True, text=True, timeout=10)
+    result = _run_on_a_virtual_clock(arguments)
 
     calls = json.loads((tmp_path / "state.json").read_text())["calls"]
     assert (result.returncode == 0) is success, result.stderr
@@ -322,7 +405,7 @@ def test_setup_removes_a_marker_of_another_build_before_it_can_fail(
     arguments = _setup_arguments(tmp_path, overrides)
 
     # Act
-    result = subprocess.run(arguments, capture_output=True, text=True, timeout=10)
+    result = _run_on_a_virtual_clock(arguments)
 
     # Assert
     probed = marker_before != "current"
@@ -342,7 +425,7 @@ def test_setup_reclaims_a_probe_container_an_earlier_setup_abandoned(tmp_path: P
     arguments = _setup_arguments(tmp_path, {"containers": ["lium-loopback-probe-v3"]})
 
     # Act: two setups, as two rents would run them
-    results = [subprocess.run(arguments, capture_output=True, text=True, timeout=10) for _ in range(2)]
+    results = [_run_on_a_virtual_clock(arguments) for _ in range(2)]
 
     # Assert: the first reclaims and probes, the second finds the marker and skips
     state = json.loads((tmp_path / "state.json").read_text())
@@ -364,7 +447,7 @@ def test_setup_fails_without_a_marker_when_an_abandoned_probe_container_cannot_b
     arguments = _setup_arguments(tmp_path, {"containers": ["lium-loopback-probe-v3"], "rm_exit": 1})
 
     # Act
-    result = subprocess.run(arguments, capture_output=True, text=True, timeout=10)
+    result = _run_on_a_virtual_clock(arguments)
 
     # Assert: a leftover is a setup error, not a warning, and no proof is written over it
     state = json.loads((tmp_path / "state.json").read_text())
@@ -384,7 +467,7 @@ def test_setup_removes_a_probe_container_its_timeout_cut_off_before_its_volume(t
     arguments[2] = _SETUP_SCRIPT.replace("PROBE_SECONDS = 60", "PROBE_SECONDS = 1")
 
     # Act: two attempts, as two rents would retry the setup
-    results = [subprocess.run(arguments, capture_output=True, text=True, timeout=20) for _ in range(2)]
+    results = [_run_on_a_virtual_clock(arguments) for _ in range(2)]
 
     # Assert
     state = json.loads((tmp_path / "state.json").read_text())
@@ -415,7 +498,7 @@ def test_setup_replaces_an_earlier_v3_build_that_owns_no_volumes(tmp_path: Path)
     )
 
     # Act
-    result = subprocess.run(arguments, capture_output=True, text=True, timeout=10)
+    result = _run_on_a_virtual_clock(arguments)
 
     # Assert: the old build goes, the pinned one is installed, verified and probed
     assert result.returncode == 0, result.stderr
@@ -437,7 +520,7 @@ def test_setup_replaces_an_earlier_v3_build_whose_only_volume_is_an_abandoned_pr
     )
 
     # Act
-    result = subprocess.run(arguments, capture_output=True, text=True, timeout=10)
+    result = _run_on_a_virtual_clock(arguments)
 
     # Assert: the abandoned probe does not pin the host to the earlier build
     assert result.returncode == 0, result.stderr
@@ -458,7 +541,7 @@ def test_setup_keeps_an_earlier_v3_build_that_still_owns_volumes(tmp_path: Path)
     )
 
     # Act
-    result = subprocess.run(arguments, capture_output=True, text=True, timeout=10)
+    result = _run_on_a_virtual_clock(arguments)
 
     # Assert: nothing is disabled, removed or installed; the host falls back until the volumes drain
     assert result.returncode == 1
@@ -474,7 +557,7 @@ def test_v2_setup_never_replaces_a_plugin_of_another_build(tmp_path: Path) -> No
     )
 
     # Act
-    result = subprocess.run(arguments, capture_output=True, text=True, timeout=10)
+    result = _run_on_a_virtual_clock(arguments)
 
     # Assert
     assert result.returncode == 1
@@ -488,7 +571,7 @@ def test_setup_reports_a_disable_that_times_out_after_a_failed_probe(tmp_path: P
     arguments[2] = _SETUP_SCRIPT.replace("DISABLE_TRY_SECONDS = 10", "DISABLE_TRY_SECONDS = 1")
 
     # Act
-    result = subprocess.run(arguments, capture_output=True, text=True, timeout=20)
+    result = _run_on_a_virtual_clock(arguments)
 
     # Assert: bounded retries, then both reasons reach stderr
     assert result.returncode == 1
@@ -515,13 +598,13 @@ def test_setup_whose_install_took_most_of_the_deadline_reports_a_hung_disable_in
         tmp_path, {"install_delay": 2, "run_hang": True, "disable_hang": True}, deadline_seconds=deadline_seconds
     )
     arguments[2] = _script_with_one_second_cleanup_and_disable_tries()
-    started = time.monotonic()
 
     # Act
-    result = subprocess.run(arguments, capture_output=True, text=True, timeout=60)
+    result = _run_on_a_virtual_clock(arguments)
 
     # Assert: every disable try ran and both reasons reached stderr before the deadline
-    assert time.monotonic() - started < deadline_seconds
+    assert result.elapsed < deadline_seconds
+    assert "cut short" not in result.stderr
     assert result.returncode == 1
     assert "docker run --rm timed out" in result.stderr
     assert "could not be disabled" in result.stderr
@@ -537,14 +620,13 @@ def test_setup_with_no_time_left_to_probe_never_enables_the_plugin(tmp_path: Pat
         tmp_path, {"install_delay": 6, "disable_hang": True}, deadline_seconds=deadline_seconds
     )
     arguments[2] = _script_with_one_second_cleanup_and_disable_tries()
-    started = time.monotonic()
 
     # Act
-    result = subprocess.run(arguments, capture_output=True, text=True, timeout=60)
+    result = _run_on_a_virtual_clock(arguments)
 
     # Assert: the install is cut where the reserve begins and nothing is enabled, so nothing needs disabling
     state = json.loads((tmp_path / "state.json").read_text())
-    assert time.monotonic() - started < deadline_seconds - 10
+    assert result.elapsed < deadline_seconds - 10
     assert result.returncode == 1
     assert "too little of the validator's deadline left to probe" in result.stderr
     assert [call[1] for call in _plugin_calls(tmp_path) if call[1] in ("enable", "disable")] == []
@@ -561,18 +643,15 @@ def test_setup_whose_lock_wait_ate_the_reserve_stops_hung_disables_before_the_de
         tmp_path, {"installed": True, "enabled": True, "disable_hang": True}, deadline_seconds=deadline_seconds
     )
     arguments[2] = _script_with_one_second_cleanup_and_disable_tries()
-    with open(tmp_path / "setup.lock", "a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        started = time.monotonic()
-        process = subprocess.Popen(arguments, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        time.sleep(12)
 
     # Act
-    _, stderr = process.communicate(timeout=60)
+    result = _run_on_a_virtual_clock(arguments, lock_held_seconds=12)
+    stderr = result.stderr
 
     # Assert: the disable tries stop before the validator's `timeout` would, and both reasons reach stderr
-    assert time.monotonic() - started < deadline_seconds
-    assert process.returncode == 1
+    assert result.elapsed < deadline_seconds
+    assert "cut short" not in stderr
+    assert result.returncode == 1
     assert "too little of the validator's deadline left to probe" in stderr
     assert "could not be disabled" in stderr
     assert 0 < sum(call[1] == "disable" for call in _plugin_calls(tmp_path)) < 3
@@ -587,7 +666,7 @@ def test_setup_reports_a_probe_that_ran_out_of_its_budget_and_a_disable_that_hun
     )
 
     # Act
-    result = subprocess.run(arguments, capture_output=True, text=True, timeout=20)
+    result = _run_on_a_virtual_clock(arguments)
 
     # Assert
     assert result.returncode == 1
@@ -600,14 +679,13 @@ def test_setup_cut_short_by_the_validators_deadline_says_so_on_stderr(tmp_path: 
     # Arrange: the probe is still running when the validator's `timeout` sends SIGTERM
     arguments = _setup_arguments(tmp_path, {"run_hang": True})
     process = subprocess.Popen(arguments, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    deadline = time.monotonic() + 10
     while not any(call[0] == "run" for call in json.loads((tmp_path / "state.json").read_text())["calls"]):
-        assert time.monotonic() < deadline
+        assert process.poll() is None, process.communicate()
         time.sleep(0.05)
 
     # Act
     process.send_signal(signal.SIGTERM)
-    _, stderr = process.communicate(timeout=20)
+    _, stderr = process.communicate()
 
     # Assert
     assert process.returncode == 1
@@ -615,13 +693,16 @@ def test_setup_cut_short_by_the_validators_deadline_says_so_on_stderr(tmp_path: 
     assert not (tmp_path / "probe-ok").exists()
 
 
+@pytest.mark.skipif(not Path("/proc/locks").exists(), reason="reads blocked lock waiters from /proc/locks")
 def test_setup_cut_short_while_waiting_for_the_setup_lock_names_the_wait(tmp_path: Path) -> None:
     # Arrange: another setup holds the lock when the validator's `timeout` sends SIGTERM
     arguments = _setup_arguments(tmp_path, {}, alias="vloopback:v3")
     with open(tmp_path / "setup.lock", "a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         process = subprocess.Popen(arguments, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        time.sleep(1)
+        while not _blocked_on(tmp_path / "setup.lock"):  # the setup is waiting for the lock, not still starting
+            assert process.poll() is None, "the setup ended before it waited for the lock"
+            time.sleep(0.01)
 
         # Act
         process.send_signal(signal.SIGTERM)
@@ -632,25 +713,37 @@ def test_setup_cut_short_while_waiting_for_the_setup_lock_names_the_wait(tmp_pat
     assert "setup cut short by the validator's deadline during the wait for the setup lock" in stderr
     assert json.loads((tmp_path / "state.json").read_text())["calls"] == []
 
+
+def _blocked_on(lock_path: Path) -> bool:
+    """True while some process waits for the flock on lock_path (Linux lists blocked waiters with `->`)."""
+    if not lock_path.exists():
+        return False
+    inode = f":{lock_path.stat().st_ino} "
+    return any("->" in line and inode in line for line in Path("/proc/locks").read_text().splitlines())
+
+
+@pytest.mark.skipif(not Path("/proc/locks").exists(), reason="reads blocked lock waiters from /proc/locks")
 @pytest.mark.asyncio
 async def test_concurrent_setup_waits_for_the_first_install(tmp_path: Path) -> None:
-    # Arrange: two rents reach the same absent plugin while its installation is still running.
-    arguments = _setup_arguments(tmp_path, {"install_delay": 0.2})
+    # Arrange: two rents reach the same absent plugin; the first install is held until the second setup is
+    # seen waiting on the setup lock, so the overlap is certain and no wall-clock delay or bound decides it
+    arguments = _setup_arguments(tmp_path, {"install_waits_for_release": True})
+    processes = [
+        await asyncio.create_subprocess_exec(
+            *arguments, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        )
+        for _ in range(2)
+    ]
+    while not (
+        any(call[:2] == ["plugin", "install"] for call in json.loads((tmp_path / "state.json").read_text())["calls"])
+        and _blocked_on(tmp_path / "setup.lock")
+    ):
+        assert all(p.returncode is None for p in processes), "a setup ended before the overlap"
+        await asyncio.sleep(0.01)
 
     # Act
-    processes = await asyncio.gather(
-        *(
-            asyncio.create_subprocess_exec(
-                *arguments,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            for _ in range(2)
-        )
-    )
-    outputs = await asyncio.wait_for(
-        asyncio.gather(*(p.communicate() for p in processes)), timeout=10
-    )
+    (tmp_path / "release").touch()
+    outputs = await asyncio.gather(*(p.communicate() for p in processes))
 
     # Assert: both rents see the verified plugin; the second cannot race another install or enable.
     assert all(p.returncode == 0 for p in processes), outputs
