@@ -95,7 +95,7 @@ class DockerCommand:
         privileged, so the host pids are visible: killing the shim makes containerd report the task
         as exited and dockerd then lets `docker rm -f` through. Prints what was killed and
         ``init=alive`` when the init process outlived the SIGKILL (the same pid and start time, not a
-        zombie: the wedge), ``init=unknown`` when its start time could not be read, else ``init=gone``; exit 0 always.
+        zombie: the wedge), ``init=unknown`` when its start time could not be read from a /proc entry that is still there, else ``init=gone``; exit 0 always.
         """
         quoted = shlex.quote(name)
         # /proc/<pid>/stat after the comm's closing paren: field 1 is the state, field 20 the start time
@@ -109,7 +109,8 @@ class DockerCommand:
             "if [ -n \"$shim\" ] && grep -qa containerd-shim /proc/$shim/cmdline 2>/dev/null; "
             "then kill -9 $shim 2>/dev/null; else shim=; fi; "
             f"sleep 3; now=$({stat} | cut -d' ' -f1,20); init=gone; "
-            "if [ -z \"$started\" ]; then init=unknown; "
+            # no /proc entry at all: init exited and was reaped before the lookup, Docker just has not caught up
+            "if [ -z \"$started\" ]; then [ -e /proc/$pid ] && init=unknown; "
             "elif [ \"${now#* }\" = \"$started\" ] && [ \"${now%% *}\" != Z ]; then init=alive; fi; "
             "echo \"killed pid=$pid shim=${shim:-none} init=$init\"; fi; true"
         )

@@ -633,6 +633,21 @@ def test_the_direct_kill_reads_a_killed_init_as_gone():
     assert f"pid={child.pid}" in ran.stdout
 
 
+def test_the_direct_kill_reads_an_init_reaped_before_the_lookup_as_gone():
+    # Docker can still return the pid of an init that already exited and was reaped: no /proc entry is gone, not unknown
+    import subprocess
+
+    script = DockerCommand.kill_container_processes("pod_x")
+    lookup = "$(/usr/bin/docker inspect -f '{{.State.Pid}}' pod_x 2>/dev/null)"
+    child = subprocess.Popen(["true"])
+    child.wait()
+    ran = subprocess.run(
+        ["sh", "-c", script.replace(lookup, str(child.pid))],
+        capture_output=True, text=True, timeout=20,
+    )
+    assert ran.stdout.strip().endswith("init=gone"), ran.stdout
+
+
 @pytest.mark.asyncio
 async def test_an_edit_without_a_container_on_the_host_behaves_like_a_create(svc, monkeypatch):
     payload = _edit_payload()
