@@ -2276,18 +2276,17 @@ class _EditSwap:
         """DinD (sysbox) pods often fail the first `docker stop` while a retry seconds later works (prod 15-21 Oct
         2026: 12 park failures on 10 hosts, all on dind-lium1). Kill it once; True when Docker reports it stopped within _PARK_KILL_WAIT_SECONDS."""
         killed = await self._run(f"/usr/bin/docker kill {shlex.quote(parked)}")
-        for _ in range(max(1, _PARK_KILL_WAIT_SECONDS // max(_PARK_KILL_SETTLE_SECONDS, 1))):
-            await asyncio.sleep(_PARK_KILL_SETTLE_SECONDS)
-            running = await self._run(f"/usr/bin/docker inspect -f '{{{{.State.Running}}}}' {shlex.quote(parked)}")
-            is_stopped = running.exit_status == 0 and (running.stdout or "").strip() == "false"
-            if is_stopped:
-                break
+        is_stopped = await self._docker_reports_stopped(parked)
+        direct = None
         if not is_stopped and _DOCKER_COULD_NOT_KILL_PHRASES[1] in (killed.stderr or "").lower():
             # dockerd lost the exit event (F-1633): kill init + shim directly, as the delete path does (DAH-2991)
-            await self._run(DockerCommand.kill_container_processes(parked))
-            running = await self._run(f"/usr/bin/docker inspect -f '{{{{.State.Running}}}}' {shlex.quote(parked)}")
-            is_stopped = running.exit_status == 0 and (running.stdout or "").strip() == "false"
-            self.unkillable = not is_stopped
+            direct = (await self._run(DockerCommand.kill_container_processes(parked))).stdout or ""
+            if "init=alive" not in direct:
+                # init is dead: a big sysbox pod's teardown can outlast a single read, so wait as after the kill
+                is_stopped = await self._docker_reports_stopped(parked)
+            # the host's fault (counted against the node) only when the process itself outlived SIGKILL: a teardown
+            # dockerd has not finished yet is not a wedge, and its retry parks (DAH-7025)
+            self.unkillable = "init=alive" in direct or ("init=gone" not in direct and not is_stopped)
         logger.warning(
             _m(
                 "docker stop failed while parking the current container; tried docker kill",
@@ -2298,11 +2297,21 @@ class _EditSwap:
                         "stop_stderr": (stopped.stderr or "").strip(),
                         "kill_stderr": (killed.stderr or "").strip(),
                         "stopped_after_kill": is_stopped,
+                        "direct_kill": direct.strip() if direct is not None else None,
                     }
                 ),
             )
         )
         return is_stopped
+
+    async def _docker_reports_stopped(self, parked: str) -> bool:
+        """Re-read the container's state every _PARK_KILL_SETTLE_SECONDS for up to _PARK_KILL_WAIT_SECONDS."""
+        for _ in range(max(1, _PARK_KILL_WAIT_SECONDS // max(_PARK_KILL_SETTLE_SECONDS, 1))):
+            await asyncio.sleep(_PARK_KILL_SETTLE_SECONDS)
+            running = await self._run(f"/usr/bin/docker inspect -f '{{{{.State.Running}}}}' {shlex.quote(parked)}")
+            if running.exit_status == 0 and (running.stdout or "").strip() == "false":
+                return True
+        return False
 
     async def _record_parked(self, parked: bool) -> None:
         """Best effort: unrecorded, a parked container's GPU load counts as the provider's."""

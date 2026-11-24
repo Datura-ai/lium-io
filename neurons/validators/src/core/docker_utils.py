@@ -93,17 +93,25 @@ class DockerCommand:
         event": the process is wedged, typically in uninterruptible I/O on a dead mount), `docker rm -f`
         fails forever and the container keeps its published ports. The executor runs `pid: host` and
         privileged, so the host pids are visible: killing the shim makes containerd report the task
-        as exited and dockerd then lets `docker rm -f` through. Prints what was killed; exit 0 always.
+        as exited and dockerd then lets `docker rm -f` through. Prints what was killed and
+        ``init=alive`` when the init process outlived the SIGKILL (the same pid and start time, not a
+        zombie: the wedge), ``init=unknown`` when its start time could not be read, else ``init=gone``; exit 0 always.
         """
         quoted = shlex.quote(name)
+        # /proc/<pid>/stat after the comm's closing paren: field 1 is the state, field 20 the start time
+        stat = "sed 's/.*) //' /proc/$pid/stat 2>/dev/null"
         return (
             f"pid=$(/usr/bin/docker inspect -f '{{{{.State.Pid}}}}' {quoted} 2>/dev/null); "
             "if [ -n \"$pid\" ] && [ \"$pid\" != 0 ]; then "
+            f"started=$({stat} | cut -d' ' -f20); "
             "shim=$(awk '/^PPid:/{print $2}' /proc/$pid/status 2>/dev/null); "
             "kill -9 $pid 2>/dev/null; "
             "if [ -n \"$shim\" ] && grep -qa containerd-shim /proc/$shim/cmdline 2>/dev/null; "
             "then kill -9 $shim 2>/dev/null; else shim=; fi; "
-            "sleep 3; echo \"killed pid=$pid shim=${shim:-none}\"; fi; true"
+            f"sleep 3; now=$({stat} | cut -d' ' -f1,20); init=gone; "
+            "if [ -z \"$started\" ]; then init=unknown; "
+            "elif [ \"${now#* }\" = \"$started\" ] && [ \"${now%% *}\" != Z ]; then init=alive; fi; "
+            "echo \"killed pid=$pid shim=${shim:-none} init=$init\"; fi; true"
         )
 
     @staticmethod

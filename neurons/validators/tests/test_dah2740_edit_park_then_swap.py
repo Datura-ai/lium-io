@@ -476,6 +476,74 @@ async def test_a_kill_without_an_exit_event_falls_back_to_killing_the_processes(
         svc._run_rental_docker_create_with_port_retry.assert_not_awaited()
 
 
+@pytest.mark.parametrize(
+    ("init", "docker_catches_up_after", "step"),
+    [
+        ("gone", 3, None),  # a big sysbox pod's teardown: init is dead, dockerd reports the exit a few reads later
+        ("gone", None, "park_current_container"),  # init is dead but dockerd never catches up: not the host's fault
+        ("alive", 1, "container_cleanup"),  # init outlived SIGKILL (F-1633): the host's fault, whatever dockerd says later
+        ("unknown", None, "container_cleanup"),  # init unreadable and the container never stops
+    ],
+    ids=["slow_teardown_parks", "dockerd_lags", "init_survives", "unreadable_and_running"],
+)
+@pytest.mark.asyncio
+async def test_only_an_init_that_outlives_sigkill_is_unkillable(svc, monkeypatch, init, docker_catches_up_after, step):
+    # DAH-7025: one State.Running read 3 s after the direct kill called a slow DinD teardown "unkillable"
+    monkeypatch.setattr("services.docker_service._PARK_KILL_SETTLE_SECONDS", 0)
+    monkeypatch.setattr("services.docker_service._PARK_KILL_WAIT_SECONDS", 10)
+    payload = _edit_payload()
+    ssh = _ssh_recording(stop_exit=1)
+    inner = ssh.run
+    reads_after_direct_kill = []
+
+    async def slow(cmd, *args, **kwargs):
+        if cmd.startswith("/usr/bin/docker kill"):
+            ssh.commands.append(cmd)
+            return _ssh_result(exit_status=1, stderr="cannot kill container: tried to kill container, but did not receive an exit event")
+        if cmd == DockerCommand.kill_container_processes(_kept(payload)):
+            ssh.commands.append(cmd)
+            reads_after_direct_kill.append(0)
+            return _ssh_result(stdout=f"killed pid=4242 shim=4241 init={init}\n")
+        if "docker inspect -f '{{.State.Running}}'" in cmd and reads_after_direct_kill:
+            reads_after_direct_kill[0] += 1
+            caught_up = docker_catches_up_after is not None and reads_after_direct_kill[0] >= docker_catches_up_after
+            return _ssh_result(stdout="false\n" if caught_up else "true\n")
+        return await inner(cmd, *args, **kwargs)
+
+    ssh.run = slow
+    _patch_happy(svc, monkeypatch, ssh)
+
+    result = await _run(svc, payload)
+
+    if step is None:
+        assert isinstance(result, ContainerCreated)
+    else:
+        assert isinstance(result, FailedContainerRequest)
+        assert result.failure_step == step
+        svc._run_rental_docker_create_with_port_retry.assert_not_awaited()
+
+
+def test_the_direct_kill_reads_a_killed_init_as_gone():
+    # the script's own /proc reading, on a real process: the pid lookup stands in for docker inspect
+    import subprocess
+
+    script = DockerCommand.kill_container_processes("pod_x")
+    lookup = "$(/usr/bin/docker inspect -f '{{.State.Pid}}' pod_x 2>/dev/null)"
+    assert lookup in script
+    # the killed child stays a zombie until wait(): the same pid and start time, state Z, so it reads as gone
+    child = subprocess.Popen(["sleep", "60"])
+    try:
+        ran = subprocess.run(
+            ["sh", "-c", script.replace(lookup, str(child.pid))],
+            capture_output=True, text=True, timeout=20,
+        )
+    finally:
+        child.kill()
+    child.wait()
+    assert ran.stdout.strip().endswith("init=gone"), ran.stdout
+    assert f"pid={child.pid}" in ran.stdout
+
+
 @pytest.mark.asyncio
 async def test_an_edit_without_a_container_on_the_host_behaves_like_a_create(svc, monkeypatch):
     payload = _edit_payload()
