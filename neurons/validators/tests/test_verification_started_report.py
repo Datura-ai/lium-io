@@ -15,6 +15,7 @@ from datura.requests.miner_requests import AcceptSSHKeyRequest, ExecutorSSHInfo,
 from payload_models.payloads import MinerJobRequestPayload
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from services.miner_service import CYCLE_DONE, EXPRESS_LANE, MinerService
+from services.roce_link_probe import CYCLE_JOB_WAIT_SECONDS, PROBE_TAIL_MARGIN_SECONDS
 from services.task.service import TaskService
 
 from core.config import settings
@@ -320,7 +321,8 @@ async def test_rest_path_reports_the_miner_once_before_launching_its_executors(m
 @pytest.mark.asyncio
 @pytest.mark.parametrize("job_timeout", [None, 110.0])
 async def test_an_express_recheck_deadline_reaches_the_task(monkeypatch, job_timeout):
-    # DAH-5933 review: a recheck's wait ends before JOB_TIME_OUT; its checks budget against that deadline
+    # DAH-5933 review: a recheck's wait ends before JOB_TIME_OUT; its checks budget against that deadline, less the
+    # tail the result needs after the task (the same tail the stranded-pod rerun keeps)
     service = _miner_service_recording([])
     service._generate_auth_headers = MagicMock(return_value={})
     service._make_rest_request = AsyncMock(return_value=(200, _accepted("exec-a").model_dump(mode="json")))
@@ -338,7 +340,8 @@ async def test_an_express_recheck_deadline_reaches_the_task(monkeypatch, job_tim
     if job_timeout is None:
         assert deadline is None
     else:
-        assert before + job_timeout <= deadline <= time.monotonic() + job_timeout
+        tail = CYCLE_JOB_WAIT_SECONDS + PROBE_TAIL_MARGIN_SECONDS
+        assert before + job_timeout - tail <= deadline <= time.monotonic() + job_timeout - tail
 
 
 @pytest.mark.asyncio
