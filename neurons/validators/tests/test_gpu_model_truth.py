@@ -224,15 +224,16 @@ async def test_a_failed_sample_keeps_a_stored_mismatch(context_factory, monkeypa
 
 
 @pytest.mark.asyncio
-async def test_a_failed_first_sample_is_not_retried_every_cycle(context_factory, sample_never_due):
+async def test_a_failed_first_sample_is_retried_next_cycle(context_factory, sample_never_due):
+    # DAH-6332 item 2: a sample with no verdict stores nothing, so the node is not left unjudged for a day
     redis = FakeRedis()
     ctx, service = _filler_ctx(context_factory, redis, None, success=False)
     assert (await CapabilityCheck().run(ctx)).passed is True
-    assert redis.ttl[_verdict_key()] == capability.GPU_MODEL_NO_VERDICT_TTL_SECONDS
+    assert _verdict_key() not in redis.ttl
 
     ctx, service = _filler_ctx(context_factory, redis, None, success=False)
     assert (await CapabilityCheck().run(ctx)).passed is True
-    assert service.budgets == []
+    assert service.budgets != []
 
 
 @pytest.mark.asyncio
