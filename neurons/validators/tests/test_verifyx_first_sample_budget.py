@@ -170,7 +170,6 @@ def _trusted_payload(monkeypatch, tmp_path):
 def test_a_bounded_run_on_a_host_without_timeout_k_runs_under_the_python_watchdog(tmp_path, monkeypatch):
     import os
     import subprocess
-    import sys
     from types import SimpleNamespace
 
     from neurons.validators.src.services.verifyx_validation_service import VerifyXValidationService
@@ -425,7 +424,6 @@ def test_only_the_watchdogs_stop_writes_the_deadline_marker(tmp_path, monkeypatc
     import os
     import shutil
     import subprocess
-    import sys
     from types import SimpleNamespace
 
     from neurons.validators.src.services.verifyx_validation_service import (
@@ -461,7 +459,6 @@ def test_only_the_watchdogs_stop_writes_the_deadline_marker(tmp_path, monkeypatc
 def test_the_watchdog_stops_the_run_with_both_ssh_readers_gone(tmp_path, monkeypatch):
     # review at 77549c7: with the session's readers closed the marker write fails (EPIPE); the kill must still land
     import subprocess
-    import sys
     import time
     from types import SimpleNamespace
 
