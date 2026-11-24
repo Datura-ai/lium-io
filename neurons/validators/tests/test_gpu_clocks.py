@@ -284,7 +284,8 @@ async def test_a_create_resets_application_and_memory_clocks_after_the_graphics_
     rgc, _, app_mem = cmd.partition("; timeout ")
     assert _reset_uuids(rgc) == [U[0], U[1]] and " -rac" not in rgc
     resets = " ".join(
-        "( " + "; ".join(f"nvidia-smi -i {u} {flag} >/dev/null 2>&1; echo {u} {flag} $?" for flag in ("-rac", "-rmc"))
+        "( " + "; ".join(f"timeout -s KILL {APP_MEM_CLOCK_RESET_TIMEOUT_SECONDS / 2:g} nvidia-smi -i {u} {flag} "
+                         f">/dev/null 2>&1; echo {u} {flag} $?" for flag in ("-rac", "-rmc"))
         + " ) &"
         for u in (U[0], U[1])
     ) + " wait"
@@ -313,10 +314,20 @@ async def test_application_and_memory_clock_resets_of_an_8_gpu_node_run_in_paral
     assert elapsed < 6, f"{elapsed:.1f} s: the resets ran one after another (16 s)"
 
 
+# uutils timeout (Ubuntu 26.04, the CI image) signals only its direct child, never the process group
+_CHILD_ONLY_TIMEOUT = """#!/bin/sh
+shift 2; t=$1; shift
+"$@" & c=$!
+( sleep "$t"; kill -KILL "$c" ) >/dev/null 2>&1 &
+wait "$c"
+"""
+
+
 @pytest.mark.asyncio
+@pytest.mark.parametrize("child_only_timeout", [False, True])
 @pytest.mark.parametrize("ignores_term", [False, True])
 async def test_a_stalled_application_or_memory_reset_is_killed_on_the_host_and_the_rgc_lines_still_come_back(
-    tmp_path, monkeypatch, ignores_term
+    tmp_path, monkeypatch, ignores_term, child_only_timeout
 ):
     """Review (lio#2309): in one SSH call a hung -rac/-rmc must not hold the -rgc results. Run for real: an
     nvidia-smi that never returns is killed by the batch's host-side timeout, the -rgc lines already printed come
@@ -327,6 +338,9 @@ async def test_a_stalled_application_or_memory_reset_is_killed_on_the_host_and_t
     trap = 'trap "" TERM\n' if ignores_term else ""
     fake.write_text(f"#!/bin/sh\n{trap}sleep 3\ntouch {marker}\n")
     fake.chmod(0o755)
+    if child_only_timeout:
+        (tmp_path / "timeout").write_text(_CHILD_ONLY_TIMEOUT)
+        (tmp_path / "timeout").chmod(0o755)
     monkeypatch.setattr(gpu_clocks, "APP_MEM_CLOCK_RESET_TIMEOUT_SECONDS", 1)
     cmd = f"echo {U[0]} 0; echo {U[1]} 0; {gpu_clocks._reset_app_and_memory_clocks([U[0], U[1]])}"
     t0 = time.monotonic()

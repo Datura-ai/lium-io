@@ -134,13 +134,17 @@ def _reset_app_and_memory_clocks(uuids: list[str]) -> str:
     back to default, so a create never hands a renter clocks the host or the last pod lowered. Each GPU's -rac then
     -rmc runs in the background so every GPU resets at once: one after another, the 16 nvidia-smi runs of an 8-GPU
     H200/B300 node outlast the budget and no clock is reset (prod, 18-19 Nov). The batch runs after the -rgc batch in
-    the same SSH call (one round trip on the create's path) under its own host-side timeout, which SIGKILLs the whole
-    process group, so a stalled reset never costs the -rgc results and none outlives the call. Not TERM then -k: the
-    batch's shell dies on TERM, timeout then returns without the KILL, and an nvidia-smi ignoring TERM keeps changing
-    clocks after the handoff (review). Each reset echoes "<uuid> <flag> <exit>"."""
+    the same SSH call (one round trip on the create's path), so a stalled reset never costs the -rgc results and none
+    outlives the call: each nvidia-smi is the direct child of its own SIGKILL timeout (half the budget, -rac then
+    -rmc), because uutils timeout (Ubuntu 26.04) signals only its direct child, so one timeout around the batch left
+    the background resets running (lio#2362 merge queue). The batch's own timeout stays as its cap. Not TERM then -k:
+    an nvidia-smi ignoring TERM keeps changing clocks after the handoff (review). Each reset echoes
+    "<uuid> <flag> <exit>", 137 when killed."""
+    per_reset = f"{APP_MEM_CLOCK_RESET_TIMEOUT_SECONDS / 2:g}"
     resets = " ".join(
         "( "
-        + "; ".join(f"nvidia-smi -i {shlex.quote(u)} {flag} >/dev/null 2>&1; echo {shlex.quote(u)} {flag} $?"
+        + "; ".join(f"timeout -s KILL {per_reset} nvidia-smi -i {shlex.quote(u)} {flag} >/dev/null 2>&1; "
+                    f"echo {shlex.quote(u)} {flag} $?"
                     for flag in ("-rac", "-rmc"))
         + " ) &"
         for u in uuids
