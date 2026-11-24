@@ -13,7 +13,7 @@ schema `--check` refuses an equal or lower one), and a validator that sends a ne
 after a backend that accepts that version is deployed.
 """
 
-PROTOCOL_VERSION = "2.18.0"
+PROTOCOL_VERSION = "2.17.0"
 
 from .backend_to_validator import BACKEND_MESSAGES, BackendMessage, BackendMessageType  # noqa: E402
 from .base import DeliveryStamps, Message, ProtocolError, Registry, WorkloadKind  # noqa: E402

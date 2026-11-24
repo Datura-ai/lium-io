@@ -851,8 +851,9 @@ class FailedContainerRequest(ContainerBaseResponse):
     # setup steps (never their stderr). Renter-safe: the renter's own Dockerfile output, never executor
     # host data. None for every other failure and from old validators.
     build_log_tail: str | None = Field(default=None, repr=False)
-    # DAH-3505: the Docker daemon's bounded reason for a failed volume step, or the fixed
-    # dead-SSH-session hint for any other step. Never executor host data; None otherwise.
+    # DAH-3505: the Docker daemon's bounded reason for a failed volume step, a fixed sentence saying whether a
+    # failed flatten_wait timed out on the node's disk lock, or the fixed dead-SSH-session hint for any other
+    # step. Never executor host data; None otherwise.
     step_detail: str | None = None
 
 

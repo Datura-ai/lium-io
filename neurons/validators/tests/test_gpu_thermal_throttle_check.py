@@ -543,6 +543,70 @@ async def test_a_collapsed_gpu_under_another_miners_rental_on_a_different_endpoi
     assert result.passed is False
 
 
+# --- the event names the cause the driver reports, never heat for a slowdown it does not call thermal ---------
+
+HW_POWER_BRAKE = 0x80
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("bits", "causes", "title", "fix"),
+    [
+        (SW_THERMAL, ["thermal"], "GPU clock collapsed by overheating", "Fix the cooling"),
+        (HW_SLOWDOWN | HW_THERMAL, ["thermal"], "GPU clock collapsed by overheating", "Fix the cooling"),
+        (HW_SLOWDOWN | HW_POWER_BRAKE, ["power_brake"], "GPU clock collapsed by a power brake", "power supply"),
+        (HW_SLOWDOWN, ["hw_slowdown"], "GPU clock collapsed by a hardware slowdown", "without saying why"),
+        (
+            SW_THERMAL | HW_SLOWDOWN | HW_POWER_BRAKE,
+            ["thermal", "power_brake"],
+            "GPU clock collapsed by overheating and a power brake",
+            "power supply",
+        ),
+    ],
+    ids=["sw-thermal", "hw-thermal", "power-brake", "hw-slowdown-only", "thermal-and-brake"],
+)
+async def test_a_collapse_names_the_cause_from_the_reason_bits(context_factory, bits, causes, title, fix):
+    result = await run(context_factory, h100(graphics_speed=500, clocks_event_reasons=bits))
+
+    assert result.passed is False  # the block is the same for every cause
+    assert result.event.reason_code == Msg.COLLAPSED.reason
+    assert result.event.what_we_saw["gpus"][0]["causes"] == causes
+    assert result.event.event == title
+    assert fix in result.event.remediation
+    if "thermal" not in causes:
+        assert "cooling" not in result.event.remediation.split("power supply")[0]
+    # several causes at once: each fix stands, none tells the provider to rule another out
+    assert "not the cooling" not in result.event.remediation
+    for cause in causes:
+        assert gpu_thermal_throttle.CAUSES[cause][1] in result.event.remediation
+    # the portal shows the availability entry's message: it must name the same cause
+    entry = next(e for e in availability_errors([result.event]) if e.reason_code == Msg.COLLAPSED.reason)
+    assert entry.message == title
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("row", "causes", "title"),
+    [
+        (
+            h100(graphics_speed=720, clocks_event_reasons=SW_POWER_CAP, power_limit=600, power_default_limit=600),
+            ["power_cap"],
+            "GPU throttled under load by its power cap",
+        ),
+        (h100(graphics_speed=650, clocks_event_reasons=None), ["low_clock"], "GPU throttled under load by an unreported cause"),
+        (h100(graphics_speed=1700, clocks_event_reasons=HW_SLOWDOWN), ["hw_slowdown"], "GPU throttled under load by a hardware slowdown"),
+    ],
+    ids=["power-cap-at-default", "no-reason", "hw-slowdown-near-full-clock"],
+)
+async def test_a_warning_names_the_cause_from_the_reason_bits(context_factory, row, causes, title):
+    result = await run(context_factory, row)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.THROTTLED.reason
+    assert result.event.what_we_saw["gpus"][0]["causes"] == causes
+    assert result.event.event == title
+
+
 # --------------------------------------------------------------------------------------------------
 # DAH-6469: the validator loads a held node's cards itself
 # --------------------------------------------------------------------------------------------------

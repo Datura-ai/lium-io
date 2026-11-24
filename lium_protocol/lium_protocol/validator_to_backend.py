@@ -327,6 +327,10 @@ class ExecutorSpecRequest(ValidatorMessage):
     # This cycle's DinD test container started on the host and its sshd never answered (a failing container
     # runtime). None from a publisher that predates the field.
     host_runtime_fault: bool | None = None
+    # 2.17.0: the rented pods this cycle's pod checks judged, by pod id, each with the host-side fault codes found on
+    # it (`RENTED_POD_PROC_FUSE_DISCONNECTED`); [] = judged and clean. A pod not listed was not judged. None = no check
+    # judged a pod, or a publisher that predates the field.
+    rented_pod_faults: dict[str, list[str]] | None = pydantic.Field(default=None, max_length=POD_STATES_MAX_ITEMS)
     # When an express recheck outside the cycle started; its `job_batch_id` is still the cycle's. None for a cycle's
     # own report and from a publisher that predates the field.
     check_started_at: datetime | None = None
