@@ -561,8 +561,8 @@ async def test_a_slow_dockerd_keeps_the_park_within_one_wait(svc, monkeypatch):
 
     result = await _run(svc, payload)
 
-    # the direct kill comes first, then reads that each end by the one 30 s budget; none starts past it, the park's
-    # own final read included (past the budget the container counts as unreadable and stays parked for the restore)
+    # the direct kill comes first, then reads that each end by the one 30 s budget; none starts past it, and the
+    # park makes no read of its own: the wait's last read ("running") decides the rename back
     assert host_timeouts == [30, 30, 18, 6]
     # the rename back is a write: cut short after dockerd applied it, the restore would remove the renter's pod
     assert rename_back_timeouts == [60]
@@ -996,15 +996,16 @@ async def test_park_waits_for_a_killed_container_that_exits_late(svc, monkeypatc
 
 @pytest.mark.parametrize(
     ("last_read", "park_renames_back"),
-    [(_ssh_result(stdout="true\n"), True), (_ssh_result(stdout="false\n"), False), (_ssh_result(exit_status=1, stderr="timeout"), False)],
-    ids=["still_running", "exited_after_the_wait", "inconclusive"],
+    [(_ssh_result(stdout="true\n"), True), (_ssh_result(exit_status=1, stderr="timeout"), False)],
+    ids=["still_running", "inconclusive"],
 )
 @pytest.mark.asyncio
 async def test_park_renames_back_only_when_a_last_read_says_it_still_runs(svc, monkeypatch, last_read, park_renames_back):
     # a kill that lands after the wait must not leave the pod stopped under its own name with no
-    # replacement: only an explicit "true" renames back; otherwise it stays parked and the undo restores it
+    # replacement: only the wait's last read answering "true" renames back (no read of its own, DAH-7025 review);
+    # an earlier "true" does not count, so an unanswered last read keeps it parked and the undo restores it
     monkeypatch.setattr("services.docker_service._PARK_KILL_SETTLE_SECONDS", 0)
-    monkeypatch.setattr("services.docker_service._PARK_KILL_WAIT_SECONDS", 1)
+    monkeypatch.setattr("services.docker_service._PARK_KILL_WAIT_SECONDS", 2)
     payload = _edit_payload()
     ssh = _ssh_recording(stop_exit=1)
     reads, after_last_read_at = [], []
@@ -1013,10 +1014,11 @@ async def test_park_renames_back_only_when_a_last_read_says_it_still_runs(svc, m
     async def running_until_the_last_read(cmd, *args, **kwargs):
         if "docker inspect -f '{{.State.Running}}'" in cmd:
             reads.append(cmd)
+            ssh.commands.append(cmd)
             if len(reads) == 2:
-                ssh.commands.append(cmd)
                 after_last_read_at.append(len(ssh.commands))
                 return last_read
+            return _ssh_result(stdout="true\n")
         return await inner(cmd, *args, **kwargs)
 
     ssh.run = running_until_the_last_read

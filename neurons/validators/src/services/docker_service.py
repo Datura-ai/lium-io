@@ -2015,8 +2015,8 @@ class _EditSwap:
         self.deleted = deleted
         # the delete arrived while the parked container was being stopped: it removes the pod's kept containers itself
         self.left_to_delete = False
-        # the end of the wait after `docker kill`; the park's last read and rename back keep to it too
-        self._kill_deadline: float | None = None
+        # the wait after `docker kill` ended with Docker answering that the container still runs
+        self.running_after_kill = False
         # the create's Docker SDK connection, independent of the SSH session: stops a renamed pod a dead SSH lost track of
         self.docker_client = docker_client
         self.container_name = container_name
@@ -2183,18 +2183,9 @@ class _EditSwap:
             # after a destructive `docker rm -fv`. If even the rename back fails, parked_name
             # stays set so __aexit__ tries the full restore once more. The kill can still land after
             # the wait, so rename back only while Docker still says it runs; a stopped or unreadable
-            # container stays parked for __aexit__ to restore. Past the kill wait's budget no read starts: the
-            # container counts as unreadable, so the park ends inside the budget a cancelling delete waits for.
-            deadline = self._kill_deadline
-            running = (
-                None
-                if deadline is not None and time.monotonic() >= deadline
-                else await self._run(
-                    f"/usr/bin/docker inspect -f '{{{{.State.Running}}}}' {shlex.quote(parked)}",
-                    _seconds_left(deadline) if deadline is not None else None,
-                )
-            )
-            if running is not None and running.exit_status == 0 and (running.stdout or "").strip() == "true":
+            # container stays parked for __aexit__ to restore. The wait's own last read decides: no new read, so the
+            # park ends inside the budget a cancelling delete waits for.
+            if self.running_after_kill:
                 # a write keeps the full timeout: cut short after dockerd applied it, the restore would remove the pod
                 renamed_back = await self._run(
                     f"/usr/bin/docker rename {shlex.quote(parked)} {shlex.quote(self.container_name)}"
@@ -2300,7 +2291,7 @@ class _EditSwap:
         killed = await self._run(f"/usr/bin/docker kill {shlex.quote(parked)}")
         # every wait after the kill shares one budget: a delete waits CANCELLED_CREATE_ABORT_TIMEOUT_SECONDS for
         # the edit it cancels, so a slow dockerd must not stretch the park past it (DAH-7025 review)
-        deadline = self._kill_deadline = time.monotonic() + _PARK_KILL_WAIT_SECONDS
+        deadline = time.monotonic() + _PARK_KILL_WAIT_SECONDS
         direct, is_stopped = await self._unless_deleted(self._wait_after_kill(parked, killed, deadline))
         if direct is not None:
             # the host's fault (counted against the node) only when Docker still reports it running and the process
@@ -2351,7 +2342,9 @@ class _EditSwap:
         raise _CreateCancelledByDelete("the pod's delete arrived while its container was being stopped for the edit")
 
     async def _docker_reports_stopped(self, parked: str, deadline: float) -> bool:
-        """Re-read the container's state every _PARK_KILL_SETTLE_SECONDS until the deadline; each read ends by it."""
+        """Re-read the container's state every _PARK_KILL_SETTLE_SECONDS until the deadline; each read ends by it.
+        Leaves running_after_kill set when the last read answered that the container still runs."""
+        self.running_after_kill = False
         for _ in range(max(1, _PARK_KILL_WAIT_SECONDS // max(_PARK_KILL_SETTLE_SECONDS, 1))):
             await asyncio.sleep(_PARK_KILL_SETTLE_SECONDS)
             if time.monotonic() >= deadline:
@@ -2359,8 +2352,10 @@ class _EditSwap:
             running = await self._run(
                 f"/usr/bin/docker inspect -f '{{{{.State.Running}}}}' {shlex.quote(parked)}", _seconds_left(deadline)
             )
-            if running.exit_status == 0 and (running.stdout or "").strip() == "false":
+            answered = (running.stdout or "").strip() if running.exit_status == 0 else None
+            if answered == "false":
                 return True
+            self.running_after_kill = answered == "true"
         return False
 
     async def _record_parked(self, parked: bool) -> None:
