@@ -368,3 +368,34 @@ async def test_a_deploy_keeps_the_open_streak_saved_under_the_uuid_alone():
         ctx, _, _ = make_ctx(SLOW, redis=redis)
         res = await ContainerDownloadSpeedCheck().run(ctx)
     assert not res.passed and res.event.reason_code == Msg.SLOW.reason
+
+
+async def test_the_median_best_endpoint_of_the_last_readings_goes_to_the_backend():
+    # DAH-6239: the listing shows what a pod downloads at next to the host-side test. Each reading counts its best
+    # endpoint (the DAH-5979 rule), the median of the last MEDIAN_OF readings rides in the specs on every cycle.
+    fast_mbps = CAP_BYTES * 8 / 1e6
+    with flags() as clock:
+        ctx, runner, _ = make_ctx(FAST, PYPI_ONLY_SLOW, FAST, SLOW, SLOW, SLOW)
+        check = ContainerDownloadSpeedCheck()
+        first = await check.run(ctx)
+        specs = first.updates["state"].specs
+        assert specs[module.SPECS_KEY] == pytest.approx(fast_mbps, abs=0.1)
+        assert specs[module.SPECS_MEASURED_AT_KEY] == clock.now
+        # a cycle that does not measure still sends the last figure
+        clock.now += 60
+        not_due = await check.run(ctx)
+        assert len(runner.commands) == 1 and not_due.updates["state"].specs[module.SPECS_KEY] == specs[module.SPECS_KEY]
+        for _ in range(5):
+            clock.now += 6 * 3600
+            res = await check.run(ctx)
+        # the last 5: F(hf) F S S S; the first FAST fell out of the window
+        assert res.updates["state"].specs[module.SPECS_KEY] == pytest.approx(0.5, abs=0.1)
+        assert res.updates["state"].specs[module.SPECS_MEASURED_AT_KEY] == clock.now
+
+
+async def test_no_figure_before_the_first_measured_reading():
+    with flags(reachable=False):
+        ctx, _, _ = make_ctx("docker: Error response from daemon: unknown runtime")
+        res = await ContainerDownloadSpeedCheck().run(ctx)
+    assert res.event.reason_code == Msg.UNMEASURED.reason
+    assert module.SPECS_KEY not in res.updates.get("state", ctx.state).specs
