@@ -92,6 +92,7 @@ from .checks import (
     DockerCpuCheck,
     NeedrestartGuardCheck,
     SysboxLayerResetCheck,
+    HostPidMaxCheck,
     PidHostRequiredCheck,
     SysboxRequiredCheck,
     TdxHostCheck,
@@ -333,6 +334,8 @@ class PipelineFactory:
                 NeedrestartGuardCheck(),
                 # DAH-6804: same place: installs the boot-time layer reset on idle Sysbox hosts without it
                 SysboxLayerResetCheck(),
+                # DAH-7041: the create refuses every rental on a host with an unusable kernel.pid_max; not listed then
+                HostPidMaxCheck(),
                 # Non-fatal, right after the scrape. A rented node that lost a GPU fails the fatal
                 # GPU checks below (DETAILS_MISMATCH, GPU_MISSING), which halt the cycle before
                 # TenantEnforcementCheck; this reports it to the backend on that same cycle.
@@ -545,6 +548,8 @@ class PipelineFactory:
                 NeedrestartGuardCheck(),
                 # DAH-6804: same place: installs the boot-time layer reset on idle Sysbox hosts without it
                 SysboxLayerResetCheck(),
+                # DAH-7041: the create refuses every rental on a host with an unusable kernel.pid_max; not listed then
+                HostPidMaxCheck(),
                 RentedGpuDropCheck(),
                 GpuLossHoldCheck(),
                 GpuThermalThrottleCheck(),
@@ -650,6 +655,8 @@ class PipelineFactory:
                 NeedrestartGuardCheck(write=False),
                 # DAH-6804: same place as in build_checks(); under DRY_RUN it reports and installs nothing
                 SysboxLayerResetCheck(write=False),
+                # DAH-7041: same place as in build_checks(); one read-only cat
+                HostPidMaxCheck(),
                 # RentedGpuDropCheck: same place as in build_checks(); under DRY_RUN it logs and posts nothing.
                 RentedGpuDropCheck(),
                 # DAH-4457: same place as in build_checks(); under DRY_RUN it reads the hold and writes none.

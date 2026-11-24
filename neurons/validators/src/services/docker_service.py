@@ -153,6 +153,12 @@ from services.gpu_wedge import cure_wedged_gpus, query_wedged_gpu_uuids
 from services.hung_gpu_reset import HungGpuResult, reset_hung_pod_gpus
 from services.host_memory_guard import TIMEOUT_SECONDS as HOST_MEMORY_GUARD_TIMEOUT_SECONDS
 from services.host_memory_guard import apply_host_memory_guard
+from services.host_pid_max import (
+    MIN_RENTAL_PIDS_LIMIT as _MIN_RENTAL_PIDS_LIMIT,
+    READ_HOST_PID_MAX_COMMAND,
+    parse_host_pid_max,
+    pid_max_refused,
+)
 from services.image_flatten import (
     FLATTEN_NO_DISK_RENTER_SENTENCE,
     FLATTEN_SIZING_SLACK_BYTES,
@@ -599,9 +605,6 @@ _HOST_READ_TIMEOUT_SECONDS = 15
 CACHE_VOLUME_REMOVE_TIMEOUT_SECONDS = 600
 # the helper's `du` has `timeout 60`; this bounds the whole size read, `docker rm -f` included
 CACHE_SIZE_READ_TIMEOUT_SECONDS = 90
-# Floor for a rental container's pids.max when it is clamped to a low host kernel.pid_max: a value
-# of 0 or below would read as "unlimited" to Docker, so never emit one.
-_MIN_RENTAL_PIDS_LIMIT = 512
 _KIB_PER_GIB = 1024 * 1024
 _LOCAL_VOLUME_TIMEOUT_THRESHOLD_GB = 100
 _LOCAL_VOLUME_TIMEOUT_BASE_SEC = 30
@@ -4715,21 +4718,14 @@ class DockerService:
         SshSessionMayStillBeTakenError and the create stops before any host side effect (review on lium-io#2364).
         """
         try:
-            res = await _run_closing_channel_on_timeout(ssh_client, "cat /proc/sys/kernel/pid_max", _HOST_READ_TIMEOUT_SECONDS)
+            res = await _run_closing_channel_on_timeout(ssh_client, READ_HOST_PID_MAX_COMMAND, _HOST_READ_TIMEOUT_SECONDS)
         except (asyncssh.Error, asyncio.TimeoutError, OSError) as e:
             why = f"read failed: {type(e).__name__}"
         else:
-            if getattr(res, "exit_status", 1) != 0:
-                why = f"exit status {getattr(res, 'exit_status', None)}"
-            else:
-                try:
-                    value = int((res.stdout or "").strip())
-                except (TypeError, ValueError):
-                    why = "unparsable output"
-                else:
-                    if value > 0:
-                        return value
-                    why = "not positive"
+            # the parser HostPidMaxCheck shares, so validation lists only a node this read accepts (DAH-7041)
+            value, why = parse_host_pid_max(getattr(res, "exit_status", 1), getattr(res, "stdout", None))
+            if value is not None:
+                return value
         logger.warning(_m(f"Host kernel.pid_max could not be read: {why}"))
         return None
 
@@ -10596,12 +10592,6 @@ class DockerService:
             host_limits_read: asyncio.Task[tuple[int | None, int | None, int | None]] | None = None
             # set once the first delete check passed: a create cancelled before it cleans up with no probe started
             first_delete_check_passed = asyncio.Event()
-
-            def pid_max_refused(host_pid_max: int | None) -> bool:
-                return settings.RENTAL_PIDS_LIMIT_PER_CPU > 0 and (
-                    host_pid_max is None
-                    or host_pid_max - settings.RENTAL_PIDS_LIMIT_HOST_MARGIN < _MIN_RENTAL_PIDS_LIMIT
-                )
 
             host_read_step = HOST_READ_PID_MAX_STEP  # the read in progress, named if its channel stays taken
 

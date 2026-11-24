@@ -1121,6 +1121,38 @@ class PidHostRequiredMessages:
     )
 
 
+class HostPidMaxMessages:
+    # DAH-7041: the create refuses every rental on this host (docker_service HOST_READ_PID_MAX_STEP)
+    UNUSABLE = MessageTemplate(
+        event="Host kernel.pid_max is not usable for a rental",
+        reason="HOST_PID_MAX_UNUSABLE",
+        severity="error",
+        # an availability error: the backend hides the node and refuses new rentals, a rental on it runs on
+        category=AVAILABILITY_CATEGORY,
+        impact="Verification failed; node hidden and not rentable until the host reports a usable kernel.pid_max "
+        "(a running rental is kept)",
+        remediation=(
+            "Every rental on this node is refused: `cat /proc/sys/kernel/pid_max` over the executor's SSH must print "
+            "one number and nothing else (the Linux default is 4194304 on 64-bit hosts). Check that the root shell "
+            "prints no banner or profile text for a command, and that sysctl kernel.pid_max has not been lowered."
+        ),
+    )
+    NOT_READ = MessageTemplate(
+        event="Host kernel.pid_max not read this cycle",
+        reason="HOST_PID_MAX_NOT_READ",
+        severity="info",
+        category="policy",
+        impact="Proceed; the read got no answer, which says nothing about the host's setting",
+    )
+    OK = MessageTemplate(
+        event="Host kernel.pid_max is usable for a rental",
+        reason="HOST_PID_MAX_OK",
+        severity="info",
+        category="policy",
+        impact="Proceed",
+    )
+
+
 class DuplicateExecutorMessages:
     DUPLICATE = MessageTemplate(
         event="Duplicate executor registration",
