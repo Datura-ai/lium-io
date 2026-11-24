@@ -757,39 +757,50 @@ async def test_create_s3fs_volume_retries_a_failed_plugin_install(
 
 
 class InstalledPluginSSHClient(RecordingSSHClient):
-    # answers `plugin inspect` with the installed instance's reference, every other command with `stdout`
-    def __init__(self, reference: str, stdout: str = ""):
+    # answers `plugin inspect` with the installed instance's reference, `plugin rm` with plugin_rm_exit, every other
+    # command with `stdout`
+    def __init__(self, reference: str, stdout: str = "", plugin_rm_exit: int = 0):
         super().__init__(stdout=stdout)
         self.reference = reference
+        self.plugin_rm_exit = plugin_rm_exit
 
     async def run(self, command, *args, **kwargs):
         self.commands.append(command)
-        stdout = self.reference + "\n" if "plugin inspect --format '{{.PluginReference}}'" in command else self.stdout
-        return SimpleNamespace(stdout=stdout, stderr="", exit_status=0)
+        if "plugin inspect --format '{{.PluginReference}}'" in command:
+            return SimpleNamespace(stdout=self.reference + "\n", stderr="", exit_status=0)
+        if command.startswith("/usr/bin/docker plugin rm "):
+            stderr = "plugin s3fs-celium-volume-safe is in use" if self.plugin_rm_exit else ""
+            return SimpleNamespace(stdout="", stderr=stderr, exit_status=self.plugin_rm_exit)
+        return SimpleNamespace(stdout=self.stdout, stderr="", exit_status=0)
+
+
+@pytest.mark.parametrize(
+    ("reference", "current"),
+    [
+        # the mochoa build (s3fs 1.86: retries go out unsigned)
+        ("docker.io/mochoa/s3fs-volume-plugin:latest", False),
+        (f"docker.io/{docker_service_module.S3FS_PLUGIN_IMAGE}", True),
+        # `docker plugin create` records the name without the registry
+        (docker_service_module.S3FS_PLUGIN_IMAGE, True),
+        (f"docker.io/{docker_service_module.S3FS_PLUGIN_IMAGE}-old", False),
+    ],
+)
+def test_only_our_plugin_build_counts_as_current(reference, current):
+    assert docker_service_module._s3fs_plugin_is_current(reference) is current
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("reference", "replaced"),
-    [
-        # an instance from the mochoa build (s3fs 1.86: retries go out unsigned) is removed before the install
-        ("docker.io/mochoa/s3fs-volume-plugin:latest", True),
-        # one from our build is only reconfigured, as before
-        (f"docker.io/{docker_service_module.S3FS_PLUGIN_IMAGE}", False),
-        # `docker plugin create` records the name without the registry
-        (docker_service_module.S3FS_PLUGIN_IMAGE, False),
-    ],
-)
-async def test_create_s3fs_volume_replaces_an_instance_of_another_build(
-    docker_service,
-    monkeypatch,
-    reference,
-    replaced,
+@pytest.mark.parametrize("removed", [True, False], ids=["removed", "removal_fails"])
+async def test_an_instance_of_another_build_is_removed_with_its_volume_or_the_rental_fails(
+    docker_service, monkeypatch, removed
 ):
-    ssh_client = InstalledPluginSSHClient(reference)
-    monkeypatch.setattr(docker_service, "execute_and_stream_logs", AsyncMock(return_value=(True, "")))
+    # review on #2397: `plugin rm` failed while the old volume kept the instance in use, the install accepted
+    # "already exists", and the rental ran on the old build
+    ssh_client = InstalledPluginSSHClient("docker.io/mochoa/s3fs-volume-plugin:latest", plugin_rm_exit=0 if removed else 1)
+    stream_logs = AsyncMock(return_value=(True, ""))
+    monkeypatch.setattr(docker_service, "execute_and_stream_logs", stream_logs)
 
-    result = await docker_service.create_s3fs_volume(
+    is_success, message = await docker_service.create_s3fs_volume(
         ssh_client=ssh_client,
         log_extra={},
         volume_info=_s3fs_volume_info(),
@@ -797,11 +808,19 @@ async def test_create_s3fs_volume_replaces_an_instance_of_another_build(
         sysbox_subuid_base=None,
     )
 
-    assert result == (True, "")
-    removal = "/usr/bin/docker plugin rm s3fs-celium-volume-safe"
-    install = next(i for i, command in enumerate(ssh_client.commands) if "plugin install" in command)
-    assert (removal in ssh_client.commands[:install]) is replaced
-    assert f"plugin install {docker_service_module.S3FS_PLUGIN_IMAGE} " in ssh_client.commands[install]
+    # the volume handle goes first, then the instance it held in use
+    assert ssh_client.commands[1:4] == [
+        "/usr/bin/docker volume rm celium-volume-safe",
+        "/usr/bin/docker plugin disable s3fs-celium-volume-safe -f",
+        "/usr/bin/docker plugin rm s3fs-celium-volume-safe",
+    ]
+    installed = any("plugin install" in command for command in ssh_client.commands)
+    if removed:
+        assert is_success is True and installed
+    else:
+        assert is_success is False and "could not be removed" in message and "in use" in message
+        assert not installed
+        stream_logs.assert_not_awaited()
 
 
 @pytest.mark.asyncio

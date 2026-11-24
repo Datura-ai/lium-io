@@ -392,6 +392,11 @@ def _published_ports(
     )
 
 
+def _s3fs_plugin_is_current(reference: str) -> bool:
+    # `docker plugin create` records the name without the registry, a pull with it
+    return reference.removeprefix("docker.io/") == S3FS_PLUGIN_IMAGE
+
+
 def _s3fs_plugin_alias(volume_name: str) -> str:
     """DAH-2512: one plugin instance per volume.
 
@@ -8159,6 +8164,11 @@ class DockerService:
         if sysbox_subuid_base is not None:
             mount_options = f"allow_other,umask=0000,uid={sysbox_subuid_base},gid={sysbox_subuid_base}"
 
+        stale = await self._remove_s3fs_plugin_of_another_build(ssh_client, plugin_alias, volume_info.name)
+        if stale is not None:
+            logger.warning(_m(f"s3fs_volume failed. {stale}", extra=get_extra_info({**log_extra})))
+            return False, stale
+
         setup_results: list[asyncssh.SSHCompletedProcess] = (
             await self._install_s3fs_plugin_instance(
                 ssh_client=ssh_client,
@@ -8211,13 +8221,6 @@ class DockerService:
         mount_options: str,
     ) -> list[asyncssh.SSHCompletedProcess]:
         """Install and configure the plugin instance that serves this one volume."""
-        installed = await ssh_client.run(
-            f"/usr/bin/docker plugin inspect --format '{{{{.PluginReference}}}}' {plugin_alias}"
-        )
-        reference = (installed.stdout or "").strip() if installed.exit_status == 0 else ""
-        if reference and reference.removeprefix("docker.io/") != S3FS_PLUGIN_IMAGE:
-            # an instance left from another build (the old s3fs 1.86 one) would only be reconfigured: replace it
-            await self.remove_s3fs_volume_plugin(ssh_client, volume_info.name)
         install_command: str = (
             f"/usr/bin/docker plugin install {S3FS_PLUGIN_IMAGE} "
             f"--alias {plugin_alias} --grant-all-permissions --disable"
@@ -8239,6 +8242,33 @@ class DockerService:
             f"/usr/bin/docker plugin enable {plugin_alias}",
         ]
         return [install_result] + [await ssh_client.run(command) for command in commands]
+
+    async def _remove_s3fs_plugin_of_another_build(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        plugin_alias: str,
+        volume_name: str,
+    ) -> str | None:
+        """Remove this volume's plugin instance when it is of another build (the old s3fs 1.86 one), which the install
+        would only reconfigure ("already exists") and leave serving the rental. None when nothing of another build is
+        left; else why it stays, and the rental fails rather than run on it."""
+        installed = await ssh_client.run(
+            f"/usr/bin/docker plugin inspect --format '{{{{.PluginReference}}}}' {plugin_alias}"
+        )
+        reference = (installed.stdout or "").strip() if installed.exit_status == 0 else ""
+        if not reference or _s3fs_plugin_is_current(reference):
+            return None
+        # its volume handle keeps the instance in use, so `plugin rm` fails until the handle is gone; the data is in the
+        # bucket. A handle a running pod still mounts stays, and so does the instance: the rental fails below
+        await ssh_client.run(f"/usr/bin/docker volume rm {volume_name}")
+        await ssh_client.run(f"/usr/bin/docker plugin disable {plugin_alias} -f")
+        removed = await ssh_client.run(f"/usr/bin/docker plugin rm {plugin_alias}")
+        if removed.exit_status == 0:
+            return None
+        return (
+            f"the s3fs plugin instance {plugin_alias} of an older build ({reference}) could not be removed: "
+            f"{(removed.stderr or '').strip() or f'exit {removed.exit_status}'}"
+        )
 
     async def _drop_legacy_shared_s3fs_volume(
         self,
