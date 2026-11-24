@@ -242,7 +242,10 @@ from services.rental_docker_sdk import (
 from services.ssh_connect_timing import connect_with_phase_timing
 from services.storage_operations import (
     REMOTE_OPERATION_DIRECTORY,
+    WIPE_LOCK_HOLDER,
     forget_storage_helper,
+    release_storage_volume_lock,
+    take_storage_volume_lock,
     note_started_storage_helper,
     start_storage_operation,
     supports_bootstrap_restore,
@@ -14718,6 +14721,31 @@ class DockerService:
         # its files are unlinked first (_wipe_volume_cmd). Never fatal: a failure leaves the delete
         # as it always was.
         fields = dict(container_name=payload.container_name, local_volume=payload.local_volume, stage=stage)
+        # DAH-7077: a backup or restore dispatched on the volume holds it until its spec is on the executor;
+        # the command's spec check covers it from there. Taken here, a dispatch arriving now is refused.
+        try:
+            locked = await take_storage_volume_lock(self.redis_service, payload.local_volume, WIPE_LOCK_HOLDER)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Skipped the volume wipe: its storage lock could not be read", error=f"{type(exc).__name__}: {exc}", **fields)
+            return
+        if not locked:
+            log.info("Skipped the volume wipe: a backup or restore is starting on it", **fields)
+            return
+        wiped = False
+        try:
+            wiped = await self._run_volume_wipe(connect_ssh, payload, log, fields)
+        finally:
+            if not wiped:
+                # the volume keeps its files: a backup may start on it again
+                await release_storage_volume_lock(self.redis_service, payload.local_volume, WIPE_LOCK_HOLDER)
+
+    async def _run_volume_wipe(
+        self,
+        connect_ssh: Callable[[], AbstractAsyncContextManager[asyncssh.SSHClientConnection]],
+        payload: ContainerDeleteRequest,
+        log: _BoundLog,
+        fields: dict,
+    ) -> bool:
         started = time.monotonic()
         try:
             result = await _run_on_own_ssh_connection(
@@ -14733,7 +14761,7 @@ class DockerService:
                 error=f"{type(exc).__name__}: {exc}",
                 **fields,
             )
-            return
+            return False
         fields["duration_ms"] = int((time.monotonic() - started) * 1000)
         fields["result"] = (result.stdout or "").strip()
         if getattr(result, "exit_status", 0) != 0:
@@ -14743,8 +14771,9 @@ class DockerService:
                 stderr=(result.stderr or "").strip(),
                 **fields,
             )
-        else:
-            log.info("Wiped the volume's files", **fields)
+            return False
+        log.info("Wiped the volume's files", **fields)
+        return True
 
     async def _terminate_and_wait(
         self,

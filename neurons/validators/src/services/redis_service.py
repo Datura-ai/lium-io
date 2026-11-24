@@ -891,6 +891,10 @@ class RedisService:
         """Set a key-value pair in Redis; `ex` is the key's lifetime in seconds (none = no expiry)."""
         await self.redis.set(key, value, ex=ex)
 
+    async def set_if_absent(self, key: str, value: str, ex: int) -> bool:
+        """SET NX with a lifetime: True when this call created the key."""
+        return bool(await self.redis.set(key, value, ex=ex, nx=True))
+
     async def get(self, key: str):
         """Get a value by key from Redis."""
         return await self.redis.get(key)

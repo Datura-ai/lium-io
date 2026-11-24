@@ -26,7 +26,8 @@ from payload_models.payloads import (
 )
 
 import services.docker_service as docker_service_module
-from services.storage_operations import REMOTE_OPERATION_DIRECTORY
+from services.storage_operations import REMOTE_OPERATION_DIRECTORY, StorageVolumeBeingWiped, storage_dispatch_holds_volume
+from tests.test_storage_volume_lock import VolumeLockRedis
 from core.config import settings
 from core.docker_utils import DockerCommand
 from services.docker_service import (
@@ -103,6 +104,9 @@ def _wire_delete(docker_service, monkeypatch, ssh_answers) -> list:
     monkeypatch.setattr(docker_service, "_prepare_known_hosts_policy", AsyncMock(return_value=None))
     docker_service.ssh_service.decrypt_payload = Mock(return_value="private-key")
     docker_service.redis_service.remove_rented_machine = AsyncMock()
+    lock_redis = VolumeLockRedis()
+    for call in ("set_if_absent", "get", "delete"):
+        setattr(docker_service.redis_service, call, getattr(lock_redis, call))
     monkeypatch.setattr(settings, "POD_VOLUME_WIPE_BEFORE_STOP_ENABLED", True)
     return order
 
@@ -508,3 +512,45 @@ async def test_delete_answers_in_progress_until_the_kept_edit_containers_are_rem
 
     assert isinstance(retried, ContainerDeleted)
     assert ("remove_volume", "volume_dirty") in order
+
+
+# DAH-7077: the volume lock between a storage dispatch and the wipe
+@pytest.mark.asyncio
+async def test_delete_skips_the_wipe_while_a_backup_dispatch_holds_the_volume(docker_service, monkeypatch):
+    order = _wire_delete(docker_service, monkeypatch, _host_answers())
+    lock_redis = docker_service.redis_service.set_if_absent.__self__
+    payload = _delete_payload()
+
+    async with storage_dispatch_holds_volume(lock_redis, payload.local_volume, uuid4()):
+        result = await _delete(docker_service, payload)
+
+    assert isinstance(result, ContainerDeleted)
+    assert not any(step == ("ssh", _bounded(WIPE_CMD, _VOLUME_WIPE_TIMEOUT_SEC)) for step in order)
+    assert ("remove", payload.container_name) in order
+
+
+@pytest.mark.parametrize(
+    "ssh_answers, dispatch_refused",
+    [
+        (_host_answers(), True),
+        (_host_answers(wipe=_make_ssh_command_result(exit_status=7, stdout="volume has a storage operation")), False),
+    ],
+    ids=["wiped", "wipe-skipped-on-the-node"],
+)
+@pytest.mark.asyncio
+async def test_a_wipe_that_ran_keeps_the_volume_from_any_later_backup(
+    docker_service, monkeypatch, ssh_answers, dispatch_refused
+):
+    _wire_delete(docker_service, monkeypatch, ssh_answers)
+    lock_redis = docker_service.redis_service.set_if_absent.__self__
+    payload = _delete_payload()
+
+    await _delete(docker_service, payload)
+
+    if dispatch_refused:
+        with pytest.raises(StorageVolumeBeingWiped):
+            async with storage_dispatch_holds_volume(lock_redis, payload.local_volume, uuid4()):
+                pass
+    else:
+        async with storage_dispatch_holds_volume(lock_redis, payload.local_volume, uuid4()):
+            pass

@@ -5,7 +5,8 @@ import json
 import logging
 import shlex
 import time
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 from typing import TYPE_CHECKING
@@ -37,6 +38,12 @@ STORAGE_HELPER_KEY_MARK = "helper:"
 # legitimately outlives that, so no record does either
 STARTED_STORAGE_HELPERS_TTL_SECONDS = 4 * 3600
 _STARTED_STORAGE_HELPERS_REDIS_TIMEOUT_SEC = 2
+# DAH-7077: one lock per volume between a storage dispatch and the delete's wipe. A dispatch holds it until its
+# spec is on the executor (the wipe's own spec check covers the run from there); a wipe that ran keeps it, as
+# the volume is going away. The TTL only clears a holder that died.
+STORAGE_VOLUME_LOCK_PREFIX = "storage_volume_lock:"
+STORAGE_VOLUME_LOCK_TTL_SECONDS = 3600
+WIPE_LOCK_HOLDER = "wipe"
 
 
 def storage_helper_name(operation_id: UUID | str) -> str:
@@ -64,6 +71,47 @@ class StorageHelperRecord:
             return cls(str(UUID(operation_id)), int(started))
         except ValueError:
             return None
+
+
+class StorageVolumeBeingWiped(RuntimeError):
+    """The volume's pod is being deleted and its files are being unlinked: no storage operation may start on it."""
+
+
+def _volume_lock_key(volume: str) -> str:
+    return f"{STORAGE_VOLUME_LOCK_PREFIX}{volume}"
+
+
+async def take_storage_volume_lock(redis: RedisService, volume: str, holder: str) -> bool:
+    """True when `holder` now holds the volume (also when it already did: a repeated dispatch)."""
+    key = _volume_lock_key(volume)
+    if await redis.set_if_absent(key, holder, STORAGE_VOLUME_LOCK_TTL_SECONDS):
+        return True
+    current = await redis.get(key)
+    return (current.decode() if isinstance(current, bytes) else current) == holder
+
+
+async def release_storage_volume_lock(redis: RedisService, volume: str, holder: str) -> None:
+    key = _volume_lock_key(volume)
+    current = await redis.get(key)
+    if (current.decode() if isinstance(current, bytes) else current) == holder:
+        await redis.delete(key)
+
+
+@asynccontextmanager
+async def storage_dispatch_holds_volume(
+    redis: RedisService, volume: str | None, operation_id: UUID | str
+) -> AsyncIterator[None]:
+    """Holds the volume against the delete's wipe from the dispatch until the spec is written (the block's end)."""
+    if not volume:
+        yield
+        return
+    holder = f"operation:{operation_id}"
+    if not await take_storage_volume_lock(redis, volume, holder):
+        raise StorageVolumeBeingWiped(f"the pod is being deleted; volume {volume} is being wiped")
+    try:
+        yield
+    finally:
+        await release_storage_volume_lock(redis, volume, holder)
 
 
 def _key(executor_id: str) -> str:
