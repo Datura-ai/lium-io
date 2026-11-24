@@ -275,9 +275,6 @@ class RentalEgressGuardCheck:
         rental = rental_of_this_node(ctx)
         if self._rented_only and not (rental and rental.pods):
             return self._skip(ctx, "guarded at the other position")
-        if ctx.host_writes_deferred:
-            # before the cadence stamp: the rules change on the first cycle that verifies the node's account
-            return self._skip(ctx, "node account not verified")
         if task_seconds_left(ctx) < HELPER_TIMEOUT_SECONDS + BUDGET_MARGIN_SECONDS:
             return self._skip(ctx, "not enough task time left")
         now = time.monotonic()

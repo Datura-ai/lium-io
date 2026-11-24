@@ -85,9 +85,7 @@ class NeedrestartGuardCheck:
             what["reason"] = specs["needrestart_guard_reason"]
         if not isinstance(guard, str):
             what = {"scrape_error": specs.get("needrestart_guard_scrape_error")}
-        if guard not in GUARDED and self.write and ctx.host_writes_deferred:
-            what["write"] = "deferred: node account not verified"
-        elif guard not in GUARDED and self.write:
+        if guard not in GUARDED and self.write:
             what["write"] = await write_needrestart_guard(ctx.ssh)
             if what["write"] == "set":
                 return CheckResult(passed=True, event=render_message(Msg.WRITTEN, ctx=ctx, check_id=self.check_id, what=what))

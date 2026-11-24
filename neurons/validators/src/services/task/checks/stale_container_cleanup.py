@@ -107,8 +107,6 @@ class StaleContainerCleanupCheck:
         self._last_sweep_at: dict[str, float] = {}
 
     async def run(self, ctx: Context) -> CheckResult:
-        if ctx.host_writes_deferred:
-            return CheckResult(passed=True, event=render_message(Msg.DEFERRED, ctx=ctx, check_id=self.check_id))
         # held here, not in _run: a timeout must not lose what was already removed and confirmed
         queue = _ReapedPodStateQueue(ctx)
         removed: list[str] = []

@@ -119,7 +119,6 @@ class SshdBootstrapCheck:
             )
         if (
             self.remove_fillers
-            and not ctx.host_writes_deferred  # the node's account is not verified: no cleanup on the host
             and rented_data
             and rented_data.get_default_job_owner(ctx.executor.uuid) == DEFAULT_JOB_OWNER_LIUM
         ):

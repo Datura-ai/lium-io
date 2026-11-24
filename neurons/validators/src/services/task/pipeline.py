@@ -377,12 +377,6 @@ class Context(BaseModel):
     # False once NodeAccountCheck finds the node on another account's machine (DAH-6539); non-fatal on a live
     # rental, so the score gate lives in calculate_scores.
     node_account_passed: bool = True
-    # True once NodeAccountCheck could not prove the machine is the listing account's, by its registered host key or
-    # by its account files: the run goes on for scoring and reporting, but no check repairs or cleans up the host.
-    host_writes_deferred: bool = False
-    # Reason codes of checks that found a failure they do not enforce yet (report-only until the portal sent the
-    # provider its per-node notice, see checks/enforcement.py). Finalize reports them so the portal can send it.
-    reported_only: tuple[str, ...] = ()
     # G1 — NVIDIA CC GPU attestation outcome: True/False when verified, None when
     # not performed (non-CVM node, no evidence supplied, or NRAS undeterminable).
     gpu_attestation_passed: bool | None = None
@@ -852,10 +846,6 @@ class Pipeline:
 
     async def run(self, ctx: Context) -> Tuple[bool, list[ValidationEvent], Context]:
         passed, events, end_ctx = await self._run_checks(ctx)
-        # the published event is the last one after _ended's reorder (a rented GPU dropout moves the fingerprint
-        # failure last), so the findings that only reported go on it here (DAH-6539)
-        if events and end_ctx.reported_only:
-            events[-1].what_we_saw["reported_only"] = list(end_ctx.reported_only)
         # another account's machine answered, or the machine could not be confirmed as the account's (a read that
         # still failed after the reconnect, which a relay can cause): no completion step touches it (DAH-6539)
         if any(event.reason_code in _NOT_THE_ACCOUNTS_MACHINE for event in events):
@@ -907,11 +897,6 @@ class Pipeline:
                             failed_check_id=(res.event.check_id or chk.check_id) if failed else None,
                         )
                     )
-                    # findings that are not enforced yet, on the run's last event whichever check ends it (a rented
-                    # node's run halts before Finalize): the portal sends the per-node notice from it (DAH-6539)
-                    reported = res.updates.get("reported_only", current_ctx.reported_only)
-                    if reported:
-                        res.event.what_we_saw["reported_only"] = list(reported)
 
                 for extra_event in res.extra_events:
                     await self.sink.emit(extra_event)

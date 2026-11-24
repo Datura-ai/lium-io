@@ -4,13 +4,12 @@ import json
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime
 from typing import TYPE_CHECKING, Self, TypeVar
 
 import aiohttp
 import bittensor
 import numpy as np
-import xxhash
 from bittensor.utils.weight_utils import process_weights_for_netuid
 from datura.chain import (
     ChainConnection,
@@ -213,43 +212,6 @@ def _classify_missing_scored_hotkeys(
         inactive_in_last_cycle=inactive_missing_hotkeys,
     )
 
-
-
-def _rpc_result(node, method: str, params: list):
-    """The `result` of a raw RPC call; an error reply (a node that does not serve the method) raises a chain error,
-    so the caller moves to the next endpoint."""
-    reply = node.rpc_request(method, params)
-    if not isinstance(reply, dict) or "result" not in reply:
-        raise ConnectionError(f"{method} failed: {reply.get('error') if isinstance(reply, dict) else reply!r}")
-    return reply["result"]
-
-
-# Finality normally trails the best block by a few blocks; an endpoint whose finalized head is further behind its own
-# best block than this has stopped finalizing.
-FINALITY_LAG_ALLOWANCE_BLOCKS = 10
-
-
-def _is_block_hash(value) -> bool:
-    if not isinstance(value, str) or len(value) != 66 or not value.startswith("0x"):
-        return False
-    try:
-        bytes.fromhex(value[2:])
-    except ValueError:
-        return False
-    return True
-
-
-def _twox(data: bytes, seeds: tuple[int, ...]) -> bytes:
-    return b"".join(xxhash.xxh64(data, seed=seed).intdigest().to_bytes(8, "little") for seed in seeds)
-
-
-def _storage_at(node, block_hash: str, pallet: str, item: str, map_key: bytes = b"") -> bytes | None:
-    """A storage value's raw bytes at `block_hash`, None when unset. Read by raw RPC: the SDK's query decodes an error
-    reply as the type's default (zero), which would hide a failing endpoint from the fallback; here it raises a
-    chain error like any other failed call."""
-    key = _twox(pallet.encode(), (0, 1)) + _twox(item.encode(), (0, 1)) + map_key
-    value = _rpc_result(node, "state_getStorage", ["0x" + key.hex(), block_hash])
-    return bytes.fromhex(value[2:]) if value else None
 
 class SubtensorClient:
     # Static class variables (shared across all instances)
@@ -1093,49 +1055,16 @@ class SubtensorClient:
             )
             return False
 
-    async def get_time_from_block(self, block: int) -> str | None:
-        """The block's own chain time as a cycle id (UTC, the format the backend parses); None when the chain did not
-        answer."""
+    async def get_time_from_block(self, block: int):
         max_retries = 3
         retries = 0
         while retries < max_retries:
             try:
                 node = self.get_node()
-                # Only a finalized block, and its hash taken from the finalized chain itself: the head's own state
-                # (System::BlockHash, read at the finalized head's hash) names the block at the height on that chain.
-                # A best-chain block can be reorganized away, and a lookup by height can reach another peer (the SDK
-                # reconnects per call) on a competing branch; either way one job block would report under two cycle
-                # ids. State read at a hash is the same on every peer, so this answers the finalized chain's block in
-                # a fixed three or four calls, however far the head is past the height (a walk down the parents took
-                # one blocking call per block on the shared loop). Until finality reaches the height there is no answer
-                # and the block is retried; the map holds the last BlockHashCount blocks, so an older one has none.
-                head = _rpc_result(node, "chain_getFinalizedHead", [])
-                if not _is_block_hash(head):
-                    # chain_getHeader with no hash answers the best block, which can be reorganized away
-                    raise ConnectionError(f"no finalized head: {head!r}")
-                header = _rpc_result(node, "chain_getHeader", [head])
-                if not header:
-                    raise ConnectionError(f"no header for the finalized head {head}")
-                if int(header["number"], 16) < block:
-                    best = _rpc_result(node, "chain_getHeader", [])
-                    if best and int(best["number"], 16) - int(header["number"], 16) > FINALITY_LAG_ALLOWANCE_BLOCKS:
-                        # this endpoint serves new blocks but its finality has stopped: another one may have it
-                        raise ConnectionError(f"finality stalled at {int(header['number'], 16)} on this endpoint")
-                    raise LookupError(f"block {block} is not finalized yet")
-                block_hash = head
-                if int(header["number"], 16) > block:
-                    height = block.to_bytes(4, "little")  # System::BlockHash is a Twox64Concat map over u32
-                    found = _storage_at(node, head, "System", "BlockHash", _twox(height, (0,)) + height)
-                    if not found or not any(found):  # unset or zero: no such block in the map's range
-                        raise LookupError(f"no hash for block {block} in the finalized head's state")
-                    block_hash = "0x" + found.hex()
-                timestamp = _storage_at(node, block_hash, "Timestamp", "Now")
-                timestamp_ms = int.from_bytes(timestamp, "little") if timestamp else 0
-                if timestamp_ms <= 0:
-                    # every finalized block has a timestamp, so an unset or zero one is a failed read of this endpoint:
-                    # the read moves to the next one, and it is never a 1970 cycle id
-                    raise ConnectionError(f"no timestamp for block {block}")
-                return datetime.fromtimestamp(timestamp_ms / 1000, tz=UTC).strftime("%Y-%m-%d %H:%M:%S")
+                block_hash = node.get_block_hash(block)
+                return datetime.fromtimestamp(
+                    node.query("Timestamp", "Now", block_hash=block_hash).value / 1000
+                ).strftime("%Y-%m-%d %H:%M:%S")
             except Exception as e:
                 logger.error(
                     _m(
@@ -1150,13 +1079,7 @@ class SubtensorClient:
                     ),
                 )
                 retries += 1
-                if retries < max_retries and is_chain_error(e):
-                    # an endpoint failing the read (one that rejects this method while it serves the others too) is
-                    # left for the next one, and the retry dials it, as a failed sync does
-                    async with self._pause_chain_reads_in_thread():
-                        self._switch_endpoint_after_read_failure(e)
-                        self.set_subtensor()
-        return None
+        return "Unknown"
 
     async def _warm_up_subtensor(self):
         count = 0

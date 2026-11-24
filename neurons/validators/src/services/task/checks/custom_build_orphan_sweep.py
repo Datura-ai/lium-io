@@ -216,9 +216,6 @@ class CustomBuildOrphanSweepCheck:
             return False
 
     async def run(self, ctx: Context) -> CheckResult:
-        if ctx.host_writes_deferred:
-            # before the cadence stamp: the sweep runs on the first cycle that verifies the account
-            return CheckResult(passed=True, event=render_message(Msg.DEFERRED, ctx=ctx, check_id=self.check_id))
         executor_uuid = ctx.executor.uuid
         now = time.monotonic()
 

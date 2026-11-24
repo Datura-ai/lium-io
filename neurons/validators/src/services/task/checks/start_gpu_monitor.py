@@ -54,10 +54,6 @@ class StartGPUMonitorCheck:
             )
             return CheckResult(passed=True, event=event)
 
-        if ctx.host_writes_deferred:
-            # the monitor changes the host (it prunes images): it waits until the node's account is verified
-            return CheckResult(passed=True, event=render_message(Msg.DEFERRED, ctx=ctx, check_id=self.check_id))
-
         # await runner.run("pip install aiohttp click pynvml psutil", timeout=30, retryable=True)
 
         program_id = str(uuid.uuid4())

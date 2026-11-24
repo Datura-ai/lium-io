@@ -87,7 +87,6 @@ PORTAL_OWNED_FIELDS = frozenset(
         "expected_account_claim",
         "expected_account_claims",
         "expected_claims_by_hotkey",
-        "check_enforce_after",
         "snapshot_valid_until",
         "owner_binding",
     }
@@ -442,17 +441,13 @@ class ExecutorService:
                     host_keys[str(uuid)] = item["ssh_host_key"]
                 binding = _current_binding(item)
                 if node_accounts is not None and binding.get("node_hotkeys"):
-                    until, enforce_after = item.get("snapshot_valid_until"), item.get("check_enforce_after")
                     node_accounts[str(uuid)] = {
                         # the expected_* fields are always the listing account's own: a validator that predates
                         # `owner_binding` reads only these and would never let an owner-wide grant end
                         **_expected_fields(item),
-                        # {} (no notice yet: report first) differs from a missing map (an older portal: enforce). A
-                        # stale row's times may belong to an earlier registration of this uuid: report first
-                        "check_enforce_after": enforce_after if enforce_after is None or _fresh(until) else {},
                         # the validator re-applies the end when it checks the node: this snapshot can be served, and
                         # the upload finish, after it
-                        "snapshot_valid_until": until,
+                        "snapshot_valid_until": item.get("snapshot_valid_until"),
                         # the owner-wide binding, only from a fresh row; the validator counts it until the time above
                         "owner_binding": _expected_fields(binding) if binding is not item else None,
                     }

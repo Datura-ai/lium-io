@@ -51,10 +51,6 @@ class JobResult(BaseModel):
     # Set by the express lane: when its run outside the cycle started (the backend reads it, not job_batch_id,
     # against a maintenance window's end).
     check_started_at: datetime | None = None
-    # Set by a cycle's wave: when this node's own run started, for tying a finding to a node registered after the
-    # cycle began. Kept apart from check_started_at, which marks an express recheck: the maintenance hold reads that
-    # one and judges a wave by its cycle's start.
-    run_started_at: datetime | None = None
     gpu_model: str | None = None
     gpu_count: int = 0
     sysbox_runtime: bool = False

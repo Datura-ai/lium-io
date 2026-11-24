@@ -729,18 +729,3 @@ async def test_an_enforce_tempo_drains_live_weights_reports_left_from_before_the
     validator.backend_client.report_live_weights.assert_awaited_once_with(800, ["c0"])
     validator.redis_service.lrem.assert_awaited_once_with(UNACKED_LIVE_WEIGHTS_KEY, left)
 
-
-
-@pytest.mark.asyncio
-async def test_the_settlement_cycle_start_is_the_cycle_ids_own_time():
-    """Review on 4f44d24: the backend keys a cycle's ledger rows, settlement and emissions attribution on the time of
-    its id. A cycle start taken from the chain's reading of the block (seconds off the estimated id) matched none of
-    those rows, so the cycle's provider allocation was lost. The start is the id's time."""
-    validator = _validator(window=None, accepted=True)
-    queue = _with_report_queue(validator)
-    scored_at = datetime(2026, 11, 19, 19, 0, 5, tzinfo=UTC)
-
-    await validator.report_cycle_scores({"hk": 1.0}, [], "burn", "2026-11-19 18:52:36", 9542550, scored_at)
-
-    [report] = [json.loads(raw) for raw in queue.items]
-    assert (report["cycle_id"], report["cycle_started_at"]) == ("2026-11-19 18:52:36", "2026-11-19T18:52:36+00:00")

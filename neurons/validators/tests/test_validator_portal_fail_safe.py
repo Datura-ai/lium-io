@@ -294,8 +294,6 @@ async def test_sync_skips_cleanly_when_no_provider_snapshot_exists(
     validator = Validator.__new__(Validator)
     validator.default_extra = {}
     validator.miner_scores = {"portal-provider": 1.0}
-    validator.live_cycle_ids = []
-    validator.pending_job_read = False
     validator.subtensor_client = MagicMock()
     validator.subtensor_client.get_miners = AsyncMock(
         side_effect=ProviderPortalDataUnavailable("no snapshot")
@@ -307,8 +305,7 @@ async def test_sync_skips_cleanly_when_no_provider_snapshot_exists(
 
     assert "[sync] No reliable provider snapshot, skipping iteration" in caplog.text
     assert "[sync] Unknown error" not in caplog.text
-    [writes] = validator.redis_service.write_atomically.await_args.args
-    cache_key, scores_json = writes.ops[0].args
+    cache_key, scores_json = validator.redis_service.set.await_args.args
     assert cache_key == MINER_SCORES_KEY
     assert json.loads(scores_json) == validator.miner_scores
 

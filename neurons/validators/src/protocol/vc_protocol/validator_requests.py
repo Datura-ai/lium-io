@@ -240,9 +240,6 @@ class ExecutorSpecRequest(BaseValidatorRequest):
     host_runtime_fault: bool | None = None
     # When an express recheck outside the cycle started (lium_protocol 2.11.0); None for a cycle's own report.
     check_started_at: datetime | None = None
-    # When a cycle's own run on the node started, later than the cycle's start; None for an express recheck (it sends
-    # check_started_at) and from an older validator. Not a maintenance-hold time: the hold judges a cycle by its start.
-    run_started_at: datetime | None = None
 
 
 class RentedMachineRequest(BaseValidatorRequest):

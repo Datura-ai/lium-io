@@ -533,29 +533,3 @@ async def test_an_unverified_ssh_host_key_is_not_forwarded():
 
     (_channel, payload), _ = service.redis_service.publish.call_args
     assert payload["ssh_host_key"] is None
-
-
-@pytest.mark.asyncio
-async def test_only_an_express_recheck_publishes_the_start_a_maintenance_hold_reads():
-    # the backend re-lists a held node on an express recheck's own start; a wave run that started at the same time
-    # after the window's end goes out with its cycle's start alone, the run's start in run_started_at
-    from datetime import UTC, datetime
-
-    from services.miner_service import MinerService
-
-    after_window_end = datetime(2026, 11, 20, 12, 0, 5, tzinfo=UTC)
-    wave = _result("e3").model_copy(update={"run_started_at": after_window_end})
-    express = _result("e4").model_copy(update={"check_started_at": after_window_end})
-    service = MinerService.__new__(MinerService)
-    service.redis_service = AsyncMock()
-
-    with patch("services.miner_service.settings") as settings:
-        settings.DRY_RUN = False
-        settings.POD_STATES_REPORT_ENABLED = False
-        await MinerService.publish_machine_specs(service, [wave, express], "hk", "ck", is_whole_miner_batch=False)
-
-    payloads = {payload["executor_uuid"]: payload for (_channel, payload), _ in service.redis_service.publish.call_args_list}
-    assert (payloads["e3"]["check_started_at"], payloads["e3"]["run_started_at"]) == (None, after_window_end.isoformat())
-    assert (payloads["e4"]["check_started_at"], payloads["e4"]["run_started_at"]) == (after_window_end.isoformat(), None)
-    spec = ExecutorSpecRequest(**payloads["e3"], validator_hotkey="v")
-    assert (spec.check_started_at, spec.run_started_at) == (None, after_window_end)

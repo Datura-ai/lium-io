@@ -1023,8 +1023,8 @@ async def _recover_pod_after_stale_vloopback_mount(
     # miner is penalised for it. Best effort in every direction — a recovery that cannot run, or
     # fails, simply leaves the POD_NOT_RUNNING verdict untouched. The one exception is a dead SSH
     # transport, which propagates: the repair runs over ctx.ssh, so DAH-2055 applies here too.
-    if not ctx.executor_ssh_private_key or ctx.host_writes_deferred:
-        return False  # no key to reach the pod, or the node's account is not verified: no repair on the host
+    if not ctx.executor_ssh_private_key:
+        return False
 
     container_error = diagnostics.get("container_error")
     try:

@@ -15,7 +15,6 @@ from payload_models.payloads import MinerJobRequestPayload
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from services.miner_service import CYCLE_DONE, EXPRESS_LANE, MinerService
 from services.task.service import TaskService
-from services.task_service import JobResult
 
 from core.config import settings
 
@@ -340,39 +339,6 @@ async def test_the_report_carries_the_claimed_list_not_what_the_express_lane_hol
     assert sorted(order[1:]) == ["create_task:exec-a", "create_task:exec-c"]
     # the run completed: the wave released its two claims and left the lane's executor alone
     assert service.in_flight == {"exec-a": CYCLE_DONE, "exec-b": EXPRESS_LANE, "exec-c": CYCLE_DONE}
-
-
-@pytest.mark.asyncio
-async def test_an_ordinary_wave_result_carries_its_runs_own_start(monkeypatch):
-    """The wave's job_batch_id is the job block's time, before the run really started; each result carries its run's
-    start (run_started_at), so the backend ties a finding to a node registered between the two (lp#3232 review
-    4634721648). Never as check_started_at: that marks an express recheck, which a maintenance hold judges by its own
-    start, so a wave whose node ran after the window's end would re-list the node a cycle before its cycle did."""
-    service = _miner_service_recording([])
-    results: list[tuple[JobResult, datetime]] = []
-
-    async def create_task(**kwargs):
-        result = JobResult(
-            executor_info=kwargs["executor_info"], score=1, job_score=1, job_batch_id="2026-09-08 02:53:00",
-            log_status="info", log_text="",
-        )
-        results.append((result, datetime.now(UTC)))  # when this run's checks were under way
-        return result
-
-    service.task_service.create_task = create_task
-    service._generate_auth_headers = MagicMock(return_value={})
-    service._make_rest_request = AsyncMock(return_value=(200, _accepted("exec-a").model_dump(mode="json")))
-    service._remove_ssh_key_via_rest = AsyncMock()
-    monkeypatch.setattr(settings, "JOB_TIME_OUT", 300)
-    monkeypatch.setattr(type(settings), "get_bittensor_wallet", lambda self: _wallet())
-    before = datetime.now(UTC)
-
-    with patch("services.miner_service.measure_and_attach", AsyncMock()):
-        await service.request_job_to_miner(_payload(), MagicMock(), RentedExecutorsResponse(executors={}), {})
-
-    [(result, running_at)] = results
-    assert before <= result.run_started_at <= running_at
-    assert result.check_started_at is None
 
 
 @pytest.mark.asyncio

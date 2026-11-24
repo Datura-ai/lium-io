@@ -51,7 +51,6 @@ async def test_gpu_monitor_start_keeps_executor_reported_values_as_single_argume
     monkeypatch.setattr(start_gpu_monitor, "render_message", lambda *args, **kwargs: None)
     monkeypatch.setattr(start_gpu_monitor, "CheckResult", lambda **kwargs: SimpleNamespace(**kwargs))
     ctx = SimpleNamespace(
-        host_writes_deferred=False,
         runner=_LocalRunner(tmp_path),
         executor=SimpleNamespace(
             python_path=_shell_text(tmp_path / "a"),

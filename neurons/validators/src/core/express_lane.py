@@ -90,6 +90,18 @@ RECHECK_MARGIN_SECONDS = 60
 RECHECK_MAX_RUNS = 2
 
 
+def _cycle_batch_id_or_clock(cycle_batch_id: str) -> str:
+    """The cycle's id, or the clock when the cycle could not read its block time
+    (SubtensorClient.get_time_from_block gives "Unknown"): the backend's write of a spec whose id
+    does not parse fails before it lists the node, and a node checked ahead of the cycle must
+    still be published."""
+    try:
+        datetime.strptime(cycle_batch_id, JOB_BATCH_ID_FORMAT)
+    except (TypeError, ValueError):
+        return datetime.now(UTC).strftime(JOB_BATCH_ID_FORMAT)
+    return cycle_batch_id
+
+
 @dataclass
 class CycleInputs:
     """What the cycle prepared for its wave. The express lane reuses it verbatim, so an express
@@ -561,7 +573,7 @@ class ExpressLane:
             payload = MinerJobRequestPayload(
                 # The cycle whose job files this run uses, even when the next cycle starts
                 # before it publishes: that cycle's wave may publish the node under its own id.
-                job_batch_id=inputs.job_batch_id,
+                job_batch_id=_cycle_batch_id_or_clock(inputs.job_batch_id),
                 miner_hotkey=miner.hotkey,
                 miner_coldkey=miner.coldkey,
                 miner_address=miner.axon_info.ip,

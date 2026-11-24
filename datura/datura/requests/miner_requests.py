@@ -69,10 +69,6 @@ class ExecutorSSHInfo(pydantic.BaseModel):
     # those of the owner's other accounts (same own-key coldkey or same confirmed e-mail). A node an owner set up under
     # one of their own older accounts is theirs, not a relay. None from an older miner: `expected_account_claim` only.
     expected_account_claims: list[str] | None = None
-    # reason code -> ISO-8601 time from which a finding that so far only reports may refuse this node: the portal sets it
-    # once it sent the provider the per-node notice for that finding. A code absent from the map only reports; no map at
-    # all (an older miner or portal) keeps every check enforced as before.
-    check_enforce_after: dict[str, str] | None = None
     # shared (pool) hotkey -> the claims a machine set up for it must report to serve this listing: the pool hotkeys of
     # the listing account's owner, whatever hotkey the node is listed under. A machine set up for one of them passes
     # only with one of these claims (an empty claim proves nothing either way, as for the listing hotkey).
@@ -81,8 +77,8 @@ class ExecutorSSHInfo(pydantic.BaseModel):
     # also accepts `owner_binding` (the owner-wide binding: the hotkeys and claims of every account of the listing's
     # owner, keyed by the four expected_* field names above); after it, or when it does not parse, only the fields
     # above, which always hold the listing account's own binding (all a validator that predates `owner_binding`
-    # reads), and it enforces no report-first finding: a miner can serve a cached snapshot, and an upload can finish,
-    # after it. None from an older miner or portal: the fields above as they are.
+    # reads): a miner can serve a cached snapshot, and an upload can finish, after it. None from an older miner or
+    # portal: the fields above as they are.
     snapshot_valid_until: str | None = None
     owner_binding: dict | None = None
 
