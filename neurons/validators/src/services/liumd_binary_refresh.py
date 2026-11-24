@@ -28,6 +28,7 @@ import aiohttp
 import redis.exceptions
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+from services.liumd_exec_client import liumd_paths_sh
 
 from core.config import settings
 
@@ -36,7 +37,8 @@ TARGET_ARCH = {"x86_64": "x86_64", "aarch64": "aarch64"}
 FILE_BY_ARCH = {"x86_64": "liumd-amd64", "aarch64": "liumd-arm64"}
 LIUMD_FILE_RX = re.compile(r"^liumd-(amd64|arm64)$")
 SHA256_RX = re.compile(r"^[0-9a-f]{64}$")
-TMP_BINARY = "/tmp/liumd.binary.fetch"
+# Beside the install target, so a non-root user never meets another user's leftover in /tmp.
+TMP_BINARY = '"$t.fetch"'
 
 # X.Y.Z, each part at most 6 digits with no leading zero (sign_manifest.py signs only this form)
 RELEASE_RX = re.compile(r"(0|[1-9][0-9]{0,5})\.(0|[1-9][0-9]{0,5})\.(0|[1-9][0-9]{0,5})")
@@ -153,7 +155,7 @@ async def _run(ctx: Any, command: str, timeout: int) -> Any:
 
 
 async def _read_version(ctx: Any) -> LiumdVersion:
-    result = await _run(ctx, f"{shlex.quote(settings.LIUMD_BINARY_PATH)} version", 15)
+    result = await _run(ctx, f'{liumd_paths_sh()}"$b" version', 15)
     if not result.success:
         if getattr(result, "error_type", None) is not None:
             return LiumdVersion(None, None, checked=False)
@@ -281,9 +283,11 @@ def _manifest_entry(manifest: dict[str, Any], arch: str) -> tuple[str, str] | No
 
 async def _download(ctx: Any, url: str, max_time: int) -> tuple[str | None, str | None]:
     command = (
-        f"curl -fsSL --max-time {max_time} -o {shlex.quote(TMP_BINARY)} {shlex.quote(url)}; "
+        f"{liumd_paths_sh()}"
+        f'mkdir -p "$(dirname "$t")"; '
+        f"curl -fsSL --max-time {max_time} -o {TMP_BINARY} {shlex.quote(url)}; "
         f"rc=$?; echo RC:$rc; "
-        f"if [ -f {shlex.quote(TMP_BINARY)} ]; then sha256sum {shlex.quote(TMP_BINARY)}; fi"
+        f"if [ -f {TMP_BINARY} ]; then sha256sum {TMP_BINARY}; fi"
     )
     result = await _run(ctx, command, max_time + 10)
     stdout = result.stdout or ""
@@ -410,7 +414,7 @@ async def _ensure(ctx: Any, budget: float, started: float) -> LiumdRefresh:
 
         install = await _run(
             ctx,
-            f"install -m 0755 {shlex.quote(TMP_BINARY)} {shlex.quote(settings.LIUMD_BINARY_PATH)}",
+            f'{liumd_paths_sh()}install -m 0755 {TMP_BINARY} "$t" && rm -f {TMP_BINARY}',
             30,
         )
         if not install.success:
@@ -509,8 +513,8 @@ async def _refresh_from_answer(
 
         install = await _run(
             ctx,
-            f"install -m 0755 {shlex.quote(TMP_BINARY)} {shlex.quote(settings.LIUMD_BINARY_PATH)}"
-            f" && sha256sum {shlex.quote(settings.LIUMD_BINARY_PATH)}",
+            f'{liumd_paths_sh()}install -m 0755 {TMP_BINARY} "$t" && rm -f {TMP_BINARY}'
+            ' && sha256sum "$t"',
             30,
         )
         if not install.success:

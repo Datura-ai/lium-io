@@ -684,9 +684,6 @@ DOCKER_SOCKET_PATH = "/var/run/docker.sock"
 # let a scrape round hang on it.
 DOCKER_API_TIMEOUT_SECONDS = 20
 VLOOPBACK_DRIVER_PREFIX = "vloopback"
-# the v2 and v3 plugins' DATA_DIRs on the host, under DockerRootDir: loopback_plugin_setup.py uses
-# the same names (v3 = direct I/O; v2 stays for the volumes made on it)
-VLOOPBACK_HOST_DATA_DIR_NAMES = ("vloopback-v2", "vloopback-v3")
 # DAH-5045: the Engy checkpoint cache, reported for its download progress. DAH-5260: unlike the Dolphin cache
 # it reads as free disk, since a customer create removes it when the renter needs the space.
 ENGY_CACHE_VOLUME_PREFIX = "engy_cache_"
@@ -1271,6 +1268,34 @@ def get_needrestart_guard(host_root="/proc/1/root"):
     return ("partial" if unguarded else "present"), unguarded, unproven
 
 
+def vloopback_plugin_data_dirs(docker_root_dir):
+    # each installed vloopback plugin's DATA_DIR as docker reports it, as a host path seen from here. DATA_DIR
+    # is a path inside the plugin: under a bind mount (the v2/v3 plugins mount the host's / at /srv) it is on
+    # the host, otherwise it is in the plugin's own rootfs. Read, not guessed: a plugin set to any other dir
+    # (by hand, or another release) is found too.
+    data_dirs = []
+    for plugin in docker_api_get("/plugins") or []:
+        if not (plugin.get("Name") or "").startswith(VLOOPBACK_DRIVER_PREFIX):
+            continue
+        settings = plugin.get("Settings") or {}
+        env = dict(entry.split("=", 1) for entry in settings.get("Env") or [] if "=" in entry)
+        data_dir = env.get("DATA_DIR") or ""
+        if not data_dir.startswith("/"):
+            continue
+        host_dir, matched = None, -1
+        for mount in settings.get("Mounts") or []:
+            destination = (mount.get("Destination") or "").rstrip("/")
+            source = mount.get("Source")
+            if source and (data_dir == destination or data_dir.startswith(destination + "/")) and len(destination) > matched:
+                host_dir, matched = source.rstrip("/") + data_dir[len(destination):], len(destination)
+        if host_dir is None:
+            host_dir = f"{docker_root_dir}/plugins/{plugin.get('Id')}/rootfs{data_dir}"
+        # a DATA_DIR the plugin has never written (or a mount source gone from the host) holds no volume
+        if os.path.isdir(f"/proc/1/root{host_dir}"):
+            data_dirs.append(f"/proc/1/root{host_dir}")
+    return data_dirs
+
+
 def get_vloopback_volume_bytes(docker_root_dir, filler_only=False, sizes=None):
     # disk held by loopback-backed volumes, which /system/df misses entirely: it only accounts for
     # the `local` driver. The plugin keeps one backing file per volume, named after the volume.
@@ -1288,20 +1313,11 @@ def get_vloopback_volume_bytes(docker_root_dir, filler_only=False, sizes=None):
     if not names:
         return 0
 
-    # DATA_DIR is set to <DockerRootDir>/loopback at install time, but the plugin writes it inside
-    # its own rootfs; reachable here because the executor container shares the host PID namespace.
-    data_dirs = glob.glob(
-        f"/proc/1/root{docker_root_dir}/plugins/*/rootfs{docker_root_dir}/loopback"
-    )
-    # the v2 and v3 plugins write their DATA_DIR on the host itself, outside any plugin rootfs
-    for host_data_dir_name in VLOOPBACK_HOST_DATA_DIR_NAMES:
-        host_data_dir = f"/proc/1/root{docker_root_dir}/{host_data_dir_name}"
-        if os.path.isdir(host_data_dir):
-            data_dirs.append(host_data_dir)
+    data_dirs = vloopback_plugin_data_dirs(docker_root_dir)
     if not data_dirs:
         # every volume would be counted as 0 and the breakdown would silently under-report by
         # terabytes; fail like the rest of the docker half so the miss lands in an error key
-        raise RuntimeError(f"no vloopback plugin data dir under {docker_root_dir} for {len(names)} volumes")
+        raise RuntimeError(f"docker reports no existing vloopback plugin DATA_DIR for {len(names)} volumes")
 
     total = 0
     mount_points = None
@@ -1874,6 +1890,9 @@ def rental_p2p_output(stdout):
     return table if table.strip() else None
 
 
+SYSBOX_CHECK_DETAIL_CAP = 500
+
+
 def check_sysbox_gpu_compatibility() -> tuple[bool, str, str | None]:
     """
     Checks if the system supports running Docker containers with the sysbox-runc runtime
@@ -1890,7 +1909,10 @@ def check_sysbox_gpu_compatibility() -> tuple[bool, str, str | None]:
         if result.returncode == 0:
             return True, "Sysbox runtime supports GPU access.", rental_p2p_output(result.stdout)
         else:
-            return False, "Sysbox runtime does not support GPU access.", None
+            # docker's own error (unknown runtime, OCI hook failure, ...) so the validator log says why
+            detail = (result.stderr or "").strip()[-SYSBOX_CHECK_DETAIL_CAP:]
+            message = "Sysbox runtime does not support GPU access."
+            return False, f"{message} {detail}" if detail else message, None
 
     except subprocess.TimeoutExpired:
         return False, "Test command timed out.", None
