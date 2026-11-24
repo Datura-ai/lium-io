@@ -266,24 +266,9 @@ systemd_env() {
     printf 'Environment=%s\n' "$(systemd_quote "$1=$2")"
 }
 
-shift_sysbox_layers_back_at_boot() {
-    # Sysbox chowns a pod's writable layer into its uid range on start and back on a stop it sees. After an unclean
-    # stop (power loss, hard reset) the layer stays shifted, and the restart-policy start at boot mounts the image
-    # layers unmapped: every image file is host uid 0, nobody inside the pod, so sudo and apt break (DAH-6503;
-    # reproduced: a hard reset always, a clean reboot never). A boot oneshot before Docker shifts such a layer back.
-    local bin unit dropin address mounts root=""
-    address=$(docker_containerd_address)
-    # Docker's effective data-root (its --data-root flag or --config-file included), as check_total_disk_for_vram reads it
-    [ -z "${SYSBOX_SETUP_HOST_ROOT:-}" ] && root=$(docker info --format '{{.DockerRootDir}}' 2>/dev/null)
-    # the disk the reset reads: Docker's own unit waits for a nofail data-disk mount, local-fs.target does not
-    mounts=$root
-    [ -n "$mounts" ] || mounts=$(python3 -Ic 'import json, sys; print(json.load(open(sys.argv[1])).get("data-root") or "")' \
-        "$(host_path /etc/docker/daemon.json)" 2>/dev/null)
-    bin=$(host_path /usr/local/sbin/lium-sysbox-layer-reset)
-    unit=$(host_path /etc/systemd/system/lium-sysbox-layer-reset.service)
-    dropin=$(host_path /etc/systemd/system/docker.service.d/lium-sysbox-layer-reset.conf)
-    mkdir -p "$(dirname "$bin")" "$(dirname "$unit")" "$(dirname "$dropin")" || return 1
-    cat > "$bin" <<'PY' || return 1
+layer_reset_program() {
+    # the boot reset program; also what removal leaves for a pending journal
+    cat <<'PY'
 #!/usr/bin/python3 -I
 # Lium (nvidia_docker_sysbox_setup.sh): shift back the writable layer a sysbox pod kept after an unclean stop, the way
 # sysbox's own stop does. Runs at boot before Docker; --dry-run only prints. Setuid bits and file capabilities kept.
@@ -522,6 +507,8 @@ def resume_point(cursor, key):
 
 def save_point(cursor, key, n, last):
     # written after its batch is done, so it never claims more than was shifted; a torn file reads as no point
+    os.makedirs(os.path.dirname(cursor), exist_ok=True)  # a batch with nothing journaled never made it
+    os.sync()  # the batch's chowns are on disk before a point that says they are done
     tmp = cursor + ".tmp"
     with open(tmp, "w") as f:
         json.dump({**key, "n": n, "last": last}, f)
@@ -617,7 +604,9 @@ def main():
             continue
         base = (bu, pod_base(top.st_gid, gids) or gids[0] + (bu - uids[0]))
         n = 0
-        # a layer whose walk outlasts the unit's start timeout resumes where the last boot stopped, not from its start
+        # a walk cut off with no start of the pod since (a power loss mid-walk, or Docker not starting it) resumes where
+        # it stopped. Once Docker started the pod (after a timeout, Docker starts anyway), sysbox re-shifted its layer:
+        # the point no longer says which entries are done, so the layer is walked whole again
         cursor = f"{os.path.dirname(JOURNAL)}/walk-{cid}.json"
         key = {"upper": upper, "started": started_at(d, cid)}
         skip, last = resume_point(cursor, key)
@@ -652,6 +641,26 @@ def main():
 
 main()
 PY
+}
+
+shift_sysbox_layers_back_at_boot() {
+    # Sysbox chowns a pod's writable layer into its uid range on start and back on a stop it sees. After an unclean
+    # stop (power loss, hard reset) the layer stays shifted, and the restart-policy start at boot mounts the image
+    # layers unmapped: every image file is host uid 0, nobody inside the pod, so sudo and apt break (DAH-6503;
+    # reproduced: a hard reset always, a clean reboot never). A boot oneshot before Docker shifts such a layer back.
+    local bin unit dropin address mounts root=""
+    address=$(docker_containerd_address)
+    # Docker's effective data-root (its --data-root flag or --config-file included), as check_total_disk_for_vram reads it
+    [ -z "${SYSBOX_SETUP_HOST_ROOT:-}" ] && root=$(docker info --format '{{.DockerRootDir}}' 2>/dev/null)
+    # the disk the reset reads: Docker's own unit waits for a nofail data-disk mount, local-fs.target does not
+    mounts=$root
+    [ -n "$mounts" ] || mounts=$(python3 -Ic 'import json, sys; print(json.load(open(sys.argv[1])).get("data-root") or "")' \
+        "$(host_path /etc/docker/daemon.json)" 2>/dev/null)
+    bin=$(host_path /usr/local/sbin/lium-sysbox-layer-reset)
+    unit=$(host_path /etc/systemd/system/lium-sysbox-layer-reset.service)
+    dropin=$(host_path /etc/systemd/system/docker.service.d/lium-sysbox-layer-reset.conf)
+    mkdir -p "$(dirname "$bin")" "$(dirname "$unit")" "$(dirname "$dropin")" || return 1
+    layer_reset_program > "$bin" || return 1
     chmod 755 "$bin" || return 1
     # the version line goes in last, once the unit is enabled and Docker's drop-in is in place: a cut-off or failed
     # install reads as an old version (no line), so the validator installs again next check
@@ -669,7 +678,7 @@ RemainAfterExit=yes
 # the walk holds one open directory per level of a layer (PATH_MAX allows ~2048)
 LimitNOFILE=65536
 # a oneshot has no start timeout by default: a reset that hangs must not hold Docker's start for the whole boot. A
-# reset cut off here is finished on the next boot (its journal)
+# reset cut off here gets its journal replayed on the next boot, and is redone there
 TimeoutStartSec=15min
 $(systemd_env LIUM_CONTAINERD_ADDRESS "$address")
 $(systemd_env LIUM_DOCKER_DATA_ROOT "$root")
@@ -708,7 +717,11 @@ remove_layer_reset() {
     fi
     if [ -e "$(host_path /var/lib/lium-sysbox-layer-reset/pending.jsonl)" ]; then
         # a cut-off reset left setuid bits and capabilities only the program restores: it stays, and so does the unit
-        # file (disabled, it never runs; the scrape keeps reporting it, so the validator retries) until a --replay-only
+        # file (disabled, it never runs; the scrape keeps reporting it, so the validator retries) until a --replay-only.
+        # The program is rewritten from this script: an older one (version 2 or 3) has no --replay-only
+        local bin
+        bin=$(host_path /usr/local/sbin/lium-sysbox-layer-reset)
+        layer_reset_program > "$bin" && chmod 755 "$bin" || return 1
         [ -n "${SYSBOX_SETUP_HOST_ROOT:-}" ] || systemctl daemon-reload
         return 3
     fi

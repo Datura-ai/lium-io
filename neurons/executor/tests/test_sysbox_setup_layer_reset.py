@@ -35,6 +35,7 @@ def _install(root) -> None:
         + _function("docker_containerd_address")
         + _function("systemd_quote")
         + _function("systemd_env")
+        + _function("layer_reset_program")
         + _function("shift_sysbox_layers_back_at_boot")
         + "shift_sysbox_layers_back_at_boot\n"
     )
@@ -127,6 +128,7 @@ def _install_on_a_live_host(root, enable_fails: bool) -> subprocess.CompletedPro
         + _function("docker_containerd_address")
         + _function("systemd_quote")
         + _function("systemd_env")
+        + _function("layer_reset_program")
         + _function("shift_sysbox_layers_back_at_boot")
         + "shift_sysbox_layers_back_at_boot\n"
     )
@@ -185,6 +187,7 @@ def _remove_on_a_live_host(root, disable_fails: bool = False) -> subprocess.Comp
     script = (
         f'host_path() {{ echo "{root}$1"; }}\n'
         + f'systemctl() {{ echo "$*" >> "{log}"; [ "$1" = disable ] && {"return 1" if disable_fails else "return 0"}; return 0; }}\n'
+        + _function("layer_reset_program")
         + _function("remove_layer_reset")
         + "remove_layer_reset\n"
     )
@@ -233,6 +236,28 @@ def test_remove_with_a_pending_journal_keeps_the_program_that_replays_it(tmp_pat
     assert (tmp_path / "etc/systemd/system/lium-sysbox-layer-reset.service").exists()  # scraped, so the validator retries
     assert (tmp_path / "systemctl.log").read_text() == "disable lium-sysbox-layer-reset.service\ndaemon-reload\n"
     assert journal.exists()
+
+
+def test_remove_with_a_pending_journal_leaves_a_program_that_can_replay_it(tmp_path):
+    # an older program (version 2 or 3) has no --replay-only and returns early once Docker ran this boot
+    assert _install_on_a_live_host(tmp_path, enable_fails=False).returncode == 0
+    program = tmp_path / "usr/local/sbin/lium-sysbox-layer-reset"
+    program.write_text('#!/usr/bin/python3 -I\nprint("Docker already ran this boot; nothing to reset")\n')
+    sudo = tmp_path / "sudo"
+    sudo.write_text("")
+    sudo.chmod(0o755)
+    journal = tmp_path / "var/lib/lium-sysbox-layer-reset/pending.jsonl"
+    journal.parent.mkdir(parents=True)
+    journal.write_text(json.dumps({"p": os.path.realpath(sudo), "m": 0o4755, "c": None}) + "\n")
+    (tmp_path / "run").mkdir()
+    (tmp_path / "run/lium-docker-started").touch()  # Docker ran this boot, stopped for the recovery
+
+    assert _remove_on_a_live_host(tmp_path).returncode == 3
+    result = _run(tmp_path, "--replay-only")  # the step the recovery_needed warning names
+
+    assert result.returncode == 0, result.stderr
+    assert stat.S_IMODE(os.lstat(sudo).st_mode) == 0o4755
+    assert not journal.exists()
 
 
 def test_remove_layer_reset_mode_reports_recovery_needed():
@@ -938,3 +963,32 @@ def test_a_layer_that_may_have_changed_since_the_cut_off_is_walked_whole(tmp_pat
     reset["main"]()
     assert set(fs.modes) <= set(seen)
     assert fs.owners == {p: 1000 if p.endswith("renterfile") else 0 for p in fs.modes}
+
+
+def test_a_first_batch_with_nothing_journaled_still_saves_its_point(tmp_path):
+    # no setuid file or capability in the layer: no journal ever makes the reset's state directory
+    reset, fs = _fake_fs(tmp_path)
+    reset["BATCH"] = 1
+    _started(tmp_path, "2026-11-24T10:00:00Z")
+    for path in fs.modes:
+        fs.modes[path] &= ~(stat.S_ISUID | stat.S_ISGID)
+        fs.xattrs[path].pop("security.capability", None)
+    reset["main"]()
+    assert fs.owners == {p: 1000 if p.endswith("renterfile") else 0 for p in fs.modes}
+
+
+def test_a_batch_is_on_disk_before_its_point_says_it_is_done(tmp_path):
+    reset, fs = _fake_fs(tmp_path)
+    reset["BATCH"] = 1
+    _started(tmp_path, "2026-11-24T10:00:00Z")
+    for path in fs.modes:  # no journal, so no journal sync either
+        fs.modes[path] &= ~(stat.S_ISUID | stat.S_ISGID)
+        fs.xattrs[path].pop("security.capability", None)
+    events = []
+    real_chown, real_replace = reset["os"].lchown, reset["os"].replace
+    reset["os"].lchown = lambda *a: (events.append("chown"), real_chown(*a))[1]
+    reset["os"].sync = lambda: events.append("sync")
+    reset["os"].replace = lambda *a: (events.append("replace"), real_replace(*a))[1]
+    reset["main"]()
+    first = events.index("replace")
+    assert events[:first].count("chown") == 1 and events[first - 1] == "sync"
