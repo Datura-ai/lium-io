@@ -448,13 +448,11 @@ class ContainerDownloadSpeedCheck:
                 continue
             if r.error in NODE_SIDE_ERRORS and await validator_reaches(dict(ENDPOINTS)[r.endpoint]):
                 return Judgement(is_failing=True, has_no_verdict=False, failed=(r,), would_fail=tuple(bad))
-        # an endpoint left unmeasured (ours, or the endpoint's) and no failure: no verdict
+        # an endpoint left unmeasured (ours, or the endpoint's) and no failure: no verdict. Record-only, the upload
+        # decides nothing, so an unmeasured one cannot hold a standing download failure either
         return Judgement(
             is_failing=False,
-            has_no_verdict=any(
-                r.mbps is None and (enforced or r.endpoint not in _UPLOAD_NAMES or r.error not in NODE_SIDE_ERRORS)
-                for r in readings
-            ),
+            has_no_verdict=any(r.mbps is None and (enforced or r.endpoint not in _UPLOAD_NAMES) for r in readings),
             would_fail=() if enforced else tuple(bad),
         )
 

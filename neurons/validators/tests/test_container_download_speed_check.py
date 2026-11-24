@@ -373,7 +373,7 @@ async def test_slow_then_fast_resets():
     ],
 )
 @pytest.mark.parametrize("enforced", [True, False])
-async def test_an_upload_the_receiver_refuses_is_inconclusive_and_keeps_the_streak(upload, enforced):
+async def test_an_upload_the_receiver_refuses_keeps_the_streak_only_when_enforced(upload, enforced):
     fast_downloads = RENTALS + line("pypi", CAP_BYTES, 1.0, 0) + line("hf", CAP_BYTES, 1.0, 0) + upload
     with flags(enforced=enforced) as clock:
         ctx, runner, redis = make_ctx(SLOW, fast_downloads)
@@ -382,9 +382,14 @@ async def test_an_upload_the_receiver_refuses_is_inconclusive_and_keeps_the_stre
         assert json.loads(next(iter(redis.store.values())))["failures_in_a_row"] == 1
         clock.now += 31 * 60
         res = await check.run(ctx)
-    assert res.passed and res.event.reason_code == Msg.SLOW_ONCE.reason
     saved = json.loads(next(iter(redis.store.values())))
-    assert saved["failures_in_a_row"] == 1 and saved["measured"] is False
+    if enforced:
+        assert res.passed and res.event.reason_code == Msg.SLOW_ONCE.reason
+        assert saved["failures_in_a_row"] == 1 and saved["measured"] is False
+    else:
+        # record-only the upload decides nothing: fast downloads clear the failure, as on main
+        assert res.passed and res.event.reason_code == Msg.OK.reason
+        assert saved["failures_in_a_row"] == 0 and saved["measured"] is True
 
 
 async def test_fast_downloads_and_upload_clear_a_failure():
