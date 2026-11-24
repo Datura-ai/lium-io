@@ -108,7 +108,14 @@ def seconds_before_probe_reserve():
 
 def run_docker(*args, timeout=None):
     global step
-    step = "docker " + " ".join(args[:2])
+    called = step = "docker " + " ".join(args[:2])
+    try:
+        return run_docker_step(args, timeout)
+    finally:
+        # a call that returned is no longer where setup waits: a later host read or write names itself
+        step = "the step after " + called
+
+def run_docker_step(args, timeout):
     if timeout is None and probe_image:
         # a probed setup's calls before the probe end where its reserve begins: however long the lock
         # and they took, a failed probe still has the time to clean up and disable the plugin
@@ -127,6 +134,8 @@ def call(*args):
     return run_docker("plugin", *args)
 
 def read_probe_marker():
+    global step
+    step = "the read of the probe marker"
     try:
         with open(marker_path) as marker:
             return marker.read().strip()
@@ -203,8 +212,10 @@ def disable_plugin(plugin_id):
     raise RuntimeError("the plugin could not be disabled")
 
 def read_saved_config(plugin_id):
+    global step
     if len(plugin_id) != 64 or any(c not in "0123456789abcdef" for c in plugin_id):
         raise RuntimeError("invalid plugin ID")
+    step = "the read of the plugin's saved config"
     with open(plugins_dir + "/" + plugin_id + "/config.json") as source:
         return json.load(source)
 
@@ -304,6 +315,7 @@ try:
                 except RuntimeError as disable_error:
                     reason += "; " + str(disable_error)
                 raise RuntimeError(reason) from None
+            step = "the write of the probe marker"
             with open(marker_path, "w") as marker:
                 marker.write(verified_probe_proof)
         print("verified plugin ready")

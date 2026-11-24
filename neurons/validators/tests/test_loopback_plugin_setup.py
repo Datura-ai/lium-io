@@ -693,6 +693,35 @@ def test_setup_cut_short_by_the_validators_deadline_says_so_on_stderr(tmp_path: 
     assert not (tmp_path / "probe-ok").exists()
 
 
+
+def test_setup_cut_short_while_reading_the_plugins_saved_config_names_that_read(tmp_path: Path) -> None:
+    # Arrange: plugin inspect answers, then the read of the plugin's saved config blocks (a named pipe) until the
+    # validator's `timeout` sends SIGTERM; the reason must not name the inspect that already returned
+    arguments = _setup_arguments(tmp_path, {"installed": True, "enabled": True})
+    config = tmp_path / "plugins" / ("a" * 64) / "config.json"
+    config.unlink()
+    os.mkfifo(config)
+    process = subprocess.Popen(arguments, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    writer = None
+    while writer is None:  # a non-blocking writer opens only once the setup waits on the pipe as its reader
+        assert process.poll() is None, process.communicate()
+        try:
+            writer = os.open(config, os.O_WRONLY | os.O_NONBLOCK)
+        except OSError:
+            time.sleep(0.01)
+
+    # Act: the setup now waits in the read, with the writer held open and nothing written
+    try:
+        process.send_signal(signal.SIGTERM)
+        _, stderr = process.communicate(timeout=20)
+    finally:
+        os.close(writer)
+
+    # Assert
+    assert process.returncode == 1
+    assert any(call[1] == "inspect" for call in _plugin_calls(tmp_path))
+    assert "setup cut short by the validator's deadline during the read of the plugin's saved config" in stderr
+
 @pytest.mark.skipif(not Path("/proc/locks").exists(), reason="reads blocked lock waiters from /proc/locks")
 def test_setup_cut_short_while_waiting_for_the_setup_lock_names_the_wait(tmp_path: Path) -> None:
     # Arrange: another setup holds the lock when the validator's `timeout` sends SIGTERM
