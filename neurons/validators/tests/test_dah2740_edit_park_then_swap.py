@@ -30,7 +30,7 @@ from services.docker_service import (
     executor_key,
     inflight_creates,
 )
-from services.gpu_reset import RECENT_RENTER_GPU_RESET_SECONDS
+from services.gpu_reset import RECENT_RENTER_GPU_RESET_SECONDS, STOPPED_UNITS_READ_COMMAND
 from services.host_memory_guard import host_memory_guard_script
 from services.hung_gpu_reset import HUNG_GPU_QUERY_COMMAND, HungGpuResult
 from services.redis_service import GPU_RESET_PENDING_KIND
@@ -209,6 +209,9 @@ async def test_a_successful_edit_runs_the_same_host_commands(svc, monkeypatch):
         # the layer read again on the stopped container, before the replacement exists
         _layer_data_check(f"id-{name}", "/root"),
         '/usr/bin/docker volume ls --format "{{.Name}}"',
+        # the hung-GPU check on the stopped pod first reads which host services an earlier GPU reset left stopped
+        # (DAH-6741): a reset whose restore never ran must not leave Fabric Manager down until a GPU hangs again
+        STOPPED_UNITS_READ_COMMAND,
         # the live power floor read twice: beside the volume create, and again right before docker run
         "nvidia-smi --query-gpu=uuid,power.limit,power.default_limit,power.min_limit,power.max_limit"
         " --format=csv,noheader,nounits",
