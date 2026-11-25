@@ -246,6 +246,17 @@ FULL_CONTAINER_ID = re.compile(r"[0-9a-f]{64}")
 LIST_CREATED_CONTAINERS = "/usr/bin/docker ps -a --no-trunc --filter status=created --format '{{.ID}} {{.Names}}'"
 
 
+def _age_minutes(now: Optional[int], created_at) -> Optional[float]:
+    """Minutes since docker's CreatedAt ("2026-11-25 09:00:00 +0000 UTC") on the host clock `now`."""
+    if now is None or not isinstance(created_at, str):
+        return None
+    try:
+        created = datetime.strptime(created_at.rsplit(" ", 1)[0], "%Y-%m-%d %H:%M:%S %z")
+    except ValueError:
+        return None
+    return (now - created.timestamp()) / 60
+
+
 def never_started_check_containers(listing: str) -> list[str]:
     return [
         fields[0]
@@ -334,7 +345,7 @@ class ContainerCleanup:
             extra["rented_container_count"] = len(rented_containers)
 
             # Check each container
-            for stripped_name, label in all_containers:
+            for stripped_name, label, age_minutes in all_containers:
                 pod_id = _bound_pod_id_label(stripped_name, label)
                 if stripped_name in rented_containers or (pod_id and pod_id in live_ids):
                     continue
@@ -343,7 +354,6 @@ class ContainerCleanup:
                 if not pod_id and not legacy and not health_check:
                     continue
 
-                age_minutes = await self._get_container_age_minutes(ssh_client, stripped_name)
                 if age_minutes and age_minutes > self.stale_threshold_minutes:
                     if legacy and not await self._legacy_ended(lium_workload_ended, stripped_name):
                         continue
@@ -870,30 +880,38 @@ class ContainerCleanup:
             )
             return False
 
-    async def _get_all_rental_containers(self, ssh_client) -> list[tuple[str, str]]:
-        """Get all containers with rental-related prefixes.
+    async def _get_all_rental_containers(self, ssh_client) -> list[tuple[str, str, Optional[float]]]:
+        """Get all containers with rental-related prefixes, with their age in minutes.
 
         Iterates RENTAL_CONTAINER_PREFIXES (services/const.py) so any short-lived
         container that competes for the rental port range is caught by cleanup.
         A stale running `health_check_*` from a crashed backend would otherwise
         hold ports 9100-9130 indefinitely.
+
+        DAH-7109: one SSH call. The host clock and each container's creation time come back with
+        the listing, instead of a `docker inspect` and a `date` call per candidate. The age is None
+        when either is unreadable, and such a container is never removed.
         """
         try:
             patterns = [f"{prefix}*" for prefix in RENTAL_CONTAINER_PREFIXES]
             # one JSON array per container: a label with a newline cannot forge a second record
-            output_format = f'[{{{{json .Names}}}},{{{{json (.Label "{LIUM_POD_ID_LABEL}")}}}}]'
-            result = await ssh_client.run(
-                DockerCommand.ps_filter(*patterns, output_format=output_format)
+            output_format = (
+                f'[{{{{json .Names}}}},{{{{json (.Label "{LIUM_POD_ID_LABEL}")}}}},{{{{json .CreatedAt}}}}]'
             )
-            # (name, pod id label or ""); the name filter is a substring regex that lists "podman" too
+            result = await ssh_client.run(
+                "date +%s && " + DockerCommand.ps_filter(*patterns, output_format=output_format)
+            )
+            lines = (result.stdout or "").splitlines()
+            now = int(lines[0]) if lines and lines[0].strip().isdigit() else None
+            # (name, pod id label or "", age); the name filter is a substring regex that lists "podman" too
             containers = []
-            for line in (result.stdout or "").splitlines():
+            for line in lines[1:]:
                 try:
-                    name, pod_id = json.loads(line)
+                    name, pod_id, created_at = json.loads(line)
                 except (ValueError, TypeError):
                     continue
                 if isinstance(name, str) and isinstance(pod_id, str) and name:
-                    containers.append((name, pod_id.strip()))
+                    containers.append((name, pod_id.strip(), _age_minutes(now, created_at)))
             return containers
         except Exception as e:
             logger.warning(
@@ -906,36 +924,6 @@ class ContainerCleanup:
             )
 
         return []
-
-    async def _get_container_age_minutes(self, ssh_client, container_name: str) -> Optional[float]:
-        """Get container age in minutes, returns None if unable to determine."""
-        try:
-            # Get container creation timestamp
-            created_result = await ssh_client.run(
-                DockerCommand.inspect_created_timestamp(container_name)
-            )
-            if created_result.exit_status != 0:
-                return None
-            created_timestamp = int(created_result.stdout.strip())
-
-            # Get current time on the machine
-            current_result = await ssh_client.run("date +%s")
-            if current_result.exit_status != 0:
-                return None
-            current_timestamp = int(current_result.stdout.strip())
-
-            # Calculate age
-            age_minutes = (current_timestamp - created_timestamp) / 60
-            return age_minutes
-
-        except Exception as e:
-            logger.warning(
-                _m(
-                    f"Error checking container age for {container_name}",
-                    extra={"container_name": container_name, "error": str(e)}
-                )
-            )
-            return None
 
     async def _remove_container(
         self,
