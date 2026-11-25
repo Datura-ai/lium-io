@@ -4,6 +4,7 @@ import os
 import shlex
 import subprocess
 import sys
+import textwrap
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -92,8 +93,11 @@ def node(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return tmp_path
 
 
-def _runner(node: Path, body: str) -> None:
-    (node / "payloads" / "storage_runner.py").write_text(body)
+def _runner(node: Path, body: str, at_import: str = "") -> None:
+    # like the real runner, the body runs only as the script: the dispatch's start check imports the module
+    (node / "payloads" / "storage_runner.py").write_text(
+        at_import + "if __name__ == '__main__':\n" + textwrap.indent(body or "pass\n", "    ")
+    )
 
 
 async def _run_locally(command: str, check: bool = False, input: str | None = None) -> SimpleNamespace:
@@ -616,23 +620,42 @@ def test_an_online_runner_that_ends_before_reading_its_spec_leaves_its_failure_f
 ) -> None:
     import asyncio as aio
 
-    _runner(node, "raise SystemExit(0)\n")
+    # it imports (the dispatch's start check passes) and then ends as a run before it reads its spec
+    _runner(node, "raise SystemExit(5)\n")
     files = storage_operations.StorageOperationFiles.for_operation(OPERATION_ID)
     spec = {"engine": "restic", "reporter": {"api_url": "https://api.example", "auth_token": "t0k", "resource": "backup"}}
-    # the interpreter is gone by the time the wrapper starts the runner: the child exits 127
     aio.run(storage_operations.start_storage_operation(
-        SimpleNamespace(run=_run_locally), str(node / "no-python"), OPERATION_ID, spec, retain_terminal_artifacts=False
+        SimpleNamespace(run=_run_locally), sys.executable, OPERATION_ID, spec, retain_terminal_artifacts=False
     ))
     _wait_for(Path(str(files.done)))
     _wait_for(Path(str(files.spec)), gone=True)
     marker = Path(str(files.done)).read_text()
-    assert "exited 127" in marker and "t0k" not in marker and _staged(node) == []
+    assert "exited 5" in marker and "t0k" not in marker and _staged(node) == []
 
     status = AsyncMock(return_value=True)
     monkeypatch.setattr(storage_operations, "_report_operation_status", status)
     _dispatch(spec)
-    assert status.await_args.kwargs["status"] == "FAILED" and "exited 127" in status.await_args.kwargs["message"]
+    assert status.await_args.kwargs["status"] == "FAILED" and "exited 5" in status.await_args.kwargs["message"]
     assert Path(str(files.done)).read_text() == ""
+
+
+@pytest.mark.parametrize("python", ["missing", "import-error"])
+def test_a_runner_that_cannot_start_fails_the_dispatch_while_it_can_report(node: Path, python: str) -> None:
+    """F-98: a missing interpreter or a runner import that fails is the dispatch's failure, reported now; nothing is
+    launched, no spec (credentials) is written and the staged copy goes"""
+    import asyncio as aio
+
+    _runner(node, "pass\n", at_import="import storage_module_that_is_not_there\n" if python == "import-error" else "")
+    files = storage_operations.StorageOperationFiles.for_operation(OPERATION_ID)
+    spec = {"engine": "restic", "reporter": {"api_url": "https://api.example", "auth_token": "t0k", "resource": "backup"}}
+    with pytest.raises(storage_operations.StorageOperationLaunchError, match="runner cannot start"):
+        aio.run(storage_operations.start_storage_operation(
+            SimpleNamespace(run=_run_locally), sys.executable if python == "import-error" else str(node / "no-python"),
+            OPERATION_ID, spec, retain_terminal_artifacts=False,
+        ))
+    storage_operations.report_launch_failure.assert_awaited_once()
+    assert not Path(str(files.spec)).exists() and not Path(str(files.launcher)).exists() and _staged(node) == []
+    assert "t0k" not in Path(str(files.done)).read_text()
 
 
 @pytest.mark.parametrize("exit_code", [0, 3])

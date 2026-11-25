@@ -296,6 +296,10 @@ async def start_storage_operation(
             check=True,
         )
         stage_dir = _staged_directory(staged.stdout)
+        # the runner's own imports, with the interpreter and flags the launch uses, while this dispatch can still report:
+        # a runner that cannot start would end before it reads its operation, and an operation the backend never
+        # dispatches again would lose that failure (F-98)
+        await _check_runner_starts(ssh_client, python_path, stage_dir)
         result = await ssh_client.run(
             _launch_command(files, operation_id, python_path, stage_dir, retain_terminal_artifacts),
             input=json.dumps(dict(spec), separators=(",", ":"), sort_keys=True),
@@ -309,6 +313,24 @@ async def start_storage_operation(
             ssh_client, operation_id, spec, error, retain_terminal_artifacts=retain_terminal_artifacts
         )
         return files
+
+
+_RUNNER_IMPORT_PROBE = "import sys\nsys.path.insert(0, sys.argv[1])\nimport storage_runner"
+
+
+async def _check_runner_starts(ssh_client: asyncssh.SSHClientConnection, python_path: str, stage_dir: str) -> None:
+    stage = shlex.quote(stage_dir)
+    result = await ssh_client.run(
+        f"{shlex.quote(python_path)} -E -s -c {shlex.quote(_RUNNER_IMPORT_PROBE)} {stage}; r=$?; "
+        f"[ $r = 0 ] || rm -rf -- {stage}; exit $r",
+        check=False,
+    )
+    if result.exit_status != 0:
+        stderr = result.stderr if isinstance(result.stderr, str) else ""
+        tail = " ".join(stderr.strip().splitlines()[-2:])[-300:]
+        raise StorageOperationLaunchError(
+            f"storage runner cannot start on the executor (exit {result.exit_status}{': ' + tail if tail else ''})"
+        )
 
 
 async def settle_dispatch_failure(
