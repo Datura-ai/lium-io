@@ -23,6 +23,7 @@ from services.const import (
     FILLER_CACHE_VOLUME_PREFIXES,
     FILLER_CONTAINER_GRACE_MINUTES,
     FILLER_CONTAINER_PREFIX,
+    JOB_CACHE_VOLUME_PREFIX,
     LEGACY_LIUM_CONTAINER_NAME,
     LIUM_HEALTH_CHECK_CONTAINER_NAME,
     LIUM_POD_ID_LABEL,
@@ -495,7 +496,8 @@ class ContainerCleanup:
         nothing, so the cache is the first thing to sacrifice.
 
         Gated on NO live filler container: a cache a sibling still mounts is in use (docker refuses to
-        remove it anyway), and a node still filling bundles is not the node this is meant to rescue.
+        remove it anyway), and a node still filling bundles is not the node this is meant to rescue. A
+        provider job cache no container mounts is the exception (DAH-6406): it goes even beside a filler.
         A live customer pod does not hold it back (DAH-6187): the rent keeps the cache when the
         pod's volume fits beside it, but the pod's container writes take real disk, so once they
         push the node under the floor the cache gives way to the renter.
@@ -515,7 +517,14 @@ class ContainerCleanup:
             # RUNNING only: _get_all_rental_containers uses `docker ps -a`, so one long-exited
             # filler_* would make "no live filler" false forever and the reclaim would never fire.
             if await self._has_running_filler(ssh_client):
-                return 0
+                # a live filler's caches are in use, but a provider job cache no container mounts (left beside a
+                # rental: the job's run is gone) still holds disk and goes like any other
+                unmounted: set[str] = set(await self._get_dangling_volumes(ssh_client) or [])
+                cache_volumes = [
+                    name for name in cache_volumes if name.startswith(JOB_CACHE_VOLUME_PREFIX) and name in unmounted
+                ]
+                if not cache_volumes:
+                    return 0
 
             free_gb = await self._get_free_disk_gb(ssh_client)
             if free_gb is None or free_gb >= DPHN_CACHE_RECLAIM_FREE_FLOOR_GB:

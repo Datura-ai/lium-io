@@ -6753,14 +6753,18 @@ class DockerService:
 
         Measured in a helper container that mounts the volume by name (the SSH session lands inside the executor
         container, where the volume's host path does not exist). A checkpoint is a few hundred large files, so
-        `du` is quick. An unmeasurable Engy cache reads as complete: mounting what exists costs nothing, as before.
+        `du` is quick. An unmeasurable Engy cache reads as complete: mounting what exists costs nothing, as before; an
+        unmeasurable job cache is charged its whole size.
         """
         expected_gb: float = _cache_download_gb(volume_name)
         if math.isinf(expected_gb):
             return 0
         is_dphn_cache: bool = volume_name.startswith(DPHN_CACHE_VOLUME_PREFIX)
-        # an unmeasured Dolphin volume can be one the reclaim wiped, so its download is charged
-        unmeasured_missing_gb: float = expected_gb if is_dphn_cache else 0
+        # an unmeasured Dolphin volume can be one the reclaim wiped, so its download is charged; a job cache can
+        # grow to its whole size, so unmeasured it is charged that too
+        unmeasured_missing_gb: float = (
+            expected_gb if is_dphn_cache or volume_name.startswith(JOB_CACHE_VOLUME_PREFIX) else 0
+        )
         try:
             result = await ssh_client.run(
                 f"{REMOVE_CACHE_SWEEP_CONTAINER}; timeout 60 /usr/bin/docker run --rm --name {CACHE_SWEEP_CONTAINER_NAME} "

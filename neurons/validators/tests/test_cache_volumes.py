@@ -981,6 +981,17 @@ async def test_a_job_cache_within_its_size_is_charged_what_it_can_still_grow_by(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(("free_gb", "granted"), [(5000, True), (300, False)])
+async def test_an_unmeasured_job_cache_is_charged_its_whole_size(docker_service, free_gb, granted):
+    # du failed: what it holds is unknown, so it is charged like a new one, as an unmeasured Dolphin cache is
+    ssh_client = DuHostSshClient([_JOB_CACHE], free_gb=free_gb, du_stdout="")
+
+    affordable = await docker_service.select_affordable_cache_volumes(ssh_client, _job_with_cache(), {})
+
+    assert bool(affordable) is granted
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("free_gb", "cache_gb", "volume_limit_gb", "granted"),
     [
