@@ -55,6 +55,8 @@ git tag lium-protocol-v<version> <merge commit> && git push origin lium-protocol
 
 CI (`scripts/check_version.py`, job `protocol`) fails a PR that changes `PROTOCOL_VERSION` without deleting a fragment (deleting fragments is what marks a release PR); a release PR that does not set exactly the version its base's fragments call for, that leaves one of them, or that changes the wire; a PR that edits a fragment already on main, adds one `release.py` cannot read, or puts one in a subfolder of `changes/` (only `changes/*.md` is read); and a PR that changes the wire without adding a fragment. The wire is the committed schema snapshot under `lium_protocol/lium_protocol/snapshots/` apart from its `protocol_version` line; CI holds the snapshot equal to the models, so a change that does not alter the snapshot (a comment, a docstring, a refactor) needs no fragment. Locally: `python lium_protocol/scripts/check_version.py $(git merge-base origin/main HEAD)`.
 
+To undo a wire change that is not released yet, `git revert` alone is not enough: it deletes the change's fragment, and CI reads a deleted fragment as a release. Put the fragment back (`git checkout origin/main -- lium_protocol/changes/<name>.md`) and add a new fragment for the revert itself, with the bump its own wire change calls for. The next release then lists both lines.
+
 ## Versions
 
 - `1.1.0` — `FailedContainerRequest.build_log_tail` (optional; the last lines a failed custom-Dockerfile build printed) and `FailedContainerRequest.step_detail` (optional; the Docker daemon's reason for a failed volume step, or the dead-transport hint).

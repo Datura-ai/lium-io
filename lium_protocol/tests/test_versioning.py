@@ -237,3 +237,28 @@ def test_a_fragment_in_a_subfolder_fails(repo: Path) -> None:
     (repo / "lium_protocol/changes/topic/x.md").write_text("minor\na change.\n")
     result = check(repo)
     assert result.returncode == 1 and "topic/x.md is not a fragment release.py reads" in result.stdout, result.stdout
+
+
+def test_a_release_that_stops_on_the_version_list_writes_nothing(repo: Path) -> None:
+    readme = repo / "lium_protocol/README.md"
+    readme.write_text(readme.read_text().replace("- `1.0.0` —", "- `1.0` —"))
+    commit(repo, "a version list without its 1.0.0 line")
+    fragment(repo, "a", "minor")
+    result = release(repo)
+    assert result.returncode != 0 and "no `1.0.0` line" in result.stderr
+    # no version file, snapshot or README touched
+    assert run(repo, "git", "status", "--porcelain").stdout == "?? lium_protocol/changes/\n"
+
+
+def test_the_readme_revert_path_for_an_unreleased_wire_change_passes(repo: Path) -> None:
+    change_wire(repo)
+    fragment(repo, "new-field", "minor")
+    commit(repo, "a wire change, not released")
+    run(repo, "git", "revert", "--no-edit", "HEAD")
+    alone = run(repo / "lium_protocol", sys.executable, str(SCRIPTS / "check_version.py"), "HEAD^")
+    assert alone.returncode == 1   # a bare revert deletes the fragment, which reads as a release
+    run(repo, "git", "checkout", "HEAD^", "--", "lium_protocol/changes/new-field.md")
+    fragment(repo, "revert-new-field", "major", "`NewField` removed again.")
+    commit(repo, "keep the fragment, add one for the revert")
+    result = run(repo / "lium_protocol", sys.executable, str(SCRIPTS / "check_version.py"), "HEAD~2")
+    assert result.returncode == 0, result.stdout

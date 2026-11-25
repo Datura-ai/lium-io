@@ -67,24 +67,31 @@ def release_and_return_new_version(root: Path) -> str:
     old = re.search(VERSION_FILES[INIT], (root / INIT).read_text(), re.MULTILINE).group(1)
     new = bumped(old, bump)
 
-    for name, pattern in VERSION_FILES.items():
-        path = root / name
-        path.write_text(replace_version(path.read_text(), pattern, old, new, name))
+    # every new text is computed before the first write, so a check that stops the release leaves the tree as it was
+    version_texts = {
+        root / name: replace_version((root / name).read_text(), pattern, old, new, name)
+        for name, pattern in VERSION_FILES.items()
+    }
 
     # the snapshot is named after the major version; a major release moves it to the new name
     old_snapshot = root / SNAPSHOT_DIR / f"lium_protocol.v{old.split('.')[0]}.json"
     new_snapshot = root / SNAPSHOT_DIR / f"lium_protocol.v{new.split('.')[0]}.json"
-    text = replace_version(old_snapshot.read_text(), SNAPSHOT_PATTERN, old, new, str(old_snapshot))
-    old_snapshot.unlink()
-    new_snapshot.write_text(text)
+    snapshot_text = replace_version(old_snapshot.read_text(), SNAPSHOT_PATTERN, old, new, str(old_snapshot))
 
     # the version list: the new line goes above `1.0.0`, the list's last line
     readme = root / README
     line = f"- `{new}` — {' '.join(entry.changelog_entry for entry in entries)}\n"
-    lines = readme.read_text().splitlines(keepends=True)
+    # README is a version file too: the list is built on its new text
+    lines = version_texts.pop(readme, None) or readme.read_text()
+    lines = lines.splitlines(keepends=True)
     first_release_line_index = next((i for i, x in enumerate(lines) if x.startswith("- `1.0.0` —")), None)
     if first_release_line_index is None:
         sys.exit(f"{README}: no `1.0.0` line to put the new version above")
+
+    for path, text in version_texts.items():
+        path.write_text(text)
+    old_snapshot.unlink()
+    new_snapshot.write_text(snapshot_text)
     readme.write_text("".join(lines[:first_release_line_index] + [line] + lines[first_release_line_index:]))
 
     for path in fragments:
