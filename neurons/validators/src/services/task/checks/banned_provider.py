@@ -67,6 +67,9 @@ async def kernel_gpu_view_with_source(ctx: Context) -> KernelGpuViews:
     )
     if host_own.uuids:
         return KernelGpuViews(host_own, KERNEL_VIEW_SOURCE_HOST, container, host_all.uuids)
+    if host_own.foreign_mounts:
+        # r510: an overlay on the container's own gpus path, whose names would pick the host's cards: overlaid, as main
+        return KernelGpuViews(host_own, KERNEL_VIEW_SOURCE_CONTAINER, _NO_SECOND_VIEW, None)
     return KernelGpuViews(container, KERNEL_VIEW_SOURCE_CONTAINER, _NO_SECOND_VIEW, None)
 
 

@@ -132,8 +132,9 @@ async def test_overlaid_kernel_view_on_a_live_rental_is_not_fatal(context_factor
     assert result.updates["kernel_gpu_view_passed"] is False  # zeroes the score instead
 
 
-def _view_stdout(lines, mounts, info_file, *, host_all=None):
-    """A view's output; `host_all` makes it the host view's: `lines` are this executor's cards, then the whole list."""
+def _view_stdout(lines, mounts, info_file, *, host_all=None, container_mounts=(), container_files=()):
+    """A view's output; `host_all` makes it the host view's: `lines` are this executor's cards, then the whole list,
+    then the container's own mounts and file rows for its gpus path."""
     rows = len(host_all) if host_all is not None else len(lines)
     return "\n".join(
         [
@@ -143,7 +144,18 @@ def _view_stdout(lines, mounts, info_file, *, host_all=None):
             *(f"{info_file}|regular empty file" for _ in range(rows)),
             nvidia_devices.KERNEL_GPU_VIEW_SEPARATOR,
             *lines,
-            *([nvidia_devices.HOST_ALL_CARDS_SEPARATOR, *host_all] if host_all is not None else []),
+            *(
+                [
+                    nvidia_devices.HOST_ALL_CARDS_SEPARATOR,
+                    *host_all,
+                    nvidia_devices.HOST_CONTAINER_MOUNTS_SEPARATOR,
+                    *container_mounts,
+                    nvidia_devices.HOST_CONTAINER_FILES_SEPARATOR,
+                    *container_files,
+                ]
+                if host_all is not None
+                else []
+            ),
         ]
     )
 
@@ -168,7 +180,12 @@ def _ssh_host_and_container(host_stdout: str, container_stdout: str) -> AsyncMoc
 @pytest.mark.asyncio
 async def test_a_stale_bind_after_a_gpu_reset_is_read_through_the_host_and_passes(context_factory):
     host = _view_stdout(
-        [f"{REAL}, 0"], [], nvidia_devices.HOST_PID1_ROOT + INFO_FILE, host_all=[f"{REAL}, 0"]
+        [f"{REAL}, 0"],
+        [],
+        nvidia_devices.HOST_PID1_ROOT + INFO_FILE,
+        host_all=[f"{REAL}, 0"],
+        container_mounts=[CONTAINER_MOUNTS[0], STALE_BIND],
+        container_files=[INFO_FILE],
     )
     container = _view_stdout([f"{REAL}, 0"], [CONTAINER_MOUNTS[0], STALE_BIND], INFO_FILE)
     ctx = context_factory(
@@ -238,3 +255,41 @@ async def test_two_executors_on_one_host_each_take_only_their_own_card_from_the_
     if not banned:
         assert result.updates["state"].kernel_gpu_uuids == [NEIGHBOUR]
         assert result.updates["state"].host_all_kernel_gpu_uuids == [REAL, NEIGHBOUR]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("container_mounts", "container_files"),
+    [
+        # r510: a tmpfs over the container's gpus path naming only the unbanned card
+        ([CONTAINER_MOUNTS[0], OVERLAY_MOUNT], [INFO_FILE]),
+        # a name under the container's gpus path that is not a PCI bus id
+        ([CONTAINER_MOUNTS[0]], [INFO_FILE, "/proc/driver/nvidia/gpus/not-a-bus-id/information"]),
+        # a proc bind of another path than its own
+        ([CONTAINER_MOUNTS[0], CONTAINER_MOUNTS[1].replace("gpus/0001", "gpus/0002", 1)], []),
+    ],
+)
+async def test_an_overlay_on_the_containers_own_gpus_path_fails_when_the_host_list_decides(
+    context_factory, container_mounts, container_files
+):
+    # host cards: REAL (banned) and NEIGHBOUR; the container's names pick only NEIGHBOUR, so they must be the kernel's
+    host = _view_stdout(
+        [f"{NEIGHBOUR}, 1"],
+        [],
+        nvidia_devices.HOST_PID1_ROOT + INFO_FILE,
+        host_all=[f"{REAL}, 0", f"{NEIGHBOUR}, 1"],
+        container_mounts=container_mounts,
+        container_files=container_files,
+    )
+    container = _view_stdout([f"{NEIGHBOUR}, 0"], container_mounts, INFO_FILE)
+    rented = RentedExecutorsResponse(executors={}, banned_provider_guids=[REAL])
+    ctx = context_factory(
+        state=build_state(gpu_uuids=NEIGHBOUR, rented_data=rented),
+        ssh=_ssh_host_and_container(host, container),
+    )
+
+    result = await BannedProviderCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.reason_code == BannedProviderMessages.KERNEL_GPU_VIEW_OVERLAID.reason
+    assert result.event.what_we_saw["kernel_view_source"] == "container"

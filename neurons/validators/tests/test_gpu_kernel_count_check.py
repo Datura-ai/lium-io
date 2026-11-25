@@ -22,6 +22,8 @@ from services.nvidia_devices import (
     KERNEL_GPU_FS_SEPARATOR,
     KERNEL_GPU_VIEW_CMD,
     HOST_ALL_CARDS_SEPARATOR,
+    HOST_CONTAINER_FILES_SEPARATOR,
+    HOST_CONTAINER_MOUNTS_SEPARATOR,
     KERNEL_GPU_VIEW_SEPARATOR,
     HOST_PROC_GPU_INFO_CMD,
 )
@@ -56,9 +58,9 @@ class _Sink:
         pass
 
 
-def _host_stdout(uuids, *, own=None, mounts=(), fstype="proc", kind="regular empty file"):
+def _host_stdout(uuids, *, own=None, mounts=(), fstype="proc", kind="regular empty file", container_mounts=()):
     """What HOST_KERNEL_GPU_VIEW_CMD prints: PID 1's mounts, the stat rows, the UUID rows of this executor's cards
-    (`own`, default every card), then the host's whole list."""
+    (`own`, default every card), the host's whole list, then the container's own mounts (no file rows)."""
     files = [
         f"{HOST_PID1_ROOT}/proc/driver/nvidia/gpus/0000:00:{i + 7:02x}.0/information"
         for i in range(len(uuids))
@@ -76,6 +78,9 @@ def _host_stdout(uuids, *, own=None, mounts=(), fstype="proc", kind="regular emp
             ),
             HOST_ALL_CARDS_SEPARATOR,
             *(f"{gpu_uuid}, {i}" for i, gpu_uuid in enumerate(uuids)),
+            HOST_CONTAINER_MOUNTS_SEPARATOR,
+            *container_mounts,
+            HOST_CONTAINER_FILES_SEPARATOR,
         ]
     )
 
@@ -243,6 +248,9 @@ def test_container_read_is_the_same_command_and_the_host_read_goes_through_pid_1
     assert "/proc/1/" not in KERNEL_GPU_VIEW_CMD
     assert "/proc/self/mountinfo" in KERNEL_GPU_VIEW_CMD
     head, _, rows = HOST_KERNEL_GPU_VIEW_CMD.partition(HOST_ALL_CARDS_SEPARATOR)
+    rows, _, container = rows.partition(f"; echo {HOST_CONTAINER_MOUNTS_SEPARATOR}")
+    # r510: the container's own evidence for the names that pick this executor's cards, read in the same command
+    assert "/proc/self/mountinfo" in container and "/proc/1/" not in container
     container_head = KERNEL_GPU_VIEW_CMD.replace(
         "/proc/self/mountinfo", "/proc/1/mountinfo"
     ).replace("/proc/driver/nvidia/gpus/*", "/proc/1/root/proc/driver/nvidia/gpus/*")
