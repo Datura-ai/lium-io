@@ -45,7 +45,7 @@ class BackendMessageType(enum.Enum):
     LockPodGpuClocksRequest = "LockPodGpuClocksRequest"
     # 2.6.0: validate one node now (a provider's "Recheck now")
     RecheckExecutorRequest = "RecheckExecutorRequest"
-    # delete a moved pod's container on the node it left, only on the host that node booted as
+    # delete a moved pod's container on the node it left, by its create id (and its boot, when the backend knows it)
     ContainerDeleteOnNodeLeftRequest = "ContainerDeleteOnNodeLeftRequest"
 
 
@@ -222,8 +222,8 @@ class ContainerDeleteOnNodeLeftRequest(ContainerDeleteRequest):
     create_command_id: str
     # the boot id of the node the pod's current placement is on, as the backend read it when it sent this delete. It
     # proves the pod left this boot only when set and not `expected_boot_id`; empty (unknown) or equal, the validator
-    # removes nothing. The backend sends no delete when it cannot tell the two boots apart. Unused when
-    # `expected_boot_id` is empty
+    # removes nothing. When the backend cannot tell the two boots apart it sends `expected_boot_id` empty: then
+    # only the create-id label decides, and this field is unused
     pod_placed_on_boot_id: str = ""
 
 
