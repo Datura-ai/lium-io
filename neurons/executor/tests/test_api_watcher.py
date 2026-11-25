@@ -13,7 +13,7 @@ STARTED_EPOCH = datetime(2026, 11, 25, 0, 0, 0, 123456, tzinfo=timezone.utc).tim
 
 
 class FakeExecutor:
-    def __init__(self, ip="172.18.0.2", status="running", started_at=STARTED, container_id="c1"):
+    def __init__(self, ip="executor-first", status="running", started_at=STARTED, container_id="c1"):
         self.id = container_id
         self.name = "executor-executor-1"
         self.attrs = {
@@ -173,13 +173,13 @@ def test_a_moved_address_is_followed_without_counting_a_failure():
     h = Harness()
     h.answers = [ALIVE]
     h.ticks(1)
-    h.executor.attrs["NetworkSettings"]["Networks"]["executor_default"]["IPAddress"] = "172.18.0.9"
+    h.executor.attrs["NetworkSettings"]["Networks"]["executor_default"]["IPAddress"] = "executor-moved"
     h.answers = [ALIVE]
-    h.watcher.probe = lambda url: ALIVE if "172.18.0.9" in url else DOWN
+    h.watcher.probe = lambda url: ALIVE if "executor-moved" in url else DOWN
 
     h.ticks(1)
 
-    assert h.watcher.target.ip == "172.18.0.9"
+    assert h.watcher.target.ip == "executor-moved"
     assert h.watcher.failures == 0
 
 
