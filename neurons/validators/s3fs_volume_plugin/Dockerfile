@@ -1,8 +1,9 @@
 # The s3fs volume plugin the validator installs for every Volume (S3FS_PLUGIN_IMAGE): the upstream driver of
-# marcelo-ochoa/docker-volume-plugins at a pinned commit, on Ubuntu 24.04's s3fs. The published mochoa build
+# marcelo-ochoa/docker-volume-plugins at a pinned commit, on Ubuntu 26.04's s3fs. The published mochoa build
 # carries Ubuntu 20.04's s3fs 1.86, which resends a failed request without its headers (fixed in s3fs 1.88,
 # s3fs-fuse commit 51f65d7): after a network blip the retry goes out unsigned, S3 refuses it and the renter's read
-# fails with an I/O error. Built and pushed by .github/workflows/s3fs_volume_plugin.yml.
+# fails with an I/O error. s3fs must be at least 1.94: 1.93 reports a 4 GiB bucket to statfs, so `df` in a pod shows a
+# 4 GB Volume. Built and pushed by .github/workflows/s3fs_volume_plugin.yml.
 FROM golang:1.26-bookworm AS driver
 ARG DRIVER_COMMIT=4921b1c14f2e3dcdd69a07b52fe276e15de12aab
 WORKDIR /src
@@ -13,7 +14,7 @@ RUN git init -q . \
 COPY go.mod go.sum ./
 RUN CGO_ENABLED=0 go build -mod=readonly -trimpath -o /s3fs-volume-plugin ./s3fs-volume-plugin
 
-FROM ubuntu:24.04
+FROM ubuntu:26.04
 RUN apt-get update \
  && apt-get install -y --no-install-recommends s3fs rsyslog tini ca-certificates \
  && mkdir -p /var/lib/rsyslog /var/lib/docker-volumes \
