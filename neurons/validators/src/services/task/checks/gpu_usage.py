@@ -161,7 +161,7 @@ class GpuUsageCheck:
         return await self._judge_process_based_usage(ctx, gpu_details, gpu_processes)
 
     async def _judge_foreign_occupancy(
-        self, ctx: Context, gpu_details: list[dict], gpu_processes: list[dict]
+        self, ctx: Context, gpu_details: list[dict], gpu_processes: list[dict], filler_containers: set[str]
     ) -> CheckResult | None:
         """Judge an idle card by WHO holds it, not by how hard it is being used (DAH-2735).
 
@@ -178,7 +178,8 @@ class GpuUsageCheck:
         if ctx.state.rented_data is None:
             return None
 
-        workload_containers: set[str] = lium_workload_containers(ctx)
+        # the fillers the caller already settled with the backend, so no container is asked about twice
+        workload_containers: set[str] = lium_workload_containers(ctx) | filler_containers
         foreign_processes: list[ForeignGpuProcess] = [
             ForeignGpuProcess(
                 pid=process.get("pid"),
@@ -266,6 +267,12 @@ class GpuUsageCheck:
         # every process belongs to ONE OF the node's fillers, not a single expected container.
         filler_containers = set(rented_data.get_filler_containers(ctx.executor.uuid)) if rented_data else set()
         process_names = {process.get("container_name") for process in gpu_processes}
+        if rented_data is not None:
+            # DAH-7071: a filler started after this cycle's snapshot is ours at ANY load, so the backend is asked
+            # before the load is judged, not only on the idle path below (it zeroed a node running our own filler)
+            filler_containers |= await _lium_named_containers_the_backend_still_owns(
+                ctx, {name for name in process_names - filler_containers if name and name.startswith(FILLER_CONTAINER_PREFIX)}
+            )
         fillers_only = bool(filler_containers) and all(name in filler_containers for name in process_names)
         # judged at any load, also beside a rental pod: a swapped filler can hold VRAM while staying
         # under the utilization limits
@@ -286,7 +293,7 @@ class GpuUsageCheck:
             violation = {**(violation or {}), "filler_foreign_processes": foreign_in_fillers}
 
         if violation is None:
-            foreign_result = await self._judge_foreign_occupancy(ctx, gpu_details, gpu_processes)
+            foreign_result = await self._judge_foreign_occupancy(ctx, gpu_details, gpu_processes, filler_containers)
             if foreign_result is not None:
                 return foreign_result
 
@@ -685,25 +692,24 @@ async def _drop_containers_the_backend_still_owns(
     as it has workers (8 in one prod pod), and this check sits on the healthy path of every
     executor in every cycle.
     """
-    claimed_elsewhere: set[str] = _containers_claimed_by_another_executor(ctx)
-    lium_named_containers: list[str] = sorted(
-        {
-            process.container_name
-            for process in foreign_processes
-            if _carries_a_lium_prefix(process)
-            and _pod_name(process.container_name) not in claimed_elsewhere
-        }
+    still_ours: set[str] = await _lium_named_containers_the_backend_still_owns(
+        ctx, {process.container_name for process in foreign_processes if _carries_a_lium_prefix(process)}
     )
+    return [process for process in foreign_processes if process.container_name not in still_ours]
+
+
+async def _lium_named_containers_the_backend_still_owns(ctx: Context, container_names: set[str]) -> set[str]:
+    """The Lium-named containers the backend confirms as live runs of this node: the one ownership decision
+    both the idle and the high-load path take (DAH-7071). A name another executor holds is never asked about."""
+    claimed_elsewhere: set[str] = _containers_claimed_by_another_executor(ctx)
+    lium_named_containers: list[str] = sorted(name for name in container_names if _pod_name(name) not in claimed_elsewhere)
     if not lium_named_containers:
-        return foreign_processes
+        return set()
 
     ownership_verdicts: list[bool] = await asyncio.gather(
         *(the_backend_still_owns(ctx, name) for name in lium_named_containers)
     )
-    still_ours: set[str] = {
-        name for name, is_ours in zip(lium_named_containers, ownership_verdicts) if is_ours
-    }
-    return [process for process in foreign_processes if process.container_name not in still_ours]
+    return {name for name, is_ours in zip(lium_named_containers, ownership_verdicts) if is_ours}
 
 
 async def the_backend_still_owns(ctx: Context, container_name: str) -> bool:

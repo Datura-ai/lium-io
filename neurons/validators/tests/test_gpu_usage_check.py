@@ -1418,6 +1418,33 @@ async def test_a_lium_named_container_is_judged_by_the_backend(
     assert result.passed is expected_pass
 
 
+@pytest.mark.parametrize(
+    "filler_run,expected_pass",
+    [
+        (FillerRunActiveResponse(active=True, status="RUNNING"), True),
+        (FillerRunActiveResponse(active=False, status="STARTING"), True),
+        (FillerRunActiveResponse(active=False, status="STOPPED"), False),
+        (FillerRunActiveResponse(active=False), False),
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_late_filler_at_full_load_is_judged_by_the_backend_once(context_factory, filler_run, expected_pass):
+    # DAH-7071: a live filler started after the snapshot, under full load, zeroed an idle node (filler_d0dc2cbc)
+    # because only the idle path asked the backend. Both paths now take the same one answer.
+    state = _idle_state(
+        [{"gpu_utilization": 100, "memory_utilization": 95, "memory_used_mb": 70000}],
+        [{"pid": 111, "info": "0::/../docker-a.scope", "container_name": LATE_FILLER}],
+    )
+    services = build_services()
+    services.backend.get_filler_run_active.return_value = filler_run
+    ctx = context_factory(services=services, config=build_context_config(), state=state)
+
+    result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is expected_pass
+    services.backend.get_filler_run_active.assert_awaited_once()
+
+
 @pytest.mark.parametrize("gpu_utilization", [0, 5])
 @pytest.mark.parametrize("closed_minutes,expected_pass", [(5, True), (30, False)])
 @pytest.mark.asyncio
