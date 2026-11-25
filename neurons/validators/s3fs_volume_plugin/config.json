@@ -1,5 +1,5 @@
 {
-    "description": "S3FS volume plugin (upstream driver, Ubuntu 24.04 s3fs)",
+    "description": "S3FS volume plugin (upstream driver, Ubuntu 26.04 s3fs)",
     "documentation": "https://github.com/Datura-ai/lium-io/tree/main/neurons/validators/s3fs_volume_plugin",
     "entrypoint": [
         "/usr/bin/tini",
