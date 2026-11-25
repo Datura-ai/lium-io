@@ -1221,7 +1221,7 @@ class VerifyXColdRetryCheck:
             )
 
         # Cut at the deadline less the margin (never past its own SSH timeout) and judge on the
-        # first sample. Raced against a rental-state watcher: a create (customer or filler) started
+        # first sample. Raced against a rental-state watcher: a renter's create started
         # after the rental data the pre-retry lookup used was read cuts it off at the next poll, within RENTAL_WATCH_INTERVAL_SECONDS
         # plus one Redis read, even if its pending-pod marker is already gone. A pod can share the node
         # for that long at most. An outer cancel still propagates.

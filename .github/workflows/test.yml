@@ -218,11 +218,25 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # a PR's checkout is its merge ref; the first parent is the base it merges into
+          fetch-depth: 2
 
       - name: Set up Python 3.11
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: '3.11'
+
+      - name: Version is set only by a release PR; a wire change carries a fragment
+        # scripts/check_version.py: a release PR is one that deletes a fragment under changes/. A push to main is not checked (its PR was).
+        # HEAD^1 is the commit this PR merges onto, in the queue too (the entry ahead of it, not the queue's base): each PR is judged on
+        # its own diff, so a fragment of a PR ahead in the queue never stands in for a missing one here
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          case "$EVENT_NAME" in
+            pull_request|pull_request_review|merge_group) python scripts/check_version.py HEAD^1 ;;
+          esac
 
       - name: Install
         # the renderer is pinned: the snapshot is pydantic's JSON Schema, and a pydantic release can change it

@@ -110,6 +110,8 @@ class JobResult(BaseModel):
     host_runtime_fault: bool = False
     # ContextState.rented_pod_faults: {pod_id: [host-side fault codes]} for the rented pods this cycle judged
     rented_pod_faults: dict[str, list[str]] | None = None
+    # DAH-6784: Context.idle_checks_passed of the pipeline run; None from a path that ran no checks
+    idle_checks_passed: list[str] | None = None
     # True only when this cycle opened the shell with known_hosts pinned to executor_info.ssh_host_key,
     # so the node proved it holds that key. Results for nodes the cycle never reached stay False.
     ssh_host_key_verified: bool = False

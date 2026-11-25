@@ -33,9 +33,12 @@ from tests.helpers import build_services, build_state, default_executor, make_co
 from tests.test_container_download_speed_check import (
     FAST,
     RENTALS,
+    PYPI_ONLY_SLOW,
     SLOW,
+    UP,
     Clock,
     FakeRedis,
+    FleetRedis,
     FakeRunner,
     line,
 )
@@ -135,7 +138,7 @@ def rented(hotkey: str = "miner-hotkey", status: str | None = None) -> RentedExe
 
 
 @contextmanager
-def flags(*, read_pressure: bool = True, enforce_pressure: bool = False, reachable: bool = True):
+def flags(*, read_pressure: bool = True, enforce_pressure: bool = False, reachable: bool = True, enforced: bool = True):
     fake = SimpleNamespace(
         RENTED_THROUGHPUT_CHECK_ENABLED=True,
         RENTED_THROUGHPUT_INTERVAL_HOURS=3.0,
@@ -143,6 +146,8 @@ def flags(*, read_pressure: bool = True, enforce_pressure: bool = False, reachab
         RENTED_THROUGHPUT_BUSY_MBPS=200.0,
         RENTED_THROUGHPUT_DISK_BUSY_MB_PER_S=200.0,
         CONTAINER_DOWNLOAD_SPEED_MIN_MBPS=10.0,
+        CONTAINER_SPEED_FLEET_RULE_ENFORCED=enforced,
+        CONTAINER_UPLOAD_SPEED_MIN_MBPS=10.0,
         DISK_PRESSURE_CHECK_ENABLED=read_pressure,
         DISK_PRESSURE_GATE_ENFORCEMENT_ENABLED=enforce_pressure,
     )
@@ -155,20 +160,21 @@ def flags(*, read_pressure: bool = True, enforce_pressure: bool = False, reachab
         patch.object(module, "settings", fake),
         patch.object(download_module, "settings", fake),
         patch.object(module, "time", clock),
+        patch.object(download_module, "time", clock),
         patch.object(download_module, "validator_reaches", reaches),
         patch.object(module, "phase_offset_seconds", lambda uuid: 3 * 3600),
     ):
         yield clock
 
 
-def make_ctx(*answers: str, rented_data=None):
+def make_ctx(*answers: str, rented_data=None, redis=None):
     runner = FakeRunner(*answers)
     ctx = make_context(
         state=build_state(
             rented_data=rented() if rented_data is None else rented_data, sysbox_runtime=True
         ),
         runner=runner,
-        services=build_services(redis=FakeRedis()),
+        services=build_services(redis=redis or FakeRedis()),
     )
     return ctx, runner
 
@@ -535,7 +541,7 @@ async def test_unmeasured_or_unattributable_never_strikes(answer):
 # What the validator cannot tell apart from the endpoint's own fault stays no verdict, uncapped: an HTTP error, or an
 # endpoint the validator cannot reach either.
 async def test_validator_side_fetch_errors_stay_no_verdict():
-    http_error = RENTALS + line("pypi", 0, 0.1, 1, "wget: server returned error: HTTP/1.1 503")
+    http_error = RENTALS + line("pypi", 0, 0.1, 1, "wget: server returned error: HTTP/1.1 503") + UP
     http_error += line("hf", CAP_BYTES, 1.0, 0)
     with flags():
         ctx = make_ctx(snaps() + disk() + http_error)[0]
@@ -543,10 +549,34 @@ async def test_validator_side_fetch_errors_stay_no_verdict():
     assert net == "none"
 
 
+# an upload the receiver refuses (HTTP 429) measured nothing: no verdict, never a pass
+async def test_an_upload_the_receiver_refuses_is_no_verdict():
+    refused = RENTALS + line("pypi", CAP_BYTES, 1.0, 0) + line("hf", CAP_BYTES, 1.0, 0)
+    refused += line("cf_up", 0, 0.1, 1, "wget: server returned error: HTTP/1.1 429 Too Many Requests")
+    with flags():
+        ctx = make_ctx(snaps() + disk() + refused)[0]
+        _, net, _ = await RentedThroughputCheck()._measure_and_judge(ctx)
+    assert net == "none"
+
+
+# record-only, the rented reading sends no upload and keeps the cycle budget it had without one (lio#2411)
+@pytest.mark.parametrize("enforced", [True, False])
+async def test_the_rented_upload_and_its_time_come_only_with_the_enforced_rule(enforced):
+    downloads = RENTALS + line("pypi", CAP_BYTES, 1.0, 0) + line("hf", CAP_BYTES, 1.0, 0)
+    with flags(enforced=enforced):
+        ctx = make_ctx(snaps() + disk() + downloads)[0]
+        _, net, _ = await RentedThroughputCheck()._measure_and_judge(ctx)
+        assert module.min_task_seconds_left() == module.MIN_TASK_SECONDS_LEFT + (module.UPLOAD_SECONDS if enforced else 0)
+        command = throughput_command(False, ["c"])
+    assert ("upl cf_up" in command) is enforced
+    # enforced, the missing upload line is a probe that died early; record-only nothing was asked of it
+    assert net == ("inconclusive" if enforced else "pass")
+
+
 # a fetch cut mid-transfer (BusyBox wget's premature-EOF exit 1) is the node's when the validator reaches the endpoint
 @pytest.mark.parametrize("reachable, verdict", [(True, "fail"), (False, "none")])
 async def test_a_cut_fetch_fails_only_when_the_validator_reaches_it(reachable, verdict):
-    cut = RENTALS + line("pypi", 1024, 0.2, 1, "wget: connection closed prematurely")
+    cut = RENTALS + line("pypi", 1024, 0.2, 1, "wget: connection closed prematurely") + UP
     cut += line("hf", CAP_BYTES, 1.0, 0)
     with flags(reachable=reachable):
         ctx = make_ctx(snaps() + disk() + cut)[0]
@@ -1352,8 +1382,8 @@ async def test_a_slow_verdict_names_the_failed_side_with_measured_and_required_v
 # the standing verdict names only endpoints a failing reading confirmed: an HF cut the validator also sees is never
 # the failure, whether it rides beside a slow PyPI or arrives on a later no-verdict reading
 HF_CUT = line("hf", 1024, 0.2, 1, "wget: connection closed prematurely")
-SLOW_PYPI_HF_CUT = snaps() + disk() + RENTALS + line("pypi", 1_800_000, 30.0, 143) + HF_CUT
-PYPI_OK_HF_CUT = snaps() + disk() + RENTALS + line("pypi", CAP_BYTES, 1.0, 0) + HF_CUT
+SLOW_PYPI_HF_CUT = snaps() + disk() + RENTALS + line("pypi", 1_800_000, 30.0, 143) + HF_CUT + UP
+PYPI_OK_HF_CUT = snaps() + disk() + RENTALS + line("pypi", CAP_BYTES, 1.0, 0) + HF_CUT + UP
 
 
 @pytest.mark.parametrize(
@@ -1376,7 +1406,7 @@ async def test_a_slow_verdict_names_only_confirmed_endpoints(answers, detail):
 
 async def test_a_reading_sends_one_control_request_per_endpoint_and_names_the_confirmed_one():
     # both fetches cut: _judge's control requests (PyPI fails, HF answers) are reused, never repeated
-    both_cuts = snaps() + disk() + RENTALS + line("pypi", 0, 30.0, 143) + line("hf", 0, 30.0, 143)
+    both_cuts = snaps() + disk() + RENTALS + line("pypi", 0, 30.0, 143) + line("hf", 0, 30.0, 143) + UP
     urls = dict(download_module.ENDPOINTS)
     reaches = AsyncMock(side_effect=lambda url: url == urls["hf"])
     with flags(), patch.object(download_module, "validator_reaches", reaches):
@@ -1400,3 +1430,64 @@ def test_a_standing_disk_verdict_names_only_a_write_this_reading_judged_failing(
     # two confirmed failures stand; a later excused (renter load) or unsure write is not published as the failure
     reading = {"disk": {"mb_per_s": mb}, "disk_min_mb_per_s": 50, "disk_verdict": verdict}
     assert slow_detail(_State(at=0, disk_failures=2, reading=reading)) == detail
+
+
+@pytest.mark.parametrize(
+    "failed, detail",
+    [
+        (["cf_up 3.0 Mbps"], "network: cf_up 3.0 Mbps measured, 5 Mbps required"),
+        (["pypi 1.5 Mbps"], "network: pypi 1.5 Mbps measured, 10 Mbps required"),
+        (
+            ["pypi 1.5 Mbps", "cf_up 3.0 Mbps"],
+            "network: pypi 1.5 Mbps, cf_up 3.0 Mbps measured, 10 Mbps download, 5 Mbps upload required",
+        ),
+    ],
+)
+def test_a_failed_upload_is_shown_against_the_upload_minimum(failed, detail):
+    # lio#2411: the upload is judged by CONTAINER_UPLOAD_SPEED_MIN_MBPS, so the detail names that minimum for it
+    reading = {"net_failed": failed, "min_mbps": 10, "min_upload_mbps": 5}
+    assert slow_detail(_State(at=0, net_failures=2, reading=reading)) == detail
+
+
+@pytest.mark.parametrize(
+    "failed, download, upload",
+    [
+        (["pypi 1.5 Mbps", "hf 2.0 Mbps"], True, False),
+        (["cf_up 3.0 Mbps"], False, True),
+        (["pypi 1.5 Mbps", "cf_up 3.0 Mbps"], True, True),
+    ],
+)
+def test_the_rented_instructions_name_only_the_network_side_that_failed(failed, download, upload):
+    text = RentedThroughputCheck._remediation(_State(at=0, net_failures=2, reading={"net_failed": failed}), Msg.SLOW)
+    assert ("downloading from PyPI" in text) is download and ("uploading" in text) is upload
+
+
+async def test_a_rented_pod_slow_to_pypi_only_on_this_providers_path_fails():
+    # PyPI slow and HF fast on one node only: the old rule passed it
+    answer = snaps() + disk() + PYPI_ONLY_SLOW
+    with flags():
+        ctx, _ = make_ctx(answer, redis=FleetRedis(pypi=(2, 40), hf=(0, 40), cf_up=(0, 40)))
+        reading, net, _ = await RentedThroughputCheck()._measure_and_judge(ctx)
+        assert net == "fail" and reading["net_failed"] == ["pypi 0.5 Mbps"]
+    with flags():
+        # a PyPI burst across the fleet stays the CDN's
+        ctx, _ = make_ctx(answer, redis=FleetRedis(pypi=(20, 40), hf=(0, 40), cf_up=(0, 40)))
+        _, net, _ = await RentedThroughputCheck()._measure_and_judge(ctx)
+        assert net == "pass"
+
+
+# the probe stopped before it reported the upload endpoint
+PARTIAL_NET = "".join(ln for ln in SLOW_NET.splitlines(keepends=True) if "ep=cf_up" not in ln)
+
+
+@pytest.mark.parametrize(
+    "answer, recorded", [(SLOW_NET, True), (BUSY_NET, False), (NO_COUNTERS, False), (PARTIAL_NET, False)]
+)
+async def test_only_a_reading_this_check_judges_goes_into_the_fleet_window(answer, recorded):
+    # a slow reading on a busy, unmeasured or partly measured host is no verdict here, so it never speaks for the endpoint
+    with flags():
+        fleet = FleetRedis()
+        ctx, _ = make_ctx(answer, redis=fleet)
+        await RentedThroughputCheck()._measure_and_judge(ctx)
+        mine = [m for ms in fleet.fleet.values() for _, m in ms if json.loads(m)[0] == ctx.miner_hotkey]
+        assert bool(mine) is recorded

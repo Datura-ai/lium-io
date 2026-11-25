@@ -467,12 +467,11 @@ class Validator:
 
                 # A fresh job-files directory for this cycle; the ones an express verification
                 # still reads are kept (DAH-2958). The express lane uses the new one from here on.
-                # Built before the cycle and the rollout window count: a failed build (obfuscator exit) retries next tick.
-                # keep the published inputs' directory too: an express tick reads it until the new inputs are published below
-                keep = self.express_lane.directories_in_use()
-                if self.cycle_inputs is not None:
-                    keep.add(self.cycle_inputs.encrypted_files.tmp_directory)
-                encrypted_files = self.file_encrypt_service.ecrypt_miner_job_files(keep_directories=keep)
+                # Prepared before the cycle and the rollout window count: a failed obfuscator run retries next tick.
+                # DAH-5899: the binary is built later, only if a stdin scrape fails.
+                encrypted_files = self.file_encrypt_service.prepare_cycle_job_files(
+                    keep_directories=self.job_file_directories_in_use
+                )
 
                 # DAH-3405: a push between two cycles opens the grace window here, after the last
                 # early return and before the first job of this cycle runs against the new digest,
@@ -1619,6 +1618,14 @@ class Validator:
             rented_now,
             job_block=job_block,
         )
+
+    def job_file_directories_in_use(self) -> set[str]:
+        """The job-file directories to keep: the express lane's, and the published inputs' one, which an express
+        tick reads until the new inputs are published."""
+        keep = set(self.express_lane.directories_in_use())
+        if self.cycle_inputs is not None:
+            keep.add(self.cycle_inputs.encrypted_files.tmp_directory)
+        return keep
 
     async def rented_at_cycle_end(
         self, all_job_results: dict[str, list[JobResult]]

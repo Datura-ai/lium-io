@@ -27,7 +27,7 @@ from services.const import (
     RENTAL_CLOSE_CLOCK_SKEW_MINUTES,
     RENTAL_TEARDOWN_GRACE_MINUTES,
 )
-from services.container_cleanup import image_repository
+from services.container_cleanup import FILLER_WORKLOADS, MULTIPROCESSING_CHILD, FillerWorkload, image_repository
 from services.gpu_reset import renter_gpu_resets
 from services.redis_service import (
     EDIT_PARKED_CONTAINER_PREFIX,
@@ -54,28 +54,9 @@ from .rental_owner import rental_of_this_node
 
 logger = logging.getLogger(__name__)
 
-# The filler workloads whose GPU processes are known, by the image repository the validator started
-# the filler from: its workload and the executable names its GPU processes run as. A name matches the start
-# of the executable's basename, or of the script or module an interpreter runs, or the part before "::"
-# of a renamed process title (vLLM's engine child shows as "VLLM::EngineCore"). A repository not
-# listed here is not judged.
-# the name of a child Python's multiprocessing started with `spawn` or `forkserver`: its command line is
-# `python -c "from multiprocessing.spawn import spawn_main; ..." --multiprocessing-fork`, not the program it runs
-MULTIPROCESSING_CHILD = "multiprocessing-child"
-
-
-@dataclass(frozen=True)
-class FillerWorkload:
-    strategy: str
-    process_names: tuple[str, ...]
-
-
-FILLER_PROCESS_ALLOWLISTS: dict[str, FillerWorkload] = {
-    "daturaai/pearl-miner": FillerWorkload("PEARL", ("peakminer",)),
-    # the worker downloads its inference engine at run time; the engine has been vLLM and sonar, and the engine
-    # starts GPU children through multiprocessing's spawn start method (sonar's P2P probe at engine start)
-    "daturaai/dolphin": FillerWorkload("DPHN", ("dolphinpod", "sonar", "vllm", MULTIPROCESSING_CHILD)),
-}
+# A filler's GPU process names (FILLER_WORKLOADS, by the image repository the validator started the
+# filler from) match the start of the executable's basename, or of the script or module an interpreter
+# runs, or the part before "::" of a renamed process title (vLLM's engine child shows as "VLLM::EngineCore").
 _INTERPRETER = re.compile(r"python[0-9.]*")
 # interpreter options that take the next argument as their value (`-W ignore`, `-X faulthandler`)
 _INTERPRETER_OPTIONS_WITH_VALUE = {"-W", "-X", "--check-hash-based-pycs"}
@@ -625,7 +606,7 @@ async def _foreign_processes_in_fillers(
                 recorded,
                 live,
             )
-        if workload := FILLER_PROCESS_ALLOWLISTS.get(recorded or live or ""):
+        if workload := FILLER_WORKLOADS.get(recorded or live or ""):
             workloads[name] = workload
     foreign: list[tuple[str, str]] = []
     for process in gpu_processes:
