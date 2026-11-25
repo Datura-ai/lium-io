@@ -751,7 +751,7 @@ async def test_a_session_lost_in_the_port_check_is_retried_not_a_failed_first_pa
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("check", ["rental", "verifyx", "rented", "uid_unread"])
+@pytest.mark.parametrize("check", ["rental", "verifyx", "rented"])
 async def test_a_rental_probe_the_task_had_no_time_for_is_no_failed_first_pass(monkeypatch, wallet, check):
     """DAH-5933: the validator's budget left the rental probe (or VerifyX) no time, or the backend found the node
     rented during the check (review 4656859541): the scored cycle has no verdict for it, so nothing is published, the
@@ -762,8 +762,6 @@ async def test_a_rental_probe_the_task_had_no_time_for_is_no_failed_first_pass(m
         "rental": RentalVerificationMessages.NO_TASK_TIME.reason,
         "verifyx": VerifyXMessages.NO_TASK_TIME.reason,
         "rented": RentalVerificationMessages.RENTED_SINCE_THE_SNAPSHOT.reason,
-        # the login uid could not be read: the run stopped before any check
-        "uid_unread": "LOGIN_USER_UNREAD",
     }[check]
 
     new_node = str(uuid4())
@@ -780,11 +778,6 @@ async def test_a_rental_probe_the_task_had_no_time_for_is_no_failed_first_pass(m
     pending = harness.lane._pending[new_node]
     assert (pending.failed_runs, pending.attempts) == (0, 1) and pending.not_before > 0
     assert await harness.redis_service.get_validated_executors() == set()
-    for _ in range(MAX_ATTEMPTS - 1):
-        pending.not_before = 0.0
-        assert await harness.tick_and_settle() == 1
-    harness.miner_service.publish_machine_specs.assert_not_awaited()
-    assert new_node in harness.lane._left_to_cycle and new_node not in harness.lane._pending
 
 
 @pytest.mark.asyncio
@@ -1264,35 +1257,6 @@ async def test_a_failed_recheck_runs_again_when_the_first_pass_retry_is_on(monke
     assert harness.miner_service.publish_machine_specs.await_count == 2
     assert await harness.redis_service.get_executor_recheck_requests() == set()
     assert await harness.tick_and_settle() == 0
-
-
-@pytest.mark.asyncio
-async def test_a_recheck_whose_login_uid_is_unread_publishes_no_failed_result(monkeypatch, wallet):
-    import core.express_lane as express_lane
-
-    node = str(uuid4())
-    harness = _Harness(
-        monkeypatch,
-        {"miner-a": [_portal_executor(node, registered_seconds_ago=7 * 86400)]},
-        [_Neuron("miner-a")],
-    )
-
-    def unread(payload, executor_id):
-        result = _job_result(executor_id, score=0.0, job_batch_id=payload.job_batch_id)
-        result.failure_reason_code = "LOGIN_USER_UNREAD"
-        return {"results": [result]}
-
-    harness.job_for = unread
-    await harness.redis_service.mark_executors_validated([node])
-    await harness.redis_service.request_executor_recheck(node)
-
-    assert await harness.tick_and_settle() == 1
-    for _ in range(express_lane.RECHECK_MAX_RUNS - 1):
-        harness.lane._recheck_pending[node].not_before = 0.0
-        assert await harness.tick_and_settle() == 1
-    harness.miner_service.publish_machine_specs.assert_not_awaited()
-    assert await harness.redis_service.get_executor_recheck_requests() == set()
-    assert await harness.redis_service.get_validated_executors() == {node}
 
 
 @pytest.mark.asyncio

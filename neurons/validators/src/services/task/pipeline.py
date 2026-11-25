@@ -27,13 +27,7 @@ from services.container_cleanup import ContainerCleanup
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from protocol.vc_protocol.validator_requests import PodContainerState
 from .availability import REASONS_THAT_HIDE_AT_ONCE, AvailabilityErrorCode
-from .messages import (
-    LoginUserMessages,
-    NodeAccountMessages,
-    RentalVerificationMessages,
-    TenantEnforcementMessages,
-    render_message,
-)
+from .messages import NodeAccountMessages, RentalVerificationMessages, TenantEnforcementMessages, render_message
 from .models import ValidationEvent
 from .runner import SSHCommandResult, SSHCommandRunner
 
@@ -859,10 +853,7 @@ class Pipeline:
         passed, events, end_ctx = await self._run_checks(ctx)
         # another account's machine answered, or the machine could not be confirmed as the account's (a read that
         # still failed after the reconnect, which a relay can cause): no completion step touches it (DAH-6539)
-        # Completion steps run host commands, so they also need this run's confirmed root login; without one they
-        # do not run and their work stays due for the next run that has it
-        reasons = {event.reason_code for event in events}
-        if reasons & _NOT_THE_ACCOUNTS_MACHINE or LoginUserMessages.ROOT.reason not in reasons:
+        if any(event.reason_code in _NOT_THE_ACCOUNTS_MACHINE for event in events):
             return passed, events, end_ctx
         for chk in self.on_completion:
             try:

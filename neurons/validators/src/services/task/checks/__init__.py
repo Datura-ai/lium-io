@@ -30,7 +30,6 @@ from .hardware_identity import HardwareIdentityCheck
 from .inspector import InspectorRentedCheck
 from .local_verify import LocalVerifyCheck
 from .machine_spec_scrape import MachineSpecScrapeCheck
-from .login_user import LoginUserCheck
 from .node_account import NodeAccountCheck
 from .nvlink_fault import NvlinkFaultCheck
 from .nvml_digest import NvmlDigestCheck
@@ -106,7 +105,6 @@ __all__ = [
     "SshdAuthLogCheck",
     "LocalVerifyCheck",
     "MachineSpecScrapeCheck",
-    "LoginUserCheck",
     "NodeAccountCheck",
     "NvlinkFaultCheck",
     "NvmlDigestCheck",
