@@ -241,6 +241,22 @@ async def test_the_removal_never_touches_the_rented_machine_record_the_replaceme
     assert [c["name"] for c in (await redis.get_rented_machine(executor))["containers"]] == [payload.container_name]
 
 
+@pytest.mark.asyncio
+async def test_a_reported_host_key_that_builds_no_policy_never_connects(docker_service, monkeypatch):
+    # asyncssh takes known_hosts=None as "verify nothing": the peer answering the boot and labels could be any host
+    from services.attestation_service import HostPolicyResult
+    from services.docker_service import DockerService
+
+    order = _wire_delete(docker_service, monkeypatch, _host_exits(0))
+    monkeypatch.setattr(docker_service, "_prepare_known_hosts_policy", DockerService._prepare_known_hosts_policy.__get__(docker_service))
+    docker_service.attestation_service.prepare_host_policy = AsyncMock(return_value=HostPolicyResult(known_hosts=None))
+    monkeypatch.setattr("services.docker_service.require_rental_docker_ssh_host_key", lambda executor_info: "ssh-ed25519 AAAA")
+
+    result = await _delete(docker_service, _payload())
+
+    assert isinstance(result, FailedContainerRequest) and order == []
+
+
 def test_a_node_left_delete_is_never_declined_as_renting_in_progress():
     # the source create's pending flag outlives its run while its receipt is processed
     from services.miner_service import _bypasses_renting_in_progress
