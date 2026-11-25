@@ -24,7 +24,11 @@ def test_returns_configured_hotkey_and_echoes_nonce():
     response = _client().get("/miner-identity", params={"nonce": NONCE})
 
     assert response.status_code == 200
-    declared = {"port_range": settings.RENTING_PORT_RANGE, "port_mappings": settings.RENTING_PORT_MAPPINGS}
+    declared = {
+        "port_range": settings.RENTING_PORT_RANGE,
+        "port_mappings": settings.RENTING_PORT_MAPPINGS,
+        "ssh_port": settings.SSH_PUBLIC_PORT or settings.SSH_PORT,
+    }
     assert response.json() == {  # no claim set
         "miner_hotkey": settings.MINER_HOTKEY_SS58_ADDRESS,
         "nonce": NONCE,
@@ -51,7 +55,11 @@ def test_carries_the_account_claim_when_configured(monkeypatch):
         "miner_hotkey": settings.MINER_HOTKEY_SS58_ADDRESS,
         "nonce": NONCE,
         "account_claim": "c1" * 16,
-        "declared_ports": {"port_range": settings.RENTING_PORT_RANGE, "port_mappings": settings.RENTING_PORT_MAPPINGS},
+        "declared_ports": {
+            "port_range": settings.RENTING_PORT_RANGE,
+            "port_mappings": settings.RENTING_PORT_MAPPINGS,
+            "ssh_port": settings.SSH_PUBLIC_PORT or settings.SSH_PORT,
+        },
     }
 
 
@@ -59,11 +67,15 @@ def test_reports_the_declared_renting_ports(monkeypatch):
     # an Edit Address onto this machine is checked against what it declares; null both ways is the default
     monkeypatch.setattr(settings, "RENTING_PORT_RANGE", "20000-20009")
     monkeypatch.setattr(settings, "RENTING_PORT_MAPPINGS", None)
+    monkeypatch.setattr(settings, "SSH_PORT", 2200)
+    monkeypatch.setattr(settings, "SSH_PUBLIC_PORT", None)
     body = _client().get("/miner-identity", params={"nonce": NONCE}).json()
-    assert body["declared_ports"] == {"port_range": "20000-20009", "port_mappings": None}
+    assert body["declared_ports"] == {"port_range": "20000-20009", "port_mappings": None, "ssh_port": 2200}
+    # the SSH port validators dial is the public one when set; they never rent it out
     monkeypatch.setattr(settings, "RENTING_PORT_RANGE", None)
+    monkeypatch.setattr(settings, "SSH_PUBLIC_PORT", 20311)
     body = _client().get("/miner-identity", params={"nonce": NONCE}).json()
-    assert body["declared_ports"] == {"port_range": None, "port_mappings": None}
+    assert body["declared_ports"] == {"port_range": None, "port_mappings": None, "ssh_port": 20311}
 
 
 def test_nonce_is_required():

@@ -500,7 +500,12 @@ async def get_miner_identity(
         nonce=nonce,
         account_claim=claim,
         ssh_host_key_port=port,
-        declared_ports={"port_range": settings.RENTING_PORT_RANGE, "port_mappings": settings.RENTING_PORT_MAPPINGS},
+        declared_ports={
+            "port_range": settings.RENTING_PORT_RANGE,
+            "port_mappings": settings.RENTING_PORT_MAPPINGS,
+            # the SSH port this executor reports to validators (miner_service), which they exclude from rental ports
+            "ssh_port": settings.SSH_PUBLIC_PORT or settings.SSH_PORT,
+        },
         # off the event loop: an RSA signature still costs ~ms, and this endpoint is public
         host_key_proofs=(
             await asyncio.to_thread(_host_key_proofs, nonce, settings.MINER_HOTKEY_SS58_ADDRESS, claim) if port else None

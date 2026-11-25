@@ -35,6 +35,7 @@ class MinerIdentityResponse(BaseModel):
     # `<type> <base64>` host key line -> base64 signature by that key over nonce, hotkey and claim (routes/apis.py)
     host_key_proofs: dict[str, str] | None = None
     # the renting ports this machine declares, as configured (`RENTING_PORT_RANGE`, `RENTING_PORT_MAPPINGS`;
-    # both empty means the validator's default range). Always sent, so its absence marks an older executor: an Edit
+    # both empty means the validator's default range), and the SSH port it reports to validators (`ssh_port`), which
+    # they never rent out. Always sent, so its absence marks an older executor: an Edit
     # Address onto this machine checks that it declares every port its pods publish.
-    declared_ports: dict[str, str | None] | None = None
+    declared_ports: dict[str, str | int | None] | None = None
