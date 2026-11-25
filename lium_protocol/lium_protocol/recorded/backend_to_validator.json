@@ -191,7 +191,8 @@
         "container_name": "container_0b1c2d3e",
         "local_volume": "volume_0b1c2d3e",
         "external_volume": null,
-        "expected_boot_id": "3f6c2b1a-9d4e-4c7b-8a2f-1e0d9c8b7a6f"
+        "expected_boot_id": "3f6c2b1a-9d4e-4c7b-8a2f-1e0d9c8b7a6f",
+        "create_command_id": "7c1e9a52-3b4d-4f8e-a6c0-2d9b8e7f1a35"
       }
     },
     {

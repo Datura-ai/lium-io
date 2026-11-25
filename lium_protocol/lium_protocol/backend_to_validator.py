@@ -223,6 +223,9 @@ class ContainerDeleteOnNodeLeftRequest(ContainerDeleteRequest):
 
     message_type: BackendMessageType = BackendMessageType.ContainerDeleteOnNodeLeftRequest
     expected_boot_id: str
+    # the `command_id` of the ContainerCreateRequest that placed the pod on the node it left (the pod's create command
+    # id there): the validator removes only a container that create made, never a later placement's on the same boot
+    create_command_id: str
 
 
 @BACKEND_MESSAGES.register

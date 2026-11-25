@@ -92,6 +92,8 @@ from services.const import (
     KEPT_UNMOUNTED_PREFIX,
     LIUM_POD_ID_LABEL,
     LIUM_EXECUTOR_ID_LABEL,
+    LIUM_CREATE_ATTEMPT_LABEL,
+    LIUM_CREATE_COMMAND_LABEL,
     LEGACY_LOOPBACK_PLUGIN_ALIAS,
     LOOPBACK_PLUGIN_ALIAS,
     FILLER_CACHE_VOLUME_PREFIXES,
@@ -197,6 +199,7 @@ from services.redis_service import (
     STOPPED_BY_RECOVERY_RENAMING,
     STOPPED_BY_RECOVERY_STOPPED,
     STREAMING_LOG_CHANNEL,
+    renter_create_id,
     RedisService,
     sshd_bootstrap_failed_key,
     sshd_bootstrap_failed_stamp,
@@ -1874,21 +1877,28 @@ def _registration_label_command(container_id: str) -> str:
 _OWN_STARTED_LEFTOVER_EXIT = 4
 
 
-def _own_stopped_leftover_check(container_id: str, owner: str, pod_id: str) -> str:
+def _own_stopped_leftover_check(container_id: str, owner: str, pod_id: str, attempt: str) -> str:
     """Exits 0 only when the container is stopped (created, exited or dead) and carries `owner` or no registration
-    label; exits 4 when it carries both this registration (`owner`) and this pod (`pod_id`): the pod's own container on
-    this registration, in any state (a re-sent create meets the one its first attempt already started), removed forced.
-    Run before its removal is marked as ours, so a refused check leaves no mark."""
-    template = "{{.State.Status}} {{index .Config.Labels \"%s\"}} {{index .Config.Labels \"%s\"}}" % (
-        LIUM_EXECUTOR_ID_LABEL,
-        LIUM_POD_ID_LABEL,
+    label; exits 4 when it carries this registration (`owner`), this pod (`pod_id`) and this create attempt
+    (`attempt`, never empty): provably this very attempt's own container in any state (a create re-sent after a
+    connector restart resumes its cut-off attempt's id and meets what that attempt started), removed forced. Any
+    other running container, the pod's live one from an earlier create included, is kept. Run before its removal is
+    marked as ours, so a refused check leaves no mark."""
+    template = "{{.State.Status}} " + " ".join(
+        f'{{{{index .Config.Labels "{label}"}}}}'
+        for label in (LIUM_EXECUTOR_ID_LABEL, LIUM_POD_ID_LABEL, LIUM_CREATE_ATTEMPT_LABEL)
     )
     cid = shlex.quote(container_id)
+    lines = [
+        f"s=$(/usr/bin/docker inspect --type container -f {shlex.quote(template)} {cid}) || exit 3",
+        'state=${s%% *}; labels=${s#* }; registration=${labels%% *}',
+    ]
+    if attempt:
+        # a create with no attempt id (not a backend create) proves no container its own
+        lines.append(f'[ "$labels" = {shlex.quote(f"{owner} {pod_id} {attempt}")} ] && exit {_OWN_STARTED_LEFTOVER_EXIT}')
     return "\n".join(
-        [
-            f"s=$(/usr/bin/docker inspect --type container -f {shlex.quote(template)} {cid}) || exit 3",
-            'state=${s%% *}; labels=${s#* }; registration=${labels%% *}',
-            f'[ "$labels" = {shlex.quote(f"{owner} {pod_id}")} ] && exit {_OWN_STARTED_LEFTOVER_EXIT}',
+        lines
+        + [
             'case "$state" in created|exited|dead) ;; *) exit 3;; esac',
             f'case "$registration" in {shlex.quote(owner)}|"") ;; *) exit 3;; esac',
         ]
@@ -1896,8 +1906,8 @@ def _own_stopped_leftover_check(container_id: str, owner: str, pod_id: str) -> s
 
 
 def _own_leftover_rm_command(container_id: str, force: bool = False) -> str:
-    """Without force: Docker refuses a container started after the check. Forced only for the pod's own labelled
-    container, removed by the ID checked."""
+    """Without force: Docker refuses a container started after the check. Forced only for this create attempt's own
+    labelled container, removed by the ID checked."""
     return f"/usr/bin/docker rm -v{' -f' if force else ''} {shlex.quote(container_id)} >/dev/null"
 
 
@@ -1914,8 +1924,9 @@ def _pod_volume_labels(payload) -> dict[str, str]:
 
 def _node_left_delete_command(payload: ContainerDeleteOnNodeLeftRequest) -> str:
     """Exits 97 on another boot, or when the pod's container or its parked edit container (``<name>__prev``) there
-    was created for another registration or another pod (a replacement made on this host through a re-pointed
-    registration or another miner's registration of the same executor); 0 once the left registration's container,
+    was created for another registration, another pod or another placement than `create_command_id` (a replacement
+    made on this host through a re-pointed registration or another miner's registration of the same executor, or the
+    pod placed back on this boot after the move); 0 once the left registration's container,
     its parked edit container and its kept edit containers are gone. Unlabelled containers (made before the labels)
     are kept.
 
@@ -1926,11 +1937,16 @@ def _node_left_delete_command(payload: ContainerDeleteOnNodeLeftRequest) -> str:
         raise ValueError("the delete names no registration")
     if not payload.expected_boot_id:
         raise ValueError("the delete names no boot id")
+    if not payload.create_command_id:
+        raise ValueError("the delete names no placement")
     if payload.container_name != DockerService.get_container_name(payload):
         # the name selects the kept containers too: only the pod's own may be named
         raise ValueError("the delete names another pod's container")
-    owner_and_pod = shlex.quote(f"{_executor_label(payload)} {payload.pod_id}")
-    found = f'{{{{.Id}}}} {{{{index .Config.Labels "{LIUM_EXECUTOR_ID_LABEL}"}}}} {{{{index .Config.Labels "{LIUM_POD_ID_LABEL}"}}}}'
+    owner_pod_and_placement = shlex.quote(f"{_executor_label(payload)} {payload.pod_id} {payload.create_command_id}")
+    found = "{{.Id}} " + " ".join(
+        f'{{{{index .Config.Labels "{label}"}}}}'
+        for label in (LIUM_EXECUTOR_ID_LABEL, LIUM_POD_ID_LABEL, LIUM_CREATE_COMMAND_LABEL)
+    )
     lines = [
         # an unreadable boot id is not this node's: the read must succeed and give a value before it is compared
         f'boot=$(cat /proc/sys/kernel/random/boot_id) && [ -n "$boot" ] '
@@ -1943,7 +1959,7 @@ def _node_left_delete_command(payload: ContainerDeleteOnNodeLeftRequest) -> str:
             # a failed inspect is absence only when a listing that succeeded shows no container under the name
             f"found=$(/usr/bin/docker inspect --type container -f {shlex.quote(found)} {name} 2>/dev/null) "
             f"|| {{ found=; named=$(/usr/bin/docker ps -aq --no-trunc --filter name=^{name}$) && [ -z \"$named\" ] || exit 1; }}",
-            f'[ -z "$found" ] || [ "${{found#* }}" = {owner_and_pod} ] || exit {_NOT_THE_NODE_LEFT_EXIT}',
+            f'[ -z "$found" ] || [ "${{found#* }}" = {owner_pod_and_placement} ] || exit {_NOT_THE_NODE_LEFT_EXIT}',
             # removed by the ID that was checked: a container created under the same name after the check is not it
             'ids="$ids ${found%% *}"',
         ]
@@ -1951,7 +1967,8 @@ def _node_left_delete_command(payload: ContainerDeleteOnNodeLeftRequest) -> str:
         f"kept=$(/usr/bin/docker ps -aq --no-trunc --filter name=^{shlex.quote(_kept_container_prefix(payload.container_name))} "
         f"--filter label={shlex.quote(f'{LIUM_EXECUTOR_ID_LABEL}={_executor_label(payload)}')} "
         # label filters all apply: a kept name's prefix and the registration alone do not make it this pod's
-        f"--filter label={shlex.quote(f'{LIUM_POD_ID_LABEL}={payload.pod_id}')}) || exit 1",
+        f"--filter label={shlex.quote(f'{LIUM_POD_ID_LABEL}={payload.pod_id}')} "
+        f"--filter label={shlex.quote(f'{LIUM_CREATE_COMMAND_LABEL}={payload.create_command_id}')}) || exit 1",
         'set -- $ids $kept',
         '[ $# -eq 0 ] || /usr/bin/docker rm -fv "$@" >/dev/null 2>&1',
         # done only when a listing that succeeded shows none of the selected containers
@@ -4848,7 +4865,12 @@ class DockerService:
             log_opts={"max-size": settings.RENTAL_LOG_MAX_SIZE, "max-file": str(settings.RENTAL_LOG_MAX_FILE)},
             entrypoint=custom_options.entrypoint,
             network=RENTAL_NETWORK_NAME,
-            labels={LIUM_POD_ID_LABEL: payload.pod_id, LIUM_EXECUTOR_ID_LABEL: _executor_label(payload)},
+            labels={
+                LIUM_POD_ID_LABEL: payload.pod_id,
+                LIUM_EXECUTOR_ID_LABEL: _executor_label(payload),
+                LIUM_CREATE_ATTEMPT_LABEL: renter_create_id.get(),
+                LIUM_CREATE_COMMAND_LABEL: payload.command_id,
+            },
             before_create=lambda: _refuse_filler_during_customer_create(payload),
             # a customer pod created since the cleanup's listing is seen here, before the filler starts
             before_start=(
@@ -6021,9 +6043,10 @@ class DockerService:
         running replacement, labelled or made before the labels. Only the same-name conflict's leftover goes, here,
         before disk admission counts its layer: the listed ID, stopped, this registration's or unlabelled, removed
         without force (`_own_stopped_leftover_check`, then `_own_leftover_rm_command`), so a container started meanwhile is
-        refused by Docker; or, labelled with this registration and this pod, removed forced in any state (a re-sent
-        create's own first attempt that already started it); only a removal that passed the check is marked as this
-        sweep's.
+        refused by Docker; or, labelled with this registration, this pod and this create attempt, removed forced in any
+        state (a create re-sent after a connector restart resumes its cut-off attempt, which may have started it); a
+        running container of an earlier create (a live pod) is kept; only a removal that passed the check is marked as
+        this sweep's.
 
         DAH-5392: an unlisted `pod_*` other than ``pod_name`` is removed (with its volume) only when the
         backend confirms its rental closed: a create that waited may sweep after a newer create on the
@@ -6111,7 +6134,9 @@ class DockerService:
                     # each bounded on the host and here: an SSH session can stay up while Docker stops answering
                     check = await _run_with_host_timeout(
                         ssh_client,
-                        _own_stopped_leftover_check(own_id, pod_owner, pod_name.removeprefix(POD_CONTAINER_PREFIX)),
+                        _own_stopped_leftover_check(
+                            own_id, pod_owner, pod_name.removeprefix(POD_CONTAINER_PREFIX), renter_create_id.get()
+                        ),
                         REMOVE_CONFIRM_INSPECT_TIMEOUT_SECONDS,
                     )
                     if check.exit_status in (124, 137):

@@ -535,6 +535,8 @@ class ContainerDeleteOnNodeLeftRequest(ContainerDeleteRequest):
 
     message_type: ContainerRequestType = ContainerRequestType.ContainerDeleteOnNodeLeftRequest
     expected_boot_id: str
+    # the create command id of the placement on the node left: only a container that create made is removed
+    create_command_id: str
     # time.monotonic() when the message was parsed off the backend socket: the answer deadline counts from here, so
     # the miner handshake before the delete runs inside it instead of before it
     _received_at: float = PrivateAttr(default_factory=time.monotonic)

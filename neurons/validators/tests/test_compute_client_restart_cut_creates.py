@@ -692,7 +692,7 @@ async def test_only_a_node_left_deletes_answer_echoes_its_command_id(deleted: bo
     )
     fields = {**ids, "container_name": "", "command_id": "cmd-1"}
     request = (
-        ContainerDeleteOnNodeLeftRequest(**fields, expected_boot_id="b")
+        ContainerDeleteOnNodeLeftRequest(**fields, expected_boot_id="b", create_command_id="c")
         if node_left
         else ContainerDeleteRequest(**fields)
     )

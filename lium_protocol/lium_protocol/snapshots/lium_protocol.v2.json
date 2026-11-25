@@ -1296,6 +1296,10 @@
           "title": "Container Name",
           "type": "string"
         },
+        "create_command_id": {
+          "title": "Create Command Id",
+          "type": "string"
+        },
         "executor_id": {
           "title": "Executor Id",
           "type": "string"
@@ -1374,7 +1378,8 @@
         "executor_id",
         "pod_id",
         "container_name",
-        "expected_boot_id"
+        "expected_boot_id",
+        "create_command_id"
       ],
       "title": "ContainerDeleteOnNodeLeftRequest",
       "type": "object"

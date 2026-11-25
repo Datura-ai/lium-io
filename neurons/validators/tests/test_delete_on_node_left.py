@@ -43,6 +43,7 @@ def _payload(boot: str = NODE_LEFT_BOOT) -> ContainerDeleteOnNodeLeftRequest:
         **delete.model_dump(exclude={"message_type", "container_name"}),
         container_name=f"pod_{delete.pod_id}",
         expected_boot_id=boot,
+        create_command_id=LEFT_PLACEMENT,
     )
 
 
@@ -82,6 +83,9 @@ async def test_one_host_command_decides_and_no_sdk_or_create_state_is_touched(
 LEFT = "left-executor"
 LEFT_MINER = "miner-a"
 LEFT_LABEL = f"{LEFT_MINER}:{LEFT}"
+# the create command id of the placement on the node left; the pod placed back on that boot later has another
+LEFT_PLACEMENT = "placement-left"
+LATER_PLACEMENT = "placement-later"
 
 
 def _daemon_stub(
@@ -95,11 +99,13 @@ def _daemon_stub(
     prev_owner: str | None = None,
     sticky_prev: bool = False,
     kept_pod: str | None = None,
+    placement: str = LEFT_PLACEMENT,
+    kept_placement: str = LEFT_PLACEMENT,
 ) -> Path:
     """A docker stub. Each file under containers/ is a container named as the file, holding "<id> <registration
-    label> <pod label>": the pod's container (`cid`, labelled `container_owner` and `container_pod`, default
-    `pod_id`) and its parked edit container `<name>__prev` (`pid`, labelled `prev_owner`). The kept container `kept1`
-    (left registration, pod `kept_pod`, default `pod_id`) exists while its file does, listed when every label filter
+    label> <pod label> <placement label>": the pod's container (`cid`, labelled `container_owner`, `container_pod`,
+    default `pod_id`, and `placement`) and its parked edit container `<name>__prev` (`pid`, labelled `prev_owner` and
+    `placement`). The kept container `kept1` (left registration, pod `kept_pod`, default `pod_id`, `kept_placement`) exists while its file does, listed when every label filter
     matches. A removal deletes each unless sticky. `inspect_fails` makes inspect fail as a daemon
     error would, with the containers still there. Each file under volumes/ is a volume whose lines are its labels
     (`inuse` marks one a container still uses), inspected as "<pod id> <registration>" and removed by name."""
@@ -108,14 +114,17 @@ def _daemon_stub(
     )
     volumes.mkdir(exist_ok=True)
     containers.mkdir(exist_ok=True)
-    kept.write_text(f"io.lium.executor_id={LEFT_LABEL} io.lium.pod_id={pod_id if kept_pod is None else kept_pod}")
+    kept.write_text(
+        f"io.lium.executor_id={LEFT_LABEL} io.lium.pod_id={pod_id if kept_pod is None else kept_pod} "
+        f"io.lium.create_command_id={kept_placement}"
+    )
     name = f"pod_{pod_id}"
     for container_name, cid, owner, pod in [
         (name, "cid", container_owner, pod_id if container_pod is None else container_pod),
         (f"{name}__prev", "pid", prev_owner, pod_id),
     ]:
         if owner is not None:
-            (containers / container_name).write_text(f"{cid} {owner} {pod}")
+            (containers / container_name).write_text(f"{cid} {owner} {pod} {placement}")
     cs, k, vols = (shlex.quote(str(path)) for path in (containers, kept, volumes))
     sticky_ids = " ".join(cid for cid, on in [("cid", sticky), ("pid", sticky_prev)] if on) or "-"
     rm_kept = "true" if sticky_kept else f"rm -f {k}"
@@ -266,6 +275,26 @@ def test_a_kept_container_of_another_pod_under_the_pods_kept_name_is_never_touch
     assert (tmp_path / "kept").exists()
 
 
+@pytest.mark.parametrize("placement", [LATER_PLACEMENT, ""], ids=["placed-back-later", "made-before-the-label"])
+def test_the_pods_container_from_another_placement_on_the_same_boot_is_never_touched(tmp_path, placement):
+    # lio#2394 M1: P moves E1 -> E2, E2's create fails and the backend places P back on E1 on the same boot before
+    # the node-left delete for the first placement runs: the new live container carries the left registration, the
+    # pod and the boot, but its own create command id, so the delete removes nothing
+    status, calls = _run(tmp_path, _payload(HOST_BOOT), placement=placement)
+
+    assert status == 97
+    assert "rm" not in calls.replace("inspect", "")
+
+
+def test_a_kept_container_of_a_later_placement_is_never_touched(tmp_path):
+    status, calls = _run(tmp_path, _payload(HOST_BOOT), kept_placement=LATER_PLACEMENT)
+
+    assert status == 0
+    assert f"label=io.lium.create_command_id={LEFT_PLACEMENT}" in calls
+    assert "kept1" not in "".join(line for line in calls.splitlines(True) if line.startswith("rm"))
+    assert (tmp_path / "kept").exists()
+
+
 @pytest.mark.parametrize("container_owner", [LEFT_LABEL, None])
 def test_the_left_registrations_parked_edit_container_goes_with_it(tmp_path, container_owner):
     # 2394-13: an edit parks the pod's container as <name>__prev; success means it is gone too
@@ -290,7 +319,7 @@ def test_a_parked_edit_container_of_another_registration_keeps_everything(tmp_pa
     assert "rm" not in calls.replace("inspect", "")
 
 
-@pytest.mark.parametrize("missing", ["executor_id", "miner_hotkey", "expected_boot_id"])
+@pytest.mark.parametrize("missing", ["executor_id", "miner_hotkey", "expected_boot_id", "create_command_id"])
 def test_a_delete_naming_no_registration_or_boot_id_is_refused(missing):
     with pytest.raises(ValueError):
         _node_left_delete_command(_payload(HOST_BOOT).model_copy(update={missing: ""}))

@@ -559,6 +559,7 @@ async def test_a_node_left_delete_whose_miner_names_another_executor_keeps_that_
     payload = ContainerDeleteOnNodeLeftRequest(
         miner_hotkey="5TestMiner", executor_id=str(uuid4()), miner_address="192.0.2.1", miner_port=8000,
         pod_id=pod_id, container_name=f"pod_{pod_id}", expected_boot_id="11111111-2222-4333-8444-555555555555",
+        create_command_id=str(uuid4()),
     )
 
     assert isinstance(await miner_service._handle_container(payload), FailedContainerRequest)
