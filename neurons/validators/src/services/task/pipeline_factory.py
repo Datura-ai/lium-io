@@ -457,6 +457,8 @@ class PipelineFactory:
                 # backend's probe was left 1 s and its client timeout read as an API error (ad2382f9, 21 Nov).
                 # Needs only the verified ports, GPU details and rented data, all settled above.
                 RentalVerificationCheck(),
+                # the rental probe can take up to 300 s, and a rent can land meanwhile
+                RentedMidCycleCheck(),
                 # liumd phase 1 (DAH-2834): one signed `POST /verify` runs the VerifyX and matmul
                 # challenges on the executor side by side; the two checks below consume a judged,
                 # passing answer and run over SSH otherwise. Off by default, never fatal.

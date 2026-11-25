@@ -58,7 +58,7 @@ def rented_since_cycle_start_event(ctx: Context, pod: str):
 class RentedMidCycleCheck:
     """Right before the GPU and network tests: a renter's create since cycle start ends the run with no verdict.
 
-    The previous result stands, as for a renter GPU reset: the pod is still starting, so it is not judged here.
+    The run is withheld and its kept result is dropped: the pod is still starting, so it is not judged here.
     A test already running is not stopped: it is read again only before the next one starts.
     """
 

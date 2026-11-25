@@ -145,7 +145,7 @@ async def test_the_marks_the_verifyx_cold_retry_reads_decide(write, stops):
 
 @pytest.mark.parametrize(
     "kwargs, renter",
-    [({}, True), ({"filler": True}, False), ({"synthetic_probe": True}, False), ({"kind": "gpu_reset"}, False)],
+    [({}, True), ({"is_filler_create": True}, False), ({"synthetic_probe": True}, False), ({"kind": "gpu_reset"}, False)],
 )
 @pytest.mark.asyncio
 async def test_only_a_renters_create_writes_the_marks(kwargs, renter):
@@ -182,8 +182,9 @@ async def test_the_run_ended_by_a_new_pod_gets_no_verdict_this_cycle():
 def test_rechecked_right_before_the_gpu_and_network_tests(fast_path):
     names = [type(check).__name__ for check in PipelineFactory.build_checks(fast_path=fast_path)]
     before = [names[i + 1] for i, name in enumerate(names) if name == "RentedMidCycleCheck"]
-    # serial: the rental check (no GPU load) sits between the halt and LocalVerify/VerifyX
-    expected = ["LocalVerifyCheck", "CapabilityCheck", "VerifyXCheck"] if fast_path else ["RentalVerificationCheck", "CapabilityCheck"]
+    # serial: once before the rental check and once after it, since its probe can take up to 300 s
+    serial = ["RentalVerificationCheck", "LocalVerifyCheck", "CapabilityCheck"]
+    expected = ["LocalVerifyCheck", "CapabilityCheck", "VerifyXCheck"] if fast_path else serial
     assert before == expected
     assert names.index("TenantEnforcementCheck") < names.index("RentedMidCycleCheck")
 

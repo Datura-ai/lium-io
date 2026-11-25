@@ -1153,15 +1153,15 @@ class RedisService:
         gpu_uuids: list[str] | None = None,
         command_id: str = "",
         synthetic_probe: bool = False,
-        filler: bool = False,
+        is_filler_create: bool = False,
     ):
         now = int(time.time())
         # a renter's pod being created: the validation cycle on the node stops its GPU and network tests for it
         # (RentedMidCycleCheck); the validator's own probe, a filler and a GPU reset or clock operation are not one
-        renter = kind is None and not synthetic_probe and not filler
+        is_renter_create = kind is None and not synthetic_probe and not is_filler_create
 
         item: dict = {"time": now, "pod_id": pod_id}
-        if renter:
+        if is_renter_create:
             item[PENDING_RENTER_CREATE] = True
         if kind:
             # DAH-4658: "gpu_reset" marks a renter's own GPU reset, which the rented GPU checks skip
@@ -1174,7 +1174,7 @@ class RedisService:
         def stamp() -> RedisWrites:
             # read at each try: a retry after a newer create's EXEC must not write an older time over its stamp
             writes = RedisWrites()
-            if renter:
+            if is_renter_create:
                 # only a renter's create stamps: the validator's own rental probe, a filler and a GPU reset or clock
                 # operation keep their marker but leave no stamp, since none is a rental being created
                 writes.set(

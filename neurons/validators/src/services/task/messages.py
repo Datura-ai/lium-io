@@ -1589,13 +1589,13 @@ class TenantEnforcementMessages:
         category="policy",
         impact="Proceed",
     )
-    # held like a renter GPU reset (executor_rollout): the run gives no verdict and the previous result stands
+    # the run gives no verdict and its kept result is dropped: the cycle saw the rental state change
     RENTED_SINCE_CYCLE_START = MessageTemplate(
         event="Executor rented since the cycle started",
         reason="RENTED_SINCE_CYCLE_START",
         severity="info",
         category="policy",
-        impact="Validation halted — no verdict this cycle, the previous result stands",
+        impact="Validation halted — no verdict this cycle",
     )
 
 

@@ -35,7 +35,6 @@ from neurons.validators.src.services.task.checks import (
     PortConnectivityCheck,
     PortCountCheck,
     RentalVerificationCheck,
-    RentedMidCycleCheck,
     SysboxRequiredCheck,
     RentedSinceStartCheck,
     TenantEnforcementCheck,
@@ -308,10 +307,7 @@ def test_fast_path_checks_are_the_serial_checks_re_ordered():
     serial_ids = sorted(type(c).__name__ for c in serial)
     fast_ids = sorted(type(c).__name__ for c in flat)
     # the one addition: the rented halt again after each rental re-read, for a pod started during the run
-    # and the mid-cycle create halt once more: LocalVerify and VerifyX are not adjacent here as they are serially
-    assert fast_ids == sorted(
-        [*serial_ids, *[RentedSinceStartCheck.__name__] * 3, RentedMidCycleCheck.__name__]
-    ), "no other check added, none dropped"
+    assert fast_ids == sorted([*serial_ids, *[RentedSinceStartCheck.__name__] * 3]), "no other check added, none dropped"
     assert [type(c) for c in PipelineFactory.build_checks(fast_path=True)] == [type(c) for c in fast]
 
     names = [type(c).__name__ for c in fast]
