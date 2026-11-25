@@ -591,6 +591,84 @@ async def test_A27g_the_pods_delete_cleans_up_the_build_artifacts_of_every_attem
     assert any(c == "/usr/bin/rm -rf /tmp/lium-build-pod-1 /tmp/lium-podbuild-pod-1.*" for c in ssh_client.calls)
 
 
+async def _another_registrations_create(pod_id: str, registered: asyncio.Event, release: asyncio.Event) -> None:
+    """A create of the pod on another registration (a moved pod's other node, which may share the daemon)."""
+    from services.docker_service import inflight_creates
+
+    with inflight_creates.track(pod_id, ("other-hotkey", "other-executor")):
+        registered.set()
+        await release.wait()
+
+
+def _registering_another_create_during(ssh_client, command_start: str, pod_id: str, release: asyncio.Event, tasks):
+    """The other registration's create registers while the first command starting `command_start` runs."""
+    run = ssh_client.run
+
+    async def _run(cmd, **kw):
+        if cmd.startswith(command_start) and not tasks:
+            registered = asyncio.Event()
+            tasks.append(asyncio.create_task(_another_registrations_create(pod_id, registered, release)))
+            await registered.wait()
+        return await run(cmd, **kw)
+
+    ssh_client.run = _run
+
+
+@pytest.mark.asyncio
+async def test_A27h_a_create_that_registers_during_the_earlier_build_container_listing_keeps_its_own(
+    svc, monkeypatch
+):
+    """Stand check 2394-23: a create of the pod on another registration registers while a resumed build lists the
+    pod's earlier build containers, and the listing shows its build container; nothing listed is torn down."""
+    from services.docker_service import executor_key, inflight_creates
+
+    payload = _base_payload(dockerfile_content="FROM alpine\n")
+    others = svc._dind_container_name(payload.pod_id, "deadbeef")
+    ssh_client = _make_dind_ssh(leftover_dinds=(others,))
+    release, tasks = asyncio.Event(), []
+    _registering_another_create_during(ssh_client, "/usr/bin/docker ps -a --format", payload.pod_id, release, tasks)
+    monkeypatch.setattr(svc, "execute_and_stream_logs", _make_esl(build=(False, "boom")))
+    monkeypatch.setattr(svc, "stream_log", AsyncMock())
+
+    try:
+        with inflight_creates.track(payload.pod_id, executor_key(payload)):
+            await svc._custom_build_image(
+                ssh_client=ssh_client, payload=payload, log_tag="t", default_extra={}, build_attempt="bbbb0000"
+            )
+    finally:
+        release.set()
+        await asyncio.gather(*tasks)
+
+    assert tasks and any(c.startswith("/usr/bin/docker ps -a --format") for c in ssh_client.calls)
+    assert not any(others in c for c in ssh_client.calls if not c.startswith("/usr/bin/docker ps -a"))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("registers_during", [None, "/usr/bin/docker image rm"], ids=["before", "during_image_rm"])
+async def test_A27i_the_pods_delete_leaves_the_build_artifacts_while_another_registrations_create_runs(
+    svc, registers_during
+):
+    """Stand check 2394-24: the delete's cleanup selects every attempt by the pod alone, so with a create of the pod
+    running on another registration it removes none of them (that create's own attempt is among them)."""
+    ssh_client = _make_dind_ssh()
+    release, tasks = asyncio.Event(), []
+    if registers_during is None:
+        registered = asyncio.Event()
+        tasks.append(asyncio.create_task(_another_registrations_create("pod-1", registered, release)))
+        await registered.wait()
+    else:
+        _registering_another_create_during(ssh_client, registers_during, "pod-1", release, tasks)
+
+    try:
+        await svc._cleanup_custom_build_artifacts(ssh_client=ssh_client, pod_id="pod-1", default_extra={})
+    finally:
+        release.set()
+        await asyncio.gather(*tasks)
+
+    assert not any(c.startswith("/usr/bin/rm -rf") for c in ssh_client.calls)
+    assert any("image rm" in c for c in ssh_client.calls) is (registers_during is not None)
+
+
 @pytest.mark.asyncio
 async def test_A27e_a_resumed_build_whose_old_build_container_cannot_be_stopped_stops_early(svc, monkeypatch):
     """DAH-5666: the old DinD still runs with its egress rules, so the create stops before a second build starts."""

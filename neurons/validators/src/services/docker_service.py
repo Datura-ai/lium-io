@@ -9857,7 +9857,12 @@ class DockerService:
                 # DAH-5437: a create resumed after a connector restart meets the build container its cut-off
                 # attempt left for this pod; no other create of this pod runs, so it is ours to replace.
                 # The full teardown, so the egress rules of the old DinD's IP go with it.
-                for old_name in await self._leftover_dind_builds(ssh_client, pod_id, setup_timeout_s):
+                old_names = await self._leftover_dind_builds(ssh_client, pod_id, setup_timeout_s)
+                # read again after the listing: a create of the pod that registered during it may have started its
+                # own build container, which the listing then shows; none can appear in it once this read passes
+                if not inflight_creates.is_only_create_on_any_registration(pod_id):
+                    old_names = []
+                for old_name in old_names:
                     old_ip: str | None = None
                     try:
                         ip_res = await ssh_client.run(
@@ -10447,9 +10452,11 @@ class DockerService:
         """Always-on inline cleanup (Phase 3.4(i)).
 
         Removes the built image and scratch directory of one create attempt (`build_attempt`), or, on the pod's
-        delete (None), of every attempt of the pod and the names used before attempts were named. Best-effort —
-        any failure is logged but never raised. Safe to call for non-custom
-        pods (no-op when the artifacts do not exist).
+        delete (None), of every attempt of the pod and the names used before attempts were named. The delete's
+        removal selects every attempt by the pod alone, so it is skipped while a create of the pod runs on any
+        registration (DAH-6531): that create's attempt is among them; it removes its own on failure and the orphan
+        sweep the rest once the pod is over. Best-effort — any failure is logged but never raised. Safe to call for
+        non-custom pods (no-op when the artifacts do not exist).
         """
         if build_attempt is not None:
             image_tag = self._custom_build_image_tag(pod_id, build_attempt)
@@ -10467,14 +10474,17 @@ class DockerService:
             )
             scratch = f"{shlex.quote(f'/tmp/{image_tag}')} {shlex.quote(f'/tmp/{attempts}')}*"
         try:
-            await ssh_client.run(
-                f"/usr/bin/docker image rm {images} 2>/dev/null || true",
-                check=False,
-            )
-            await ssh_client.run(
-                f"/usr/bin/rm -rf {scratch}",
-                check=False,
-            )
+            for command in (f"/usr/bin/docker image rm {images} 2>/dev/null || true", f"/usr/bin/rm -rf {scratch}"):
+                # read before each command: a create of the pod may register while the one before runs
+                if build_attempt is None and not inflight_creates.is_only_create_on_any_registration(pod_id):
+                    logger.info(
+                        _m(
+                            "Custom build artifact cleanup skipped: a create of the pod is running",
+                            extra=get_extra_info({**default_extra, "image_tag": image_tag}),
+                        )
+                    )
+                    return
+                await ssh_client.run(command, check=False)
         except Exception as exc:  # noqa: BLE001 — best-effort
             logger.warning(
                 _m(
