@@ -249,8 +249,11 @@ from services.rental_docker_sdk import (
 )
 from services.ssh_connect_timing import connect_with_phase_timing
 from services.storage_operations import (
+    StorageOperationLaunchError,
     forget_storage_helper,
     note_started_storage_helper,
+    remove_finished_helpers_mounting,
+    report_storage_operation_failed,
     start_storage_operation,
     supports_bootstrap_restore,
     supports_storage_operation,
@@ -7294,6 +7297,8 @@ class DockerService:
             # the pod's volume is shared by name too: another live create of the pod may have restored into it (F-78)
             if remove_volume and volume_name and (pod_id is None or inflight_creates.is_only_create(pod_id)):
                 volume = shlex.quote(volume_name)
+                # a failed bootstrap restore's exited helper still mounts the volume
+                await remove_finished_helpers_mounting(ssh_client, volume_name)
                 await retry_ssh_command(
                     ssh_client,
                     f"/usr/bin/docker volume rm {volume} 2>/dev/null || true",
@@ -8397,6 +8402,7 @@ class DockerService:
                 )
                 await self.remove_s3fs_volume_plugin(ssh_client, external_volume_name)
             if local_volume:
+                await remove_finished_helpers_mounting(ssh_client, local_volume)
                 await retry_ssh_command(
                     ssh_client,
                     f"/usr/bin/docker volume rm {shlex.quote(local_volume)} 2>/dev/null || true",
@@ -12858,7 +12864,7 @@ class DockerService:
                 "failure_timeout_seconds": restore.failure_timeout_seconds,
             },
         }
-        await note_started_storage_helper(self.redis_service, executor_info.uuid, operation_id)
+        await note_started_storage_helper(self.redis_service, executor_info.uuid, operation_id, spec)
         try:
             files = await start_storage_operation(
                 ssh_client,
@@ -12867,7 +12873,12 @@ class DockerService:
                 spec,
                 retain_terminal_artifacts=True,
             )
-            await wait_for_storage_operation(ssh_client, files)
+            try:
+                await wait_for_storage_operation(ssh_client, files)
+            except StorageOperationLaunchError as error:
+                # a killed or crashed helper could not report; its record is dropped below, so report it now
+                await report_storage_operation_failed(operation_id, spec, str(error))
+                raise
         finally:
             # the restore ended (or never started) here: its helper is no longer Lium's
             await forget_storage_helper(self.redis_service, executor_info.uuid, operation_id)
@@ -15404,6 +15415,7 @@ class DockerService:
                     with _best_effort_delete_step(
                         log, "remove_volume_local", volume_name=payload.local_volume
                     ):
+                        await remove_finished_helpers_mounting(ssh_client, payload.local_volume)
                         await self._remove_named_volume(
                             docker_client,
                             payload.local_volume,
@@ -15416,6 +15428,7 @@ class DockerService:
                     with _best_effort_delete_step(
                         log, "remove_volume_external", volume_name=payload.external_volume
                     ):
+                        await remove_finished_helpers_mounting(ssh_client, payload.external_volume)
                         await self._remove_named_volume(
                             docker_client,
                             payload.external_volume,
