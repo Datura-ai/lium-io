@@ -1798,6 +1798,22 @@ async def test_a_pod_that_owns_every_host_gpu_leaves_the_holders_to_the_host_uni
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("holders", [[XORG], []], ids=["xorg holds a GPU", "no holder"])
+async def test_a_whole_host_pod_on_a_host_without_systemd_resets_directly(holders):
+    # Arrange: no systemd and nothing to stop, so no host unit: still a whole-host pod, never the part-node read
+    host = FakeHost(device_ids=U, device_holders=holders, systemd=False)
+
+    # Act
+    report, _ = await _reset(host, backend=U)
+
+    # Assert
+    assert report.ok and report.pod_stopped is True
+    assert host.holder_reads == 0
+    assert not any(c.startswith("nsenter -t 1 -m -- systemd-run ") for c in host.commands)
+    assert any(c.startswith("nvidia-smi -r") for c in host.commands)
+
+
+@pytest.mark.asyncio
 async def test_a_refused_reset_reports_the_start_of_the_nvidia_smi_text():
     # Arrange
     host = FakeHost(reset_exit=255, reset_output=NVIDIA_SMI_REFUSAL)
