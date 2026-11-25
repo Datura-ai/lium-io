@@ -615,11 +615,12 @@ _SMALL_STORE = {f"{SNAPSHOTS}/.keep": "", f"small/containerd/{_OVERLAYFS}/.keep"
         {**_SMALL_STORE, **_containerd_process("--root", "/small/containerd")},
     ],
 )
-def test_a_host_without_ctr_is_skipped_not_measured(tmp_path, files):
+def test_a_host_without_ctr_fails_the_idle_pay_disk_check_not_measured(tmp_path, files):
+    # the validator stops idle pay while containerd's root is unknown, so --check must fail here, not skip
     rc, out, _ = run_check(tmp_path, "check_total_disk_for_vram", env=_NO_CTR_DISKS, files=files, without=("ctr",))
-    assert rc == 0, out
-    assert "SKIP" in out and "PASS=1" not in out and "/small/containerd" not in out
-    assert "install containerd's ctr" in out, out
+    assert rc == 1, out
+    assert "FIX" in out and "SKIP=0" in out and "PASS=1" not in out and "/small/containerd" not in out
+    assert "install containerd's ctr" in out and "idle" in out, out
 
 
 # ── free disk for the node's images and VerifyX's storage test ───────────────

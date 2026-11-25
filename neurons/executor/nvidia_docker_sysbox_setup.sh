@@ -573,7 +573,12 @@ check_total_disk_for_vram() {
     command -v nvidia-smi &>/dev/null || { pf_skip "Disk >= ${MIN_DISK_TO_VRAM_RATE}x VRAM — no NVIDIA driver, VRAM unknown."; return 0; }
     vram_mib=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | awk '{s += $1} END {print s + 0}')
     [ "${vram_mib:-0}" -gt 0 ] 2>/dev/null || { pf_skip "Disk >= ${MIN_DISK_TO_VRAM_RATE}x VRAM — nvidia-smi reports no GPU memory."; return 0; }
-    resolve_disk_dir || { pf_skip "Disk >= ${MIN_DISK_TO_VRAM_RATE}x VRAM — $CTRD_UNKNOWN"; return 0; }
+    # the validator stops idle pay while containerd's root is unknown (rental_price disk_unknown), so this fails too
+    resolve_disk_dir || {
+        pf_fix "Disk >= ${MIN_DISK_TO_VRAM_RATE}x VRAM — $CTRD_UNKNOWN" \
+            "Until it is known the validators pay this node nothing while idle; once ctr answers, run this check again."
+        return 1
+    }
     read -r total_kb data_root <<<"$(tighter_df_kb 2)"
     [ "${total_kb:-0}" -gt 0 ] 2>/dev/null || { pf_skip "Disk >= ${MIN_DISK_TO_VRAM_RATE}x VRAM — cannot read the filesystem size of $DISK_DIR."; return 0; }
     vram_gb=$(awk -v m="$vram_mib" 'BEGIN {printf "%.1f", m / 1024}')
