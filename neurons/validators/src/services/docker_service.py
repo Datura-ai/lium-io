@@ -166,7 +166,7 @@ from services.image_flatten import (
     flatten_sized_mark_command,
     wait_for_node_flatten,
 )
-from services.s3fs_plugin_copy import S3FS_PLUGIN_DIFF_ID, s3fs_plugin_command
+from services.s3fs_plugin_copy import S3FS_PLUGIN_COPY_DESCRIPTION, S3FS_PLUGIN_DIFF_ID, s3fs_plugin_command
 from services.loopback_plugin_setup import (
     LOOPBACK_PLUGIN_BUILDS,
     current_loopback_plugin_alias,
@@ -393,15 +393,15 @@ def _published_ports(
     )
 
 
-def _s3fs_plugin_is_current(diff_ids: str) -> bool:
-    """Whether an instance's layers (`docker plugin inspect` .Config.Rootfs.DiffIds, as JSON) are the pinned build's.
-
-    By content, not name: an instance made from the node's copy (`docker plugin create`) carries its own alias as its
-    reference, an installed one the tag it was pulled by."""
+def _s3fs_plugin_is_current(inspected: str) -> bool:
+    """Whether an instance (`docker plugin inspect` of [.Config.Rootfs.DiffIds, .Config.Description], as JSON) is the
+    pinned build: installed by tag it carries the pinned layer; made from the node's copy (`docker plugin create`, which
+    recomputes the layer digest) it carries the description the copy writes. By content, not name."""
     try:
-        return json.loads(diff_ids) == [S3FS_PLUGIN_DIFF_ID]
-    except ValueError:
+        diff_ids, description = json.loads(inspected)
+    except (ValueError, TypeError):
         return False
+    return diff_ids == [S3FS_PLUGIN_DIFF_ID] or description == S3FS_PLUGIN_COPY_DESCRIPTION
 
 
 def _s3fs_plugin_alias(volume_name: str) -> str:
@@ -8268,7 +8268,8 @@ class DockerService:
         would only reconfigure ("already exists") and leave serving the rental. None when nothing of another build is
         left; else why it stays, and the rental fails rather than run on it."""
         installed = await ssh_client.run(
-            f"/usr/bin/docker plugin inspect --format '{{{{json .Config.Rootfs.DiffIds}}}}' {plugin_alias}"
+            f"/usr/bin/docker plugin inspect --format "
+            f"'[{{{{json .Config.Rootfs.DiffIds}}}},{{{{json .Config.Description}}}}]' {plugin_alias}"
         )
         layers = (installed.stdout or "").strip() if installed.exit_status == 0 else ""
         if not layers or _s3fs_plugin_is_current(layers):
@@ -8289,7 +8290,7 @@ class DockerService:
         if removed.exit_status == 0:
             return None
         return (
-            f"the s3fs plugin instance {plugin_alias} of an older build (layers {layers}) could not be removed: "
+            f"the s3fs plugin instance {plugin_alias} of an older build ({layers}) could not be removed: "
             f"{(removed.stderr or '').strip() or f'exit {removed.exit_status}'}"
         )
 

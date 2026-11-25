@@ -24,7 +24,12 @@ from unittest.mock import patch
 
 import pytest
 
-from services.s3fs_plugin_copy import S3FS_PLUGIN_REPOSITORY, S3FS_PLUGIN_TAG, s3fs_plugin_command
+from services.s3fs_plugin_copy import (
+    S3FS_PLUGIN_COPY_DESCRIPTION_PREFIX,
+    S3FS_PLUGIN_REPOSITORY,
+    S3FS_PLUGIN_TAG,
+    s3fs_plugin_command,
+)
 from services.task.checks import s3fs_plugin_copy as check_module
 from services.task.runner import SSHCommandResult
 
@@ -51,8 +56,11 @@ if args[:1] == ["info"]:
 if args[:2] == ["plugin", "inspect"]:
     if args[-1] not in state["plugins"]:
         done(1, err="Error: No such plugin: " + args[-1])
+    plugin = state["plugins"][args[-1]]
     if "{{json .Config.Rootfs.DiffIds}}" in args:
-        done(out=json.dumps(state["plugins"][args[-1]]["diff_ids"]) + "\n")
+        done(out=json.dumps(plugin["diff_ids"]) + "\n")
+    if "[{{json .Config.Rootfs.DiffIds}},{{json .Config.Description}}]" in args:
+        done(out=json.dumps([plugin["diff_ids"], plugin.get("config", {}).get("description", "")]) + "\n")
     done(out="[{}]")
 if args[:2] == ["plugin", "install"]:
     if os.environ.get("FAKE_INSTALL_ERROR"):
@@ -65,7 +73,9 @@ if args[:2] == ["plugin", "rm"]:
 if args[:2] == ["plugin", "create"]:
     name, directory = args[2], args[3]
     rootfs = directory + "/rootfs"
+    # like dockerd, create recomputes the layer digest from the directory, so it never equals the registry's
     state["plugins"][name] = {
+        "diff_ids": ["sha256:" + "c" * 64],
         "marker": open(rootfs + "/.lium-instance").read(),
         "tini": open(rootfs + "/usr/bin/tini").read(),
         "config": json.load(open(directory + "/config.json")),
@@ -177,6 +187,7 @@ def node(tmp_path, registry):
         state = json.loads((tmp_path / "state.json").read_text())
         return result, state
 
+    run.docker, run.env = docker, env
     run.base = host_root / DOCKER_ROOT.lstrip("/") / "lium-s3fs-plugin"
     run.copy = run.base / registry.pinned.split(":")[-1][:12]
     return run
@@ -194,11 +205,33 @@ def test_a_node_without_the_copy_downloads_once_and_every_volume_after_is_made_l
     for alias in ("s3fs-celium-volume-one", "s3fs-celium-volume-two"):
         # each instance has the plugin's files plus its own marker, which keeps dockerd from refusing the second
         assert plugins[alias]["tini"] == "tini" and plugins[alias]["marker"] == alias + "\n"
-        assert plugins[alias]["config"] == json.loads(CONFIG)
+        # create keeps the config's description, which tells the validator the instance is the pinned build
+        description = S3FS_PLUGIN_COPY_DESCRIPTION_PREFIX + registry.pinned
+        assert plugins[alias]["config"] == json.loads(CONFIG) | {"description": description}
     assert (node.copy / "ready").exists() and not (node.copy / "rootfs" / ".lium-instance").exists()
     assert not [path for path in node.base.iterdir() if path.name.startswith("instance-") or path.name.endswith(".tmp")]
     # nothing is installed through dockerd and nothing of dockerd's own plugin store is read
     assert not any(call[:2] == ["plugin", "install"] for call in state["calls"])
+
+
+def test_an_instance_made_from_the_copy_counts_as_the_pinned_build_on_the_rent_path(node, registry, monkeypatch):
+    # review on #2345: the rent path read the instance's layer digest, which create recomputes, and so tore down
+    # every instance the copy made; it reads what `docker plugin inspect` shows of the created instance
+    from services import docker_service
+
+    result, _ = node("s3fs-celium-volume-one")
+    assert result.returncode == 0, result.stderr
+    inspected = subprocess.run(
+        [str(node.docker), "plugin", "inspect", "--format",
+         "[{{json .Config.Rootfs.DiffIds}},{{json .Config.Description}}]", "s3fs-celium-volume-one"],
+        capture_output=True, text=True, env=node.env,
+    ).stdout
+    pinned_description = S3FS_PLUGIN_COPY_DESCRIPTION_PREFIX + registry.pinned
+    monkeypatch.setattr(docker_service, "S3FS_PLUGIN_COPY_DESCRIPTION", pinned_description)
+    assert docker_service._s3fs_plugin_is_current(inspected)
+    other_description = S3FS_PLUGIN_COPY_DESCRIPTION_PREFIX + "sha256:0"
+    monkeypatch.setattr(docker_service, "S3FS_PLUGIN_COPY_DESCRIPTION", other_description)
+    assert not docker_service._s3fs_plugin_is_current(inspected)
 
 
 @pytest.mark.parametrize("registry", [False], indirect=True)

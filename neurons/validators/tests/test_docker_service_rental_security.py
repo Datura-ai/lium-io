@@ -734,9 +734,14 @@ async def test_create_s3fs_volume_reports_why_the_instance_could_not_be_made(doc
     assert "Step 0: exit=1, stdout=, stderr=plugin install failed: connection reset by peer" in str(warning.call_args.args[0])
 
 
-# `docker plugin inspect` .Config.Rootfs.DiffIds of an instance of our build, and of the mochoa build (s3fs 1.86)
-OUR_LAYERS = json.dumps([docker_service_module.S3FS_PLUGIN_DIFF_ID])
-MOCHOA_LAYERS = json.dumps(["sha256:adb3d068dfc915b2495c679c13681166bd0a333d3766a7393fd45294dd75bd48"])
+# `docker plugin inspect` [.Config.Rootfs.DiffIds, .Config.Description] of an instance of our build installed by tag,
+# of one `docker plugin create` made from the node's copy (create recomputes the layer digest from the directory, so it
+# never equals the registry's), and of the mochoa build (s3fs 1.86)
+OUR_LAYERS = json.dumps([[docker_service_module.S3FS_PLUGIN_DIFF_ID], "s3fs volume plugin"])
+OUR_COPY = json.dumps([["sha256:" + "c" * 64], docker_service_module.S3FS_PLUGIN_COPY_DESCRIPTION])
+MOCHOA_LAYERS = json.dumps(
+    [["sha256:adb3d068dfc915b2495c679c13681166bd0a333d3766a7393fd45294dd75bd48"], "S3FS plugin for Docker"]
+)
 
 
 class InstalledPluginSSHClient(RecordingSSHClient):
@@ -752,7 +757,7 @@ class InstalledPluginSSHClient(RecordingSSHClient):
 
     async def run(self, command, *args, **kwargs):
         self.commands.append(command)
-        if "plugin inspect --format '{{json .Config.Rootfs.DiffIds}}'" in command:
+        if "plugin inspect --format '[{{json .Config.Rootfs.DiffIds}},{{json .Config.Description}}]'" in command:
             return SimpleNamespace(stdout=self.reference + "\n", stderr="", exit_status=0)
         if command.startswith("/usr/bin/docker ps -aq --filter volume="):
             return SimpleNamespace(stdout=self.holders, stderr="", exit_status=0)
@@ -772,9 +777,13 @@ class InstalledPluginSSHClient(RecordingSSHClient):
     [
         # the mochoa build (s3fs 1.86: retries go out unsigned)
         (MOCHOA_LAYERS, False),
-        # ours, whether installed by tag or made from the node's copy (`docker plugin create` keeps the layers)
+        # ours, installed by tag (the pinned layer) or made from the node's copy (the copy's description)
         (OUR_LAYERS, True),
-        (json.dumps([docker_service_module.S3FS_PLUGIN_DIFF_ID, "sha256:" + "0" * 64]), False),
+        (OUR_COPY, True),
+        # a copy description of another pinned build
+        (json.dumps([["sha256:" + "c" * 64], "lium s3fs plugin copy of sha256:" + "0" * 64]), False),
+        (json.dumps([[docker_service_module.S3FS_PLUGIN_DIFF_ID, "sha256:" + "0" * 64], ""]), False),
+        (json.dumps([docker_service_module.S3FS_PLUGIN_DIFF_ID]), False),
         ("", False),
         ("not json", False),
     ],

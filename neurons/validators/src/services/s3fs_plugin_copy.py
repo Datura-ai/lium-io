@@ -18,9 +18,13 @@ import shlex
 S3FS_PLUGIN_REPOSITORY = "daturaai/compute-subnet-validator"
 S3FS_PLUGIN_TAG = "daturaai/compute-subnet-validator:s3fs-volume-plugin"
 S3FS_PLUGIN_MANIFEST = "sha256:6c66443497c0e8c4258462b5ef1eae47b6b1da63d41c5ea969260c8dc5617867"
-# the uncompressed digest of its one layer (the config's rootfs.diff_ids), which `docker plugin inspect` also shows:
-# how an instance on the node is checked to be the pinned build
+# the uncompressed digest of its one layer (the config's rootfs.diff_ids), which `docker plugin inspect` shows for an
+# instance installed by tag: how such an instance is checked to be the pinned build
 S3FS_PLUGIN_DIFF_ID = "sha256:85fb3ced1a33e10ce889e49c26f25fc4df4ad3000fd8c55b9f192779ac305750"
+# `docker plugin create` recomputes the layer digest from the directory it is given (the instance marker included), so
+# an instance made from the copy is told by the description the copy writes into its config, which create keeps
+S3FS_PLUGIN_COPY_DESCRIPTION_PREFIX = "lium s3fs plugin copy of "
+S3FS_PLUGIN_COPY_DESCRIPTION = S3FS_PLUGIN_COPY_DESCRIPTION_PREFIX + S3FS_PLUGIN_MANIFEST
 REGISTRY_URL = "https://registry-1.docker.io"
 # a 54 MB download, its unpack and a create; the rent path waits for it on a node without the copy
 S3FS_PLUGIN_COMMAND_TIMEOUT_SECONDS = 300
@@ -41,7 +45,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-docker, host_root, registry, repository, manifest, diff_id, tag, alias = sys.argv[1:]
+docker, host_root, registry, repository, manifest, diff_id, tag, alias, description_prefix = sys.argv[1:]
+description = description_prefix + manifest
 
 def run(*args, timeout=120):
     return subprocess.run([docker, *args], capture_output=True, text=True, check=False, timeout=timeout)
@@ -152,7 +157,13 @@ def create_instance(copy):
         # own: dockerd refuses a second plugin made from byte-identical files ("content ... already exists")
         if subprocess.run(["cp", "-al", copy + "/rootfs", instance + "/rootfs"], capture_output=True).returncode:
             raise RuntimeError("linking the plugin files failed")
-        shutil.copyfile(copy + "/config.json", instance + "/config.json")
+        with open(copy + "/config.json") as source:
+            config = json.load(source)
+        for key in [k for k in config if k.lower() == "description"]:
+            del config[key]
+        config["description"] = description
+        with open(instance + "/config.json", "w") as out:
+            json.dump(config, out)
         with open(instance + "/rootfs/.lium-instance", "w") as marker:
             marker.write(alias + "\n")
         created = run("plugin", "create", alias, instance, timeout=150)
@@ -221,5 +232,6 @@ def s3fs_plugin_command(
             diff_id,
             S3FS_PLUGIN_TAG,
             alias,
+            S3FS_PLUGIN_COPY_DESCRIPTION_PREFIX,
         )
     )
