@@ -867,6 +867,7 @@ class VolumeHostProbe:
     vloopback_volume_names: list[str]   # names only; sizes still need `docker volume inspect`
     loopback_plugin_enabled: bool       # `docker plugin inspect --format {{.Enabled}}` said true (v3: and its probe marker is there)
     loopback_plugin_installed: bool = False  # said true or false (installed, maybe disabled)
+    root_error: str = ""  # why `docker info` gave no root, when docker_root_dir is ""
 
 
 @dataclass
@@ -977,6 +978,43 @@ def _parse_remove_and_list_containers(stdout: str) -> RemoveAndListContainersOut
     )
 
 
+def _docker_root_dir_shell() -> str:
+    """Sets $root to Docker's data root, printing `ROOTERR\t<exit status> <stderr>` when `docker info`
+    gives none. Some hosts' `docker info` prints no DockerRootDir while the volume API answers in the
+    same trip, so the root is then read from a local volume's Mountpoint (<root>/volumes/<name>/_data).
+    shortcut: a host with no local volume stays unknown (its reason names docker info's error); read the
+    root from a throwaway volume if the reasons show such hosts.
+    One `docker info` call with stdout and stderr together, the root on its own tagged line: no temporary
+    file (a host without a writable /tmp lost the root to it) and no second call (a slow failing docker info
+    would cost its time twice)."""
+    return (
+        "info=\"$(/usr/bin/docker info --format 'DOCKERROOT={{.DockerRootDir}}' 2>&1)\"; info_status=$?; "
+        "root=\"$(printf '%s\\n' \"$info\" | sed -n 's/^DOCKERROOT=//p' | head -n 1)\"; "
+        'case "$root" in /*) ;; *) '
+        "info_err=\"$(printf '%s\\n' \"$info\" | grep -v '^DOCKERROOT=' | head -c 300 | tr '\\n' ' ')\"; "
+        "printf 'ROOTERR\\t%s %s\\n' \"$info_status\" \"$info_err\"; "
+        "mount=\"$(/usr/bin/docker volume ls -q --filter driver=local | head -n 1 "
+        "| xargs -r /usr/bin/docker volume inspect --format '{{.Mountpoint}}')\"; "
+        # the name holds no "/", so the last /volumes/ is the one before it
+        'case "$mount" in /*/volumes/*/_data) root="${mount%/volumes/*}" ;; *) root="" ;; esac ;; esac; '
+    )
+
+
+def _parse_root_error(line: str) -> str:
+    # a ROOTERR line's `<exit status> <stderr>`, as the reason names it
+    exit_status, _, stderr = line.partition("\t")[2].strip().partition(" ")
+    return (f"docker info exit {exit_status}" + (f": {stderr.strip()}" if stderr.strip() else ""))[:_PROBE_OUTPUT_LOG_CAP]
+
+
+def _parse_docker_root_dir(stdout: str) -> tuple[str, str]:
+    """The output of _docker_root_dir_shell then the root on its own line: the root ("" when unknown)
+    and why `docker info` gave none ("" when it did)."""
+    lines = [line for line in stdout.split("\n") if line.strip()]
+    errors = [_parse_root_error(line) for line in lines if line.startswith("ROOTERR\t")]
+    roots = [line.strip() for line in lines if not line.startswith("ROOTERR\t")]
+    return (roots[-1] if roots else ""), (errors[-1] if errors else "")
+
+
 def _volume_host_probe_command(*, with_df: bool) -> str:
     """One shell line: DockerRootDir, (optionally) df through the helper container, the volume
     list and the loopback plugin state, each output line tagged so the parser never guesses.
@@ -985,13 +1023,13 @@ def _volume_host_probe_command(*, with_df: bool) -> str:
     df_cmd = df_command('"$root"')
     df_part = (
         # df prints two lines; fold them onto one tagged line (\n → \r) so every record stays one line
-        f"printf 'DF\\t%s\\n' \"$({df_cmd} | tr '\\n' '\\r')\"; "
+        f"case \"$root\" in /*) printf 'DF\\t%s\\n' \"$({df_cmd} | tr '\\n' '\\r')\" ;; esac; "
         if with_df
         else ""
     )
     return (
-        "root=\"$(/usr/bin/docker info --format '{{.DockerRootDir}}')\"; "
-        "printf 'ROOT\\t%s\\n' \"$root\"; "
+        _docker_root_dir_shell()
+        + "printf 'ROOT\\t%s\\n' \"$root\"; "
         f"{df_part}"
         "/usr/bin/docker volume ls --format 'VOL\\t{{.Name}}\\t{{.Driver}}'; "
         "printf 'VOLS\\t%s\\n' \"$?\"; "
@@ -1002,6 +1040,7 @@ def _volume_host_probe_command(*, with_df: bool) -> str:
 
 def _parse_volume_host_probe(stdout: str, *, with_df: bool) -> VolumeHostProbe:
     docker_root_dir: str | None = None
+    root_error = ""
     df_avail_bytes: int | None = None
     volume_names: list[str] = []
     volume_ls_status: str | None = None
@@ -1013,6 +1052,8 @@ def _parse_volume_host_probe(stdout: str, *, with_df: bool) -> VolumeHostProbe:
         tag, _, rest = raw_line.partition("\t")
         if tag == "ROOT":
             docker_root_dir = rest.strip()
+        elif tag == "ROOTERR":
+            root_error = _parse_root_error(raw_line)
         elif tag == "DF":
             # the multi-line df output travels on one line with \r in place of \n
             try:
@@ -1027,9 +1068,10 @@ def _parse_volume_host_probe(stdout: str, *, with_df: bool) -> VolumeHostProbe:
             volume_ls_status = rest.strip()
         elif tag == "PLUGIN":
             plugin_state = rest.strip()
-    if not docker_root_dir:
-        raise Exception(f"volume host probe: no DockerRootDir in {shown!r}")
-    if with_df and df_avail_bytes is None:
+    if docker_root_dir is None:
+        raise Exception(f"volume host probe: no ROOT line in {shown!r}")
+    # an empty root is an answer (docker info gave none, root_error says why): re-asking would cost its time again
+    if with_df and docker_root_dir and df_avail_bytes is None:
         raise Exception(f"volume host probe: no df output in {shown!r}")
     if volume_ls_status != "0":
         # an empty volume list is legitimate, a failed `docker volume ls` is not: without this the
@@ -1043,6 +1085,7 @@ def _parse_volume_host_probe(stdout: str, *, with_df: bool) -> VolumeHostProbe:
         vloopback_volume_names=volume_names,
         loopback_plugin_enabled=plugin_state == "true",
         loopback_plugin_installed=plugin_state in ("true", "false"),
+        root_error=root_error,
     )
 
 
@@ -8520,14 +8563,22 @@ class DockerService:
         self,
         ssh_client: asyncssh.SSHClientConnection,
         timeout: int | None = None,
-    ):
-        """Get Docker storage info using docker info command"""
-        command = "/usr/bin/docker info --format '{{.DockerRootDir}}'"
+    ) -> str:
+        """Docker's data root, "" when the host shows none (see _docker_root_dir_shell)."""
+        return (await self.read_docker_root_dir(ssh_client, timeout))[0]
+
+    @staticmethod
+    async def read_docker_root_dir(
+        ssh_client: asyncssh.SSHClientConnection,
+        timeout: int | None = None,
+    ) -> tuple[str, str]:
+        """Docker's data root ("" when unknown) and why `docker info` showed none ("" when it did)."""
+        command = _docker_root_dir_shell() + "printf '%s\\n' \"$root\""
         if timeout is None:
             result = await ssh_client.run(command)
         else:
             result = await ssh_client.run(command, timeout=timeout)
-        return result.stdout.strip()
+        return _parse_docker_root_dir(result.stdout or "")
 
     @staticmethod
     def _get_local_volume_create_timeout(limit: int | None, requested_timeout: int) -> int:
@@ -8652,13 +8703,22 @@ class DockerService:
         current_alias = current_loopback_plugin_alias()
         if host_probe is not None and host_probe.loopback_plugin_enabled:
             return current_alias
-        root = host_probe.docker_root_dir if host_probe else await self.get_docker_root_dir(ssh_client)
+        root, root_error = (
+            (host_probe.docker_root_dir, host_probe.root_error)
+            if host_probe
+            else await self.read_docker_root_dir(ssh_client)
+        )
         if not root.startswith("/"):
-            # An existing enabled plugin remains usable even when DockerRootDir could not be read.
-            if await self._get_current_loopback_plugin_state(ssh_client, timeout) == "true":
+            # An existing enabled plugin remains usable even when DockerRootDir could not be read
+            # (a probe already said it is not enabled).
+            if host_probe is None and await self._get_current_loopback_plugin_state(ssh_client, timeout) == "true":
                 return current_alias
             return await self._fall_back_to_old_loopback_plugin(
-                ssh_client, timeout, log_extra, "Docker data root unknown", None
+                ssh_client,
+                timeout,
+                log_extra,
+                "Docker data root unknown" + (f" ({root_error})" if root_error else ""),
+                None,
             )
         reason = await self._set_up_loopback_plugin(ssh_client, root, current_alias)
         if reason is None:
@@ -8943,7 +9003,10 @@ class DockerService:
                     ssh_client, host_probe.vloopback_volume_names
                 )
             else:
-                docker_root_dir = await self.get_docker_root_dir(ssh_client)
+                # a probe's root is the same reading (docker info is not asked twice)
+                docker_root_dir = (
+                    host_probe.docker_root_dir if host_probe is not None else await self.get_docker_root_dir(ssh_client)
+                )
                 if df_avail_bytes is None:
                     df_avail_bytes = await self._get_fs_available_bytes(ssh_client, docker_root_dir)
                 existing_volumes_bytes = await self._get_existing_vloopback_bytes(ssh_client)
