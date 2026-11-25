@@ -5,7 +5,6 @@ import re
 from collections.abc import Callable
 from dataclasses import replace
 
-from core.config import settings
 from core.utils import _m, get_extra_info
 from services.default_docker_image_digest_service import executor_build_published
 from services.executor_image_policy import (
