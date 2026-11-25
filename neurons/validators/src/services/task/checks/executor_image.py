@@ -114,14 +114,13 @@ class ExecutorImageCheck:
             passed = True
         else:
             passed = is_rented
-            if not is_rented:
-                impact = "Validation failed - executor unavailable for rent until the image is current"
-            elif report.status is ImageVerdict.UNOFFICIAL:
-                impact = "Rental can continue, but no incentive until the image is official"
-            else:
-                impact = "Rental and incentive continue; update the image before the rental ends"
+            impact = None  # the OUTDATED templates carry their own impact
             if report.status is ImageVerdict.UNOFFICIAL:
                 template = Msg.UNOFFICIAL
+                if is_rented:
+                    impact = "Rental can continue, but no incentive until the image is official"
+                else:
+                    impact = "Validation failed - executor unavailable for rent until the image is current"
             else:
                 template = Msg.RENTED_OUTDATED if is_rented else Msg.OUTDATED
             event = render_message(

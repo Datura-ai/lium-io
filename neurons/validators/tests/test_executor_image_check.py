@@ -14,6 +14,7 @@ from services.executor_image_policy import (
 )
 from services.default_docker_image_digest_service import executor_build_published as real_executor_build_published
 from services.task.checks.executor_image import ExecutorImageCheck
+from services.task.messages import ExecutorImageMessages as Msg
 from services.task.score_calculator import calculate_scores
 
 from tests.helpers import build_context_config, build_state, make_context
@@ -71,7 +72,7 @@ async def test_unrented_outdated_executor_fails_validation():
 
     assert result.passed is False
     assert result.updates["state"].executor_image_report.status is ImageVerdict.OUTDATED
-    assert "unavailable for rent" in result.event.impact
+    assert result.event.impact == Msg.OUTDATED.impact
     assert result.event.severity == "error"
     assert "off the rent list" in result.event.remediation
     assert "a rented node keeps its rental and incentive" in result.event.remediation

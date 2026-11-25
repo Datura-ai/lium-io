@@ -103,8 +103,8 @@ class DefaultIncentive(BaseIncentive):
         report = result.executor_image_report or {}
         status = report.get("status")
         # a report stored before rented_when_read existed (carried from Redis) falls back to the result's own rental state
-        free_node = not report.get("rented_when_read", result.is_rented) and not result.is_split_remainder
-        if status != "UNOFFICIAL" and not (status == "OUTDATED" and free_node):
+        was_free_when_image_read = not report.get("rented_when_read", result.is_rented) and not result.is_split_remainder
+        if status != "UNOFFICIAL" and not (status == "OUTDATED" and was_free_when_image_read):
             return False
         if not any(
             reason.reason == ZeroIncentiveReason.OUTDATED_EXECUTOR_IMAGE.value
