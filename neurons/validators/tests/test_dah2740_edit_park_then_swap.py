@@ -144,7 +144,7 @@ def _docker(commands: list[str], verb: str) -> list[str]:
 
 @pytest.mark.asyncio
 async def test_edit_parks_the_current_container_before_the_sweep_and_removes_it_after_success(svc, monkeypatch):
-    payload = _edit_payload()
+    payload = _edit_payload(superseded_command_id="cmd-failed")
     ssh = _ssh_recording()
     _patch_happy(svc, monkeypatch, ssh)
     name, parked = _pod_name(payload), _kept(payload)
@@ -163,6 +163,8 @@ async def test_edit_parks_the_current_container_before_the_sweep_and_removes_it_
     assert protected == ["pod_someone_else", parked]
     # DAH-6531: the pod's own name is swept only as this registration's stopped leftover
     assert svc.clean_existing_containers.await_args.kwargs["pod_owner"] == f"{payload.miner_hotkey}:{payload.executor_id}"
+    # lio#2394: a stopped leftover goes only when the backend named its create as superseded
+    assert svc.clean_existing_containers.await_args.kwargs["superseded_command_id"] == payload.superseded_command_id
     # only after the replacement is up is the old container removed, by its ID: a later edit may park
     # another container under the same name before a late rm lands; the new one is never removed
     assert _docker(ssh.commands, "rm -fv")[-1] == f"/usr/bin/docker rm -fv id-{name}"

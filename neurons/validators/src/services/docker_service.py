@@ -1877,32 +1877,35 @@ def _registration_label_command(container_id: str) -> str:
 _OWN_STARTED_LEFTOVER_EXIT = 4
 
 
-def _own_stopped_leftover_check(container_id: str, owner: str, pod_id: str, attempt: str) -> str:
-    """Exits 0 only when the container is stopped (created, exited or dead) and carries `owner` or no registration
-    label; exits 4 when it carries this registration (`owner`), this pod (`pod_id`) and this create attempt
+def _own_stopped_leftover_check(container_id: str, owner: str, pod_id: str, attempt: str, superseded: str) -> str:
+    """Exits 4 when the container carries this registration (`owner`), this pod (`pod_id`) and this create attempt
     (`attempt`, never empty): provably this very attempt's own container in any state (a create re-sent after a
-    connector restart resumes its cut-off attempt's id and meets what that attempt started), removed forced. Any
-    other running container, the pod's live one from an earlier create included, is kept. Run before its removal is
-    marked as ours, so a refused check leaves no mark."""
-    template = "{{.State.Status}} " + " ".join(
-        f'{{{{index .Config.Labels "{label}"}}}}'
-        for label in (LIUM_EXECUTOR_ID_LABEL, LIUM_POD_ID_LABEL, LIUM_CREATE_ATTEMPT_LABEL)
+    connector restart resumes its cut-off attempt's id and meets what that attempt started), removed forced. Exits 0
+    only when the container is stopped (created, exited or dead) and carries this registration, this pod and the
+    create command id the backend named as superseded (`superseded`, never empty: its retry after that failed
+    create), removed without force. Every other container is kept: a renter's stopped pod is a live rental, and only
+    the backend knows which placement is live, so without its superseded id (an older backend) nothing stopped goes
+    and the create fails on the name. Run before its removal is marked as ours, so a refused check leaves no mark."""
+    # "|" never occurs in these labels, and an empty one keeps its field
+    template = "|".join(
+        ["{{.State.Status}}"]
+        + [
+            f'{{{{index .Config.Labels "{label}"}}}}'
+            for label in (LIUM_EXECUTOR_ID_LABEL, LIUM_POD_ID_LABEL, LIUM_CREATE_ATTEMPT_LABEL, LIUM_CREATE_COMMAND_LABEL)
+        ]
     )
     cid = shlex.quote(container_id)
     lines = [
         f"s=$(/usr/bin/docker inspect --type container -f {shlex.quote(template)} {cid}) || exit 3",
-        'state=${s%% *}; labels=${s#* }; registration=${labels%% *}',
+        "set -f; IFS='|'; set -- $s; unset IFS",  # $1 state, $2 registration, $3 pod, $4 attempt, $5 command id
     ]
     if attempt:
         # a create with no attempt id (not a backend create) proves no container its own
-        lines.append(f'[ "$labels" = {shlex.quote(f"{owner} {pod_id} {attempt}")} ] && exit {_OWN_STARTED_LEFTOVER_EXIT}')
-    return "\n".join(
-        lines
-        + [
-            'case "$state" in created|exited|dead) ;; *) exit 3;; esac',
-            f'case "$registration" in {shlex.quote(owner)}|"") ;; *) exit 3;; esac',
-        ]
-    )
+        lines.append(f'[ "$2|$3|$4" = {shlex.quote(f"{owner}|{pod_id}|{attempt}")} ] && exit {_OWN_STARTED_LEFTOVER_EXIT}')
+    lines.append('case "$1" in created|exited|dead) ;; *) exit 3;; esac')
+    if superseded:
+        lines.append(f'[ "$2|$3|$5" = {shlex.quote(f"{owner}|{pod_id}|{superseded}")} ] && exit 0')
+    return "\n".join(lines + ["exit 3"])
 
 
 def _own_leftover_rm_command(container_id: str, force: bool = False) -> str:
@@ -6035,18 +6038,21 @@ class DockerService:
         removed_at_ssh_connect: dict[str, str] | None = None,
         refuse_before_removal: Callable[[list[str]], None] | None = None,
         pod_owner: str | None = None,
+        superseded_command_id: str = "",
     ) -> list[str]:
         """Force-remove stale pod_/filler_ containers (and their volumes); returns the names removed.
 
         DAH-6531: with ``pod_owner`` (a pod create's registration) ``pod_name`` is never force-swept, and its volume
         stays: one pod keeps one name on every registration, so on a shared daemon it may be another registration's
         running replacement, labelled or made before the labels. Only the same-name conflict's leftover goes, here,
-        before disk admission counts its layer: the listed ID, stopped, this registration's or unlabelled, removed
-        without force (`_own_stopped_leftover_check`, then `_own_leftover_rm_command`), so a container started meanwhile is
-        refused by Docker; or, labelled with this registration, this pod and this create attempt, removed forced in any
-        state (a create re-sent after a connector restart resumes its cut-off attempt, which may have started it); a
-        running container of an earlier create (a live pod) is kept; only a removal that passed the check is marked as
-        this sweep's.
+        before disk admission counts its layer: the listed ID, stopped and labelled with this registration, this pod and
+        ``superseded_command_id`` (the failed create the backend's retry names), removed without force
+        (`_own_stopped_leftover_check`, then `_own_leftover_rm_command`), so a container started meanwhile is refused by
+        Docker; or, labelled with this registration, this pod and this create attempt, removed forced in any state (a
+        create re-sent after a connector restart resumes its cut-off attempt, which may have started it). Any other
+        container is kept, a renter's stopped pod (a live rental) and anything stopped when the backend names no
+        superseded create included: the create then fails on the name. Only a removal that passed the check is marked
+        as this sweep's.
 
         DAH-5392: an unlisted `pod_*` other than ``pod_name`` is removed (with its volume) only when the
         backend confirms its rental closed: a create that waited may sweep after a newer create on the
@@ -6135,7 +6141,11 @@ class DockerService:
                     check = await _run_with_host_timeout(
                         ssh_client,
                         _own_stopped_leftover_check(
-                            own_id, pod_owner, pod_name.removeprefix(POD_CONTAINER_PREFIX), renter_create_id.get()
+                            own_id,
+                            pod_owner,
+                            pod_name.removeprefix(POD_CONTAINER_PREFIX),
+                            renter_create_id.get(),
+                            superseded_command_id,
                         ),
                         REMOVE_CONFIRM_INSPECT_TIMEOUT_SECONDS,
                     )
@@ -11627,6 +11637,7 @@ class DockerService:
                     removed_at_ssh_connect=fillers_removed_at_ssh_connect.listed_id_by_filler_name,
                     refuse_before_removal=lambda names: _refuse_filler_beside_unlisted_pod(payload, names),
                     pod_owner=_executor_label(payload) if container_name.startswith(POD_CONTAINER_PREFIX) else None,
+                    superseded_command_id=payload.superseded_command_id,
                 )
                 # DAH-3980: removing only fillers (confirmed gone, their volumes left to the backend's
                 # filler delete) changes no listing but the containers and their mounts, so the listings

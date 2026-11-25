@@ -446,6 +446,10 @@ class ContainerCreateRequest(ContainerBaseRequest):
     # protocol 1.18.0: False when the backend rents the pod part of its host, so it gets no host-wide devices
     # (RDMA, nvidia-caps) even when every GPU the host shows is requested. None from an older backend.
     whole_host: bool | None = None
+    # 2.18.0: the backend's retry after a failed create names that create's `command_id`; the validator removes a
+    # stopped container of the pod in the way only when it carries that id (io.lium.create_command_id). Empty from
+    # an older backend and on any other create: every stopped container is kept, the create fails on the name.
+    superseded_command_id: str = ""
 
 
 class ExecutorRentFinishedRequest(ContainerBaseRequest):

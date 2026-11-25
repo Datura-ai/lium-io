@@ -113,7 +113,8 @@
         "ships_sshd": true,
         "gpu_power_limits": null,
         "cache_volumes": null,
-        "whole_host": true
+        "whole_host": true,
+        "superseded_command_id": "5d2e8c41-7a9b-4c3f-b1e6-0f4a3d9c2b87"
       }
     },
     {

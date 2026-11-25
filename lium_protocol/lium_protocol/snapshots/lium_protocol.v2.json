@@ -1006,6 +1006,11 @@
           "default": null,
           "title": "Storage Limit Gb"
         },
+        "superseded_command_id": {
+          "default": "",
+          "title": "Superseded Command Id",
+          "type": "string"
+        },
         "timestamp": {
           "anyOf": [
             {

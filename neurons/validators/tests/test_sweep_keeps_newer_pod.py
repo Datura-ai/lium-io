@@ -230,40 +230,59 @@ ATTEMPT = "attempt-now"
 EARLIER = "attempt-done"
 
 
+# the backend's create command ids (io.lium.create_command_id): a failed create the retry names as superseded, and
+# the create that made the renter's live pod
+FAILED = "cmd-failed"
+LIVE = "cmd-live"
+
+
 @pytest.mark.parametrize(
-    ("status", "label", "pod", "attempt", "current", "removal"),
+    ("status", "label", "pod", "attempt", "command", "current", "superseded", "removal"),
     [
-        # this registration's earlier attempt: its layer is freed before disk admission
-        ("exited", OWNER, "", "", ATTEMPT, "rm -v"),
-        ("created", "", "", "", ATTEMPT, "rm -v"),  # made before the labels
-        ("dead", OWNER, "", "", ATTEMPT, "rm -v"),
-        ("exited", OWNER, POD_ID, ATTEMPT, ATTEMPT, "rm -v -f"),  # this very attempt's own container
+        # lio#2394 (25 Nov, coordinator): the backend's retry after a failed create names that create's command id;
+        # its stopped container (this registration, this pod, that id) is freed before disk admission, not forced
+        ("exited", OWNER, POD_ID, EARLIER, FAILED, ATTEMPT, FAILED, "rm -v"),
+        ("created", OWNER, POD_ID, EARLIER, FAILED, ATTEMPT, FAILED, "rm -v"),
+        ("dead", OWNER, POD_ID, EARLIER, FAILED, ATTEMPT, FAILED, "rm -v"),
+        # a renter-stopped pod is a live rental: its create is not the superseded one, so it is kept
+        ("exited", OWNER, POD_ID, EARLIER, LIVE, ATTEMPT, FAILED, None),
+        # no superseded id (an older backend, or no retry): every stopped container is kept, the create fails on the name
+        ("exited", OWNER, POD_ID, EARLIER, LIVE, ATTEMPT, "", None),
+        ("exited", OWNER, POD_ID, EARLIER, FAILED, ATTEMPT, "", None),
+        ("exited", OWNER, POD_ID, EARLIER, "", ATTEMPT, FAILED, None),  # made before the command label
+        ("created", "", "", "", "", ATTEMPT, FAILED, None),  # made before the labels
+        ("exited", OWNER, "", "", FAILED, ATTEMPT, FAILED, None),  # this registration's label without the pod's
+        ("exited", OWNER, "other", EARLIER, FAILED, ATTEMPT, FAILED, None),  # another pod's
+        ("exited", "miner-b:exec-b", POD_ID, EARLIER, FAILED, ATTEMPT, FAILED, None),  # another registration's
+        # the superseded create's container running (started meanwhile, or never failed): the running rule keeps it
+        ("running", OWNER, POD_ID, EARLIER, FAILED, ATTEMPT, FAILED, None),
+        ("exited", OWNER, POD_ID, ATTEMPT, LIVE, ATTEMPT, "", "rm -v -f"),  # this very attempt's own container
         # lio#2394 (25 Nov): a create re-sent after a connector restart resumes its cut-off attempt (same attempt id)
         # and meets the container that attempt already started: provably its own, so it goes (forced) and is made again
-        ("running", OWNER, POD_ID, ATTEMPT, ATTEMPT, "rm -v -f"),
+        ("running", OWNER, POD_ID, ATTEMPT, LIVE, ATTEMPT, "", "rm -v -f"),
         # lio#2394 r450 H1: the pod's live container from an earlier create that finished (dedupe expired, a new
         # command id, a validator restart, a delayed create after a repointed registration): never removed
-        ("running", OWNER, POD_ID, EARLIER, ATTEMPT, None),
-        ("running", OWNER, POD_ID, "", ATTEMPT, None),  # the pod's live container made before the attempt label
-        ("running", OWNER, POD_ID, "", "", None),  # a create with no attempt id proves nothing about it
-        ("running", OWNER, "", ATTEMPT, ATTEMPT, None),  # this registration's label without the pod's
-        ("running", OWNER, "other", ATTEMPT, ATTEMPT, None),  # another pod's
-        ("running", "", "", "", ATTEMPT, None),  # an unlabelled running replacement on a shared daemon
-        ("running", "miner-b:exec-b", POD_ID, ATTEMPT, ATTEMPT, None),  # another registration's replacement
-        ("exited", "miner-b:exec-b", POD_ID, "", ATTEMPT, None),  # another registration's
-        (None, None, None, None, ATTEMPT, None),  # the inspect failed
+        ("running", OWNER, POD_ID, EARLIER, LIVE, ATTEMPT, "", None),
+        ("running", OWNER, POD_ID, EARLIER, LIVE, ATTEMPT, LIVE, None),  # even when named superseded: it runs
+        ("running", OWNER, POD_ID, "", "", ATTEMPT, "", None),  # the pod's live container made before the attempt label
+        ("running", OWNER, POD_ID, "", "", "", "", None),  # a create with no attempt id proves nothing about it
+        ("running", OWNER, "", ATTEMPT, "", ATTEMPT, "", None),  # this registration's label without the pod's
+        ("running", OWNER, "other", ATTEMPT, "", ATTEMPT, "", None),  # another pod's
+        ("running", "", "", "", "", ATTEMPT, "", None),  # an unlabelled running replacement on a shared daemon
+        ("running", "miner-b:exec-b", POD_ID, ATTEMPT, "", ATTEMPT, "", None),  # another registration's replacement
+        (None, None, None, None, None, ATTEMPT, FAILED, None),  # the inspect failed
     ],
 )
 def test_only_this_registrations_leftover_is_removed_by_its_id_forced_only_when_it_is_this_attempts_own(
-    tmp_path, status, label, pod, attempt, current, removal
+    tmp_path, status, label, pod, attempt, command, current, superseded, removal
 ):
     import subprocess
 
     from services.docker_service import _own_leftover_rm_command, _own_stopped_leftover_check
 
     log = tmp_path / "calls"
-    stub = _docker_stub(tmp_path, log, None if status is None else f"{status} {label} {pod} {attempt}")
-    check = _own_stopped_leftover_check(OWN_ID, OWNER, POD_ID, current).replace("/usr/bin/docker", str(stub))
+    stub = _docker_stub(tmp_path, log, None if status is None else (status, label, pod, attempt, command))
+    check = _own_stopped_leftover_check(OWN_ID, OWNER, POD_ID, current, superseded).replace("/usr/bin/docker", str(stub))
 
     done = subprocess.run(["sh", "-c", check], capture_output=True, text=True)
     # the sweep sends the removal only after a passing check, forced only for this attempt's own labelled container
@@ -275,21 +294,32 @@ def test_only_this_registrations_leftover_is_removed_by_its_id_forced_only_when_
     assert [c for c in calls if c.startswith("rm")] == ([f"{removal} {OWN_ID}"] if removal else [])
 
 
-def _docker_stub(tmp_path, log, inspected: str | None):
-    """A docker CLI that logs each call and answers rm with 0. `inspected` is "<state> <registration> <pod> <attempt>"
-    (None: the inspect fails); inspect renders the -f template from it, so a check reading fewer labels sees fewer."""
+def _docker_stub(tmp_path, log, inspected: tuple | None):
+    """A docker CLI that logs each call and answers rm with 0. `inspected` is (state, registration, pod, attempt,
+    create command id) (None: the inspect fails); inspect renders the -f template from it, so a check reading fewer
+    labels sees fewer."""
     import json
     import shlex
     import sys
 
-    from services.const import LIUM_CREATE_ATTEMPT_LABEL, LIUM_EXECUTOR_ID_LABEL, LIUM_POD_ID_LABEL
+    from services.const import (
+        LIUM_CREATE_ATTEMPT_LABEL,
+        LIUM_CREATE_COMMAND_LABEL,
+        LIUM_EXECUTOR_ID_LABEL,
+        LIUM_POD_ID_LABEL,
+    )
 
     container = None
     if inspected is not None:
-        state, registration, pod, attempt = (inspected.split(" ") + ["", "", ""])[:4]
+        state, registration, pod, attempt, command = inspected
         container = {
             "state": state,
-            "labels": {LIUM_EXECUTOR_ID_LABEL: registration, LIUM_POD_ID_LABEL: pod, LIUM_CREATE_ATTEMPT_LABEL: attempt},
+            "labels": {
+                LIUM_EXECUTOR_ID_LABEL: registration,
+                LIUM_POD_ID_LABEL: pod,
+                LIUM_CREATE_ATTEMPT_LABEL: attempt,
+                LIUM_CREATE_COMMAND_LABEL: command,
+            },
         }
     render = tmp_path / "render.py"
     render.write_text(
@@ -327,42 +357,65 @@ def _host_shell_ssh(stub):
 
 
 @pytest.mark.parametrize(
-    ("container_attempt", "removed"),
+    ("state", "container_attempt", "command", "superseded", "removal"),
     [
         # the create re-sent after a connector restart resumes its cut-off attempt: the container that attempt
         # started is this attempt's own, so it goes (forced) and the create makes it again
-        (ATTEMPT, True),
+        ("running", ATTEMPT, LIVE, "", "rm -v -f"),
         # lio#2394 r450 H1: create C1 finished and the renter uses the pod; a later create of the pod on this
         # registration (dedupe answer expired after 900 s, dedupe failed open, a new command id, a validator restart
         # that emptied the in-process registry, a delayed create after a repointed registration) is the only create
         # running now, but the live container is C1's: it stays and the create fails on the name instead
-        (EARLIER, False),
-        ("", False),  # made before the attempt label
+        ("running", EARLIER, LIVE, "", None),
+        ("running", "", "", "", None),  # made before the attempt label
+        # lio#2394 (25 Nov, coordinator): a renter-stopped pod is a live rental, kept whatever the create names
+        ("exited", EARLIER, LIVE, FAILED, None),
+        ("exited", EARLIER, LIVE, "", None),
+        # the backend's retry after a failed create names it: that create's stopped container goes, not forced
+        ("exited", EARLIER, FAILED, FAILED, "rm -v"),
+        # an older backend names nothing: the failed create's stopped container is kept, the create fails on the name
+        ("exited", EARLIER, FAILED, "", None),
+        ("exited", "", "", FAILED, None),  # made before the labels
     ],
-    ids=["this-attempts-own", "finished-earlier-create-live-pod", "unlabelled-live-pod"],
+    ids=[
+        "this-attempts-own",
+        "finished-earlier-create-live-pod",
+        "unlabelled-live-pod",
+        "renter-stopped-live-pod-kept",
+        "renter-stopped-live-pod-kept-no-superseded",
+        "superseded-failed-attempt-removed",
+        "failed-attempt-kept-without-superseded-id",
+        "unlabelled-stopped-kept",
+    ],
 )
 @pytest.mark.asyncio
 async def test_the_only_create_of_the_pod_force_removes_only_its_own_attempts_running_container(
-    tmp_path, retry_ssh_mock, container_attempt, removed
+    tmp_path, retry_ssh_mock, state, container_attempt, command, superseded, removal
 ):
     from services.redis_service import renter_create_id
 
     own_sweep_removals.clear()
     log = tmp_path / "calls"
-    stub = _docker_stub(tmp_path, log, f"running {OWNER} {POD_ID} {container_attempt}")
+    stub = _docker_stub(tmp_path, log, (state, OWNER, POD_ID, container_attempt, command))
     ssh_client = _host_shell_ssh(stub)
     ssh_client.run.side_effect = _with_listing(ssh_client.run.side_effect, f"pod_target {OWN_ID}\n")
     token = renter_create_id.set(ATTEMPT)
     try:
         with ds_module.inflight_creates.track("target", ("miner-a", "exec-a")):
             result = await _sweep_service().clean_existing_containers(
-                ssh_client=ssh_client, default_extra={}, pod_name="pod_target", active_container_names=[], pod_owner=OWNER
+                ssh_client=ssh_client,
+                default_extra={},
+                pod_name="pod_target",
+                active_container_names=[],
+                pod_owner=OWNER,
+                superseded_command_id=superseded,
             )
     finally:
         renter_create_id.reset(token)
 
     rms = [c for c in log.read_text().splitlines() if c.startswith("rm")]
-    assert rms == ([f"rm -v -f {OWN_ID}"] if removed else [])
+    removed = removal is not None
+    assert rms == ([f"{removal} {OWN_ID}"] if removed else [])
     assert (result == ["pod_target"]) is removed and bool(own_sweep_removals.sent_rm_for(OWN_ID)) is removed
     assert retry_ssh_mock.await_args_list == []  # no sweep by name, no volume rm
     own_sweep_removals.clear()
