@@ -2500,7 +2500,8 @@ def test_docker_read_timeout_detection_matches_the_wrapped_sdk_error_and_the_pro
 
 @pytest.mark.asyncio
 async def test_inspector_lifecycle_command_quotes_executor_paths(docker_service):
-    executor_info = ExecutorSSHInfo(
+    # the model refuses such a path from a node; the command quotes it all the same
+    executor_info = ExecutorSSHInfo.model_construct(
         uuid="exec-1",
         address="127.0.0.1",
         port=8080,
