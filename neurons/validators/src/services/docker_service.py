@@ -249,12 +249,15 @@ from services.rental_docker_sdk import (
 )
 from services.ssh_connect_timing import connect_with_phase_timing
 from services.storage_operations import (
+    StorageOperationLaunchError,
     forget_storage_helper,
     note_started_storage_helper,
+    run_job_with_secrets,
+    remove_finished_helpers_mounting,
+    report_storage_operation_failed,
     start_storage_operation,
     supports_bootstrap_restore,
     supports_storage_operation,
-    upload_secrets_file,
     wait_for_storage_operation,
 )
 from services.task.runner import SSHCommandRunner
@@ -7292,6 +7295,8 @@ class DockerService:
             # the pod's volume is shared by name too: another live create of the pod may have restored into it (F-78)
             if remove_volume and volume_name and (pod_id is None or inflight_creates.is_only_create(pod_id)):
                 volume = shlex.quote(volume_name)
+                # a failed bootstrap restore's exited helper still mounts the volume
+                await remove_finished_helpers_mounting(ssh_client, volume_name)
                 await retry_ssh_command(
                     ssh_client,
                     f"/usr/bin/docker volume rm {volume} 2>/dev/null || true",
@@ -8395,6 +8400,7 @@ class DockerService:
                 )
                 await self.remove_s3fs_volume_plugin(ssh_client, external_volume_name)
             if local_volume:
+                await remove_finished_helpers_mounting(ssh_client, local_volume)
                 await retry_ssh_command(
                     ssh_client,
                     f"/usr/bin/docker volume rm {shlex.quote(local_volume)} 2>/dev/null || true",
@@ -10653,6 +10659,7 @@ class DockerService:
                 payload.pod_id,
                 command_id=payload.command_id,
                 synthetic_probe=synthetic_probe,
+                is_filler_create=payload.workload_kind == WorkloadKind.FILLER,
             )
 
             current_step = "ssh_key_import"
@@ -11575,7 +11582,7 @@ class DockerService:
                     # would put the backup's plaintext on a disk the renter asked to encrypt, and
                     # the old encrypted mode would hand the executor the passphrase.
                     current_step = "bootstrap_restore_probe"
-                    if not await supports_bootstrap_restore(ssh_client, executor_info.python_path):
+                    if not await supports_bootstrap_restore(ssh_client, executor_payload.EXECUTOR_PYTHON):
                         raise RuntimeError(
                             "executor image cannot restore into an encrypted volume at create time "
                             "(no workspace.bootstrap); the provider must update the executor image"
@@ -12855,16 +12862,21 @@ class DockerService:
                 "failure_timeout_seconds": restore.failure_timeout_seconds,
             },
         }
-        await note_started_storage_helper(self.redis_service, executor_info.uuid, operation_id)
+        await note_started_storage_helper(self.redis_service, executor_info.uuid, operation_id, spec)
         try:
             files = await start_storage_operation(
                 ssh_client,
-                executor_info.python_path,
+                executor_payload.EXECUTOR_PYTHON,
                 operation_id,
                 spec,
                 retain_terminal_artifacts=True,
             )
-            await wait_for_storage_operation(ssh_client, files)
+            try:
+                await wait_for_storage_operation(ssh_client, files)
+            except StorageOperationLaunchError as error:
+                # a killed or crashed helper could not report; its record is dropped below, so report it now
+                await report_storage_operation_failed(operation_id, spec, str(error))
+                raise
         finally:
             # the restore ended (or never started) here: its helper is no longer Lium's
             await forget_storage_helper(self.redis_service, executor_info.uuid, operation_id)
@@ -12878,33 +12890,32 @@ class DockerService:
         local_volume: str,
         local_volume_path: str,
     ) -> None:
-        local_jobs = Path(__file__).resolve().parent.parent / "miner_jobs"
-        remote_script = "/root/app/restore_storage.py"
-        remote_helper = "/root/app/workspace_mount.py"
-        async with ssh_client.start_sftp_client() as sftp:
-            await sftp.put(str(local_jobs / "restore_storage.py"), remote_script)
-            await sftp.put(str(local_jobs / "workspace_mount.py"), remote_helper)
-        command = [
-            executor_info.python_path,
-            remote_script,
-            "--api-url",
-            settings.COMPUTE_REST_API_URL_EXTERNAL,
-            "--target-volume",
-            local_volume,
-            "--restore-path",
-            restore.restore_path or local_volume_path,
-            "--backup-source-path",
-            restore.legacy_object_key or "",
-            "--secrets-file",
-            await upload_secrets_file(ssh_client, restore.auth_token, restore.backup_volume_info),
-            "--restore-log-id",
-            restore.restore_log_id,
-            "--backup-volume-name",
-            restore.backup_volume_info.name,
-            "--target-volume-path",
-            local_volume_path,
-        ]
-        await ssh_client.run(shlex.join(command), check=True)
+        # the validator's restore job, staged first; its credentials file only then (run_job_with_secrets)
+        await run_job_with_secrets(
+            ssh_client,
+            "restore",
+            executor_payload.RESTORE_JOB,
+            restore.auth_token,
+            restore.backup_volume_info,
+            lambda secrets_file: [
+                "--api-url",
+                settings.COMPUTE_REST_API_URL_EXTERNAL,
+                "--target-volume",
+                local_volume,
+                "--restore-path",
+                restore.restore_path or local_volume_path,
+                "--backup-source-path",
+                restore.legacy_object_key or "",
+                "--secrets-file",
+                secrets_file,
+                "--restore-log-id",
+                restore.restore_log_id,
+                "--backup-volume-name",
+                restore.backup_volume_info.name,
+                "--target-volume-path",
+                local_volume_path,
+            ],
+        )
 
     async def _report_pull_progress(self, docker_client, image: str, log_tag: str, every: float = 15) -> None:
         """DAH-6025: a big pull showed one 'Pulling' line for minutes, and renters cancelled pods that were
@@ -15400,6 +15411,7 @@ class DockerService:
                     with _best_effort_delete_step(
                         log, "remove_volume_local", volume_name=payload.local_volume
                     ):
+                        await remove_finished_helpers_mounting(ssh_client, payload.local_volume)
                         await self._remove_named_volume(
                             docker_client,
                             payload.local_volume,
@@ -15412,6 +15424,7 @@ class DockerService:
                     with _best_effort_delete_step(
                         log, "remove_volume_external", volume_name=payload.external_volume
                     ):
+                        await remove_finished_helpers_mounting(ssh_client, payload.external_volume)
                         await self._remove_named_volume(
                             docker_client,
                             payload.external_volume,

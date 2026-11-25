@@ -36,7 +36,7 @@ from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from services.executor_image_policy import ExpectedImageSnapshot
 from services.miner_service import EXPRESS_LANE, MinerService
 from services.redis_service import EXPRESS_REDIS_SLOT
-from services.task.messages import CYCLE_END_READ_REASONS, RentalVerificationMessages
+from services.task.messages import CYCLE_END_READ_REASONS, RENTED_AFTER_START_REASONS
 from services.task_service import JobResult
 
 from core.config import settings
@@ -693,9 +693,9 @@ class ExpressLane:
             return
         if result.failure_reason_code in CYCLE_END_READ_REASONS:
             # DAH-5933: a result the scored cycle holds for its cycle-end rented read (a budget stop, a rental the
-            # backend found during the check) has no verdict: no failed first pass goes out; asked again within
-            # MAX_ATTEMPTS, then the cycle carries or withholds it
-            rented = result.failure_reason_code == RentalVerificationMessages.RENTED_SINCE_THE_SNAPSHOT.reason
+            # backend found during the check, a renter's create since cycle start) has no verdict: no failed first
+            # pass goes out; asked again within MAX_ATTEMPTS, then the cycle carries or withholds it
+            rented = result.failure_reason_code in RENTED_AFTER_START_REASONS
             self._defer(pending, RENTED_DURING_THE_CHECK if rented else NO_TASK_TIME_FOR_THE_RENTAL_PROBE)
             return
         passed = result.score > 0 or result.job_score > 0

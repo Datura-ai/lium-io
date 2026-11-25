@@ -27,13 +27,31 @@ import socket
 import aiohttp
 from aiohttp.abc import AbstractResolver, ResolveResult
 from aiohttp.resolver import DefaultResolver
-from datura.public_address import is_public_address
+from datura.public_address import is_public_address as _is_public_address
 
 from core.config import settings
 
 
+ALLOWED_PRIVATE_NETWORKS = tuple(
+    ipaddress.ip_network(n.strip()) for n in settings.NODE_ADDRESS_ALLOWED_NETWORKS.split(",") if n.strip()
+)
+
+
 class NonPublicNodeAddress(aiohttp.ClientConnectionError):
     """The node's address name resolves to an address that is not public; nothing was dialled."""
+
+
+def is_public_address(address: str) -> bool:
+    """datura's public-address rule, plus the private network a dev stack names (DAH-7120; unset in production)."""
+    try:
+        ip = ipaddress.ip_address(address.strip("[]").split("%", 1)[0])
+    except ValueError:
+        return False
+    if any(ip in network for network in ALLOWED_PRIVATE_NETWORKS) and ip.is_private and not (
+        ip.is_loopback or ip.is_link_local or ip.is_unspecified
+    ):
+        return True
+    return _is_public_address(address)
 
 
 def _is_ip_literal(host: str) -> bool:

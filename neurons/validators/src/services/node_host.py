@@ -17,6 +17,7 @@ import contextvars
 import functools
 import ipaddress
 import logging
+import os
 import socket
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -24,7 +25,7 @@ from concurrent.futures import ThreadPoolExecutor
 import aiohttp
 import asyncssh
 from aiohttp.abc import AbstractResolver, ResolveResult
-from datura.public_address import is_public_ip
+from datura.public_address import is_public_ip as _is_public_ip
 
 from core.utils import _m, get_extra_info
 
@@ -205,6 +206,20 @@ class _QuotaSlotExecutor:
         self.submitted = True
         future.add_done_callback(lambda _: _give_dns_slot(self.key))
         return future
+
+
+ALLOWED_PRIVATE_NETWORKS = tuple(  # comma-separated CIDRs
+    ipaddress.ip_network(n.strip()) for n in os.environ.get("NODE_ADDRESS_ALLOWED_NETWORKS", "").split(",") if n.strip()
+)
+
+
+def is_public_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    """datura's public-address rule, plus the private network a dev stack names (DAH-7120; unset in production)."""
+    if any(ip in network for network in ALLOWED_PRIVATE_NETWORKS) and ip.is_private and not (
+        ip.is_loopback or ip.is_link_local or ip.is_unspecified
+    ):
+        return True
+    return _is_public_ip(ip)
 
 
 def _check_literal(host: str, port: int) -> None:
