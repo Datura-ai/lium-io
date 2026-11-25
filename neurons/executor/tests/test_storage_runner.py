@@ -936,8 +936,9 @@ def test_no_rendered_helper_spec_carries_a_volume_passphrase(
     payload = _operation_payload(action="restore", mode=mode)
     runner = ResticStorageRunner(StorageOperationSpec.from_mapping(payload), workspace)
     command, env = _launched_helper(monkeypatch, runner, json.dumps(payload))
-    rendered = [*command, *env.values()]
     forwarded_env = {command[index + 1] for index, argument in enumerate(command) if argument == "-e"}
+    # the docker CLI copies only the `-e NAME` values of its environment into the container
+    rendered = [*command, *(env.get(name, "") for name in forwarded_env)]
 
     # only `-e NAME` entries cross from the executor's environment into the container
     assert "LIUM_VOLUME_PASSPHRASE" not in forwarded_env, forwarded_env
@@ -998,9 +999,52 @@ def test_a_helper_whose_start_fails_is_removed(monkeypatch: pytest.MonkeyPatch) 
 
     monkeypatch.setattr("storage.restic.subprocess.run", fake_run)
     with pytest.raises(ResticOperationError):
-        runner.launch_wrapper_helper("/usr/bin/python3", "/root/app/src/storage_runner.py", json.dumps(payload))
+        runner.launch_wrapper_helper("/usr/bin/python3", RUNNER, json.dumps(payload))
 
     assert calls[-1][1:] == ["rm", "--force", runner._helper_container_name()]
+
+
+RUNNER = str(Path(storage_runner.__file__).resolve())
+
+
+def test_the_helper_runs_the_runner_code_it_was_given_not_a_path_on_the_executor(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # the validator stages its runner in a private directory on the executor; the helper is a fresh container of the
+    # image and cannot see that directory, so it must start from the code it carries, here a copy in a directory the
+    # helper does not have
+    staged = tmp_path / "staged"
+    shutil.copytree(Path(RUNNER).parent / "storage", staged / "storage", ignore=shutil.ignore_patterns("__pycache__"))
+    shutil.copy(RUNNER, staged / "storage_runner.py")
+    runner = ResticStorageRunner(
+        StorageOperationSpec.from_mapping(_operation_payload()),
+        DockerVolumeWorkspace(IMAGE, "customer-volume", PurePosixPath("/workspace"), True),
+    )
+    real_run = subprocess.run
+    launched: list[tuple[list[str], dict[str, str]]] = []
+
+    def fake_run(command: list[str], *args: object, **kwargs: object) -> SimpleNamespace:
+        if command[1] == "run":
+            launched.append((command, kwargs.get("env") or {}))  # type: ignore[arg-type]
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("storage.restic.subprocess.run", fake_run)
+    runner.launch_wrapper_helper(sys.executable, str(staged / "storage_runner.py"), "{}")
+    monkeypatch.undo()
+    command, env = launched[0]
+    assert not any(str(staged) in part for part in command)
+    assert len(env[restic.HELPER_CODE_ENV]) < 100_000  # one environment string may not exceed 128 KiB (MAX_ARG_STRLEN)
+    shutil.rmtree(staged)  # gone, as on the helper's filesystem
+
+    start = command[command.index("--entrypoint") + 1 :]
+    entry = start[start.index("-c") + 1].replace("/tmp/lium-storage-code", str(tmp_path / "code"))
+    helper_env = {"PATH": os.environ.get("PATH", ""), restic.HELPER_CODE_ENV: env[restic.HELPER_CODE_ENV]}
+    shown = real_run(
+        [sys.executable, "-I", "-c", entry, "--help"], env=helper_env, cwd=tmp_path, capture_output=True, text=True
+    )
+    assert shown.returncode == 0, shown.stderr
+    assert "--in-helper" in shown.stdout
+    assert restic.HELPER_CODE_ENV in command and restic.HELPER_CODE_ENV + "=" not in " ".join(command)
 
 
 def _launched_helper(
@@ -1015,7 +1059,7 @@ def _launched_helper(
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr("storage.restic.subprocess.run", fake_run)
-    runner.launch_wrapper_helper("/usr/bin/python3", "/root/app/src/storage_runner.py", spec_json)
+    runner.launch_wrapper_helper("/usr/bin/python3", RUNNER, spec_json)
     return launched[0]
 
 
@@ -2141,8 +2185,10 @@ def test_executor_only_launches_the_helper_detached_with_the_runner_as_its_entry
     assert "--detach" in command and "--rm" not in command
     assert f"{restic.HELPER_SPEC_DIR}:rw,nosuid,nodev,noexec,size=1m,mode=0700" in command
     entrypoint = command.index("--entrypoint")
-    assert command[entrypoint + 1 : entrypoint + 4] == [sys.executable, IMAGE, str(Path(storage_runner.__file__).resolve())]
-    assert command[entrypoint + 4] == "--in-helper"
+    # the helper starts from the runner code it carries (_RUN_HELPER_CODE), not from a path on the executor
+    assert command[entrypoint + 1 : entrypoint + 6] == [sys.executable, IMAGE, "-I", "-c", restic._RUN_HELPER_CODE]
+    assert command[entrypoint + 6] == "--in-helper"
+    assert env[restic.HELPER_CODE_ENV] == restic.helper_code(str(Path(storage_runner.__file__).resolve()))
     assert ("--namespace-pid" in command and "--privileged" in command and "host" in command) is encrypted
     assert ("customer-volume:/workspace:ro" in command) is not encrypted
     # review, Pixel: the helper's config (what docker inspect shows after it ends) holds no secret at all
@@ -2517,5 +2563,5 @@ def test_a_failed_spec_hand_off_removes_the_started_helper(monkeypatch: pytest.M
 
     monkeypatch.setattr("storage.restic.subprocess.run", fake_run)
     with pytest.raises(ResticOperationError, match="did not start"):
-        runner.launch_wrapper_helper("/usr/bin/python3", "/root/app/src/storage_runner.py", "{}")
+        runner.launch_wrapper_helper("/usr/bin/python3", RUNNER, "{}")
     assert calls[-1][1:3] == ["rm", "--force"]

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import base64
+import gzip
+import io
 import json
 import os
 import queue
@@ -7,12 +10,13 @@ import re
 import signal
 import subprocess
 import sys
+import tarfile
 import threading
 import time
 from datetime import datetime, timedelta, timezone
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import IO
 
 from storage.models import (
@@ -72,6 +76,29 @@ _WRITE_HELPER_SPEC = (
     "os.close(fd)\n"
     "os.rename(path + '.part', path)\n"
 )
+# The helper is a fresh container of the image, so a path on the executor's filesystem (the validator's staged runner)
+# does not exist in it: the runner code itself goes in, by name in its environment, and is unpacked into its own /tmp
+HELPER_CODE_ENV = "LIUM_STORAGE_CODE"
+_RUN_HELPER_CODE = (
+    "import base64, io, os, sys, tarfile\n"
+    "code = '/tmp/lium-storage-code'\n"
+    f"data = base64.b64decode(os.environ.pop({HELPER_CODE_ENV!r}))\n"
+    "with tarfile.open(fileobj=io.BytesIO(data), mode='r:gz') as archive:\n"
+    "    archive.extractall(code, **({'filter': 'data'} if hasattr(tarfile, 'data_filter') else {}))\n"
+    "os.execv(sys.executable, [sys.executable, '-E', '-s', code + '/storage_runner.py', *sys.argv[1:]])\n"
+)
+
+
+def helper_code(runner: str) -> str:
+    """storage_runner.py and the storage package beside it, as the helper unpacks them (_RUN_HELPER_CODE)."""
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w") as archive:
+        archive.add(runner, arcname="storage_runner.py")
+        for module in sorted((Path(runner).parent / "storage").glob("*.py")):
+            archive.add(module, arcname=f"storage/{module.name}")
+    return base64.b64encode(gzip.compress(buffer.getvalue(), mtime=0)).decode()
+
+
 CGROUP_MEMORY_EVENTS = "/sys/fs/cgroup/memory.events"
 STALE_HELPER_AGE = timedelta(minutes=10)
 # Without `|| exit`, a failed cd leaves sh in the helper's own directory and restic backs that up instead.
@@ -869,14 +896,20 @@ class ResticStorageRunner:
             f"{WRAPPER_LABEL}=1",
             "-e",
             "PYTHONDONTWRITEBYTECODE=1",
+            "-e",
+            HELPER_CODE_ENV,
             "--entrypoint",
             python,
             workspace.image,
-            runner,
+            "-I",
+            "-c",
+            _RUN_HELPER_CODE,
             "--in-helper",
             *arguments,
         ]
-        started = subprocess.run(command, capture_output=True, text=True)
+        started = subprocess.run(
+            command, capture_output=True, text=True, env={**os.environ, HELPER_CODE_ENV: helper_code(runner)}
+        )
         if started.returncode == 0:
             started = subprocess.run(
                 [self._docker_binary, "exec", "-i", self._helper_container_name(), python, "-I", "-c",
