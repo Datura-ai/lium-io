@@ -35,6 +35,8 @@ PENDING_PODS_PREFIX = "pending_pods_prefix"
 # VerifyX cold retry sees a create whose pending-pod marker came and went between two of its reads
 CREATE_STARTED_AT_PREFIX = "create_started_at"
 CREATE_STARTED_AT_TTL_SECONDS = 900
+# set on the pending-pod entry of a renter's create (not a filler's, a probe's or a GPU operation's)
+PENDING_RENTER_CREATE = "renter"
 GPU_RESET_PENDING_KIND = "gpu_reset"
 # DAH-4663: a renter's own GPU clock lock in progress (a second lock, reset or create is declined meanwhile)
 GPU_CLOCKS_PENDING_KIND = "gpu_clocks"
@@ -216,6 +218,8 @@ RECHECK_POP_ATTEMPTS = 5
 # an in-memory stamp restarted with every rollout and logged discovery waits of up to 25 min (5 Nov).
 EXPRESS_LANE_FIRST_SEEN_PREFIX = "express_lane:first_seen"
 EXPRESS_LANE_FIRST_SEEN_TTL_SECONDS = 2 * 3600
+# every node's in-container reading of each endpoint, scored by time: the fleet control for that endpoint
+ENDPOINT_SPEED_FLEET_PREFIX = "endpoint_speed_fleet"
 
 # Distributed lock settings
 EXECUTOR_LOCK_TIMEOUT = 30  # TTL for lock auto-release (seconds)
@@ -258,6 +262,9 @@ def _executor_create_lock_key(executor_id: str) -> str:
 
 # the connector's id of the create execution being run (InflightBackendCreate.create_id), set around the create
 renter_create_id: ContextVar[str] = ContextVar("renter_create_id", default="")
+# DAH-6992: the create being run is the backend's re-send of one a connector restart cut off (it never replied), so a
+# container under the pod's name is that cut-off attempt's, started or not, and nobody was handed it
+resumed_create: ContextVar[bool] = ContextVar("resumed_create", default=False)
 
 
 def _renter_create_lock_token(pod_id: str, create_id: str = "") -> str:
@@ -740,6 +747,19 @@ class RedisService:
             if value is not None
         }
 
+    async def record_endpoint_speed(self, endpoint: str, member: str, now: float, window_seconds: float) -> None:
+        """One node's reading of an endpoint into that endpoint's fleet window; older readings drop out."""
+        key = f"{ENDPOINT_SPEED_FLEET_PREFIX}:{endpoint}"
+        async with self.redis.pipeline(transaction=False) as pipe:
+            pipe.zadd(key, {member: now})
+            pipe.zremrangebyscore(key, "-inf", now - window_seconds)
+            pipe.expire(key, int(window_seconds * 2))
+            await pipe.execute()
+
+    async def endpoint_speeds_since(self, endpoint: str, since: float) -> list[str]:
+        members = await self.redis.zrangebyscore(f"{ENDPOINT_SPEED_FLEET_PREFIX}:{endpoint}", since, "+inf")
+        return [m.decode() if isinstance(m, bytes) else m for m in members]
+
     async def is_forced_validation_cycle_requested(self) -> bool:
         return await self.get(FORCED_VALIDATION_CYCLE_KEY) is not None
 
@@ -1177,10 +1197,16 @@ class RedisService:
         gpu_uuids: list[str] | None = None,
         command_id: str = "",
         synthetic_probe: bool = False,
+        is_filler_create: bool = False,
     ):
         now = int(time.time())
+        # a renter's pod being created: the validation cycle on the node stops its GPU and network tests for it
+        # (RentedMidCycleCheck); the validator's own probe, a filler and a GPU reset or clock operation are not one
+        is_renter_create = kind is None and not synthetic_probe and not is_filler_create
 
         item: dict = {"time": now, "pod_id": pod_id}
+        if is_renter_create:
+            item[PENDING_RENTER_CREATE] = True
         if kind:
             # DAH-4658: "gpu_reset" marks a renter's own GPU reset, which the rented GPU checks skip
             item["kind"] = kind
@@ -1192,9 +1218,9 @@ class RedisService:
         def stamp() -> RedisWrites:
             # read at each try: a retry after a newer create's EXEC must not write an older time over its stamp
             writes = RedisWrites()
-            if kind is None and not synthetic_probe:
-                # only a rental create stamps: the validator's own rental probe and a GPU reset or clock operation
-                # keep their marker but leave no stamp, since neither is a rental being created
+            if is_renter_create:
+                # only a renter's create stamps: the validator's own rental probe, a filler and a GPU reset or clock
+                # operation keep their marker but leave no stamp, since none is a rental being created
                 writes.set(
                     create_started_at_key(miner_hotkey, executor_id), str(time.time()), ex=CREATE_STARTED_AT_TTL_SECONDS
                 )
@@ -1540,6 +1566,7 @@ class RedisService:
         evidence: dict | None = None,
         reanchor_uuids: str = '',
         respec: str = '',
+        unrented_only: bool = False,
     ):
         # a changed model:count is reset once, then verified from scratch as it is now
         spec = respec or prev_info.get('spec', '')
@@ -1568,6 +1595,8 @@ class RedisService:
                 "reason_code": reason_code,
                 "check_id": check_id,
                 "evidence": evidence or None,
+                # DAH-6784: idle-only reset; an older backend ignores the key
+                "unrented_only": unrented_only is True,
             },
         )
 

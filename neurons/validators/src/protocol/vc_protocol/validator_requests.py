@@ -237,6 +237,8 @@ class ExecutorSpecRequest(BaseValidatorRequest):
     # lium_protocol 2.17.0: the rented pods this cycle's pod checks judged, each with its host-side fault codes
     # ([] = clean).
     rented_pod_faults: dict[str, list[str]] | None = None
+    # DAH-6784: the check_ids of the idle-only checks this cycle ran in full and passed; None from an older publisher.
+    idle_checks_passed: list[str] | None = None
     # When an express recheck outside the cycle started (lium_protocol 2.11.0); None for a cycle's own report.
     check_started_at: datetime | None = None
 
@@ -326,6 +328,9 @@ class ResetVerifiedJobRequest(BaseValidatorRequest):
     reason_code: str | None = None
     check_id: str | None = None
     evidence: ResetVerifiedJobEvidence | None = None
+    # DAH-6784: the reset is for an idle node only; the backend applies it only while no customer pod runs there.
+    # Its own field so an evidence cut cannot drop it; an older backend ignores it.
+    unrented_only: bool = False
 
 
 class DuplicateExecutorsRequest(BaseValidatorRequest):

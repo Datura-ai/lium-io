@@ -51,6 +51,7 @@ from services.task.messages import (
     NO_TASK_TIME_REASONS,
     PortConnectivityMessages,
     PortCountMessages,
+    RENTED_AFTER_START_REASONS,
     RentalVerificationMessages,
     SCRAPE_HOST_SIDE_FAILURE_REASONS,
     SCRAPE_UNDETERMINED_FAILURE_REASONS,
@@ -560,8 +561,10 @@ def withhold_renter_gpu_reset_verdicts(
                 WithheldVerdict(
                     miner_hotkey=miner_hotkey,
                     result=result,
-                    # the node's own checks can spend the task's time: that keeps no miner active (review)
-                    keeps_miner_active=result.failure_reason_code not in NO_TASK_TIME_REASONS,
+                    # the node's own checks can spend the task's time, and a provider can start a create on his own
+                    # node: neither keeps a miner active (reviews)
+                    keeps_miner_active=result.failure_reason_code not in NO_TASK_TIME_REASONS
+                    and result.failure_reason_code != TenantEnforcementMessages.RENTED_SINCE_CYCLE_START.reason,
                 )
             )
             logger.info(
@@ -803,9 +806,10 @@ def rental_state_unchanged(
     """The one rule every carry goes through (DAH-5933): a kept result stands in for a held cycle only when it was
     scored with exactly the node's rental state that cycle saw at its start (the snapshot) and at the cycle-end read:
     no rental, or the same rental pod ids holding the same known GPU count. A cycle that itself saw the node rented
-    after its start (RENTAL_STARTED_DURING_CHECK) saw a change. Anything else is withheld: never scored or paid.
+    after its start (RENTED_AFTER_START_REASONS: found during the check, or a renter's create it stopped for) saw a
+    change. Anything else is withheld: never scored or paid.
     `rental_at_start` / `rental_at_end` are the node's own rentals (rental_owned_by), None for none."""
-    if held.failure_reason_code == RentalVerificationMessages.RENTED_SINCE_THE_SNAPSHOT.reason:
+    if held.failure_reason_code in RENTED_AFTER_START_REASONS:
         return False
     if previous is None or previous.rental_pod_ids is None:
         return False
@@ -863,7 +867,7 @@ async def carry_renter_gpu_reset_results(
             needs_end_read = held.failure_reason_code in CYCLE_END_READ_REASONS
             if rentals_at_start is None or (rentals_at_end is None and needs_end_read):
                 # a rental state that cannot be read carries nothing; one the cycle saw change still drops the kept result
-                seen_rented = held.failure_reason_code == RentalVerificationMessages.RENTED_SINCE_THE_SNAPSHOT.reason
+                seen_rented = held.failure_reason_code in RENTED_AFTER_START_REASONS
                 if in_redis and seen_rented:
                     await _spend_kept_result(redis_service, miner_hotkey, held)
                 continue

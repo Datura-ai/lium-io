@@ -93,9 +93,11 @@ from .checks import (
     DockerCpuCheck,
     NeedrestartGuardCheck,
     SysboxLayerResetCheck,
+    HostPidMaxCheck,
     PidHostRequiredCheck,
     SysboxRequiredCheck,
     TdxHostCheck,
+    RentedMidCycleCheck,
     HalfStartedStopRetryCheck,
     TenantEnforcementCheck,
     UploadFilesCheck,
@@ -272,14 +274,13 @@ class PipelineFactory:
                 pod_recovery=self.pod_recovery,
             ),
             config=ContextConfig(
-                executor_root=executor_info.root_dir,
                 compute_rest_app_url=settings.COMPUTE_REST_API_URL,
-                gpu_monitor_script_relative="src/gpus_utility.py",
                 machine_scrape_filename=encrypted_files.machine_scrape_file_name,
                 # DAH-2794: an executor that can run the source needs no upload at all. The
                 # binary stays built because the miner picks the executor image, and one that
                 # predates a dependency the scrape imports has to keep the self-contained path.
                 machine_scrape_source=encrypted_files.machine_scrape_source,
+                machine_scrape_binary_build=encrypted_files.machine_scrape_binary_build,
                 machine_scrape_timeout=JOB_LENGTH,
                 obfuscation_keys=encrypted_files.all_keys,
                 default_docker_image_digests=default_docker_image_digests,
@@ -423,6 +424,10 @@ class PipelineFactory:
                 # instance so cadence state persists across `build_checks()`
                 # calls.
                 _CUSTOM_BUILD_ORPHAN_SWEEP_SINGLETON,
+                # DAH-7041: the create refuses every rental on a host with an unusable kernel.pid_max; not listed then.
+                # Fatal, so it runs after the stale container cleanup and every non-fatal check above: a halt here
+                # must not leave an ended rental's container running on the host or skip one of them
+                HostPidMaxCheck(),
                 PortConnectivityCheck(),
                 PortCountCheck(),
                 # Before the rented short-circuit; it leaves a rented node alone itself (no pull beside a
@@ -450,10 +455,14 @@ class PipelineFactory:
                 # DAH-4663: idle nodes only; resets a leftover clock lock or unlists the node
                 GpuClockLockCheck(),
                 GpuUsageCheck(),
+                # A node rented since the cycle started halts here, before the GPU and network tests.
+                RentedMidCycleCheck(),
                 # DAH-5933: before VerifyX, which can take its whole 600 s on a slow download; after it, the
                 # backend's probe was left 1 s and its client timeout read as an API error (ad2382f9, 21 Nov).
                 # Needs only the verified ports, GPU details and rented data, all settled above.
                 RentalVerificationCheck(),
+                # the rental probe can take up to 300 s, and a rent can land meanwhile
+                RentedMidCycleCheck(),
                 # liumd phase 1 (DAH-2834): one signed `POST /verify` runs the VerifyX and matmul
                 # challenges on the executor side by side; the two checks below consume a judged,
                 # passing answer and run over SSH otherwise. Off by default, never fatal.
@@ -461,6 +470,8 @@ class PipelineFactory:
                 VerifyXCheck(),
                 # DAH-4961: the listing's disk floor, judged on the figure VerifyX just published (idle nodes only)
                 DiskSpaceCheck(),
+                # again before the matmul: VerifyX takes minutes, and a rent can land meanwhile
+                RentedMidCycleCheck(),
                 CapabilityCheck(),
                 # DAH-3035: the kernel-fault probe right after the matmul it complements — same idle,
                 # capability-verified population, same filler skip. Flag-gated, shadow-first, off by default.
@@ -585,6 +596,8 @@ class PipelineFactory:
                 _STALE_CONTAINER_CLEANUP_SINGLETON,
                 ProviderSideLoadCheck(),
                 _CUSTOM_BUILD_ORPHAN_SWEEP_SINGLETON,
+                # DAH-7041: same place as in build_checks(), after the stale container cleanup
+                HostPidMaxCheck(),
                 ExecutorImageCheck(),
                 InspectorRentedCheck(),
                 RentedPodResourcesCheck(),
@@ -610,8 +623,11 @@ class PipelineFactory:
                 PidHostRequiredCheck(),
                 DockerCpuCheck(),
                 RentalVerificationCheck(),
+                # A renter's create since the cycle started halts the run before each GPU workload.
+                RentedMidCycleCheck(),
                 # alone, so no traffic of ours shares the network it measures; ahead of the matmul that consumes it
                 LocalVerifyCheck(),
+                RentedMidCycleCheck(),
                 CapabilityCheck(),
                 # a customer pod CapabilityCheck found started during the run is handled right here, before the next
                 # GPU workload (fault, pinned-memory and NVLink probes, VerifyX) runs beside it (stand check at c795850)
@@ -624,6 +640,7 @@ class PipelineFactory:
                 PostRentalGpuRecheckCheck(),
                 NvlinkFaultCheck(),
                 CachedTemplateVerificationCheck(),
+                RentedMidCycleCheck(),
                 VerifyXCheck(),
                 DiskSpaceCheck(),
                 RentalProbeCheck(),
@@ -672,6 +689,8 @@ class PipelineFactory:
                 SplitDiskCheck(),
                 # DAH-3484: before the rented halt, same as build_checks().
                 TdxHostCheck(),
+                # DAH-7041: one read-only cat; the dry run has no stale container cleanup to run first
+                HostPidMaxCheck(),
                 GpuCountCheck(),
                 GpuModelValidCheck(),
                 GpuVramPrecheck(),

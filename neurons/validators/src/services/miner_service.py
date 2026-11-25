@@ -9,6 +9,7 @@ from typing import Annotated
 from uuid import UUID
 
 import aiohttp
+import yarl
 from asyncssh import SSHKey
 import asyncssh
 import bittensor
@@ -79,7 +80,15 @@ from services.docker_service import (
     inflight_creates,
 )
 from services.executor_image_policy import ExpectedImageSnapshot
-from services.node_host import for_payload_miner, public_host_sock
+from services.node_host import (
+    NodeHostError,
+    NonPublicAddressError,
+    for_payload_miner,
+    is_ip_literal,
+    public_host_connector,
+    public_host_sock,
+    resolve_node_host,
+)
 from services.redis_service import MACHINE_SPEC_CHANNEL, POD_STATES_CHANNEL, RedisService
 from services.efa_link_probe import measure_and_attach as measure_and_attach_efa
 from services.roce_link_probe import CYCLE_JOB_WAIT_SECONDS, PROBE_TAIL_MARGIN_SECONDS, measure_and_attach
@@ -396,6 +405,12 @@ async def _remount_dropped_gocryptfs(ssh_client, payload: BackupContainerRequest
         logger.error(
             _m("DAH-5047: pre-backup gocryptfs check/remount failed", extra=get_extra_info({**extra, "error": str(error)}))
         )
+
+
+def _miner_base_url(address: str | None, port: int | str | None) -> str:
+    """http://host:port of a miner's axon, with an IPv6 address bracketed (a bare one makes an unparsable URL)."""
+    host = f"[{address.strip('[]')}]" if address and ":" in address else address
+    return f"http://{host}:{port}"
 
 
 class MinerService:
@@ -1498,6 +1513,7 @@ class MinerService:
                         ),
                         "host_runtime_fault": result.host_runtime_fault,
                         "rented_pod_faults": result.rented_pod_faults,
+                        "idle_checks_passed": result.idle_checks_passed,
                         "check_started_at": (
                             result.check_started_at.isoformat() if result.check_started_at else None
                         ),
@@ -1807,15 +1823,16 @@ class MinerService:
                     raise error
                 if payload.volume_encrypted and payload.container_name:
                     await _remount_dropped_gocryptfs(ssh_client, payload, docker_service)
+                spec = self._restic_backup_operation_spec(payload)
                 await note_started_storage_helper(
-                    self.redis_service, executor_info.uuid, operation_id
+                    self.redis_service, executor_info.uuid, operation_id, spec
                 )
                 try:
                     await start_storage_operation(
                         ssh_client,
                         executor_info.python_path,
                         operation_id,
-                        self._restic_backup_operation_spec(payload),
+                        spec,
                         retain_terminal_artifacts=False,
                     )
                 except Exception:
@@ -1876,15 +1893,16 @@ class MinerService:
 
             if payload.backup_engine == "restic":
                 operation_id = UUID(payload.restore_log_id)
+                spec = self._restic_restore_operation_spec(payload)
                 await note_started_storage_helper(
-                    self.redis_service, executor_info.uuid, operation_id
+                    self.redis_service, executor_info.uuid, operation_id, spec
                 )
                 try:
                     await start_storage_operation(
                         ssh_client,
                         executor_info.python_path,
                         operation_id,
-                        self._restic_restore_operation_spec(payload),
+                        spec,
                         retain_terminal_artifacts=False,
                     )
                 except Exception:
@@ -1943,7 +1961,7 @@ class MinerService:
             client_keys=[pkey],
             known_hosts=await _storage_known_hosts(docker_service, executor_info, payload),
         ) as ssh_client:
-            await cancel_storage_operation(ssh_client, UUID(payload.operation_id))
+            await cancel_storage_operation(ssh_client, self.redis_service, UUID(payload.operation_id))
             await forget_storage_helper(
                 self.redis_service, executor_info.uuid, payload.operation_id
             )
@@ -2042,7 +2060,7 @@ class MinerService:
             )
             status, data = await self._make_rest_request(
                 method="POST",
-                url=f"http://{miner.axon_info.ip}:{miner.axon_info.port}/executors",
+                url=f"{_miner_base_url(miner.axon_info.ip, miner.axon_info.port)}/executors",
                 json_data=request.model_dump(),
                 headers={"Content-Type": "application/json", **self._generate_auth_headers(my_key, miner.hotkey)},
                 timeout=REST_EXECUTOR_LIST_TIMEOUT,
@@ -2091,13 +2109,24 @@ class MinerService:
             aiohttp.ClientError: For other HTTP client errors
         """
         try:
-            async with aiohttp.ClientSession() as session:
+            # The URL is the miner's own axon address: only a public one is dialled (the connector checks a
+            # name; aiohttp dials a literal without a lookup, so it is checked here), and a redirect is never
+            # followed to another address.
+            target = yarl.URL(url)
+            # a miner the operator configured (a dev copy's in-cluster miner, a stand's local one) is not an address a
+            # miner reported, so it is dialled as set
+            configured = (target.host, target.port) in settings.configured_miner_origins()
+            if not configured and target.host and is_ip_literal(target.host):
+                await resolve_node_host(target.host, target.port)
+            connector = aiohttp.TCPConnector() if configured else public_host_connector()
+            async with aiohttp.ClientSession(connector=connector) as session:
                 async with session.request(
                     method=method,
                     url=url,
                     json=json_data,
                     headers=headers,
                     timeout=aiohttp.ClientTimeout(total=timeout, sock_connect=MINER_CONNECT_TIMEOUT_S),
+                    allow_redirects=False,
                 ) as response:
                     response.raise_for_status
                     response_data = await response.json()
@@ -2116,7 +2145,8 @@ class MinerService:
                 ),
             )
             raise
-        except aiohttp.ClientError as e:
+        # a refused literal address is the same outcome as the connector's refusal of a name (a ClientError)
+        except (aiohttp.ClientError, NodeHostError) as e:
             logger.debug(
                 _m(
                     f"REST API {operation_name} client error",
@@ -2301,7 +2331,7 @@ class MinerService:
             )
             
             # Make REST API call
-            base_url = f"http://{payload.miner_address}:{payload.miner_port}"
+            base_url = _miner_base_url(payload.miner_address, payload.miner_port)
             headers = self._generate_auth_headers(my_key, payload.miner_hotkey)
             headers["Content-Type"] = "application/json"
             
@@ -2558,7 +2588,7 @@ class MinerService:
         )
 
         try:
-            base_url = f"http://{payload.miner_address}:{payload.miner_port}"
+            base_url = _miner_base_url(payload.miner_address, payload.miner_port)
             # Generate SSH key and send it to miner
             private_key, public_key = self.ssh_service.generate_ssh_key(my_key.ss58_address)
 
@@ -2607,11 +2637,11 @@ class MinerService:
                     stale = status == 401 and "too old" in str(response_data)
                     if not stale or time.monotonic() >= deadline:
                         break
-                except (aiohttp.ClientConnectorError, aiohttp.ConnectionTimeoutError):
+                except (aiohttp.ClientConnectorError, aiohttp.ConnectionTimeoutError) as exc:
                     # refused, or a connect nobody answered: it never reached the miner, so its rental hook did not
                     # run and a resubmit must run it. A read timeout may have run it, and the hook is not idempotent:
-                    # that create fails.
-                    if time.monotonic() >= deadline:
+                    # that create fails. A non-public miner address stays non-public, so that one fails at once.
+                    if isinstance(getattr(exc, "os_error", None), NonPublicAddressError) or time.monotonic() >= deadline:
                         raise
                 await asyncio.sleep(MINER_RESTART_RETRY_S)
 
@@ -2870,7 +2900,7 @@ class MinerService:
         }
 
         try:
-            base_url = f"http://{payload.miner_address}:{payload.miner_port}"
+            base_url = _miner_base_url(payload.miner_address, payload.miner_port)
             headers = self._generate_auth_headers(my_key, payload.miner_hotkey)
             headers["Content-Type"] = "application/json"
             
@@ -2986,7 +3016,7 @@ class MinerService:
         try:
             # DAH-6740: never sign against the empty map of a restart; wait before the 10 s auth headers are made
             await first_owner_hotkeys_read()
-            base_url = f"http://{payload.miner_address}:{payload.miner_port}"
+            base_url = _miner_base_url(payload.miner_address, payload.miner_port)
             headers = self._generate_auth_headers(my_key, payload.miner_hotkey)
             headers["Content-Type"] = "application/json"
 

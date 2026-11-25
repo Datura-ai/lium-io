@@ -157,10 +157,19 @@ async def test_the_first_sample_leaves_only_the_scoring_margin(context_factory, 
         assert service.calls[0]["deadline_monotonic"] == pytest.approx(time.monotonic() + budget, abs=5)
 
 
-def test_a_bounded_run_on_a_host_without_timeout_k_runs_under_the_python_watchdog(tmp_path):
+def _trusted_payload(monkeypatch, tmp_path):
+    """The validator ships the script from tmp_path/src and runs it with this test's interpreter (DAH-6681)."""
+    import sys
+
+    from services import executor_payload
+
+    monkeypatch.setattr(executor_payload, "PAYLOAD_DIR", tmp_path / "src")
+    monkeypatch.setattr(executor_payload, "EXECUTOR_PYTHON", sys.executable)
+
+
+def test_a_bounded_run_on_a_host_without_timeout_k_runs_under_the_python_watchdog(tmp_path, monkeypatch):
     import os
     import subprocess
-    import sys
     from types import SimpleNamespace
 
     from neurons.validators.src.services.verifyx_validation_service import VerifyXValidationService
@@ -172,7 +181,8 @@ def test_a_bounded_run_on_a_host_without_timeout_k_runs_under_the_python_watchdo
     # busybox-style: `timeout -k` is refused
     (fake_bin / "timeout").write_text("#!/bin/sh\nexit 1\n")
     (fake_bin / "timeout").chmod(0o755)
-    executor = SimpleNamespace(python_path=sys.executable, root_dir=str(tmp_path))
+    _trusted_payload(monkeypatch, tmp_path)
+    executor = SimpleNamespace(python_path="/reported/python", root_dir="/reported/root")
     challenge = SimpleNamespace(seed=1, cipher_text="x")
     service = VerifyXValidationService.__new__(VerifyXValidationService)
     env = {**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}"}
@@ -341,6 +351,8 @@ async def test_no_launch_once_the_preflight_spent_the_budget(monkeypatch):
 def test_both_remote_watchdogs_take_the_given_seconds():
     from types import SimpleNamespace
 
+    from services import executor_payload
+
     from neurons.validators.src.services.verifyx_validation_service import VerifyXValidationService
 
     service = VerifyXValidationService.__new__(VerifyXValidationService)
@@ -350,7 +362,8 @@ def test_both_remote_watchdogs_take_the_given_seconds():
     bounded = service._verifyx_command(executor, challenge, "lib", ".verifyx-t", True, 137)
     retry = service._verifyx_command(executor, challenge, "lib", ".verifyx-t", False, 137)
 
-    assert " 137 /usr/bin/python3 /root/app/src/verifyx_executor.py" in bounded
+    assert f" 137 {executor_payload.EXECUTOR_PYTHON} -E -s \"$d\"/verifyx_executor.py" in bounded
+    assert "/usr/bin/python3" not in bounded + retry  # never the executor's reported interpreter (DAH-6681)
     assert "timeout -k 10 137 " in retry
     assert " 600 " not in bounded + retry
 
@@ -406,12 +419,11 @@ wait $p
     ],
     ids=["stopped", "own-124", "own-143", "just-in-time"],
 )
-def test_only_the_watchdogs_stop_writes_the_deadline_marker(tmp_path, timeout_kind, child, marked):
+def test_only_the_watchdogs_stop_writes_the_deadline_marker(tmp_path, monkeypatch, timeout_kind, child, marked):
     # F-29/F-32: the marker comes from the one actor that stops the run, whatever `timeout` the host has
     import os
     import shutil
     import subprocess
-    import sys
     from types import SimpleNamespace
 
     from neurons.validators.src.services.verifyx_validation_service import (
@@ -431,7 +443,8 @@ def test_only_the_watchdogs_stop_writes_the_deadline_marker(tmp_path, timeout_ki
         (fake_bin / "timeout").write_text(_BUSYBOX_TIMEOUT if timeout_kind == "busybox" else "#!/bin/sh\nexit 1\n")
         (fake_bin / "timeout").chmod(0o755)
         env["PATH"] = f"{fake_bin}:{env['PATH']}"
-    executor = SimpleNamespace(python_path=sys.executable, root_dir=str(tmp_path))
+    _trusted_payload(monkeypatch, tmp_path)
+    executor = SimpleNamespace(python_path="/reported/python", root_dir="/reported/root")
     challenge = SimpleNamespace(seed=1, cipher_text="x")
     service = VerifyXValidationService.__new__(VerifyXValidationService)
 
@@ -443,10 +456,9 @@ def test_only_the_watchdogs_stop_writes_the_deadline_marker(tmp_path, timeout_ki
 
 
 
-def test_the_watchdog_stops_the_run_with_both_ssh_readers_gone(tmp_path):
+def test_the_watchdog_stops_the_run_with_both_ssh_readers_gone(tmp_path, monkeypatch):
     # review at 77549c7: with the session's readers closed the marker write fails (EPIPE); the kill must still land
     import subprocess
-    import sys
     import time
     from types import SimpleNamespace
 
@@ -455,7 +467,8 @@ def test_the_watchdog_stops_the_run_with_both_ssh_readers_gone(tmp_path):
     done = tmp_path / "done"
     (tmp_path / "src").mkdir()
     (tmp_path / "src" / "verifyx_executor.py").write_text(f"import time; time.sleep(3); open({str(done)!r}, 'w')\n")
-    executor = SimpleNamespace(python_path=sys.executable, root_dir=str(tmp_path))
+    _trusted_payload(monkeypatch, tmp_path)
+    executor = SimpleNamespace(python_path="/reported/python", root_dir="/reported/root")
     service = VerifyXValidationService.__new__(VerifyXValidationService)
     command = service._verifyx_command(executor, SimpleNamespace(seed=1, cipher_text="x"), "lib", ".verifyx-t", True, 1)
 

@@ -24,11 +24,13 @@ import bittensor
 import pytest
 import services.matrix_validation_service as mvs
 import services.verifyx_validation_service as vvs
+from services import executor_payload
 from aiohttp import web
 from aiohttp.test_utils import TestServer
 from datura.requests.miner_requests import ExecutorSSHInfo
 from datura.requests.validator_requests import MatmulStep, VerifyXStep
 from neurons.validators.src.services.task.checks.capability import CapabilityCheck
+import neurons.validators.src.services.task.checks.local_verify as local_verify
 from neurons.validators.src.services.task.checks.local_verify import (
     ROUND_TRIP_CAP_MS_BY_STEP,
     LocalVerifyCheck,
@@ -67,13 +69,19 @@ EXECUTOR_UUID = "executor-123"
 MINER_HOTKEY = "5MinerHotkeyOfTheExecutorUnderTest"
 
 
+REAL_MATMUL_SSH_REASON = local_verify._matmul_ssh_reason
+
 # --- fakes -------------------------------------------------------------------------------------
 
 
 @pytest.fixture(autouse=True)
 def allcards_off(monkeypatch):
-    """The one call carries the matmul only while the all-cards check (on by default) is off."""
+    """The one call carries the matmul only while the all-cards check (on by default) is off. The tests below exercise
+    the one-call path as if it were asked for; `test_the_first_pass_matmul_runs_the_validators_script` the real choice."""
     monkeypatch.setattr(settings, "MATMUL_ALLCARDS_CHECK_ENABLED", False)
+    monkeypatch.setattr(
+        local_verify, "_matmul_ssh_reason", lambda: "allcards_ssh" if settings.MATMUL_ALLCARDS_CHECK_ENABLED else None
+    )
 
 
 @pytest.fixture
@@ -507,8 +515,8 @@ def test_wire_contract_with_the_executor_side(keypair):
 async def test_the_intent_the_check_sends_is_what_the_executor_accepts(
     keypair, monkeypatch, short_local_verify_timeouts, verifyx_service
 ):
-    """Not a hand-built intent: the document `LocalVerifyCheck._run` actually put on the wire (both
-    GPU steps, the facts, the deadline) goes through the executor's own model."""
+    """Not a hand-built intent: the document `LocalVerifyCheck._run` actually put on the wire (the
+    matmul, the facts, the deadline) goes through the executor's own model."""
     import importlib.util
     import pathlib
 
@@ -526,7 +534,7 @@ async def test_the_intent_the_check_sends_is_what_the_executor_accepts(
         )
         await LocalVerifyCheck(client_factory=client_factory(keypair)).run(ctx)
     parsed = exe.VerifyIntent.model_validate(executor.intents[0])
-    assert parsed.steps.matmul is not None and parsed.steps.verifyx is not None
+    assert parsed.steps.matmul is not None and parsed.steps.verifyx is None
     assert parsed.steps.docker and parsed.steps.ports and parsed.steps.inspector
     assert parsed.deadline_s == executor_deadline_s(settings.LOCAL_VERIFY_TIMEOUT_SECONDS)
 
@@ -657,7 +665,7 @@ async def test_client_reports_absent_route_dead_tunnel_and_dead_host_as_fallback
         port=9,
         ssh_username="r",
         ssh_port=22,
-        python_path="p",
+        python_path="/p",
         root_dir="/r",
     )
     assert await client.advertised(dead) == Advertised(set(), None)
@@ -667,12 +675,14 @@ async def test_client_reports_absent_route_dead_tunnel_and_dead_host_as_fallback
 
 
 @pytest.mark.asyncio
-async def test_advertised_executor_is_verified_in_one_call_and_ssh_is_not_used(
+async def test_advertised_executor_runs_the_matmul_in_one_call_and_verifyx_over_ssh(
     keypair, monkeypatch, short_local_verify_timeouts, verifyx_service
 ):
     validation = matmul_service(monkeypatch)
     ssh_matmul = AsyncMock(side_effect=AssertionError("SSH matmul must not run"))
-    ssh_verifyx = AsyncMock(side_effect=AssertionError("SSH VerifyX must not run"))
+    ssh_verifyx = AsyncMock(
+        return_value=vvs.VerifyXResponse(data={"success": True, "network": {"download_speed": 900.0}})
+    )
     validation.validate_gpu_model_and_process_job = ssh_matmul
     verifyx_service.validate_verifyx_and_process_job = ssh_verifyx
 
@@ -687,19 +697,18 @@ async def test_advertised_executor_is_verified_in_one_call_and_ssh_is_not_used(
 
         assert local.passed and local.event.reason_code == "LOCAL_VERIFY_OK", local.event
         assert (
-            local.event.what_we_saw["consumed"] == ["matmul", "verifyx"]
-            and local.event.what_we_saw["fallbacks"] == {}
+            local.event.what_we_saw["consumed"] == ["matmul"]
+            and local.event.what_we_saw["fallbacks"] == {"verifyx": "ssh_only"}
         )
         outcome: LocalVerifyOutcome = local.updates["state"].local_verify
         assert outcome.matmul.success and outcome.matmul.metrics == {"tflops": 42.0}
-        assert outcome.verifyx.data["success"]
+        assert outcome.verifyx is None
 
         assert capability.passed and capability.event.what_we_saw["transport"] == "local_verify"
         assert capability.updates["state"].gpu_metrics == {"tflops": 42.0}
-        assert verifyx.passed and verifyx.event.what_we_saw["transport"] == "local_verify"
-        assert verifyx.updates["state"].specs["network"]["verifyx_download_speed"] == 900.0
+        assert verifyx.passed and verifyx.event.what_we_saw["transport"] == "ssh"
         ssh_matmul.assert_not_awaited()
-        ssh_verifyx.assert_not_awaited()
+        ssh_verifyx.assert_awaited_once()
 
         # The POST went through the pipeline's SSH session to the port `/version` named, and the
         # tunnel listener did not outlive the call.
@@ -712,7 +721,7 @@ async def test_advertised_executor_is_verified_in_one_call_and_ssh_is_not_used(
         assert sent["executor_uuid"] == ctx.executor.uuid and sent["miner_hotkey"] == ctx.miner_hotkey
         assert sent["parallel_gpu"] is True and sent["steps"]["matmul"]["cipher_text"] == "deadbeef"
         assert set(sent["steps"]["matmul"]) == {"dim_n", "dim_k", "seed", "cipher_text"}
-        assert sent["steps"]["verifyx"]["cipher_text"].startswith("vx")
+        assert sent["steps"]["verifyx"] is None
         assert sent["steps"]["docker"] and sent["steps"]["ports"] and sent["steps"]["inspector"]
 
 
@@ -905,15 +914,15 @@ async def test_timeout_falls_back_to_ssh(
 async def test_a_step_that_fails_the_judgement_is_left_to_ssh_per_step(
     keypair, monkeypatch, short_local_verify_timeouts, verifyx_service
 ):
-    """A judged FAILURE of the local run never decides: the SSH run of that step does. The other
-    step is still consumed. The metric line names the step and reason."""
+    """A judged FAILURE of the local run never decides: the SSH run of that step does. The metric
+    line names the step and reason."""
     validation = matmul_service(
         monkeypatch, sealed="not-the-challenge-uuid"
     )  # unseals to the wrong uuid
     ssh_matmul = AsyncMock(return_value=mvs.ValidationResult(success=True, metrics={"from": "ssh"}))
     validation.validate_gpu_model_and_process_job = ssh_matmul
     verifyx_service.validate_verifyx_and_process_job = AsyncMock(
-        side_effect=AssertionError("VerifyX was consumed locally")
+        return_value=vvs.VerifyXResponse(data={"success": True, "network": {}})
     )
     async with FakeExecutor(keypair) as executor:
         ctx = context(
@@ -923,12 +932,12 @@ async def test_a_step_that_fails_the_judgement_is_left_to_ssh_per_step(
             local, verifyx, capability = await run_local_then_consumers(
                 ctx, LocalVerifyCheck(client_factory=client_factory(keypair))
             )
-    assert local.event.reason_code == "LOCAL_VERIFY_OK"
-    assert local.event.what_we_saw["consumed"] == ["verifyx"]
-    assert local.event.what_we_saw["fallbacks"] == {"matmul": "local_failed"}
+    assert local.event.reason_code == "LOCAL_VERIFY_FALLBACK"
+    assert local.event.what_we_saw["consumed"] == []
+    assert local.event.what_we_saw["fallbacks"] == {"matmul": "local_failed", "verifyx": "ssh_only"}
     assert capability.passed and capability.event.what_we_saw["transport"] == "ssh"
     assert capability.updates["state"].gpu_metrics == {"from": "ssh"}
-    assert verifyx.event.what_we_saw["transport"] == "local_verify"
+    assert verifyx.event.what_we_saw["transport"] == "ssh"
     outcomes = [
         call.args[0].extra
         for call in log.info.call_args_list
@@ -939,147 +948,38 @@ async def test_a_step_that_fails_the_judgement_is_left_to_ssh_per_step(
         by_step["matmul"]["outcome"] == "fallback" and by_step["matmul"]["reason"] == "local_failed"
     )
     assert by_step["matmul"]["detail"].startswith("UUID mismatch")
-    assert by_step["verifyx"]["outcome"] == "consumed" and by_step["verifyx"]["reason"] == "ok"
     assert all(o["first_pass"] is True and "round_trip_ms" in o for o in outcomes)
 
 
 @pytest.mark.asyncio
-async def test_outdated_libverifyx_on_the_executor_falls_back_like_the_ssh_checksum_gate(
-    keypair, monkeypatch, short_local_verify_timeouts, verifyx_service
-):
-    validation = matmul_service(monkeypatch)
-    validation.validate_gpu_model_and_process_job = AsyncMock(
-        return_value=mvs.ValidationResult(success=True)
-    )
-    verifyx_service.validate_verifyx_and_process_job = AsyncMock(
-        return_value=vvs.VerifyXResponse(data={"success": True, "network": {}})
-    )
-    async with FakeExecutor(keypair, lib_sha="stale") as executor:
-        ctx = context(
-            keypair, executor.executor_info, validation=validation, verifyx=verifyx_service
-        )
-        local, verifyx, _ = await run_local_then_consumers(
-            ctx, LocalVerifyCheck(client_factory=client_factory(keypair))
-        )
-    assert local.event.what_we_saw["fallbacks"] == {"verifyx": "lib_mismatch"}
-    assert local.event.what_we_saw["consumed"] == ["matmul"]
-    assert verifyx.event.what_we_saw["transport"] == "ssh"
-
-
-@pytest.mark.asyncio
-async def test_a_verifyx_response_the_library_rejects_is_left_to_ssh(
-    keypair, monkeypatch, short_local_verify_timeouts, verifyx_service
-):
-    """The judged failure of the OTHER step: libverifyx refuses the response → VerifyXCheck runs
-    over SSH; the matmul beside it is still consumed."""
-    validation = matmul_service(monkeypatch)
-    validation.validate_gpu_model_and_process_job = AsyncMock(
-        side_effect=AssertionError("matmul was consumed locally")
-    )
-    ssh_verifyx = AsyncMock(
-        return_value=vvs.VerifyXResponse(
-            data={"success": True, "network": {"download_speed": 1.0, "upload_speed": 1.0}}
-        )
-    )
-    verifyx_service.validate_verifyx_and_process_job = ssh_verifyx
-    async with FakeExecutor(keypair, verifyx_ok=False) as executor:
-        ctx = context(
-            keypair, executor.executor_info, validation=validation, verifyx=verifyx_service
-        )
-        local, verifyx, capability = await run_local_then_consumers(
-            ctx, LocalVerifyCheck(client_factory=client_factory(keypair))
-        )
-    assert local.event.what_we_saw["consumed"] == ["matmul"]
-    assert local.event.what_we_saw["fallbacks"] == {"verifyx": "local_failed"}
-    assert capability.event.what_we_saw["transport"] == "local_verify"
-    assert verifyx.event.what_we_saw["transport"] == "ssh"
-    ssh_verifyx.assert_awaited_once()
-
-
-@pytest.mark.asyncio
-async def test_a_failed_verifyx_verdict_logs_its_errors(
-    keypair, monkeypatch, short_local_verify_timeouts, verifyx_service
-):
-    """A verdict that decrypts but fails (RAM, disk) carries no `error`: the metric line names
-    the verdict's own errors, not "None"."""
-    monkeypatch.setattr(
-        vvs,
-        "_perform_verification_checks",
-        lambda payload, **_: {
-            "success": False,
-            "errors": [None, "Insufficient memory: 10 GB allocated, 16 GB required"],
-        },
-    )
-    validation = matmul_service(monkeypatch)
-    verifyx_service.validate_verifyx_and_process_job = AsyncMock(
-        return_value=vvs.VerifyXResponse(data={"success": True, "network": {}})
-    )
-    async with FakeExecutor(keypair) as executor:
-        ctx = context(
-            keypair, executor.executor_info, validation=validation, verifyx=verifyx_service
-        )
-        with patch("neurons.validators.src.services.task.checks.local_verify.logger") as log:
-            local, _, _ = await run_local_then_consumers(
-                ctx, LocalVerifyCheck(client_factory=client_factory(keypair))
-            )
-    assert local.event.what_we_saw["fallbacks"] == {"verifyx": "local_failed"}
-    verifyx_outcome = next(
-        call.args[0].extra
-        for call in log.info.call_args_list
-        if str(call.args[0]) == "[local_verify] outcome" and call.args[0].extra["step"] == "verifyx"
-    )
-    assert verifyx_outcome["detail"] == "None; Insufficient memory: 10 GB allocated, 16 GB required"
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "matmul_step,verifyx_step,expected_fallbacks,expected_consumed",
+    "matmul_step,expected_reason",
     [
-        (
-            {"status": "timeout", "error": "timed out after 120s"},
-            None,
-            {"matmul": "step_timeout"},
-            ["verifyx"],
-        ),
-        (
-            {"status": "failed", "exit_status": 1, "stderr_tail": "CUDA error"},
-            None,
-            {"matmul": "step_failed"},
-            ["verifyx"],
-        ),
-        ({"status": "ok", "exit_status": 0}, None, {"matmul": "step_no_stdout"}, ["verifyx"]),
-        (None, {"status": "unsupported"}, {"verifyx": "step_malformed"}, ["matmul"]),
-        (None, {"status": "skipped"}, {"verifyx": "step_skipped"}, ["matmul"]),
-        (None, "absent", {"verifyx": "step_skipped"}, ["matmul"]),
-        (None, "not-an-object", {"verifyx": "step_malformed"}, ["matmul"]),
+        ({"status": "timeout", "error": "timed out after 120s"}, "step_timeout"),
+        ({"status": "failed", "exit_status": 1, "stderr_tail": "CUDA error"}, "step_failed"),
+        ({"status": "ok", "exit_status": 0}, "step_no_stdout"),
+        ({"status": "unsupported"}, "step_malformed"),
+        ({"status": "skipped"}, "step_skipped"),
+        ("absent", "step_skipped"),
+        ("not-an-object", "step_malformed"),
     ],
 )
-async def test_a_step_that_did_not_run_is_left_to_ssh_and_the_other_is_consumed(
-    keypair,
-    monkeypatch,
-    short_local_verify_timeouts,
-    verifyx_service,
-    matmul_step,
-    verifyx_step,
-    expected_fallbacks,
-    expected_consumed,
+async def test_a_step_that_did_not_run_is_left_to_ssh(
+    keypair, monkeypatch, short_local_verify_timeouts, verifyx_service, matmul_step, expected_reason
 ):
     """Every non-`ok` status the executor can answer with — and an `ok` without stdout, a step it
-    left out, a step that is not an object, a status outside the executor's closed set — falls back
-    for THAT step only."""
+    left out, a step that is not an object, a status outside the executor's closed set — falls back."""
     validation = matmul_service(monkeypatch)
     ssh_matmul = AsyncMock(return_value=mvs.ValidationResult(success=True, metrics={"from": "ssh"}))
-    ssh_verifyx = AsyncMock(
-        return_value=vvs.VerifyXResponse(
-            data={"success": True, "network": {"download_speed": 1.0, "upload_speed": 1.0}}
-        )
-    )
     validation.validate_gpu_model_and_process_job = ssh_matmul
-    verifyx_service.validate_verifyx_and_process_job = ssh_verifyx
+    verifyx_service.validate_verifyx_and_process_job = AsyncMock(
+        return_value=vvs.VerifyXResponse(data={"success": True, "network": {}})
+    )
 
     def cut(raw):
-        # The executor's own answer with one step replaced — a real `deadline_hit` document.
-        answer = {
+        # The executor's own answer with the step replaced — a real `deadline_hit` document.
+        steps = {} if matmul_step == "absent" else {"matmul": matmul_step}
+        return {
             "schema": SCHEMA,
             "nonce": raw["nonce"],
             "executor_uuid": raw["executor_uuid"],
@@ -1087,31 +987,8 @@ async def test_a_step_that_did_not_run_is_left_to_ssh_and_the_other_is_consumed(
             "started_at": int(time.time()),
             "elapsed_ms": 12,
             "deadline_hit": True,
-            "steps": {
-                "matmul": {
-                    "status": "ok",
-                    "ms": 1,
-                    "exit_status": 0,
-                    "stdout": matmul_stdout("GPU-1"),
-                    "stderr_tail": "",
-                },
-                "verifyx": {
-                    "status": "ok",
-                    "ms": 1,
-                    "exit_status": 0,
-                    "stdout": raw["steps"]["verifyx"]["cipher_text"] + "-ok",
-                    "stderr_tail": "",
-                    "data": {"lib_sha256": "lib-sha"},
-                },
-            },
+            "steps": steps,
         }
-        if matmul_step is not None:
-            answer["steps"]["matmul"] = matmul_step
-        if verifyx_step == "absent":
-            del answer["steps"]["verifyx"]
-        elif verifyx_step is not None:
-            answer["steps"]["verifyx"] = verifyx_step
-        return answer
 
     async with FakeExecutor(keypair) as executor:
         executor.answer_override = cut
@@ -1121,19 +998,10 @@ async def test_a_step_that_did_not_run_is_left_to_ssh_and_the_other_is_consumed(
         local, verifyx, capability = await run_local_then_consumers(
             ctx, LocalVerifyCheck(client_factory=client_factory(keypair))
         )
-    assert local.passed and local.event.reason_code == "LOCAL_VERIFY_OK"
-    assert local.event.what_we_saw["fallbacks"] == expected_fallbacks
-    assert local.event.what_we_saw["consumed"] == expected_consumed
-    assert local.event.what_we_saw["deadline_hit"] is True
-    fell_back = set(expected_fallbacks)
-    assert capability.event.what_we_saw["transport"] == (
-        "ssh" if "matmul" in fell_back else "local_verify"
-    )
-    assert verifyx.event.what_we_saw["transport"] == (
-        "ssh" if "verifyx" in fell_back else "local_verify"
-    )
-    assert ssh_matmul.await_count == (1 if "matmul" in fell_back else 0)
-    assert ssh_verifyx.await_count == (1 if "verifyx" in fell_back else 0)
+    assert local.passed and local.event.what_we_saw["deadline_hit"] is True
+    assert local.event.what_we_saw["fallbacks"] == {"matmul": expected_reason, "verifyx": "ssh_only"}
+    assert capability.event.what_we_saw["transport"] == "ssh" and ssh_matmul.await_count == 1
+    assert verifyx.event.what_we_saw["transport"] == "ssh"
 
 
 def test_executor_deadline_leaves_the_answer_room_inside_the_client_timeout():
@@ -1183,14 +1051,13 @@ async def test_all_cards_check_keeps_the_matmul_on_ssh(
     keypair, monkeypatch, short_local_verify_timeouts, verifyx_service
 ):
     """DAH-2671 item 3: `probe_all_claimed_cards` runs inside the SSH matmul path only. With the
-    check on, the intent carries no matmul, CapabilityCheck runs the SSH path (probe included) and
-    VerifyX is still consumed locally."""
+    check on no step is left for the local call: it is skipped, and both checks run over SSH."""
     monkeypatch.setattr(settings, "MATMUL_ALLCARDS_CHECK_ENABLED", True)
     validation = matmul_service(monkeypatch)
     ssh_matmul = AsyncMock(return_value=mvs.ValidationResult(success=True, metrics={"from": "ssh"}))
     validation.validate_gpu_model_and_process_job = ssh_matmul
     verifyx_service.validate_verifyx_and_process_job = AsyncMock(
-        side_effect=AssertionError("VerifyX was consumed locally")
+        return_value=vvs.VerifyXResponse(data={"success": True, "network": {}})
     )
     async with FakeExecutor(keypair) as executor:
         ctx = context(
@@ -1199,14 +1066,73 @@ async def test_all_cards_check_keeps_the_matmul_on_ssh(
         local, verifyx, capability = await run_local_then_consumers(
             ctx, LocalVerifyCheck(client_factory=client_factory(keypair))
         )
-    assert executor.intents[0]["steps"]["matmul"] is None
+    assert executor.intents == []
     assert validation.wrapper.generateChallenge.call_count == 0  # no challenge built for nothing
-    assert local.event.what_we_saw["consumed"] == ["verifyx"]
-    assert local.event.what_we_saw["fallbacks"] == {"matmul": "allcards_ssh"}
+    assert local.event.reason_code == "LOCAL_VERIFY_SKIPPED"
     assert capability.event.what_we_saw["transport"] == "ssh"
-    assert capability.updates["state"].gpu_metrics == {"from": "ssh"}
     ssh_matmul.assert_awaited_once()
-    assert verifyx.event.what_we_saw["transport"] == "local_verify"
+    assert verifyx.event.what_we_saw["transport"] == "ssh"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("advertise", [True, False])
+async def test_the_first_pass_matmul_runs_the_validators_script(
+    keypair, monkeypatch, short_local_verify_timeouts, verifyx_service, advertise
+):
+    """On a first pass, advertised or not, the matmul runs over SSH with the validator's own script."""
+    monkeypatch.setattr(local_verify, "_matmul_ssh_reason", REAL_MATMUL_SSH_REASON)
+    validation = matmul_service(monkeypatch)
+    ssh_matmul = AsyncMock(return_value=mvs.ValidationResult(success=True, metrics={"from": "ssh"}))
+    validation.validate_gpu_model_and_process_job = ssh_matmul
+    verifyx_service.validate_verifyx_and_process_job = AsyncMock(
+        return_value=vvs.VerifyXResponse(data={"success": True, "network": {}})
+    )
+    async with FakeExecutor(keypair, advertise=advertise) as executor:
+        ctx = context(keypair, executor.executor_info, validation=validation, verifyx=verifyx_service)
+        local, verifyx, capability = await run_local_then_consumers(
+            ctx, LocalVerifyCheck(client_factory=client_factory(keypair))
+        )
+    assert executor.intents == []
+    assert capability.event.what_we_saw["transport"] == "ssh"
+    ssh_matmul.assert_awaited_once()
+    assert verifyx.event.what_we_saw["transport"] == "ssh"
+
+
+class _RecordingSSH(FakeSSH):
+    """FakeSSH that also answers `run`: records each command and answers with no output."""
+
+    def __init__(self):
+        super().__init__()
+        self.commands: list[str] = []
+
+    async def run(self, cmd, **_kwargs):
+        self.commands.append(cmd)
+        return SimpleNamespace(stdout="", stderr="", exit_status=1)
+
+
+@pytest.mark.asyncio
+async def test_the_first_pass_matmul_command_is_the_validators_own(
+    keypair, monkeypatch, short_local_verify_timeouts, verifyx_service
+):
+    """The real SSH launcher, not a mock: the command it sends names the validator's interpreter and script and none of
+    the paths the executor reported."""
+    monkeypatch.setattr(local_verify, "_matmul_ssh_reason", REAL_MATMUL_SSH_REASON)
+    verifyx_service.validate_verifyx_and_process_job = AsyncMock(
+        return_value=vvs.VerifyXResponse(data={"success": True, "network": {}})
+    )
+    ssh = _RecordingSSH()
+    async with FakeExecutor(keypair) as executor:
+        reported = executor.executor_info.model_copy(
+            update={"python_path": "/opt/reported/bin/python", "root_dir": "/opt/reported"}
+        )
+        ctx = context(keypair, reported, validation=matmul_service(monkeypatch), verifyx=verifyx_service, ssh=ssh)
+        await run_local_then_consumers(ctx, LocalVerifyCheck(client_factory=client_factory(keypair)))
+    matmul = [cmd for cmd in ssh.commands if "decrypt_challenge.py" in cmd]
+    assert len(matmul) == 1
+    assert reported.python_path not in matmul[0]
+    assert reported.root_dir not in matmul[0]
+    assert executor_payload.EXECUTOR_PYTHON in matmul[0]
+    assert '"$d"/decrypt_challenge.py' in matmul[0]
 
 
 @pytest.mark.asyncio
@@ -1287,42 +1213,28 @@ async def test_filler_only_node_is_skipped_without_a_call(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("slow_step", ["matmul", "verifyx"])
 async def test_a_pass_slower_than_the_ssh_cap_is_left_to_ssh(
-    keypair, monkeypatch, short_local_verify_timeouts, verifyx_service, slow_step
+    keypair, monkeypatch, short_local_verify_timeouts, verifyx_service
 ):
-    """The SSH path fails a matmul past MATRIX_VERIFY_TIMEOUT_SECONDS and a VerifyX past
-    VERIFYX_COMMAND_TIMEOUT_SECONDS; the executor's `ms` is its own word, so the validator's round
-    trip is held to the same cap and a slower pass is not consumed — the SSH run decides."""
+    """The SSH path fails a matmul past MATRIX_VERIFY_TIMEOUT_SECONDS; the executor's `ms` is its own
+    word, so the validator's round trip is held to the same cap and a slower pass is not consumed."""
     validation = matmul_service(monkeypatch)
     ssh_matmul = AsyncMock(return_value=mvs.ValidationResult(success=True, metrics={"from": "ssh"}))
-    ssh_verifyx = AsyncMock(
-        return_value=vvs.VerifyXResponse(
-            data={"success": True, "network": {"download_speed": 1.0, "upload_speed": 1.0}}
-        )
-    )
     validation.validate_gpu_model_and_process_job = ssh_matmul
-    verifyx_service.validate_verifyx_and_process_job = ssh_verifyx
-    # The fake answers in under a millisecond; only the slow step's cap is pulled under that.
-    monkeypatch.setitem(ROUND_TRIP_CAP_MS_BY_STEP, slow_step, -1)
-    other = "verifyx" if slow_step == "matmul" else "matmul"
-
+    verifyx_service.validate_verifyx_and_process_job = AsyncMock(
+        return_value=vvs.VerifyXResponse(data={"success": True, "network": {}})
+    )
+    # The fake answers in under a millisecond; the cap is pulled under that.
+    monkeypatch.setitem(ROUND_TRIP_CAP_MS_BY_STEP, "matmul", -1)
     async with FakeExecutor(keypair) as executor:
         ctx = context(
             keypair, executor.executor_info, validation=validation, verifyx=verifyx_service
         )
-        local, verifyx, capability = await run_local_then_consumers(
+        local, _, capability = await run_local_then_consumers(
             ctx, LocalVerifyCheck(client_factory=client_factory(keypair))
         )
-    assert local.event.what_we_saw["fallbacks"] == {slow_step: "step_overtime"}
-    assert local.event.what_we_saw["consumed"] == [other]
-    assert local.event.what_we_saw["round_trip_ms"] > ROUND_TRIP_CAP_MS_BY_STEP[slow_step]
-    slow, fast = (capability, verifyx) if slow_step == "matmul" else (verifyx, capability)
-    assert slow.event.what_we_saw["transport"] == "ssh"
-    assert fast.event.what_we_saw["transport"] == "local_verify"
-    assert (ssh_matmul.await_count, ssh_verifyx.await_count) == (
-        (1, 0) if slow_step == "matmul" else (0, 1)
-    )
+    assert local.event.what_we_saw["fallbacks"] == {"matmul": "step_overtime", "verifyx": "ssh_only"}
+    assert capability.event.what_we_saw["transport"] == "ssh" and ssh_matmul.await_count == 1
 
 
 def test_the_wall_clock_caps_are_the_ssh_paths_own():
@@ -1585,7 +1497,7 @@ async def test_ssh_and_local_transports_of_the_same_output_give_the_same_verdict
     captured = {}
 
     async def run(command, timeout=None):
-        captured["cipher"] = command.split("--cipher_text ")[1]
+        captured["cipher"] = command.split("--cipher_text ")[1].split()[0].rstrip(";")
         return SimpleNamespace(stdout=captured["cipher"] + "-ok", stderr="", exit_status=0)
 
     shell.ssh_client = SimpleNamespace(run=run)
@@ -1604,61 +1516,3 @@ async def test_ssh_and_local_transports_of_the_same_output_give_the_same_verdict
         rejected.error.startswith("challenge verification failed")
         and rejected.diagnostics["failure_class"] == "CIPHER_REJECTED"
     )
-
-
-# --- the e2e-stack measurement: SSH sequence vs one call on the stub ------------------------------
-
-
-@pytest.mark.asyncio
-async def test_measure_one_call_against_the_ssh_sequence_on_the_stub(
-    keypair, monkeypatch, short_local_verify_timeouts, verifyx_service, capsys
-):
-    """Stub node: matmul and VerifyX each take STEP seconds of node work; SSH costs RTT per command.
-    SSH path today = checksum + VerifyX + matmul, three serial commands; local path = one HTTP call
-    with the two probes side by side. Printed for the PR body; asserted loosely (CI boxes vary)."""
-    STEP, RTT = 0.4, 0.15
-    validation = matmul_service(monkeypatch)
-
-    async def ssh_run(command, timeout=None):
-        await asyncio.sleep(RTT)
-        if "decrypt_challenge.py" in command:
-            await asyncio.sleep(STEP)
-            return SimpleNamespace(stdout=matmul_stdout("GPU-1"), stderr="", exit_status=0)
-        await asyncio.sleep(STEP)
-        return SimpleNamespace(
-            stdout=command.split("--cipher_text ")[1] + "-ok", stderr="", exit_status=0
-        )
-
-    async def ssh_checksum(path):
-        await asyncio.sleep(RTT)
-        return "lib-sha"
-
-    shell = SimpleNamespace(
-        ssh_client=SimpleNamespace(run=ssh_run), get_sha256_checksum_by_path=ssh_checksum
-    )
-    executor_ssh = SimpleNamespace(root_dir="/root/app", python_path="/usr/bin/python")
-
-    started = time.perf_counter()
-    vx = await verifyx_service.validate_verifyx_and_process_job(shell, executor_ssh, {}, SPECS)
-    mm = await validation.validate_gpu_model_and_process_job(
-        shell.ssh_client, executor_ssh, {}, SPECS
-    )
-    ssh_s = time.perf_counter() - started
-    assert vx.data["success"] and mm.success
-
-    async with FakeExecutor(keypair, step_sleep=STEP) as executor:
-        ctx = context(
-            keypair, executor.executor_info, validation=validation, verifyx=verifyx_service
-        )
-        started = time.perf_counter()
-        local, verifyx, capability = await run_local_then_consumers(
-            ctx, LocalVerifyCheck(client_factory=client_factory(keypair))
-        )
-        local_s = time.perf_counter() - started
-    assert local.event.what_we_saw["consumed"] == ["matmul", "verifyx"]
-
-    print(
-        f"\nMEASURE stub: ssh_sequence={ssh_s:.2f}s (3 commands, RTT {RTT}s, step {STEP}s serial) "
-        f"one_call={local_s:.2f}s (1 GET /version + 1 POST /verify, steps parallel) saving={ssh_s - local_s:.2f}s"
-    )
-    assert local_s < ssh_s
