@@ -162,3 +162,80 @@ def test_declared_ports_keep_the_internal_port_a_rental_binds():
 
     expected = [PortPair(9000, 40000), PortPair(9002, 40002), PortPair(9004, 40003)]
     assert declared_ports(info) == expected
+
+
+@pytest.mark.parametrize(
+    "port_range, ssh_port, expected",
+    [
+        ("9002,9000,22,9000,9001", 22, [9000, 9001, 9002]),
+        ("9000-9004", 9002, [9000, 9001, 9003, 9004]),
+        (" 9000 - 9002 ", 2200, [9000, 9001, 9002]),
+    ],
+)
+def test_declared_ports_from_range_sorted_unique_without_ssh_port(port_range, ssh_port, expected):
+    from services.executor_connectivity.port_selector import declared_ports
+
+    info = _executor_info(port_range=port_range, ssh_port=ssh_port)
+
+    assert declared_ports(info) == [PortPair(p, p) for p in expected]
+
+
+def test_declared_ports_default_range_without_ssh_port():
+    from services.executor_connectivity.port_selector import declared_ports
+
+    info = _executor_info(port_range=None, ssh_port=30000)
+
+    declared = declared_ports(info)
+
+    assert len(declared) == 45535
+    assert (declared[0], declared[-1]) == (PortPair(20000, 20000), PortPair(65535, 65535))
+    assert PortPair(30000, 30000) not in declared
+
+
+def test_declared_ports_empty_mappings_declare_nothing():
+    from services.executor_connectivity.port_selector import declared_ports
+
+    info = _executor_info(port_mappings="[]", port_range="9000-9001")
+
+    assert declared_ports(info) == []
+
+
+def test_declared_ports_follow_a_changed_ssh_port_or_range():
+    from services.executor_connectivity.port_selector import declared_ports
+
+    first = declared_ports(_executor_info(port_range="9000-9002", ssh_port=9000))
+    other_ssh = declared_ports(_executor_info(port_range="9000-9002", ssh_port=9001))
+    other_range = declared_ports(_executor_info(port_range="9005-9006", ssh_port=9001))
+
+    assert first == [PortPair(9001, 9001), PortPair(9002, 9002)]
+    assert other_ssh == [PortPair(9000, 9000), PortPair(9002, 9002)]
+    assert other_range == [PortPair(9005, 9005), PortPair(9006, 9006)]
+
+
+def test_declared_ports_caller_changes_do_not_leak_into_the_next_call():
+    from services.executor_connectivity.port_selector import declared_ports
+
+    info = _executor_info(port_range="9000-9002")
+    declared_ports(info).clear()
+
+    assert declared_ports(info) == [PortPair(9000, 9000), PortPair(9001, 9001), PortPair(9002, 9002)]
+
+
+def test_declared_ports_invalid_range_raises_every_time():
+    from services.executor_connectivity.port_selector import declared_ports
+
+    info = _executor_info(port_range="9000-abc")
+
+    for _ in range(2):
+        with pytest.raises(ValueError):
+            declared_ports(info)
+
+
+def test_declared_ports_expand_a_range_once_for_every_ssh_port(mocker):
+    from services.executor_connectivity import port_selector
+
+    expand = mocker.spy(port_selector, "get_all_ports")
+    port_selector.declared_ports(_executor_info(port_range="9100-9199", ssh_port=9100))
+    port_selector.declared_ports(_executor_info(port_range="9100-9199", ssh_port=9101))
+
+    assert expand.call_count == 1
