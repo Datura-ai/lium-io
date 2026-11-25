@@ -1854,6 +1854,8 @@ def _kept_container_prefix(container_name: str) -> str:
 
 
 _NOT_THE_NODE_LEFT_EXIT = 97
+# /proc/sys/kernel/random/boot_id's own spelling; any other spelling of a boot compares unequal to it
+_BOOT_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 
 
 class _CreatesOfThePodStillRunning(RuntimeError):
@@ -1934,19 +1936,21 @@ def _node_left_delete_command(payload: ContainerDeleteOnNodeLeftRequest) -> str:
     made under another create id (an edit's, or a later placement's on this boot) or none is kept.
 
     Refused (ValueError, nothing removed) unless the delete proves the pod left this boot: `pod_placed_on_boot_id`, the
-    boot the backend read the pod's current placement on, is set and is not `expected_boot_id`. A live container's
-    absence proves nothing: the pod may be placed back here with its container not made yet.
+    boot the backend read the pod's current placement on, is a boot id and is not `expected_boot_id`. Both must be in
+    /proc's own lowercase 8-4-4-4-12 form: any other spelling compares unequal. A live container's absence
+    proves nothing: the pod may be placed back here with its container not made yet.
 
     The pod's named volume is never removed here: one pod keeps one volume name on every registration, so on a
     daemon two registrations share it may be the replacement's, mounted or about to be, and nothing on the host
     tells the two apart until the mount exists. It stays until the pod ends, as before this delete."""
     if not payload.executor_id or not payload.miner_hotkey:
         raise ValueError("the delete names no registration")
-    if not payload.expected_boot_id:
+    if not _BOOT_ID.fullmatch(payload.expected_boot_id):
         raise ValueError("the delete names no boot id")
     if not payload.create_command_id:
         raise ValueError("the delete names no placement")
-    if not payload.pod_placed_on_boot_id or payload.pod_placed_on_boot_id == payload.expected_boot_id:
+    placed_on = payload.pod_placed_on_boot_id
+    if not _BOOT_ID.fullmatch(placed_on) or placed_on == payload.expected_boot_id:
         raise ValueError("the delete does not prove the pod left this boot")
     if payload.container_name != DockerService.get_container_name(payload):
         # the name selects the kept containers too: only the pod's own may be named

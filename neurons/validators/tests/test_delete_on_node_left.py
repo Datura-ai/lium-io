@@ -377,6 +377,29 @@ def test_a_delete_naming_no_registration_or_boot_id_is_refused(missing):
         _node_left_delete_command(_payload(HOST_BOOT).model_copy(update={missing: ""}))
 
 
+# coordinator r475: only /proc's own spelling (lowercase 8-4-4-4-12) is a boot id; any other compares unequal to the
+# host's boot and would pass as proof that the pod left it
+NOT_A_BOOT_ID = {
+    "blank": " ",
+    "upper-case": HOST_BOOT.upper(),
+    "trailing-newline": HOST_BOOT + "\n",
+    "padded": f" {HOST_BOOT} ",
+    "no-dashes": HOST_BOOT.replace("-", ""),
+    "braces": "{" + HOST_BOOT + "}",
+    "urn": f"urn:uuid:{HOST_BOOT}",
+    "garbage": "garbage",
+}
+
+
+@pytest.mark.parametrize("field", ["expected_boot_id", "pod_placed_on_boot_id"])
+@pytest.mark.parametrize("spelling", NOT_A_BOOT_ID.values(), ids=NOT_A_BOOT_ID.keys())
+def test_a_boot_id_not_in_canonical_form_removes_nothing(field, spelling):
+    payload = _payload(HOST_BOOT).model_copy(update={field: spelling})
+
+    with pytest.raises(ValueError):
+        _node_left_delete_command(payload)
+
+
 def test_the_backend_message_parses_to_the_checked_delete():
     raw = _payload().model_dump_json()
 
