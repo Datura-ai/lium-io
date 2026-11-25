@@ -2,6 +2,7 @@ import asyncio
 import os
 import signal
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -182,6 +183,81 @@ async def test_sigterm_exits_at_the_drain_bound_when_work_hangs(tmp_path, monkey
     assert codes == [0]
     assert not hung.done()  # left for the exit, as the SIGKILL would
     hung.cancel()
+
+
+@pytest.mark.asyncio
+async def test_the_new_leader_holds_its_restart_sweep_until_the_old_pods_drain_ends(tmp_path, monkeypatch) -> None:
+    """The new leader's restart sweep resumes every recorded create; one the old pod still drives would then run
+    twice, so taking the lead waits until the old pod's drain ends."""
+    monkeypatch.setattr(compute_client, "CONNECTOR_READY_FILE", str(tmp_path / "ready"))
+    _no_lua_release(monkeypatch)
+    exited, codes = _fake_exit(monkeypatch)
+    server = FakeServer()
+    old, new = _client(server), _client(server)
+    await old.take_connector_lead()
+    release_work = asyncio.Event()
+    old.track_in_flight_driver(asyncio.create_task(release_work.wait()))
+    old.exit_on_sigterm(asyncio.get_running_loop())
+    try:
+        os.kill(os.getpid(), signal.SIGTERM)
+        await asyncio.sleep(0.3)  # the old pod released the lead and drains
+        taking = asyncio.create_task(new.take_connector_lead())
+        await asyncio.sleep(1)
+        assert not taking.done()  # leads only once the old pod's create is done
+        release_work.set()
+        await asyncio.wait_for(exited.wait(), 3)
+        await asyncio.wait_for(taking, 3)
+    finally:
+        asyncio.get_running_loop().remove_signal_handler(signal.SIGTERM)
+    new._lead_task.cancel()
+    assert codes == [0]
+
+
+@pytest.mark.asyncio
+async def test_the_drain_marker_expires_when_the_old_pod_is_killed(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(compute_client, "CONNECTOR_READY_FILE", str(tmp_path / "ready"))
+    monkeypatch.setattr(compute_client, "SIGTERM_DRAIN_SECONDS", 0.5)
+    server = FakeServer()
+    await FakeRedis(server=server).set(compute_client.CONNECTOR_DRAIN_KEY, "1", px=500)  # its pod SIGKILLed mid-drain
+    new = _client(server)
+    await asyncio.wait_for(new.take_connector_lead(), 3)
+    new._lead_task.cancel()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("draining", [False, True])
+async def test_a_command_after_sigterm_is_not_started(draining) -> None:
+    """The drain waits only for the work it saw at SIGTERM, so a later command would be cut by the exit."""
+    client = _client(FakeServer())
+    client.draining = draining
+    client.miner_drivers = asyncio.Queue()
+    client.resumed_creates_report = None
+    client.accepted_request_type = lambda: SimpleNamespace(parse=lambda raw: SimpleNamespace())
+    client.miner_driver = lambda job_request: asyncio.sleep(0)
+    await client.handle_message('{"command": 1}')
+    assert client.miner_drivers.qsize() == (0 if draining else 1)
+
+
+@pytest.mark.asyncio
+async def test_the_drain_waits_for_a_reply_being_sent(tmp_path, monkeypatch) -> None:
+    """The send loop pops a reply before its send ends: an empty queue is not a sent reply."""
+    client = _client(FakeServer())
+    client.lock = asyncio.Lock()
+    client.ws = MagicMock()
+    sent = []
+
+    async def slow_send(model) -> None:
+        await asyncio.sleep(0.5)
+        sent.append(model)
+
+    client.send_model = slow_send
+    client.message_queue.append(MagicMock(failure_step=None))
+    sender = asyncio.create_task(client.handle_send_messages())
+    await asyncio.sleep(0.1)  # popped, in send
+    assert not client.message_queue
+    await client._finish_in_flight_work(asyncio.get_running_loop().time() + 3)
+    sender.cancel()
+    assert len(sent) == 1
 
 
 def test_run_sh_execs_the_connector() -> None:
