@@ -322,31 +322,40 @@ def test_detached_wrapper_keeps_the_log_only_when_the_runner_fails(
         assert not log.exists()
 
 
-@pytest.mark.asyncio
-async def test_the_periodic_pass_reports_an_online_helper_killed_whole(monkeypatch):
-    killed = AsyncMock(return_value=True)
-    monkeypatch.setattr(storage_operations, "report_killed_helper", killed)
-    operation_id = str(uuid4())
-    commands: list[str] = []
 
+def _node(state: str, commands: list[str]):
     async def run(command: str) -> str:
         commands.append(command)
         if command.startswith("cat "):
             return '{"reporter": {"api_url": "https://x", "auth_token": "t", "resource": "backup"}}'
-        return "STATUS:137\n" if "docker inspect" in command else ""
+        return state if "docker inspect" in command else ""
 
-    assert await storage_operations.report_killed_detached_helper(run, operation_id) is True
-    killed.assert_awaited_once()
+    return run
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("state", "message"),
+    [("STATUS:137\n", "killed"), ("STATUS:1\n", "exited with code 1"), ("STATUS:139\n", "code 139")],
+)
+async def test_an_exited_helper_with_its_job_open_is_reported_failed_and_removed(monkeypatch, state, message):
+    report = AsyncMock(return_value=True)
+    monkeypatch.setattr(storage_operations, "_report_operation_status", report)
+    commands: list[str] = []
+
+    assert await storage_operations.report_exited_detached_helper(_node(state, commands), str(uuid4()))
+    assert report.await_args.kwargs["status"] == "FAILED"
+    assert report.await_args.kwargs["stage"] == "BACKUP"
+    assert message in report.await_args.kwargs["message"]
     assert "docker rm -f" in commands[-1]
 
 
 @pytest.mark.asyncio
-async def test_the_periodic_pass_leaves_a_running_helper_alone(monkeypatch):
-    killed = AsyncMock(return_value=True)
-    monkeypatch.setattr(storage_operations, "report_killed_helper", killed)
+async def test_a_running_helper_is_left_alone(monkeypatch):
+    report = AsyncMock(return_value=True)
+    monkeypatch.setattr(storage_operations, "_report_operation_status", report)
+    commands: list[str] = []
 
-    async def run(command: str) -> str:
-        return "RUNNING\n"
-
-    assert await storage_operations.report_killed_detached_helper(run, str(uuid4())) is False
-    killed.assert_not_awaited()
+    assert not await storage_operations.report_exited_detached_helper(_node("RUNNING\n", commands), str(uuid4()))
+    report.assert_not_awaited()
+    assert len(commands) == 1

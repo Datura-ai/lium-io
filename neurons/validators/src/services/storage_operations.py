@@ -418,16 +418,31 @@ async def _operation_state(
     return (result.stdout or "").strip()
 
 
-async def report_killed_detached_helper(
+async def report_exited_detached_helper(
     run: Callable[[str], Awaitable[str | None]], operation_id: str
 ) -> bool:
-    """An online job's helper killed whole (OOM, docker kill) cannot report, and no validator is waiting
-    on it: the periodic pass reports it when it sees it. True when it did (the operation is over)."""
+    """The runner reports before it exits, so an exited helper whose job the backend still has open lost
+    its report (killed whole, crash): the periodic pass reports it when it sees it. True when it did."""
     files = StorageOperationFiles.for_operation(UUID(operation_id))
-    if ((await run(_operation_state_command(files))) or "").strip() != f"STATUS:{KILLED_EXIT}":
+    state = ((await run(_operation_state_command(files))) or "").strip()
+    if not state.startswith("STATUS:"):
         return False
     spec = _parse_spec(await run(f"cat {shlex.quote(str(files.spec))}"))
-    if spec is None or not await report_killed_helper(UUID(operation_id), spec):
+    exit_code = state.removeprefix("STATUS:").strip()
+    reporter = spec.get("reporter") if spec else None
+    backup = isinstance(reporter, Mapping) and reporter.get("resource") == "backup"
+    if spec is None or not await _report_operation_status(
+        UUID(operation_id),
+        spec,
+        status="FAILED",
+        stage="BACKUP" if backup else "RESTORING",
+        message=(
+            "Storage helper was killed (often out of memory)"
+            if exit_code == str(KILLED_EXIT)
+            else f"Storage helper exited with code {exit_code[:20]} without reporting"
+        ),
+        attempts=3,
+    ):
         return False
     await run(_remove_operation_artifacts_command(files))
     return True
@@ -616,8 +631,8 @@ async def report_launch_failure(
     )
 
 
-async def report_killed_helper(operation_id: UUID, spec: Mapping[str, object]) -> bool:
-    return await _report_operation_status(
+async def report_killed_helper(operation_id: UUID, spec: Mapping[str, object]) -> None:
+    await _report_operation_status(
         operation_id,
         spec,
         status="FAILED",

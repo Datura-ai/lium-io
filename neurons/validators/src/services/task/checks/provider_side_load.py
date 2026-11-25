@@ -13,7 +13,7 @@ from core.utils import _m, get_extra_info
 from services.const import LIUM_INFRA_CONTAINER_PREFIXES
 from services.storage_operations import (
     STORAGE_HELPER_KEY_MARK,
-    report_killed_detached_helper,
+    report_exited_detached_helper,
     settle_excused_storage_helper_keys,
 )
 
@@ -303,7 +303,7 @@ async def storage_operation_open(ctx: Context, operation_id: str) -> bool | None
         return None
     if answer is None or not answer.active:
         return None if answer is None else False
-    if ctx.runner is not None and await report_killed_detached_helper(
+    if ctx.runner is not None and await report_exited_detached_helper(
         lambda command: _stdout(ctx, command), operation_id
     ):
         return False
