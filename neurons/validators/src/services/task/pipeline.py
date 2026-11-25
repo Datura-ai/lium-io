@@ -200,6 +200,8 @@ class ContextState:
     kernel_gpu_foreign_mounts: list[str] = field(default_factory=list)
     # which view the list above came from: "host_pid1_root" or "container" (DAH-7076)
     kernel_gpu_view_source: str = "container"
+    # with the host's list: the container view's foreign mounts, kept as evidence (a stale bind after a reset)
+    container_kernel_gpu_foreign_mounts: list[str] = field(default_factory=list)
     verified_port_count: int = 0
     # verified_port_count is out of the ports probed this cycle (at most BATCH_PORT_VERIFICATION_SIZE,
     # the lowest free ones), never the declared range: declared - probed were not probed at all,

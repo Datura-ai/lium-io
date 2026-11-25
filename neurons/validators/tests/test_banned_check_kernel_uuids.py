@@ -177,7 +177,10 @@ async def test_a_stale_bind_after_a_gpu_reset_is_read_through_the_host_and_passe
     assert result.event.what_we_saw["kernel_view_source"] == "host_pid1_root"
     assert result.updates["state"].kernel_gpu_uuids == [REAL]
     assert result.updates["state"].kernel_gpu_view_source == "host_pid1_root"
-    assert [c.args[0] for c in ctx.ssh.run.await_args_list] == [nvidia_devices.HOST_KERNEL_GPU_VIEW_CMD]
+    # the stale bind is still reported, as evidence only
+    [stale] = result.event.what_we_saw["container_kernel_gpu_foreign_mounts"]
+    assert stale.endswith("proc:/driver/nvidia/gpus/0001:00:00.0//deleted")
+    assert result.event.what_we_saw["kernel_gpu_foreign_mounts"] == []
 
 
 @pytest.mark.asyncio
@@ -194,4 +197,5 @@ async def test_an_unusable_host_view_falls_back_to_the_container_and_an_overlay_
     assert result.passed is False
     assert result.event.reason_code == BannedProviderMessages.KERNEL_GPU_VIEW_OVERLAID.reason
     assert result.event.what_we_saw["kernel_view_source"] == "container"
+    assert result.event.what_we_saw["container_kernel_gpu_foreign_mounts"] == []
     assert result.updates["kernel_gpu_view_passed"] is False

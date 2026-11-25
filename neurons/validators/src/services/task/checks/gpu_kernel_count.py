@@ -230,7 +230,7 @@ class GpuKernelCountCheck:
     async def _evaluate(self, ctx: Context) -> CheckResult:
         reported_uuids = reported_gpu_uuids(ctx)
         reported_count = reported_gpu_count(ctx, reported_uuids)
-        (kernel_uuids, foreign_mounts), source = await kernel_gpu_view_with_source(ctx)
+        (kernel_uuids, foreign_mounts), source, container_mounts = await kernel_gpu_view_with_source(ctx)
 
         kernel_check_fields = evaluate_kernel_view(
             reported_count=reported_count,
@@ -285,6 +285,7 @@ class GpuKernelCountCheck:
                 "reported_uuids": reported_uuids,
                 "kernel_gpu_uuids": kernel_uuids,
                 "kernel_gpu_foreign_mounts": foreign_mounts,
+                "container_kernel_gpu_foreign_mounts": container_mounts,
                 "would_fail": would_fail,
             }
         )
