@@ -6,7 +6,7 @@ The validator↔backend wire, once. Pydantic v2 models for:
 - `lium_protocol.backend_to_validator` — every message the backend sends down that socket (`BackendMessageType`, 19 types: container lifecycle, ssh keys, backups, Jupyter, the estimate request, the staging-only forced cycle, the one-node recheck), plus the three typeless replies it sends there (`SOCKET_REPLIES`: `Response`, `RentedMachineResponse`, `RevenuePerGpuTypeResponse` — no `message_type`, told apart by the request the validator is waiting for).
 - `lium_protocol.http` — the bodies of the backend HTTP API the validator reads between cycles (`HTTP_MODELS`, 10 bodies).
 
-No application code: nothing here imports the validator or the backend. `PROTOCOL_VERSION` (`2.17.0`) is semver over the wire.
+No application code: nothing here imports the validator or the backend. `PROTOCOL_VERSION` (`2.24.0`) is semver over the wire.
 
 ## Using it
 
@@ -73,7 +73,7 @@ Consumers pin a tag `lium-protocol-v<PROTOCOL_VERSION>` of this repository. The 
 - `2.13.0` — `ContainerCreated.command_id` (optional, default empty): the `ContainerCreateRequest`'s `command_id`, echoed. `ExecutorRentFinishedRequest.create_command_id` (optional, default empty): the backend names in it the `ContainerCreated.command_id` the receipt answers. It is not `command_id`, which the validator dedupes requests on. The backend applies a success only for the pod's current create; an older one gets its receipt alone. The validator clears only the pending state of the dispatch a receipt names, and the `ResumedCreatesReport` goes once every success replayed ahead of it has its receipt. Empty on either side: as before.
 - `2.15.0` — `SshPubKeyRemoved.command_id` (optional, default empty): the `RemoveSshPublicKeysRequest`'s `command_id`, echoed, as `SshPubKeyAdded` does since 1.14.0; a removal's `FailedContainerRequest` echoes it too. The backend confirms a removal only on the answer to that send, so a delayed answer to an earlier send cannot confirm a later one. Empty from an older validator.
 - `2.16.0` — `GpuResetErrorCode.GpusLostOnHost`: a renter's GPU reset found the GPUs gone from the host driver (the host GPU listing failed, timed out or came back empty); the provider has to reboot the host. The validator sends it once the backend accepts it; a validator released before that sends `ResetNotSupported` with the same detail for this case.
-- `2.17.0` — `RentedPod.gpu_uuids` (optional) and `RentedExecutorsResponse.filler_gpu_uuids_by_executor` (optional, default empty): the GPU UUIDs the backend assigned to each pod, and per executor the GPU UUIDs its active fillers hold (a whole-node filler lists every card). An older backend sends neither.
+- `2.24.0` — `RentedPod.gpu_uuids` (optional) and `RentedExecutorsResponse.filler_gpu_uuids_by_executor` (optional, default empty): the GPU UUIDs the backend assigned to each pod, and per executor the GPU UUIDs its active fillers hold (a whole-node filler lists every card). An older backend sends neither.
 - `1.0.0` — first release.
 
 ## Tests

@@ -396,12 +396,13 @@ async def _redis_set(ctx: Context, template: str, ttl_seconds: int, *, value: st
 
 
 async def unanswered_cards_on_lium_workload(
-    ctx: Context, specs: dict, probe: AllCardsProbe
+    ctx: Context, specs: dict, probe: AllCardsProbe, *, fillers_removed: bool = False
 ) -> tuple[bool, RentedExecutorsResponse | None]:
     """Whether every card that gave no answer has a Lium workload assigned to it by the backend now (that card was
     not the node's to give this cycle), and the fresh snapshot read. Shared by CapabilityCheck and the post-rental
-    recheck, so both judge the same run the same way."""
-    assigned, snapshot = await _lium_workload_gpu_uuids(ctx)
+    recheck, so both judge the same run the same way. `fillers_removed`: the caller removed every filler before the
+    run, so a filler the backend still lists holds no card."""
+    assigned, snapshot = await _lium_workload_gpu_uuids(ctx, count_fillers=not fillers_removed)
     details = (specs.get("gpu") or {}).get("details") or []
     card_uuids = [
         ((details[i].get("uuid") or "") if i < len(details) else "").strip().lower() for i in probe.unanswered_cards
@@ -409,7 +410,9 @@ async def unanswered_cards_on_lium_workload(
     return bool(card_uuids) and all(uuid and uuid in assigned for uuid in card_uuids), snapshot
 
 
-async def _lium_workload_gpu_uuids(ctx: Context) -> tuple[set[str], RentedExecutorsResponse | None]:
+async def _lium_workload_gpu_uuids(
+    ctx: Context, *, count_fillers: bool = True
+) -> tuple[set[str], RentedExecutorsResponse | None]:
     """The GPU UUIDs the backend has a Lium workload assigned to on this node right now (lower case), and the fresh
     snapshot they came from. Only the backend's assignment counts, never the node's word; no answer is no card."""
     try:
@@ -420,7 +423,7 @@ async def _lium_workload_gpu_uuids(ctx: Context) -> tuple[set[str], RentedExecut
     if fresh is None:
         return set(), None
     uuids: list[str] = []
-    if not uuid_listed_under_another_miner(ctx, fresh):
+    if count_fillers and not uuid_listed_under_another_miner(ctx, fresh):
         uuids += fresh.get_filler_gpu_uuids(ctx.executor.uuid)
     rental = rental_of_this_node(ctx, rented_data=fresh)
     for pod in rental.pods if rental else []:

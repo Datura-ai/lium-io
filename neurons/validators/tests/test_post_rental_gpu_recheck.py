@@ -374,6 +374,65 @@ async def test_a_filler_is_removed_and_the_cards_probed_on_the_first_cycle(
     assert KEY not in ctx.services.redis.store
 
 
+def _filler_ctx(context_factory, validation, fillers, rm_exit_statuses):
+    """Our fillers on GPU-0 at the snapshot; the recheck removes them (each `docker rm` exits as given)."""
+    ssh = AsyncMock()
+    ssh.run.side_effect = [
+        step
+        for status in rm_exit_statuses
+        for step in (
+            SimpleNamespace(exit_status=0, stdout="abc123\n", stderr=""),
+            SimpleNamespace(exit_status=status, stdout="", stderr=""),
+        )
+    ]
+    services = build_services(validation=validation)
+    services.redis.store[KEY] = json.dumps(MARKER)
+    uuid = default_executor().uuid
+    listed = RentedExecutorsResponse(
+        all_filler_containers_by_executor={uuid: fillers},
+        filler_gpu_uuids_by_executor={uuid: ["GPU-0"]},
+        default_job_owner_by_executor={uuid: "lium"},
+        executors={},
+    )
+    services.backend.get_rented_executors_now.return_value = listed  # not caught up with the removal yet
+    return context_factory(
+        services=services,
+        config=build_context_config(),
+        state=build_state(
+            specs={"gpu": {"count": 2, "details": [{"uuid": "GPU-0"}, {"uuid": "GPU-1"}]}}, rented_data=listed
+        ),
+        runner=FakeRunner(probe_stdout("ok")),
+        ssh=ssh,
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_card_whose_filler_the_recheck_removed_is_judged_though_the_backend_still_lists_it(context_factory):
+    # review of lio#2440: the fresh read still lists the filler the recheck just removed; its card is free now, so a
+    # timeout there is the card's verdict (the stuck-card case), not our workload
+    validation = FakeValidation(_all_cards("timeout", ""))
+    ctx = _filler_ctx(context_factory, validation, ["filler_run-1"], [0])
+
+    result = await PostRentalGpuRecheckCheck().run(ctx)
+
+    assert validation.calls == 1
+    assert result.passed is False and result.event.reason_code == Msg.FAILED.reason
+    assert KEY in ctx.services.redis.store
+
+
+@pytest.mark.asyncio
+async def test_a_filler_left_running_after_a_partial_removal_is_inconclusive(context_factory):
+    # one of two fillers could not be removed: it may still hold a card, so the cards are not probed this cycle
+    validation = FakeValidation(_all_cards("timeout", ""))
+    ctx = _filler_ctx(context_factory, validation, ["filler_run-1", "filler_run-2"], [0, 1])
+
+    result = await PostRentalGpuRecheckCheck().run(ctx)
+
+    assert validation.calls == 0
+    assert result.passed and result.event.reason_code == Msg.INCONCLUSIVE.reason
+    assert KEY in ctx.services.redis.store
+
+
 @pytest.mark.asyncio
 async def test_a_filler_that_cannot_be_removed_is_inconclusive_not_a_failure(context_factory):
     runner, validation = FakeRunner(probe_stdout("ok")), FakeValidation(_all_cards("", ""))

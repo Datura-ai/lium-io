@@ -127,7 +127,7 @@ async def record_gpu_drop(ctx: Context, missing_uuids: list[str]) -> None:
     )
 
 
-async def _all_cards_no_verdict(ctx: Context, probe: AllCardsProbe) -> bool:
+async def _all_cards_no_verdict(ctx: Context, probe: AllCardsProbe, *, fillers_removed: bool) -> bool:
     # Only a lost connection to the whole node (`AllCardsProbe.connection_lost`), unanswered cards the backend has a
     # Lium workload on now, and the wall clock with every card answering say nothing about the cards, as
     # CapabilityCheck judges them. Otherwise a timeout, a timeout again on the probe's retry (`timeout_after_retry`) or
@@ -140,7 +140,15 @@ async def _all_cards_no_verdict(ctx: Context, probe: AllCardsProbe) -> bool:
         return probe.over_wall_clock
     if probe.connection_lost:
         return True
-    return not probe.wrong_answer and (await unanswered_cards_on_lium_workload(ctx, ctx.state.specs or {}, probe))[0]
+    # fillers_removed: the backend can still list the fillers this recheck removed, whose cards are free now
+    return (
+        not probe.wrong_answer
+        and (
+            await unanswered_cards_on_lium_workload(
+                ctx, ctx.state.specs or {}, probe, fillers_removed=fillers_removed
+            )
+        )[0]
+    )
 
 
 class PostRentalGpuRecheckCheck:
@@ -170,8 +178,8 @@ class PostRentalGpuRecheckCheck:
         if get_filler_only_container(ctx):
             # both probes would compete with the filler for VRAM
             what["removed_fillers"] = await self._remove_fillers(ctx)
-            if not what["removed_fillers"]:
-                # the filler still holds VRAM: a probe OOM here would fail a healthy card
+            if set(what["removed_fillers"]) != set(ctx.state.rented_data.get_filler_containers(ctx.executor.uuid)):
+                # a filler still holds VRAM: a probe OOM here would fail a healthy card
                 await self._refresh_marker(ctx, key, what)
                 self._log(ctx, "POST_RENTAL_GPU_RECHECK_INCONCLUSIVE", what, logging.INFO)
                 return self._not_run(ctx, marker, Msg.INCONCLUSIVE, what)
@@ -287,7 +295,7 @@ class PostRentalGpuRecheckCheck:
         if all_cards_probe is not None and all_cards_probe.passed:
             await record_all_cards_pass(ctx)
         if all_cards_probe is not None and not all_cards_probe.passed:
-            if await _all_cards_no_verdict(ctx, all_cards_probe):
+            if await _all_cards_no_verdict(ctx, all_cards_probe, fillers_removed=bool(what.get("removed_fillers"))):
                 inconclusive = True
             else:
                 failures.append(f"all-cards matmul: {all_cards_probe.failure_reason}")
