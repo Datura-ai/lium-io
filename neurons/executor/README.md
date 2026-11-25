@@ -34,7 +34,7 @@ The script installs the [`lium`](https://github.com/Datura-ai/lium) CLI and runs
 1. clones this repository into `./compute-subnet` (or pulls the branch if the directory already exists),
 2. runs `scripts/install_executor_on_ubuntu.sh` (Docker Engine and the compose plugin), then checks prerequisites — `nvidia-smi`, `nvidia-container-cli`, `docker info`,
 3. renders `neurons/executor/.env` from `.env.template` with the hotkey and the ports — you are prompted for the service port (`8080`), the node SSH port (`2200`), an optional public SSH port and an optional renting port range; pass `--auto` to accept the defaults without prompts,
-4. starts the executor with `docker compose up -d` and waits for the container to report `healthy`,
+4. starts the executor with `docker compose up -d` and waits for the node API to answer,
 5. runs the validator's own check against the node (`daturaai/compute-subnet-validator:preflight`).
 
 At the end it prints the node's endpoint, GPU type and count, and a `provider.lium.io/nodes?action=add&…` link that pre-fills the **Add Node** form in the [Provider Portal](https://provider.lium.io) with those values. Other options: `-d/--dir` (checkout directory, default `compute-subnet`) and `-b/--branch` (default `main`); `lium mine --help` lists them.

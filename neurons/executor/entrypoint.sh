@@ -154,6 +154,29 @@ fi
 
 docker compose up --pull "$pull" --detach --wait --force-recreate
 
+# DAH-7125: the executor has no Docker healthcheck any more (the monitor's API watcher restarts it), so --wait only
+# waits for the start. Readiness is the API answering; a node still starting is logged, never recreated again here.
+tries=0
+until docker compose exec -T executor sh -c 'curl -fsS --max-time 5 "http://127.0.0.1:$INTERNAL_PORT/version"' >/dev/null 2>&1; do
+    tries=$((tries + 1))
+    if [ "$tries" -ge "${RUNNER_READY_MAX_TRIES:-36}" ]; then
+        echo "The executor API did not answer yet; the monitor restarts it if it stays down."
+        break
+    fi
+    sleep 5
+done
+if [ "$tries" -lt "${RUNNER_READY_MAX_TRIES:-36}" ]; then echo "Executor API ready."; fi
+
+# The autoheal service left the compose file, but compose keeps a container it no longer knows (no --remove-orphans:
+# the runner and its updater share the project). Remove this stack's own autoheal only, never a neighbour's.
+executor_id=$(docker compose ps --quiet executor 2>/dev/null || true)
+project=$(docker inspect --format '{{index .Config.Labels "com.docker.compose.project"}}' "$executor_id" 2>/dev/null || true)
+if [ -n "$project" ]; then
+    for old in $(docker ps --all --quiet --filter "label=com.docker.compose.project=$project" --filter label=com.docker.compose.service=autoheal 2>/dev/null || true); do
+        if docker rm --force "$old" >/dev/null 2>&1; then echo "Removed the old autoheal container $old"; fi
+    done
+fi
+
 # The executor is pulled by digest, so its old images are not dangling and `image prune` keeps them
 # (2-5 GB per release, every past release too). Remove every executor image but the one now running;
 # Docker refuses to remove an image a container still uses.
