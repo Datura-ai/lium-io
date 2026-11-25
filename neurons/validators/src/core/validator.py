@@ -234,6 +234,7 @@ class Validator:
             backend_client=self.backend_client,
             subtensor_client=self.subtensor_client,
             cycle_inputs=self.express_lane_cycle_inputs,
+            registry_digest=self.fetch_executor_digest_or_none,
         )
         # DAH-5215: re-probes rented pods' SSH between cycles; observe only.
         self.rented_pod_watch = RentedPodWatch(backend_client=self.backend_client)

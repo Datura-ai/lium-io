@@ -24,7 +24,7 @@ import logging
 import os
 import time
 from collections import Counter
-from collections.abc import Callable, Iterator
+from collections.abc import Awaitable, Callable, Iterator
 from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -33,11 +33,11 @@ import bittensor
 from clients.validator_portal_api import PortalExecutor, ValidatorPortalAPI, start_owner_hotkeys_read
 from payload_models.payloads import MinerJobEnryptedFiles, MinerJobRequestPayload
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
-from services.executor_image_policy import ExpectedImageSnapshot
+from services.executor_image_policy import ExpectedImageSnapshot, normalize_sha256_digest
 from services.executor_rollout import RolloutWindow, rollout_grace_reason
 from services.miner_service import EXPRESS_LANE, MinerService
 from services.redis_service import EXPRESS_REDIS_SLOT
-from services.task.messages import CYCLE_END_READ_REASONS, RentalVerificationMessages
+from services.task.messages import CYCLE_END_READ_REASONS, ExecutorImageMessages, RentalVerificationMessages
 from services.task_service import JobResult
 
 from core.config import settings
@@ -190,6 +190,7 @@ class ExpressLane:
         subtensor_client,
         cycle_inputs: Callable[[], CycleInputs | None],
         portal_api=ValidatorPortalAPI,
+        registry_digest: Callable[[], Awaitable[str | None]] | None = None,
     ):
         self.miner_service = miner_service
         self.redis_service = redis_service
@@ -200,6 +201,8 @@ class ExpressLane:
         # before it.
         self.cycle_inputs = cycle_inputs
         self.portal_api = portal_api
+        # The validator's read-only registry digest fetch (no rollout state is touched by it)
+        self.registry_digest = registry_digest
         self._pending: dict[str, _Pending] = {}
         # The wave leaves what this lane has queued to it (MinerService._claim_for_cycle), through
         # a view of this dict, never rebound, so the wave always reads the current queue.
@@ -704,7 +707,7 @@ class ExpressLane:
             self._defer(pending, RENTED_DURING_THE_CHECK if rented else NO_TASK_TIME_FOR_THE_RENTAL_PROBE)
             return
         passed = result.score > 0 or result.job_score > 0
-        if not passed and self._rollout_explains(result):
+        if not passed and await self._rollout_explains(result):
             # lio#2389 review: a failure the executor-image rollout explains gets no verdict in the cycle; published
             # here it would be a zero that takes a node updating right after the push off the rent list
             self._left_to_cycle.add(executor_id)
@@ -828,13 +831,25 @@ class ExpressLane:
             )
         )
 
-    def _rollout_explains(self, result: JobResult) -> bool:
-        """Whether the rollout grace withholds this result, as `withhold_rollout_verdicts` does at the cycle end,
-        read from the window the cycle holds."""
+    async def _rollout_explains(self, result: JobResult) -> bool:
+        """Whether the rollout grace withholds this failure, as `withhold_rollout_verdicts` does at the cycle end.
+
+        The window the cycle holds decides first. An OUTDATED failure it does not cover asks the registry once (a
+        read, never `observe`, so no cycle is counted): a digest other than the window's is a push since the cycle
+        started, and the cycle end's own read opens a window on this cycle that withholds it (lio#2389 review)."""
         inputs = self.cycle_inputs()
         if inputs is None or inputs.rollout_window is None or inputs.job_block is None:
             return False
-        return rollout_grace_reason(result, inputs.rollout_window, inputs.job_block) is not None
+        window = inputs.rollout_window
+        if rollout_grace_reason(result, window, inputs.job_block) is not None:
+            return True
+        if result.failure_reason_code != ExecutorImageMessages.OUTDATED.reason or self.registry_digest is None:
+            return False
+        held = normalize_sha256_digest(window.digest)
+        if held is None:  # the first digest ever seen opens no window at the cycle end either
+            return False
+        now = normalize_sha256_digest(await self.registry_digest())
+        return now is not None and now != held
 
     def _defer(self, pending: _Pending, reason: str) -> None:
         """Try again after retry_seconds_for(reason), or after max_attempts_for(reason) asks leave
