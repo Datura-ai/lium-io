@@ -417,7 +417,7 @@ class ContainerCleanup:
 
         return len(removed_names), removed_names, unremovable_names
 
-    def _removal_age_minutes_for_unlisted_container(self, name: str, rented_data: Optional[RentedExecutorsResponse]) -> float:
+    def _removal_age_minutes_for_unlisted_container(self, name: str, rented_data: RentedExecutorsResponse | None) -> float:
         """Minutes old an unlisted container must be before it is removed.
 
         DAH-7071: a filler_ container older than the rented list it is missing from is no live run, so
