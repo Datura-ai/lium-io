@@ -440,7 +440,6 @@ class FileEncryptService:
             'ib_driver': "",
             'data_boot_id': "",
             'data_egress_ip': "",
-            'data_egress_ips': "",
             'data_container_cap_eff': "",
             'data_executor_pid_mode_scrape_error': "",
             'data_executor_pid_mode': "",
