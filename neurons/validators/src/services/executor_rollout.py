@@ -602,12 +602,14 @@ def withhold_session_lost_verdicts(
 
 
 # DAH-6564: failures a rental or filler that started or ended during the cycle produces (the checks judge the node
-# against the list read at the cycle start)
+# against the list read at the cycle start). An OUTDATED image fails only a node that list has free (DAH-6845), so a
+# rental that starts later in the cycle gets no verdict instead of a zero, and the next cycle scores it rented
 RENTAL_CHANGE_REASONS = frozenset(
     {
         PortCountMessages.INSUFFICIENT_PORTS.reason,
         RentalVerificationMessages.FAILED.reason,
         GpuUsageMessages.USAGE_HIGH.reason,
+        ExecutorImageMessages.OUTDATED.reason,
     }
 )
 # one hash for the fleet: "<miner hotkey>:<executor uuid>" -> {"batches": [withheld job_batch_ids], "at": epoch}
@@ -663,9 +665,10 @@ async def withhold_rental_change_verdicts(
     redis_service: RedisService,
     published_early: set[str],
 ) -> tuple[dict[str, list[JobResult]], list[WithheldVerdict]]:
-    """DAH-6564: a ports, rental-check or GPU-usage failure on a node whose pods or fillers changed between the
-    cycle-start list and the cycle-end list gets no verdict, at most MAX_RENTAL_CHANGE_WITHHELD_CYCLES cycles
-    since the node's last real pass. No cycle-end list, or Redis not answering: every verdict stands."""
+    """DAH-6564: a ports, rental-check, GPU-usage or free-node outdated-image failure on a node whose pods or
+    fillers changed between the cycle-start list and the cycle-end list gets no verdict, at most
+    MAX_RENTAL_CHANGE_WITHHELD_CYCLES cycles since the node's last real pass. No cycle-end list, or Redis not
+    answering: every verdict stands."""
     candidates = has_rental_change_candidates(job_results)
     if candidates and rented_at_end is None:
         logger.warning(_m("Rental-change rule: the cycle-end rented list gave no answer; every verdict stands"))

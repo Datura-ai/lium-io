@@ -270,3 +270,31 @@ async def test_the_cycle_end_takes_the_withheld_result_out_and_it_keeps_no_miner
     assert kept == {MINER: [healthy]}
     assert [w.result for w in withheld] == [failed]
     assert session_kept_hotkeys(withheld) == set()
+
+
+OUTDATED_IMAGE = "EXECUTOR_IMAGE_OUTDATED"
+
+
+@pytest.mark.asyncio
+async def test_a_rental_started_after_a_free_nodes_outdated_image_read_withholds_its_zero():
+    # review on lium-io#2389: a node free when its OUTDATED image was read, rented before the cycle published
+    standing, withheld = await _rule([_fail(OUTDATED_IMAGE)], _listed(), _listed(pods={NODE: ["p1"]}))
+
+    assert standing == {MINER: []}
+    assert _withheld_uuids(withheld) == [NODE]
+
+
+@pytest.mark.asyncio
+async def test_a_free_node_on_an_outdated_image_still_free_at_the_cycle_end_stands():
+    standing, withheld = await _rule([_fail(OUTDATED_IMAGE)], _listed(), _listed())
+
+    assert [r.executor_info.uuid for r in standing[MINER]] == [NODE]
+    assert withheld == []
+
+
+@pytest.mark.asyncio
+async def test_an_unofficial_image_stands_when_a_rental_started():
+    standing, withheld = await _rule([_fail("EXECUTOR_IMAGE_UNOFFICIAL")], _listed(), _listed(pods={NODE: ["p1"]}))
+
+    assert [r.executor_info.uuid for r in standing[MINER]] == [NODE]
+    assert withheld == []
