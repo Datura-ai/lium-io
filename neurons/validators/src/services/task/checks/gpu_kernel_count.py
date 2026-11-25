@@ -17,10 +17,12 @@ from ..messages import GpuKernelCountMessages as Msg
 from ..messages import MessageTemplate, render_message
 from ..models import ValidationEvent
 from ..pipeline import CheckResult, Context
-from .banned_provider import has_live_rental, kernel_gpu_view, reported_gpu_uuids
-
-KERNEL_VIEW_SOURCE_CONTAINER = "container"
-KERNEL_VIEW_SOURCE_HOST = "host_pid1_root"
+from .banned_provider import (
+    KERNEL_VIEW_SOURCE_HOST,
+    has_live_rental,
+    kernel_gpu_view_with_source,
+    reported_gpu_uuids,
+)
 
 
 def _normalized(uuids: list[str] | None) -> list[str]:
@@ -228,14 +230,14 @@ class GpuKernelCountCheck:
     async def _evaluate(self, ctx: Context) -> CheckResult:
         reported_uuids = reported_gpu_uuids(ctx)
         reported_count = reported_gpu_count(ctx, reported_uuids)
-        kernel_uuids, foreign_mounts = await kernel_gpu_view(ctx)
+        (kernel_uuids, foreign_mounts), source = await kernel_gpu_view_with_source(ctx)
 
         kernel_check_fields = evaluate_kernel_view(
             reported_count=reported_count,
             reported_uuids=reported_uuids,
             kernel_uuids=kernel_uuids,
         ).as_fields()
-        kernel_check_fields["kernel_view_source"] = KERNEL_VIEW_SOURCE_CONTAINER
+        kernel_check_fields["kernel_view_source"] = source
         if kernel_check_fields["kernel_verdict"] == "count_lower":
             kernel_check_fields["container_kernel_gpu_count"] = kernel_check_fields[
                 "kernel_gpu_count"

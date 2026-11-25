@@ -130,3 +130,68 @@ async def test_overlaid_kernel_view_on_a_live_rental_is_not_fatal(context_factor
     assert result.event.reason_code == BannedProviderMessages.KERNEL_GPU_VIEW_OVERLAID.reason
     assert result.fatal is False
     assert result.updates["kernel_gpu_view_passed"] is False  # zeroes the score instead
+
+
+def _view_stdout(lines, mounts, info_file):
+    return "\n".join(
+        [
+            *mounts,
+            nvidia_devices.KERNEL_GPU_FS_SEPARATOR,
+            *(f"{info_file} proc" for _ in lines),
+            *(f"{info_file}|regular empty file" for _ in lines),
+            nvidia_devices.KERNEL_GPU_VIEW_SEPARATOR,
+            *lines,
+        ]
+    )
+
+
+# DAH-7076, node fc1b5612: after a renter reset the container's bind of the card points at the deleted entry
+STALE_BIND = (
+    "1619 1575 0:23 /driver/nvidia/gpus/0001:00:00.0//deleted /proc/driver/nvidia/gpus/0001:00:00.0 "
+    "ro,nosuid,nodev,noexec,relatime master:5 - proc proc rw"
+)
+
+
+def _ssh_host_and_container(host_stdout: str, container_stdout: str) -> AsyncMock:
+    async def run(command, *args, **kwargs):
+        stdout = host_stdout if command == nvidia_devices.HOST_KERNEL_GPU_VIEW_CMD else container_stdout
+        return MagicMock(exit_status=0, stdout=stdout, stderr="")
+
+    ssh = AsyncMock()
+    ssh.run = AsyncMock(side_effect=run)
+    return ssh
+
+
+@pytest.mark.asyncio
+async def test_a_stale_bind_after_a_gpu_reset_is_read_through_the_host_and_passes(context_factory):
+    host = _view_stdout([f"{REAL}, 0"], [], nvidia_devices.HOST_PID1_ROOT + INFO_FILE)
+    container = _view_stdout([f"{REAL}, 0"], [CONTAINER_MOUNTS[0], STALE_BIND], INFO_FILE)
+    ctx = context_factory(
+        state=build_state(gpu_uuids=REAL, rented_data=RentedExecutorsResponse(executors={})),
+        ssh=_ssh_host_and_container(host, container),
+    )
+
+    result = await BannedProviderCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.what_we_saw["kernel_view_source"] == "host_pid1_root"
+    assert result.updates["state"].kernel_gpu_uuids == [REAL]
+    assert result.updates["state"].kernel_gpu_view_source == "host_pid1_root"
+    assert [c.args[0] for c in ctx.ssh.run.await_args_list] == [nvidia_devices.HOST_KERNEL_GPU_VIEW_CMD]
+
+
+@pytest.mark.asyncio
+async def test_an_unusable_host_view_falls_back_to_the_container_and_an_overlay_still_fails(context_factory):
+    # PID 1 is the container's own init: its table has the runtime's mounts, so the host rules refuse it
+    overlaid = _view_stdout([f"{REAL}, 0"], [*CONTAINER_MOUNTS, OVERLAY_MOUNT], INFO_FILE)
+    ctx = context_factory(
+        state=build_state(gpu_uuids=REAL, rented_data=RentedExecutorsResponse(executors={})),
+        ssh=_ssh_host_and_container(overlaid, overlaid),
+    )
+
+    result = await BannedProviderCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.reason_code == BannedProviderMessages.KERNEL_GPU_VIEW_OVERLAID.reason
+    assert result.event.what_we_saw["kernel_view_source"] == "container"
+    assert result.updates["kernel_gpu_view_passed"] is False

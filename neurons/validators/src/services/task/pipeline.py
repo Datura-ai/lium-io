@@ -198,6 +198,8 @@ class ContextState:
     # mounts that are not procfs at or under /proc/driver/nvidia/gpus ("<mount point> <fstype>");
     # non-empty = the kernel list above was withheld because it was read through them
     kernel_gpu_foreign_mounts: list[str] = field(default_factory=list)
+    # which view the list above came from: "host_pid1_root" or "container" (DAH-7076)
+    kernel_gpu_view_source: str = "container"
     verified_port_count: int = 0
     # verified_port_count is out of the ports probed this cycle (at most BATCH_PORT_VERIFICATION_SIZE,
     # the lowest free ones), never the declared range: declared - probed were not probed at all,

@@ -13,17 +13,37 @@ def reported_gpu_uuids(ctx: Context) -> list[str]:
     return [gpu_uuid for gpu_uuid in (ctx.state.gpu_uuids or "").split(",") if gpu_uuid]
 
 
+KERNEL_VIEW_SOURCE_CONTAINER = "container"
+KERNEL_VIEW_SOURCE_HOST = "host_pid1_root"
+
+
 async def kernel_gpu_view(ctx: Context) -> KernelGpuView:
     """Kernel-side GPU identity, read once per cycle: this check stores it in ctx.state for BannedGpuCheck.
 
     `kernel_gpu_uuids_read_attempted` marks the attempt, so an unreadable procfs is read once per cycle too —
     the second check must not open another 15 s SSH read on the same wedged host.
     """
+    return (await kernel_gpu_view_with_source(ctx))[0]
+
+
+async def kernel_gpu_view_with_source(ctx: Context) -> tuple[KernelGpuView, str]:
+    """The kernel list and the view it came from: the host's, read through PID 1's root, when that read is the
+    host's own procfs (read_kernel_gpu_view's host rules); otherwise the executor container's, as before.
+
+    DAH-7076: the container's binds under /proc/driver/nvidia/gpus are made when the executor starts. A GPU reset
+    re-creates the card's host entry, the bind keeps pointing at the deleted one, and the container's list reads
+    as overlaid until the executor restarts. Where the PID namespace is not shared, PID 1's mount table is the
+    container's, the host rules refuse it, and the container read runs exactly as before.
+    """
     if ctx.state.kernel_gpu_uuids_read_attempted:
-        return KernelGpuView(ctx.state.kernel_gpu_uuids, ctx.state.kernel_gpu_foreign_mounts)
+        view = KernelGpuView(ctx.state.kernel_gpu_uuids, ctx.state.kernel_gpu_foreign_mounts)
+        return view, ctx.state.kernel_gpu_view_source
     if ctx.ssh is None:
-        return KernelGpuView(uuids=None, foreign_mounts=[])
-    return await read_kernel_gpu_view(ctx.ssh)
+        return KernelGpuView(uuids=None, foreign_mounts=[]), KERNEL_VIEW_SOURCE_CONTAINER
+    host = await read_kernel_gpu_view(ctx.ssh, host_view=True)
+    if host.uuids:
+        return host, KERNEL_VIEW_SOURCE_HOST
+    return await read_kernel_gpu_view(ctx.ssh), KERNEL_VIEW_SOURCE_CONTAINER
 
 
 async def kernel_gpu_uuids(ctx: Context) -> list[str] | None:
@@ -55,7 +75,7 @@ class BannedProviderCheck:
         rented_data = ctx.state.rented_data
         gpu_uuids = reported_gpu_uuids(ctx)
         # DAH-2662: match bans against the kernel's GPU list too (shapes: kernel_gpu_view)
-        kernel_uuids, foreign_mounts = await kernel_gpu_view(ctx)
+        (kernel_uuids, foreign_mounts), source = await kernel_gpu_view_with_source(ctx)
         is_banned = bool(
             rented_data
             and rented_data.is_provider_banned(
@@ -83,6 +103,7 @@ class BannedProviderCheck:
             "kernel_ban_enforced": True,
             "kernel_gpu_foreign_mounts": foreign_mounts,
             "kernel_overlay_enforced": True,
+            "kernel_view_source": source,
         }
         specs = ctx.state.specs
         if kernel_uuids is not None:
@@ -93,6 +114,7 @@ class BannedProviderCheck:
                 kernel_gpu_uuids=kernel_uuids,
                 kernel_gpu_uuids_read_attempted=True,
                 kernel_gpu_foreign_mounts=foreign_mounts,
+                kernel_gpu_view_source=source,
                 specs=specs,
             )
         }
