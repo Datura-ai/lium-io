@@ -1566,8 +1566,9 @@ case "${1:-}" in
         # line, like --install-layer-reset; never stops or restarts Docker, never runs the reset.
         if [ "$(id -u)" != 0 ]; then echo "layer_reset_skipped not_root"
         else
-            remove_layer_reset >/dev/null 2>&1
-            case $? in
+            # `|| rc=$?`: under `set -e` a bare failing call would end the script before it answers
+            rc=0; remove_layer_reset >/dev/null 2>&1 || rc=$?
+            case $rc in
                 0) echo "layer_reset_removed" ;;
                 3) echo "layer_reset_failed recovery_needed" ;;
                 *) echo "layer_reset_failed remove" ;;

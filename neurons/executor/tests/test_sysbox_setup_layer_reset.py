@@ -260,8 +260,14 @@ def test_remove_with_a_pending_journal_leaves_a_program_that_can_replay_it(tmp_p
     assert not journal.exists()
 
 
-def test_remove_layer_reset_mode_reports_recovery_needed():
-    assert '3) echo "layer_reset_failed recovery_needed" ;;' in open(SCRIPT).read()
+@pytest.mark.parametrize("rc, answer", [
+    (0, "layer_reset_removed"), (3, "layer_reset_failed recovery_needed"), (1, "layer_reset_failed remove"),
+])
+def test_remove_layer_reset_mode_answers_each_result_under_set_e(rc, answer):
+    branch = re.search(r"^    --remove-layer-reset\)\n(.*?^        ;;)$", open(SCRIPT).read(), re.S | re.M).group(1)
+    script = f"set -e\nid() {{ echo 0; }}\nremove_layer_reset() {{ return {rc}; }}\ncase x in\n    x)\n{branch}\nesac\n"
+    result = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=60)
+    assert (result.returncode, result.stdout) == (0, answer + "\n"), result.stderr
 
 
 def test_remove_on_a_host_without_the_reset_is_a_no_op(tmp_path):
