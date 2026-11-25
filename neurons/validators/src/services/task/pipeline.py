@@ -14,6 +14,7 @@ from datura.requests.miner_requests import ExecutorSSHInfo
 from core.utils import _m
 from clients.backend_client import BackendClient
 from services.ssh_service import SSHService
+from services.file_encrypt_service import ScrapeBinaryBuild
 from services.redis_service import RedisService
 from services.matrix_validation_service import ValidationService
 from services.verifyx_validation_service import VerifyXValidationService
@@ -157,6 +158,8 @@ class ContextConfig:
     # DAH-2794: obfuscated scrape source, piped to the executor's interpreter over stdin.
     # None => the legacy path, where the scrape is a binary uploaded by UploadFilesCheck.
     machine_scrape_source: Optional[str] = None
+    # DAH-5899: builds the cycle's binary on the first stdin failure; None => it is already built
+    machine_scrape_binary_build: ScrapeBinaryBuild | None = None
     # DAH-3011: True only for a never-validated executor's first, unscored verification
     # (set in PipelineFactory.build_context). The capability
     # matmul and VerifyX right-size their probes and the bandwidth gate is deferred to the first
@@ -290,6 +293,8 @@ class Context(BaseModel):
     # time.monotonic() at the executor task's start; a best-effort step budgets against
     # the executor task's timeout from here.
     started_at_monotonic: float = Field(default_factory=time.monotonic)
+    # an express recheck's own deadline (time.monotonic()), when it cancels the task before its timeout does
+    deadline_monotonic: float | None = None
     executor: ExecutorSSHInfo
     miner_hotkey: str
     miner_coldkey: str | None = None
@@ -327,6 +332,8 @@ class Context(BaseModel):
     contract_version: str | None = None
     is_rental_succeed: bool = False
     rented: bool = False
+    # the rental snapshot whose listed pods the rented halt judged all closed: a later halt judges only a fresher read
+    rentals_judged_closed: RentedExecutorsResponse | None = None
     renting_in_progress: bool = False
     ssh_pub_keys: list[str] | None = None
     port_count: int = 0
@@ -872,7 +879,26 @@ class Pipeline:
 
         for index, step in enumerate(self.checks):
             parallel = isinstance(step, ParallelStage)
-            ran_checks, current_ctx = await self._run_step_surviving_a_dropped_session(step, current_ctx)
+            step_started = time.perf_counter()
+            try:
+                ran_checks, current_ctx = await self._run_step_surviving_a_dropped_session(step, current_ctx)
+            except asyncio.CancelledError:
+                # any cancellation inside a step (the per-node or whole-miner limit, shutdown) names the step it
+                # cut; a cancellation outside the steps (connect, context build, result handling) writes nothing
+                step_check_ids = [chk.check_id for chk in step.checks] if parallel else [step.check_id]
+                logger.warning(
+                    _m(
+                        "Validation cancelled mid-step",
+                        extra={
+                            **current_ctx.default_extra,
+                            "cancelled_check_ids": step_check_ids,
+                            "cancelled_step_elapsed_ms": int((time.perf_counter() - step_started) * 1000),
+                            "elapsed_time_ms": int((time.perf_counter() - pipeline_start_time) * 1000),
+                            "steps": dict(steps),
+                        },
+                    )
+                )
+                raise
             for ran in ran_checks:
                 ran.result.event.context["execution_time_ms"] = int((ran.finished - ran.started) * 1000)
                 ran.result.event.context["elapsed_time_ms"] = int((ran.finished - pipeline_start_time) * 1000)

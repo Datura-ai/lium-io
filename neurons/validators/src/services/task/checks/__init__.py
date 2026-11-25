@@ -49,7 +49,7 @@ from .rented_pod_resources import RentedPodResourcesCheck
 from .rented_throughput import RentedThroughputCheck
 from .rented_gpu_drop import RentedGpuDropCheck
 from .provider_maintenance import ProviderMaintenanceCheck
-from .rented_machine import HalfStartedStopRetryCheck, TenantEnforcementCheck
+from .rented_machine import HalfStartedStopRetryCheck, RentedSinceStartCheck, TenantEnforcementCheck
 from .score import ScoreCheck
 from .spec_change import SpecChangeCheck
 from .storage_limit import StorageLimitCheck
@@ -60,6 +60,7 @@ from .start_gpu_monitor import StartGPUMonitorCheck
 from .docker_cpu import DockerCpuCheck
 from .needrestart_guard import NeedrestartGuardCheck
 from .sysbox_layer_reset import SysboxLayerResetCheck
+from .host_pid_max import HostPidMaxCheck
 from .pid_host_required import PidHostRequiredCheck
 from .sysbox_required import SysboxRequiredCheck
 from .tdx_host import TdxHostCheck
@@ -122,6 +123,7 @@ __all__ = [
     "TdxHostCheck",
     "ProviderMaintenanceCheck",
     "HalfStartedStopRetryCheck",
+    "RentedSinceStartCheck",
     "TenantEnforcementCheck",
     "ScoreCheck",
     "StaleContainerCleanupCheck",
@@ -129,6 +131,7 @@ __all__ = [
     "DockerCpuCheck",
     "NeedrestartGuardCheck",
     "SysboxLayerResetCheck",
+    "HostPidMaxCheck",
     "PidHostRequiredCheck",
     "SysboxRequiredCheck",
     "SpecChangeCheck",
