@@ -139,29 +139,37 @@ def _storage_payload(kind, engine="restic", **extra):
 
 
 @pytest.mark.parametrize(
-    "kind,engine,extra",
+    "kind,engine,extra,reported",
     [
-        ("backup", "restic", {}),
-        ("backup", "tar_aws_cli", {}),
-        ("restore", "restic", {}),
-        ("restore", "restic", {"recovery": True}),
+        ("backup", "restic", {}, True),
+        ("backup", "tar_aws_cli", {}, False),
+        ("restore", "restic", {}, True),
+        # a reconnect re-dispatch may find the executor down while the first runner still works; never fail it
+        ("restore", "restic", {"recovery": True}, False),
     ],
 )
 @pytest.mark.asyncio
-async def test_a_storage_op_that_never_reached_the_node_reports_nothing(mocker, miner_service, kind, engine, extra):
-    """Another dispatch may have launched the operation while this one could not reach the node: only a failure
-    recorded on the node is reported (storage_operations.settle_dispatch_failure), so a live run is never failed."""
+async def test_storage_op_that_fails_before_its_runner_starts_is_reported_at_once(
+    mocker, miner_service, kind, engine, extra, reported
+):
+    """An unreachable executor used to leave the operation IN_PROGRESS until the 20-min heartbeat sweep."""
     payload = _storage_payload(kind, engine, **extra)
     failed = FailedContainerRequest(
         miner_hotkey="miner", executor_id="executor", pod_id="pod", msg="Error: Executor unreachable",
         error_code=FailedContainerErrorCodes.ExecutorUnreachable,
     )
     mocker.patch.object(miner_service, "_route_container", AsyncMock(return_value=failed))
-    report = mocker.patch("services.storage_operations._report_operation_status", AsyncMock())
+    report = mocker.patch("services.miner_service.report_launch_failure", AsyncMock())
 
     assert await miner_service.handle_container(payload) is failed
 
-    report.assert_not_awaited()
+    if not reported:
+        report.assert_not_awaited()
+        return
+    operation_id, spec, error = report.await_args.args
+    assert str(operation_id) == (payload.backup_log_id if kind == "backup" else payload.restore_log_id)
+    assert spec["reporter"]["auth_token"] == "token" and spec["reporter"]["resource"] == kind
+    assert str(error) == "Error: Executor unreachable"
 
 
 @pytest.mark.asyncio
@@ -172,12 +180,9 @@ async def test_an_old_executor_image_reports_its_specific_reason(mocker, miner_s
     ssh.__aexit__ = AsyncMock(return_value=False)
     mocker.patch("services.miner_service.asyncssh.connect", return_value=ssh)
     mocker.patch("services.miner_service.public_host_sock", AsyncMock(return_value={}))
-    mocker.patch("services.miner_service.storage_operation_has_incumbent", AsyncMock(return_value=False))
     mocker.patch("services.miner_service.supports_workspace_field", AsyncMock(return_value=False))
     start = mocker.patch("services.miner_service.start_storage_operation", AsyncMock())
-    # the failure is recorded on the node under the lock, so it is reported with its own reason
-    mocker.patch("services.storage_operations._settle_failed_dispatch", AsyncMock(return_value="RECORDED"))
-    report = mocker.patch("services.storage_operations.report_launch_failure", AsyncMock(return_value=False))
+    report = mocker.patch("services.miner_service.report_launch_failure", AsyncMock())
     executor = Mock(address="h", ssh_port=22, ssh_username="root", python_path="python3")
 
     with pytest.raises(RuntimeError, match="exclude_patterns"):

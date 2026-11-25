@@ -697,6 +697,19 @@ def _a_finding(ran: _RanCheck) -> bool:
     )
 
 
+def _ends_on_the_lost_session(
+    ran: list[_RanCheck], ctx: Context, step: "Check | ParallelStage | None" = None
+) -> list[_RanCheck]:
+    """The run's end on a session that is gone. A login uid that could not be read stays the end: it is no verdict (the
+    rollout window, the express lane and the result handler keep the stored state for it), where the transport failure
+    would be published as a failed validation."""
+    unread = [r for r in ran if r.result.event.reason_code == LoginUserMessages.UNREAD.reason]
+    if unread:
+        end = unread[-1]
+        return [*(_not_terminal(r) for r in ran if r is not end), replace(end, result=end.result.model_copy(update={"fatal": True}))]
+    return [*(_not_terminal(r) for r in ran), _session_lost(ran, ctx, step)]
+
+
 def _session_lost(ran: list[_RanCheck], ctx: Context, step: "Check | ParallelStage | None" = None) -> _RanCheck:
     # the failed check names the event; after a failed reconnect the run may have no failure (or nothing ran)
     failed = next((r for r in ran if not r.result.passed), ran[-1] if ran else None)
@@ -837,7 +850,7 @@ class Pipeline:
                 )
                 # the node refused the new session: the run ends here on the transport failure, whether the step
                 # passed or raised, never carrying on over the dead session or ending with no verdict
-                return [*(_not_terminal(r) for r in ran), _session_lost(ran, ctx, step)], ctx
+                return _ends_on_the_lost_session(ran, ctx, step), ctx
             else:
                 logger.warning(
                     _m(
@@ -865,7 +878,7 @@ class Pipeline:
             else:
                 # any other failure the check returned on a session that died is the transport's, not the node's:
                 # the run ends on the dead session, and what the check finished (its updates) stays in the result
-                ran = [*(_not_terminal(r) for r in ran), _session_lost(ran, ctx)]
+                ran = _ends_on_the_lost_session(ran, ctx)
         if error is not None:
             raise error
         return ran, ctx

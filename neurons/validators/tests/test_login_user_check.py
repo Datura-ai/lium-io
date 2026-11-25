@@ -116,3 +116,50 @@ async def test_no_host_command_runs_after_a_login_that_is_not_confirmed_root(mon
     assert ok is False and events[-1].reason_code == reason
     # the login read is the last command: nothing installed, scraped or run on the host after it
     assert shell.commands[-1] == "id -u"
+
+
+class _DropsWhileReading:
+    """A login uid read whose session closes under it, as a recreated executor container does."""
+
+    def __init__(self, ssh):
+        self.ssh = ssh
+
+    async def run(self, cmd, **_):
+        self.ssh.is_closed.return_value = True
+        now = datetime.now(timezone.utc)
+        return SSHCommandResult(command=cmd, command_id="c", exit_code=255, stdout="", stderr="", duration_ms=1,
+                                started_at=now, finished_at=now, success=False, error_type="ssh_error")
+
+
+@pytest.mark.parametrize("reconnect_fails", [True, False])
+async def test_a_session_that_drops_while_the_uid_is_read_ends_the_run_with_no_verdict(monkeypatch, reconnect_fails):
+    """review 4693567618: the unread uid stays the run's end; the transport failure would publish a failed validation"""
+    from unittest.mock import MagicMock
+
+    import asyncssh
+
+    from services.task.pipeline import Pipeline
+
+    def session():
+        ssh = MagicMock(spec=asyncssh.SSHClientConnection)
+        ssh.is_closed.return_value = False
+        return ssh
+
+    first, fresh = session(), session()
+
+    async def reconnect():
+        if reconnect_fails:
+            raise OSError("connection refused")
+        return fresh
+
+    class _Sink:
+        async def emit(self, event):
+            pass
+
+    # reconnected, the rerun's session drops under the read too
+    monkeypatch.setattr("services.task.pipeline.SSHCommandRunner", lambda ssh, **_: _DropsWhileReading(ssh))
+    ok, events, _ = await Pipeline([LoginUserCheck()], _Sink(), reconnect=reconnect).run(
+        make_context(ssh=first, runner=_DropsWhileReading(first))
+    )
+    assert not ok and events[-1].reason_code == "LOGIN_USER_UNREAD"
+    assert "EXECUTOR_TRANSPORT_UNREACHABLE" not in [e.reason_code for e in events]
