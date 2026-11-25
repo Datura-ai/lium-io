@@ -408,9 +408,7 @@ async def test_encrypted_bootstrap_restore_spec_never_carries_the_passphrase(mon
     monkeypatch.setattr(docker_service_module, "supports_storage_operation", AsyncMock(return_value=True))
     start = AsyncMock(return_value={"spec": "/tmp/spec.json"})
     monkeypatch.setattr(docker_service_module, "start_storage_operation", start)
-    reconnected = object()  # the session the wait reopened after an executor restart
-    wait = AsyncMock(return_value=reconnected)
-    monkeypatch.setattr(docker_service_module, "wait_for_storage_operation", wait)
+    monkeypatch.setattr(docker_service_module, "wait_for_storage_operation", AsyncMock())
     service = DockerService.__new__(DockerService)
     service.redis_service = AsyncMock()  # DAH-6148: records the helper it starts
     restore = SimpleNamespace(
@@ -432,8 +430,7 @@ async def test_encrypted_bootstrap_restore_spec_never_carries_the_passphrase(mon
         failure_timeout_seconds=600,
     )
 
-    reconnect = AsyncMock()
-    live_ssh = await service._run_bootstrap_restore(
+    await service._run_bootstrap_restore(
         ssh_client=AsyncMock(),
         executor_info=_executor_info(),
         payload=SimpleNamespace(pod_id="pod-1"),
@@ -442,11 +439,7 @@ async def test_encrypted_bootstrap_restore_spec_never_carries_the_passphrase(mon
         local_volume_path="/root",
         encrypted=True,
         container_name="pod_pod-1",
-        reconnect_ssh=reconnect,
     )
-
-    # the create continues on the session the wait ended on, not the one an executor restart closed
-    assert live_ssh is reconnected and wait.await_args.kwargs["reconnect"] is reconnect
 
     spec = start.await_args.args[3]
     passphrase = derive_volume_passphrase(master_secret, "pod-1")

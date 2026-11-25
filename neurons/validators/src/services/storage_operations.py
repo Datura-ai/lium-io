@@ -368,47 +368,8 @@ async def wait_for_storage_operation(
     files: StorageOperationFiles,
     poll_interval_seconds: float = 5.0,
     launch_grace_polls: int = 6,
-    *,
-    reconnect: Callable[[], Awaitable[asyncssh.SSHClientConnection]] | None = None,
-    reconnect_window_seconds: float = 600.0,
-    spec: Mapping[str, object] | None = None,
-) -> asyncssh.SSHClientConnection:
-    """Wait for the operation's terminal status; return the live connection the wait ended on.
-
-    With ``reconnect``, a lost SSH connection (the executor container restarting) is reopened and the wait
-    reattaches to the operation: its helper keeps running, and its state is read from that container.
-    The caller owns the reopened connection and continues on it.
-    """
-    try:
-        await _wait_for_storage_operation(
-            ssh_client, files, poll_interval_seconds, launch_grace_polls, False, spec
-        )
-        return ssh_client
-    except (asyncssh.Error, OSError):
-        if reconnect is None:
-            raise
-    deadline = asyncio.get_running_loop().time() + reconnect_window_seconds
-    while True:
-        await asyncio.sleep(poll_interval_seconds)
-        try:
-            fresh_client = await reconnect()
-            await _wait_for_storage_operation(
-                fresh_client, files, poll_interval_seconds, launch_grace_polls, True, spec
-            )
-            return fresh_client
-        except (asyncssh.Error, OSError):
-            if asyncio.get_running_loop().time() >= deadline:
-                raise
-
-
-async def _wait_for_storage_operation(
-    ssh_client: asyncssh.SSHClientConnection,
-    files: StorageOperationFiles,
-    poll_interval_seconds: float,
-    launch_grace_polls: int,
-    runner_seen: bool,
-    spec: Mapping[str, object] | None,
 ) -> None:
+    runner_seen = False
     starting_polls = 0
     while True:
         # Healthy large operations have no wall-clock deadline; only terminal
@@ -422,8 +383,6 @@ async def _wait_for_storage_operation(
                 raise StorageOperationLaunchError(
                     "storage operation returned an invalid status"
                 ) from error
-            if exit_code == KILLED_EXIT and spec is not None:
-                await report_killed_helper(UUID(str(spec["operation_id"])), spec)
             if exit_code != 0:
                 detail = await _tail_operation_log(ssh_client, files.log, files.helper)
                 await _remove_operation_artifacts(ssh_client, files)

@@ -7,7 +7,6 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from uuid import UUID
 
-import asyncssh
 import pytest
 
 from services import storage_operations
@@ -115,51 +114,6 @@ async def test_state_is_read_from_the_wrapper_helper(
         (tmp_path / f"{OPERATION_ID}.status").write_text(status_file + "\n")
     files = storage_operations.StorageOperationFiles.for_operation(OPERATION_ID)
     assert await storage_operations._operation_state(_local_ssh(fake_docker), files) == expected
-
-
-@pytest.mark.asyncio
-async def test_wait_reattaches_after_the_executor_restarts(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    monkeypatch.setattr(storage_operations, "REMOTE_OPERATION_DIRECTORY", tmp_path)
-    files = storage_operations.StorageOperationFiles.for_operation(OPERATION_ID)
-    fake_docker, _ = _fake_docker(
-        tmp_path, "1 exited 0 false"
-    )  # the helper finished after the restart
-    fresh = _local_ssh(fake_docker)
-
-    async def dropped(command: str, check: bool = False) -> SimpleNamespace:
-        raise asyncssh.ConnectionLost("executor restarted")
-
-    live = await storage_operations.wait_for_storage_operation(
-        SimpleNamespace(run=dropped),
-        files,
-        poll_interval_seconds=0,
-        reconnect=AsyncMock(return_value=fresh),
-    )
-    assert live is fresh  # the caller continues on the reopened session
-
-
-@pytest.mark.asyncio
-async def test_wait_reports_a_killed_helper(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    # the wrapper cannot report its own OOM kill or SIGKILL: the validator's poll does
-    monkeypatch.setattr(storage_operations, "REMOTE_OPERATION_DIRECTORY", tmp_path)
-    report = AsyncMock()
-    monkeypatch.setattr(storage_operations, "_report_operation_status", report)
-    fake_docker, _ = _fake_docker(tmp_path, "1 exited 137 true")
-    files = storage_operations.StorageOperationFiles.for_operation(OPERATION_ID)
-    spec = {"operation_id": str(OPERATION_ID), "action": "restore", "reporter": {}}
-
-    with pytest.raises(storage_operations.StorageOperationLaunchError, match="exit 137"):
-        await storage_operations.wait_for_storage_operation(
-            _local_ssh(fake_docker), files, poll_interval_seconds=0, spec=spec
-        )
-    assert (
-        report.await_args.kwargs["status"] == "FAILED"
-        and report.await_args.kwargs["stage"] == "RESTORING"
-    )
 
 
 @pytest.mark.asyncio
