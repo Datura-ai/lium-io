@@ -12,12 +12,12 @@ TABLE = [
     ("64:ff9b::808:808", True),  # DNS64 answer for a public A record
     ("::ffff:8.8.8.8", True),
     ("127.0.0.1", False),
-    ("10.0.0.1", False),
+    ("10.0.0.1", False),  # secret-scan: allow
     ("169.254.169.254", False),
-    ("100.64.0.1", False),
+    ("100.64.0.1", False),  # secret-scan: allow
     ("0.0.0.0", False),
-    ("224.0.0.1", False),
-    ("240.0.0.1", False),
+    ("224.0.0.1", False),  # secret-scan: allow
+    ("240.0.0.1", False),  # secret-scan: allow
     ("::1", False),
     ("fe80::1%eth0", False),
     ("fd00::1", False),
