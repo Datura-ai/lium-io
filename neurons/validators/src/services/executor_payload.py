@@ -11,8 +11,11 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import io
+import re
 import secrets
 import shlex
+import tarfile
 from pathlib import Path
 
 EXECUTOR_PYTHON = "/root/app/.venv/bin/python"
@@ -21,12 +24,18 @@ EXECUTOR_PYTHON = "/root/app/.venv/bin/python"
 SERVICE_DIR_PARENT = "/root/app"
 _IMAGE_PAYLOADS = Path(__file__).resolve().parents[1] / "executor_payloads"
 PAYLOAD_DIR = _IMAGE_PAYLOADS if _IMAGE_PAYLOADS.is_dir() else Path(__file__).resolve().parents[3] / "executor" / "src"
+# the validator's own miner jobs (src/miner_jobs), run by run_job; entry script first, then the module it imports
+MINER_JOBS = Path(__file__).resolve().parents[1] / "miner_jobs"
+BACKUP_JOB = ("backup_storage.py", "workspace_mount.py")
+RESTORE_JOB = ("restore_storage.py", "workspace_mount.py")
 
 # entry script first; the rest are modules it imports from its own directory
 GPU_MONITOR = ("gpus_utility.py", "services/pull_lock.py")
 INSPECTOR = ("inspector_executor.py",)
 VERIFYX = ("verifyx_executor.py",)
 MATRIX = ("decrypt_challenge.py",)
+# the storage runner and the package it imports, too large for one command line: sent as an archive on stdin (unpack)
+STORAGE = ("storage_runner.py",) + tuple(sorted(f"storage/{p.name}" for p in (PAYLOAD_DIR / "storage").glob("*.py")))
 
 # the executor runs with pid: host, so a bare pkill/pgrep also sees other containers' and the host's processes;
 # this selector keeps them to the shell's mount namespace, the executor's own
@@ -57,6 +66,7 @@ def install(
     parent: str | None = None,
     cleanup: bool = False,
     tag: str = "",
+    source: Path | None = None,
 ) -> str:
     """Shell that makes a fresh 0700 directory under `parent`, sets `$d` to it and writes `files` into it; exits 1 on
     any failure. `cleanup`: the directory goes when the shell ends (also on HUP/INT/TERM), set before the first write.
@@ -68,8 +78,29 @@ def install(
     for name in files:
         if "/" in name:
             steps.append(f'mkdir -p "$d"/{shlex.quote(str(Path(name).parent))}')
-        data = base64.b64encode((PAYLOAD_DIR / name).read_bytes()).decode()
+        data = base64.b64encode(((source or PAYLOAD_DIR) / name).read_bytes()).decode()
         steps.append(f'printf %s {data} | base64 -d > "$d"/{shlex.quote(name)}')
+    return "{ " + " && ".join(steps) + "; } || " + _FAIL
+
+
+def archive(files: tuple[str, ...]) -> bytes:
+    """`files` as the stdin of an `unpack` command: a gzipped tar, base64-encoded."""
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as tar:
+        for name in files:
+            data = (PAYLOAD_DIR / name).read_bytes()
+            entry = tarfile.TarInfo(name)
+            entry.size, entry.mode = len(data), 0o600
+            tar.addfile(entry, io.BytesIO(data))
+    return base64.b64encode(buffer.getvalue())
+
+
+def unpack(purpose: str, cleanup: bool = False) -> str:
+    """As `install`, but the files come from stdin, an `archive` of them."""
+    steps = [f"d=$(mktemp -d {shlex.quote(service_dir_glob(purpose) + 'XXXXXXXX')})"]
+    if cleanup:
+        steps += ["trap 'rm -rf \"$d\"' EXIT", "trap 'exit 1' HUP INT TERM"]
+    steps.append('base64 -d | tar -xzf - -C "$d"')
     return "{ " + " && ".join(steps) + "; } || " + _FAIL
 
 
@@ -89,6 +120,38 @@ def run_once(purpose: str, files: tuple[str, ...], args: str, env: str = "", tag
     # a tagged run cancelled before its shell existed (kill_runs left the marker) never starts
     gate = f"[ ! -e {shlex.quote(cancel_marker(purpose, tag))} ] || exit 1; " if tag else ""
     return f"{gate}{install(purpose, files, cleanup=True, tag=tag)}; {env}{run(files)} {args}"
+
+
+def stage_job(purpose: str, files: tuple[str, ...]) -> str:
+    """Shell that stages a validator miner job (`files` from MINER_JOBS) in a fresh 0700 directory and prints it; nothing
+    runs. A failed staging leaves no directory. The caller hands the job its inputs, then starts it with run_job."""
+    return f'{install(purpose, files, source=MINER_JOBS)}; printf "%s" "$d"'
+
+
+def staged_directory(purpose: str, stdout: object) -> str:
+    """The directory a stage command printed: only a fresh one of the `purpose` template, never another path."""
+    path = stdout.strip() if isinstance(stdout, str) else ""
+    if not re.fullmatch(re.escape(service_dir_glob(purpose)) + r"[A-Za-z0-9]{8}", path):
+        raise ValueError(f"staging the {purpose} files returned no directory")
+    return path
+
+
+def run_job(staged: str, files: tuple[str, ...], args: list[str], log: str | None = None) -> str:
+    """Start the job staged in `staged` (stage_job) with the trusted interpreter and -E -s, so its imports resolve to the
+    staged files only, never to code on the node or in its environment. The directory goes when the run ends, also when
+    it is killed. `log`: run detached (nohup) with its output there."""
+    command = f'{shlex.quote(EXECUTOR_PYTHON)} -E -s "$D"/{shlex.quote(files[0])} {shlex.join(args)}'
+    worker = "trap 'rm -rf \"$D\"' EXIT; trap 'exit 1' HUP INT TERM; " + command
+    if log is None:
+        return f"D={shlex.quote(staged)}; {worker}"
+    log_q = shlex.quote(log)
+    # the log is opened before detaching: a detached job that could not open it would never start the shell that
+    # removes the directory (and the credentials in it), while this command still succeeded
+    return (
+        f"D={shlex.quote(staged)}; if ( : > {log_q} ) 2>/dev/null; then exec 8>>{log_q}; "
+        'else rm -rf "$D"; exit 1; fi; '
+        f'D="$D" nohup /bin/sh -c {shlex.quote(worker)} >&8 2>&8 < /dev/null 8>&- &'
+    )
 
 
 def label(files: tuple[str, ...], args: str) -> str:
