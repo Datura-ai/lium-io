@@ -1652,3 +1652,32 @@ async def test_the_cleanup_runs_once_and_its_removed_filler_stays_excluded_when_
 
     assert len(runs) == 1 and not reconnect.called
     assert after.state.gpu_processes == []
+
+
+@pytest.mark.asyncio
+async def test_an_unlisted_filler_older_than_the_rented_list_goes_at_once_and_a_newer_one_stays():
+    """DAH-7071: a filler_ container created before the rented list was read, and missing from it, is no
+    live run; one created after the read may be a run the list does not show yet. pod_ keeps its grace."""
+    import time
+
+    from services.const import FILLER_CONTAINER_GRACE_MINUTES, FILLER_LIST_READ_MARGIN_MINUTES
+
+    read_minutes_ago = 3
+    before_read = "filler_00000000-0000-4000-8000-0000000000b1"
+    after_read = "filler_00000000-0000-4000-8000-0000000000b2"
+    young_pod = "pod_00000000-0000-4000-8000-0000000000b3"
+    older = read_minutes_ago + FILLER_LIST_READ_MARGIN_MINUTES + 1
+    assert older < FILLER_CONTAINER_GRACE_MINUTES  # the fixed grace alone would keep it
+    ssh, rm_calls = _make_ssh_mock(
+        containers=[before_read, after_read, young_pod],
+        ages_by_name={before_read: older, after_read: read_minutes_ago - 1, young_pod: older},
+    )
+    rented_data = _real_rented_data(EXECUTOR_UUID, [LIVE_POD])
+    rented_data._read_started_at = time.monotonic() - read_minutes_ago * 60
+
+    _, removed_names, _ = await ContainerCleanup().cleanup(
+        ssh_client=ssh, rented_data=rented_data, executor_uuid=EXECUTOR_UUID
+    )
+
+    assert removed_names == [before_read]
+    assert not any(after_read in c or young_pod in c for c in rm_calls)

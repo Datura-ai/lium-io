@@ -5,6 +5,7 @@ import random
 import re
 from datetime import UTC, datetime, timedelta
 import shlex
+import time
 from typing import Awaitable, Callable, Optional
 
 import asyncssh
@@ -20,6 +21,7 @@ from services.const import (
     FILLER_CACHE_VOLUME_PREFIXES,
     FILLER_CONTAINER_GRACE_MINUTES,
     FILLER_CONTAINER_PREFIX,
+    FILLER_LIST_READ_MARGIN_MINUTES,
     LEGACY_LIUM_CONTAINER_NAME,
     LIUM_HEALTH_CHECK_CONTAINER_NAME,
     LIUM_POD_ID_LABEL,
@@ -344,7 +346,7 @@ class ContainerCleanup:
                     continue
 
                 age_minutes = await self._get_container_age_minutes(ssh_client, stripped_name)
-                if age_minutes and age_minutes > self.stale_threshold_minutes:
+                if age_minutes and age_minutes > self._stale_after_minutes(stripped_name, rented_data):
                     if legacy and not await self._legacy_ended(lium_workload_ended, stripped_name):
                         continue
                     if (
@@ -414,6 +416,18 @@ class ContainerCleanup:
         await self.remove_never_started_check_containers(ssh_client, executor_uuid)
 
         return len(removed_names), removed_names, unremovable_names
+
+    def _stale_after_minutes(self, name: str, rented_data: Optional[RentedExecutorsResponse]) -> float:
+        """Minutes old an unlisted container must be before it is removed.
+
+        DAH-7071: a filler_ container older than the rented list it is missing from is no live run, so
+        it goes once its age (host clock) passes the validator's time since the list was read, plus a
+        margin. pod_ and health_check_ containers, and a list with no read time, keep the fixed grace.
+        """
+        read_started_at = rented_data._read_started_at if isinstance(rented_data, RentedExecutorsResponse) else None
+        if not name.startswith(FILLER_CONTAINER_PREFIX) or read_started_at is None:
+            return self.stale_threshold_minutes
+        return (time.monotonic() - read_started_at) / 60 + FILLER_LIST_READ_MARGIN_MINUTES
 
     async def remove_never_started_check_containers(self, ssh_client, executor_uuid: str) -> int:
         # best-effort like the volume prune above: never raises

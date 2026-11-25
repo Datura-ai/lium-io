@@ -701,3 +701,17 @@ async def test_check_executor_health_sends_the_portals_owner_hotkeys_for_the_lis
     owned, other = (call.kwargs["json_data"] for call in signed.await_args_list)
     assert owned["owner_hotkeys"] == ["5OwnerA", "5OwnerB"]
     assert "owner_hotkeys" not in other
+
+
+@pytest.mark.asyncio
+async def test_a_rented_list_read_carries_its_read_start_and_the_wire_cannot_set_it(client):
+    """DAH-7071: the container cleanup measures a filler's age against the moment this validator asked."""
+    answer = RentedExecutorsResponse.model_validate({"executors": {}, "_read_started_at": 1.0})
+    assert answer._read_started_at is None
+    with (
+        patch.object(backend_client_module.time, "monotonic", return_value=123.0),
+        patch.object(client, "_signed_request", AsyncMock(return_value=answer)),
+    ):
+        rented = await client.get_rented_executors_now()
+
+    assert rented._read_started_at == 123.0

@@ -3,7 +3,7 @@ import math
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, RootModel, ValidationError, field_validator
+from pydantic import BaseModel, PrivateAttr, RootModel, ValidationError, field_validator
 
 from services.const import FILLER_CONTAINER_PREFIX, POD_CONTAINER_PREFIX
 
@@ -165,6 +165,9 @@ class MaintenanceWindow(BaseModel):
 class RentedExecutorsResponse(BaseModel):
     """Response with executors dict and banned GUIDs."""
     executors: dict[str, RentedExecutor]  # key = executor_id
+    # time.monotonic() on this validator just before the request that returned this list; set by
+    # BackendClient, never parsed from the wire. None for a list built any other way.
+    _read_started_at: float | None = PrivateAttr(default=None)
     # Legacy single-filler map (one container per executor), kept for a backend that predates the
     # list field. Read via get_filler_containers' fallback, never directly.
     filler_containers_by_executor: dict[str, str] = {}  # executor_id -> filler_<FillerRun.id>
