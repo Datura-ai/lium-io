@@ -180,10 +180,8 @@ class ExecutorApiWatcher:
         self.failures += 1
         if self.failures < FAILURES_BEFORE_RESTART or self.restarting or self.monotonic() < self.next_restart_at:
             return None
-        # a last look right before acting: an API that recovered meanwhile is a healthy node
-        if self.probe(self._url(current)) == ALIVE:
-            self._healthy()
-            return None
+        # the worker's own probe right before it calls Docker is the last look: a second one here only cost another
+        # probe timeout before the restart (review 6058311232)
         self.restarting = True
         self.next_restart_at = self.monotonic() + self.backoff
         self.backoff = min(self.backoff * 2, BACKOFF_MAX_S)
@@ -208,11 +206,21 @@ class ExecutorApiWatcher:
             self.target = None  # the restart can move the address
 
 
-def watch_executor_api_forever(client, port: int, report: Callable[[str, str], None]) -> None:
-    watcher = ExecutorApiWatcher(client, port, report=report)
+def watch_executor_api_forever(
+    client,
+    port: int,
+    report: Callable[[str, str], None],
+    sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
+    **watcher_args,
+) -> None:
+    watcher = ExecutorApiWatcher(client, port, report=report, monotonic=monotonic, **watcher_args)
     while True:
+        started = monotonic()
         try:
             watcher.tick()
         except Exception as ex:
             report("executor_api_watch_error", str(ex))
-        time.sleep(PROBE_INTERVAL_S)
+        # a probe every PROBE_INTERVAL_S from the start of the last one: a probe timeout must not stretch the
+        # interval, or five failures take far past ~2.5 min (review 6058311232)
+        sleep(max(0.0, started + PROBE_INTERVAL_S - monotonic()))

@@ -6,6 +6,8 @@ import threading
 import urllib.request
 from datetime import datetime, timezone
 
+import pytest
+
 from services import api_watcher
 from services.api_watcher import ALIVE, DOWN, ExecutorApiWatcher, probe_http
 
@@ -304,3 +306,38 @@ def test_a_pending_restart_probes_once_more_before_it_calls_docker():
     pending[0]()
 
     assert h.executor.restarts == 0
+
+
+def test_a_hung_api_is_restarted_within_two_and_a_half_minutes_although_each_probe_times_out():
+    """Review 6058311232: each 10 s probe timeout stretched the 30 s interval, and a second last look cost one more,
+    so the restart came after ~212 s instead of ~150 s."""
+    h = Harness()
+    clock = [0.0]
+    restarted_at = []
+
+    def hung_probe(url):
+        clock[0] += api_watcher.PROBE_TIMEOUT_S  # the API accepts the connection and never answers
+        return DOWN
+
+    def restart(timeout):
+        restarted_at.append(clock[0])
+        raise SystemExit  # ends the endless loop
+
+    def sleep(seconds):
+        clock[0] += seconds
+
+    h.executor.restart = restart
+    with pytest.raises(SystemExit):
+        api_watcher.watch_executor_api_forever(
+            type("Client", (), {"containers": h.containers})(),
+            8001,
+            report=lambda event, reason: None,
+            sleep=sleep,
+            monotonic=lambda: clock[0],
+            probe=hung_probe,
+            spawn=lambda run: run(),
+            own_container="monitor",
+        )
+
+    # five probes 30 s apart from the first one's start, then the worker's own last probe
+    assert restarted_at == [4 * api_watcher.PROBE_INTERVAL_S + 2 * api_watcher.PROBE_TIMEOUT_S]
