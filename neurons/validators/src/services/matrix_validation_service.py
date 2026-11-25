@@ -237,6 +237,15 @@ class AllCardsProbe:
         return [c["card_index"] for c in self.per_card if not c.get("ok") and c.get("reason") != "wrong_answer"]
 
     @property
+    def channel_cut_on_live_connection(self) -> bool:
+        """A card's run lost its channel (an SSH error, or no exit status) while the connection stayed open. A card a
+        workload holds answers late, wrong or out of memory; it does not close its channel, so this is never waived."""
+        return not self.connection_closed and any(
+            not c.get("ok") and ((c.get("reason") or "").startswith("ssh_error") or c.get("reason") == "exit_status=None")
+            for c in self.per_card
+        )
+
+    @property
     def connection_lost(self) -> bool:
         """The SSH connection to the whole node was lost: every card's run raised an SSH error, or the connection itself
         was closed when the run ended and every card that failed lost its run to it (an SSH error, or no exit status:

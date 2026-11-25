@@ -297,6 +297,23 @@ async def test_a_card_our_own_workload_holds_now_gives_no_verdict(context_factor
     assert KEY in ctx.services.redis.store
 
 
+@pytest.mark.parametrize("cut", ["exit_status=None", "ssh_error: channel closed"])
+@pytest.mark.asyncio
+async def test_a_channel_cut_on_a_live_connection_fails_even_on_a_card_our_workload_holds(context_factory, cut):
+    # review 6061077726: the same run as CapabilityCheck's, judged the same way
+    specs = {"gpu": {"count": 2, "details": [{"uuid": "GPU-0"}, {"uuid": "GPU-1"}]}}
+    ctx = _idle_ctx(context_factory, FakeRunner(probe_stdout("ok")), FakeValidation(_all_cards(cut, "")), specs=specs)
+    ctx.services.backend.get_rented_executors_now.return_value = RentedExecutorsResponse(
+        executors={},
+        all_filler_containers_by_executor={ctx.executor.uuid: ["filler_e741"]},
+        filler_gpu_uuids_by_executor={ctx.executor.uuid: ["GPU-0"]},
+    )
+
+    result = await PostRentalGpuRecheckCheck().run(ctx)
+
+    assert (result.passed, result.event.reason_code) == (False, Msg.FAILED.reason)
+
+
 @pytest.mark.asyncio
 async def test_a_node_rented_at_the_cycle_snapshot_is_not_probed_this_cycle(context_factory):
     """The A6000 case (DAH-6978): the rental ended mid-cycle and its workload still loaded the cards. The cards prove

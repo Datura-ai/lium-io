@@ -300,9 +300,9 @@ async def judge_all_cards(
 
     A card that gave no answer is not proven this cycle only when the backend has a Lium workload (rental, filler,
     default job) assigned to that very card now; a workload on other cards says nothing about it. A wrong answer
-    is never waived, nor is a run over the wall clock with every card answering. A lost connection to the whole
-    node defers too. A deferral is bounded: one retry in the next idle cycle, and the node is offered meanwhile
-    only on a live last pass.
+    is never waived, nor is a card's channel cut on a live connection, nor a run over the wall clock with every
+    card answering. A lost connection to the whole node defers too. A deferral is bounded: one retry in the next idle
+    cycle, and the node is offered meanwhile only on a live last pass.
     """
     gpu_count = (specs.get("gpu") or {}).get("count") or 0
     if gpu_count <= 1:
@@ -402,6 +402,8 @@ async def unanswered_cards_on_lium_workload(
     not the node's to give this cycle), and the fresh snapshot read. Shared by CapabilityCheck and the post-rental
     recheck, so both judge the same run the same way. `fillers_removed`: the caller removed every filler before the
     run, so a filler the backend still lists holds no card."""
+    if probe.channel_cut_on_live_connection:
+        return False, None
     assigned, snapshot = await _lium_workload_gpu_uuids(ctx, count_fillers=not fillers_removed)
     details = (specs.get("gpu") or {}).get("details") or []
     card_uuids = [

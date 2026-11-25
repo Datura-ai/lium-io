@@ -394,6 +394,22 @@ async def test_cards_whose_channels_fail_on_a_live_connection_fail(context_facto
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "cut", [SimpleNamespace(exit_status=None, stdout="", stderr=""), ConnectionResetError("channel closed")],
+    ids=["no_exit_status", "channel_error"],
+)
+async def test_a_channel_cut_on_a_live_connection_fails_even_on_a_card_our_workload_holds(context_factory, svc, cut):  # noqa: F811
+    # review 6061077726: a busy card answers late, wrong or out of memory; a channel closed while the connection serves
+    # other runs is the node's doing, so our workload on that card does not defer it
+    ssh, _ = _node({0: cut, **{i: OOM for i in range(1, 4)}}, closed=False)
+
+    result, _ = await _cycle(context_factory, svc, ssh, redis=_proven(FakeRedis()), fresh=_filler_on(range(4)))
+
+    assert result.passed is False
+    assert result.event.what_we_saw["allcards"]["outcome"] == "failed"
+
+
+@pytest.mark.asyncio
 async def test_an_honest_pass_records_the_pass(context_factory, svc):  # noqa: F811
     ssh, pinned = _node({})
     redis = FakeRedis()
