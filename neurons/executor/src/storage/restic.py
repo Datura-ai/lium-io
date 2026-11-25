@@ -57,7 +57,21 @@ HELPER_LABEL = "lium.backup-helper"
 WRAPPER_LABEL = "lium.storage-wrapper"
 HELPER_VOLUME_ROOT = "/workspace"
 # The operation spec, by name only: its value comes from the launching process's environment, never argv.
-SPEC_ENV = "LIUM_STORAGE_SPEC"
+# DAH-5893 (review, Pixel): the detached helper gets its spec (repository keys, restic password, reporter token)
+# through `docker exec` stdin into this tmpfs, never its config: `docker inspect` shows no secret, and the tmpfs
+# is discarded when the helper stops, so nothing readable is left on the host once it ends
+HELPER_SPEC_DIR = "/run/lium-storage-spec"
+HELPER_SPEC_PATH = f"{HELPER_SPEC_DIR}/spec.json"
+HELPER_SPEC_WAIT_SECONDS = 60
+# written to a .part then renamed, so the helper never reads half a spec
+_WRITE_HELPER_SPEC = (
+    "import os, sys\n"
+    "path = sys.argv[1]\n"
+    "fd = os.open(path + '.part', os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)\n"
+    "os.write(fd, sys.stdin.buffer.read())\n"
+    "os.close(fd)\n"
+    "os.rename(path + '.part', path)\n"
+)
 CGROUP_MEMORY_EVENTS = "/sys/fs/cgroup/memory.events"
 STALE_HELPER_AGE = timedelta(minutes=10)
 # Without `|| exit`, a failed cd leaves sh in the helper's own directory and restic backs that up instead.
@@ -862,9 +876,13 @@ class ResticStorageRunner:
             "--in-helper",
             *arguments,
         ]
-        started = subprocess.run(
-            command, env={**os.environ, SPEC_ENV: spec_json}, capture_output=True, text=True
-        )
+        started = subprocess.run(command, capture_output=True, text=True)
+        if started.returncode == 0:
+            started = subprocess.run(
+                [self._docker_binary, "exec", "-i", self._helper_container_name(), python, "-I", "-c",
+                 _WRITE_HELPER_SPEC, HELPER_SPEC_PATH],
+                input=spec_json, capture_output=True, text=True,
+            )
         if started.returncode != 0:
             # docker run can fail after creating the container; a created helper reads as running and is never reaped
             subprocess.run(
@@ -895,9 +913,9 @@ class ResticStorageRunner:
             raise ResticOperationError("could not read the storage helper's exit code") from None
 
     def _docker_helper_base(self) -> list[str]:
-        # the helper gets the whole spec (repository credentials and reporter token) in one variable,
-        # and keeps its (redacted) event log so the validator can read why it failed
-        secrets = ["-e", SPEC_ENV]
+        # the spec arrives in this tmpfs after the start (HELPER_SPEC_DIR); the helper keeps only its (redacted)
+        # event log and exit code, which hold no secret, so the validator can read why it failed
+        secrets = ["--tmpfs", f"{HELPER_SPEC_DIR}:rw,nosuid,nodev,noexec,size=1m,mode=0700"]
         logs = ["--log-driver", "json-file", "--log-opt", "max-size=10m"]
         return [
             self._docker_binary,

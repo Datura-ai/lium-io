@@ -5,14 +5,15 @@ import json
 import os
 import signal
 import stat
+import time
 import sys
 from collections.abc import Mapping
 from pathlib import Path, PurePosixPath
 
+from storage import restic
 from storage.models import OperationSpecError, StorageOperationSpec
 from storage.reporting import ReportingLeaseExpired, StorageEventReporter
 from storage.restic import (
-    SPEC_ENV,
     JsonEventWriter,
     ResticOperationError,
     ResticResult,
@@ -32,14 +33,27 @@ def _cancel_on_sigterm(signum: int, frame: object) -> None:
     raise StorageOperationCancelled("storage runner received SIGTERM")
 
 
+def _take_helper_spec() -> str:
+    path = Path(restic.HELPER_SPEC_PATH)
+    deadline = time.monotonic() + restic.HELPER_SPEC_WAIT_SECONDS
+    while not path.exists():
+        if time.monotonic() > deadline:
+            raise RuntimeError("the storage helper's spec never arrived")
+        time.sleep(0.1)
+    try:
+        return path.read_text()
+    finally:
+        path.unlink(missing_ok=True)
+
+
 def main() -> int:
     signal.signal(signal.SIGTERM, _cancel_on_sigterm)
     arguments = _parse_arguments()
     event_writer: JsonEventWriter | None = None
     try:
-        # in the helper the spec comes from its environment; drop it there once read
+        # in the helper the spec arrives in its tmpfs after the start; removed there once read
         payload = (
-            _parse_object(os.environ.pop(SPEC_ENV, ""))
+            _parse_object(_take_helper_spec())
             if arguments.in_helper
             else _load_operation(arguments.spec)
         )

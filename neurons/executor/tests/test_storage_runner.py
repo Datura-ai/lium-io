@@ -8,6 +8,7 @@ import os
 import runpy
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -22,6 +23,7 @@ from uuid import UUID
 import pytest
 import requests
 import storage_runner
+from storage import restic
 from storage.models import (
     OperationResultQuality,
     OperationSpecError,
@@ -42,7 +44,6 @@ from storage.restic import (
     RESTIC_TMPFS_BYTES,
     JsonEventWriter,
     ResticOperationError,
-    SPEC_ENV,
     ResticStorageRunner,
     RestoreStats,
     StorageOperationCancelled,
@@ -935,7 +936,7 @@ def test_no_rendered_helper_spec_carries_a_volume_passphrase(
     payload = _operation_payload(action="restore", mode=mode)
     runner = ResticStorageRunner(StorageOperationSpec.from_mapping(payload), workspace)
     command, env = _launched_helper(monkeypatch, runner, json.dumps(payload))
-    rendered = [*command, env[SPEC_ENV]]
+    rendered = [*command, *env.values()]
     forwarded_env = {command[index + 1] for index, argument in enumerate(command) if argument == "-e"}
 
     # only `-e NAME` entries cross from the executor's environment into the container
@@ -1010,7 +1011,7 @@ def _launched_helper(
 
     def fake_run(command: list[str], *args: object, **kwargs: object) -> SimpleNamespace:
         if command[1] == "run":
-            launched.append((command, kwargs["env"]))  # type: ignore[arg-type]
+            launched.append((command, kwargs.get("env") or {}))  # type: ignore[arg-type]
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr("storage.restic.subprocess.run", fake_run)
@@ -2123,8 +2124,12 @@ def test_executor_only_launches_the_helper_detached_with_the_runner_as_its_entry
     monkeypatch.setattr(storage_runner.WorkspaceResolver, "resolve", lambda self, operation: workspace)
     calls: list[tuple[list[str], dict[str, str]]] = []
 
+    spec_inputs: list[str] = []
+
     def fake_run(command: list[str], *args: object, **kwargs: object) -> SimpleNamespace:
         calls.append((command, kwargs.get("env") or {}))  # type: ignore[arg-type]
+        if command[1] == "exec":
+            spec_inputs.append(kwargs["input"])  # type: ignore[arg-type]
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr("storage.restic.subprocess.run", fake_run)
@@ -2133,15 +2138,20 @@ def test_executor_only_launches_the_helper_detached_with_the_runner_as_its_entry
     assert storage_runner.main() == 0
 
     command, env = next((c, e) for c, e in calls if c[1] == "run")
-    assert "--detach" in command and "--rm" not in command and f"{storage_runner.SPEC_ENV}" in command
+    assert "--detach" in command and "--rm" not in command
+    assert f"{restic.HELPER_SPEC_DIR}:rw,nosuid,nodev,noexec,size=1m,mode=0700" in command
     entrypoint = command.index("--entrypoint")
     assert command[entrypoint + 1 : entrypoint + 4] == [sys.executable, IMAGE, str(Path(storage_runner.__file__).resolve())]
     assert command[entrypoint + 4] == "--in-helper"
     assert ("--namespace-pid" in command and "--privileged" in command and "host" in command) is encrypted
     assert ("customer-volume:/workspace:ro" in command) is not encrypted
+    # review, Pixel: the helper's config (what docker inspect shows after it ends) holds no secret at all
     for secret in ("access-key", "secret-key", "session-token", "repository-password"):
-        assert secret not in " ".join(command)  # by environment only, like today's helper credentials
-    assert json.loads(env[storage_runner.SPEC_ENV])["repository"]["password"] == "repository-password"
+        assert secret not in " ".join(command) + " ".join(env.values())
+    exec_command, _ = next((c, e) for c, e in calls if c[1] == "exec")
+    assert exec_command[:4] == ["/usr/bin/docker", "exec", "-i", command[command.index("--name") + 1]]
+    assert exec_command[-1] == restic.HELPER_SPEC_PATH
+    assert json.loads(spec_inputs[0])["repository"]["password"] == "repository-password"
 
 
 @pytest.mark.parametrize(("oom_kills", "message"), [("1", "backup ran out of memory"), ("0", "backup was killed")])
@@ -2170,10 +2180,12 @@ def test_in_helper_a_killed_restic_child_is_reported_from_the_helper_cgroup(
         runner.run()
 
 
-def test_in_helper_sigterm_reports_cancelled(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_in_helper_sigterm_reports_cancelled(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     # cancel is `docker kill --signal TERM <helper>`: the wrapper stops restic and reports CANCELLED itself
     monkeypatch.setattr("sys.argv", ["storage_runner.py", "--in-helper", "--workspace", "/workspace"])
-    monkeypatch.setenv(storage_runner.SPEC_ENV, json.dumps(_operation_payload()))
+    spec = tmp_path / "spec.json"
+    spec.write_text(json.dumps(_operation_payload()))
+    monkeypatch.setattr(restic, "HELPER_SPEC_PATH", str(spec))
 
     def cancelled(self: object) -> None:
         raise StorageOperationCancelled("storage runner received SIGTERM")
@@ -2187,7 +2199,7 @@ def test_in_helper_sigterm_reports_cancelled(monkeypatch: pytest.MonkeyPatch) ->
     finally:
         signal.signal(signal.SIGTERM, previous)
     assert '"status":"CANCELLED"' in output.getvalue()
-    assert storage_runner.SPEC_ENV not in os.environ  # read once, then dropped from the wrapper's environment
+    assert not spec.exists()  # read once, then removed from the helper's tmpfs
 
 
 def test_encrypted_legacy_tar_restore_enters_the_target_without_following_links() -> None:
@@ -2480,4 +2492,30 @@ def test_without_detach_the_executor_returns_only_when_the_helper_ends(
     monkeypatch.setattr("storage.restic.subprocess.run", fake_run)
 
     assert storage_runner.main() == 3
-    assert calls[-4:] == ["run", "logs", "wait", "rm"]
+    assert calls[-5:] == ["run", "exec", "logs", "wait", "rm"]
+
+
+def test_the_helper_spec_write_is_atomic_and_private(tmp_path: Path) -> None:
+    # the exact script the executor runs through `docker exec -i`: the spec appears whole, readable by its owner only
+    target = tmp_path / "spec.json"
+    subprocess.run([sys.executable, "-I", "-c", restic._WRITE_HELPER_SPEC, str(target)], input='{"a":1}', text=True, check=True)
+    assert target.read_text() == '{"a":1}'
+    assert stat.S_IMODE(target.stat().st_mode) == 0o600
+    assert not (tmp_path / "spec.json.part").exists()
+
+
+def test_a_failed_spec_hand_off_removes_the_started_helper(monkeypatch: pytest.MonkeyPatch) -> None:
+    runner = ResticStorageRunner(
+        StorageOperationSpec.from_mapping(_operation_payload()),
+        DockerVolumeWorkspace(IMAGE, "customer-volume", PurePosixPath("/workspace"), True),
+    )
+    calls: list[list[str]] = []
+
+    def fake_run(command: list[str], *args: object, **kwargs: object) -> SimpleNamespace:
+        calls.append(command)
+        return SimpleNamespace(returncode=1 if command[1] == "exec" else 0, stdout="", stderr="exec failed")
+
+    monkeypatch.setattr("storage.restic.subprocess.run", fake_run)
+    with pytest.raises(ResticOperationError, match="did not start"):
+        runner.launch_wrapper_helper("/usr/bin/python3", "/root/app/src/storage_runner.py", "{}")
+    assert calls[-1][1:3] == ["rm", "--force"]
