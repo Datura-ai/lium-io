@@ -1,6 +1,7 @@
 """DAH-7077: one lock per volume between a storage dispatch and the delete's wipe."""
 
 import time
+from unittest.mock import AsyncMock
 from uuid import uuid4
 
 import pytest
@@ -124,8 +125,11 @@ async def _lapse_cases(redis):
 
 
 @pytest.mark.asyncio
-async def test_a_token_past_its_deadline_never_blocks_and_a_renewed_one_does():
-    await _lapse_cases(VolumeLockRedis())
+async def test_a_release_error_after_the_dispatch_never_fails_the_started_operation():
+    service = VolumeLockRedis()
+    service.remove_volume_hold = AsyncMock(side_effect=ConnectionError("redis down"))
+    async with storage_dispatch_holds_volume(service, "vol", uuid4()):
+        pass
 
 
 @pytest.mark.asyncio

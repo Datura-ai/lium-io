@@ -111,7 +111,11 @@ async def storage_dispatch_holds_volume(
     try:
         yield
     finally:
-        await release_storage_volume_lock(redis, volume, token)
+        try:
+            await release_storage_volume_lock(redis, volume, token)
+        except Exception as exc:  # noqa: BLE001
+            # the operation already started: a lost release only lets the token lapse at its deadline
+            logger.warning("Storage volume %s: releasing hold %s failed: %s", volume, token, exc)
 
 
 def _key(executor_id: str) -> str:
