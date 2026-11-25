@@ -26,6 +26,7 @@ from payload_models.payloads import (
 )
 import services.miner_service as miner_service_module
 from services.miner_service import MinerService
+from services.node_host import NodeHostError
 
 
 def _make_executor_info(executor_id: str) -> ExecutorSSHInfo:
@@ -189,6 +190,31 @@ async def test_an_old_executor_image_reports_its_specific_reason(mocker, miner_s
 
 def _refused():
     return aiohttp.ClientConnectorError(Mock(host="10.0.0.1", port=8000, ssl=None), OSError(111, "Connect call failed"))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error, retried",
+    [
+        (miner_service_module.NonPublicAddressError("miner.example.net resolves to a non-public address"), False),
+        (NodeHostError("miner.example.net does not resolve"), True),
+    ],
+    ids=["non-public-address", "lookup-failed"],
+)
+async def test_a_create_fails_at_once_on_a_non_public_miner_address_but_retries_a_failed_lookup(
+    mocker, miner_service, error, retried
+):
+    executor_id = str(uuid4())
+    _wire_common_mocks(mocker, miner_service, executor_id)
+    dns_error = aiohttp.ClientConnectorDNSError(Mock(host="miner.example.net", port=8000, ssl=None), error)
+    miner_service._make_rest_request.side_effect = [dns_error, (200, {"message_type": "AcceptSSHKeyRequest"})]
+    mocker.patch("services.miner_service.asyncio.sleep", AsyncMock())
+    create_mock = mocker.patch("services.miner_service.DockerService.create_container", AsyncMock(return_value=Mock()))
+
+    await miner_service._handle_container(_make_create_payload(executor_id))
+
+    assert miner_service._make_rest_request.await_count == (2 if retried else 1)
+    assert create_mock.await_count == (1 if retried else 0)
 
 
 @pytest.mark.asyncio
@@ -409,6 +435,17 @@ async def test_a_failed_report_under_the_new_gpu_uuid_does_not_hide_the_recovery
     published = [call.args[1] for call in miner_service.redis_service.publish.await_args_list]
     assert [spec["executor_uuid"] for spec in published] == [node]
 
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("passed", [None, [], ["executor.validate.rental_probe"]])
+async def test_the_published_spec_names_the_idle_only_checks_that_passed(mocker, miner_service, passed):
+    """DAH-6784: compute_client reads the key off this payload into ExecutorSpecRequest.idle_checks_passed."""
+    mocker.patch("services.miner_service.settings.DRY_RUN", False)
+    result = _passed_result(str(uuid4()), "GPU-1").model_copy(update={"idle_checks_passed": passed})
+    await miner_service.publish_machine_specs([result], "hk", "ck")
+    [spec] = [call.args[1] for call in miner_service.redis_service.publish.await_args_list]
+    assert spec["idle_checks_passed"] == passed
 
 # DAH-5510: the backend stops a moved pod's old container on the node it left
 

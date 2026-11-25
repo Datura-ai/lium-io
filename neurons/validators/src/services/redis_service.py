@@ -216,6 +216,8 @@ RECHECK_POP_ATTEMPTS = 5
 # an in-memory stamp restarted with every rollout and logged discovery waits of up to 25 min (5 Nov).
 EXPRESS_LANE_FIRST_SEEN_PREFIX = "express_lane:first_seen"
 EXPRESS_LANE_FIRST_SEEN_TTL_SECONDS = 2 * 3600
+# every node's in-container reading of each endpoint, scored by time: the fleet control for that endpoint
+ENDPOINT_SPEED_FLEET_PREFIX = "endpoint_speed_fleet"
 
 # Distributed lock settings
 EXECUTOR_LOCK_TIMEOUT = 30  # TTL for lock auto-release (seconds)
@@ -243,6 +245,9 @@ def _executor_create_lock_key(executor_id: str) -> str:
 
 # the connector's id of the create execution being run (InflightBackendCreate.create_id), set around the create
 renter_create_id: ContextVar[str] = ContextVar("renter_create_id", default="")
+# DAH-6992: the create being run is the backend's re-send of one a connector restart cut off (it never replied), so a
+# container under the pod's name is that cut-off attempt's, started or not, and nobody was handed it
+resumed_create: ContextVar[bool] = ContextVar("resumed_create", default=False)
 
 
 def _renter_create_lock_token(pod_id: str, create_id: str = "") -> str:
@@ -724,6 +729,19 @@ class RedisService:
             for executor_id, value in zip(executor_ids, values, strict=True)
             if value is not None
         }
+
+    async def record_endpoint_speed(self, endpoint: str, member: str, now: float, window_seconds: float) -> None:
+        """One node's reading of an endpoint into that endpoint's fleet window; older readings drop out."""
+        key = f"{ENDPOINT_SPEED_FLEET_PREFIX}:{endpoint}"
+        async with self.redis.pipeline(transaction=False) as pipe:
+            pipe.zadd(key, {member: now})
+            pipe.zremrangebyscore(key, "-inf", now - window_seconds)
+            pipe.expire(key, int(window_seconds * 2))
+            await pipe.execute()
+
+    async def endpoint_speeds_since(self, endpoint: str, since: float) -> list[str]:
+        members = await self.redis.zrangebyscore(f"{ENDPOINT_SPEED_FLEET_PREFIX}:{endpoint}", since, "+inf")
+        return [m.decode() if isinstance(m, bytes) else m for m in members]
 
     async def is_forced_validation_cycle_requested(self) -> bool:
         return await self.get(FORCED_VALIDATION_CYCLE_KEY) is not None
@@ -1514,6 +1532,7 @@ class RedisService:
         evidence: dict | None = None,
         reanchor_uuids: str = '',
         respec: str = '',
+        unrented_only: bool = False,
     ):
         # a changed model:count is reset once, then verified from scratch as it is now
         spec = respec or prev_info.get('spec', '')
@@ -1542,6 +1561,8 @@ class RedisService:
                 "reason_code": reason_code,
                 "check_id": check_id,
                 "evidence": evidence or None,
+                # DAH-6784: idle-only reset; an older backend ignores the key
+                "unrented_only": unrented_only is True,
             },
         )
 

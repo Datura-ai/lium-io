@@ -22,9 +22,12 @@ from ..messages import MessageTemplate, render_message
 from ..models import ValidationEvent
 from ..pipeline import CheckResult, Context
 from ..runner import SSHCommandResult
+from .container_download_speed import SPECS_KEY as IN_POD_DOWNLOAD_KEY
+from .container_download_speed import SPECS_MEASURED_AT_KEY as IN_POD_DOWNLOAD_AT_KEY
 from .gpu_loss_hold import GpuLossHoldCheck
 from .rented_gpu_drop import RentedGpuDropCheck, missing_gpus_under_reset
-from .upload_files import UploadFailed, upload_validation_files_to_fresh_remote_dir
+from .task_time import task_seconds_left
+from .upload_files import UPLOAD_TIMEOUT, UploadFailed, upload_validation_files_to_fresh_remote_dir
 
 logger = logging.getLogger(__name__)
 
@@ -555,6 +558,9 @@ class MachineSpecScrapeCheck:
     ) -> CheckResult:
         specs.pop("port_verify_first_miss", None)
         specs.pop("split_disk", None)
+        # the in-pod download figure is the validator's own reading (ContainerDownloadSpeedCheck), never the node's
+        specs.pop(IN_POD_DOWNLOAD_KEY, None)
+        specs.pop(IN_POD_DOWNLOAD_AT_KEY, None)
         vloopback = specs.pop("vloopback_check", None)
         gpu_info = specs.get("gpu", {}) or {}
         gpu_count = gpu_info.get("count", 0) or 0
@@ -622,12 +628,17 @@ class MachineSpecScrapeCheck:
         *,
         reason: str | None = None,
     ) -> CheckResult:
+        from services.liumd_exec_client import LiumdRefusal
         from services.local_verify_client import LocalVerifyUnavailable
 
         if reason is None:
             if isinstance(answer, LocalVerifyUnavailable):
                 reason = answer.reason or "unavailable"
                 detail = detail or answer.detail
+            elif isinstance(answer, LiumdRefusal):
+                # liumd answered and refused: its own error code and detail say why, not "malformed"
+                reason = answer.error or "refused"
+                detail = detail or answer.detail or f"liumd exit {answer.exit_status}"
             elif answer is None:
                 reason = "no_early_read"
             else:
@@ -684,9 +695,33 @@ class MachineSpecScrapeCheck:
         if scrape_run.exit_code != 0 and _scrape_reported_its_own_failure(scrape_run.stdout):
             return result
 
+        if not await self._binary_ready_in_time(ctx, timeout):
+            return result
+
         return await self._retry_scrape_with_uploaded_binary(
             ctx, timeout, fallback_from=StdinAttempt.from_failed_result(result), start_shadow=start_shadow
         )
+
+    async def _binary_ready_in_time(self, ctx: Context, timeout: int) -> bool:
+        # DAH-5899: the cycle builds its binary only now, once for every node that needs it; the build counts
+        # against the task's time, and a retry whose scrape would no longer fit keeps the stdin verdict
+        # (upload up to UPLOAD_TIMEOUT, then the scrape's own timeout)
+        if ctx.config.machine_scrape_binary_build is None:
+            return True
+        seconds_the_retry_needs = timeout + UPLOAD_TIMEOUT
+        wait_seconds = task_seconds_left(ctx) - seconds_the_retry_needs
+        if wait_seconds <= 0:
+            return False
+        try:
+            await ctx.config.machine_scrape_binary_build.ensure(wait_seconds)
+        except Exception as exc:
+            logger.error(
+                _m("[scrape] binary not ready; keeping the stdin result", extra=get_extra_info(
+                    {**ctx.default_extra, "error": repr(exc)[:400]}
+                ))
+            )
+            return False
+        return task_seconds_left(ctx) >= seconds_the_retry_needs
 
     async def _retry_scrape_with_uploaded_binary(
         self,

@@ -130,7 +130,7 @@ class _FakeVerifyXValidator:
     def verify_response(self, response):
         if not response.endswith("-ok"):
             raise RuntimeError("cipher rejected")
-        return {"ok": True}
+        return {"challenge_data": {}, "response_data": {}}
 
 
 @pytest.fixture

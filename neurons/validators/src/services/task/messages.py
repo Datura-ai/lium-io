@@ -1079,6 +1079,31 @@ class SysboxLayerResetMessages:
         impact="Proceed; score not changed",
         remediation=OUTDATED.remediation,
     )
+    REMOVE_PENDING = MessageTemplate(
+        event="Host boot-time layer reset to be removed",
+        reason="SYSBOX_LAYER_RESET_REMOVE_PENDING",
+        severity="info",
+        category="env",
+        impact="Proceed",
+    )
+    REMOVED = MessageTemplate(
+        event="Host boot-time layer reset removed",
+        reason="SYSBOX_LAYER_RESET_REMOVED",
+        severity="info",
+        category="env",
+        impact="Proceed",
+    )
+    REMOVE_FAILED = MessageTemplate(
+        event="Host boot-time layer reset could not be removed",
+        reason="SYSBOX_LAYER_RESET_REMOVE_FAILED",
+        severity="warning",
+        category="env",
+        impact="Proceed; score not changed",
+        remediation=(
+            "Run `sudo bash nvidia_docker_sysbox_setup.sh --remove-layer-reset` from lium-io neurons/executor on the "
+            "host: it removes lium-sysbox-layer-reset.service and Docker's drop-in for it, and restarts nothing."
+        ),
+    )
     UNKNOWN = MessageTemplate(
         event="Host boot-time layer reset not reported",
         reason="SYSBOX_LAYER_RESET_UNKNOWN",
@@ -1125,6 +1150,38 @@ class PidHostRequiredMessages:
     OK = MessageTemplate(
         event="Executor PID namespace check passed",
         reason="EXECUTOR_PID_HOST_OK",
+        severity="info",
+        category="policy",
+        impact="Proceed",
+    )
+
+
+class HostPidMaxMessages:
+    # DAH-7041: the create refuses every rental on this host (docker_service HOST_READ_PID_MAX_STEP)
+    UNUSABLE = MessageTemplate(
+        event="Host kernel.pid_max is not usable for a rental",
+        reason="HOST_PID_MAX_UNUSABLE",
+        severity="error",
+        # an availability error: the backend hides the node and refuses new rentals, a rental on it runs on
+        category=AVAILABILITY_CATEGORY,
+        impact="Verification failed; node hidden and not rentable until the host reports a usable kernel.pid_max "
+        "(a running rental is kept)",
+        remediation=(
+            "Every rental on this node is refused: `cat /proc/sys/kernel/pid_max` over the executor's SSH must print "
+            "one number and nothing else (the Linux default is 4194304 on 64-bit hosts). Check that the root shell "
+            "prints no banner or profile text for a command, and that sysctl kernel.pid_max has not been lowered."
+        ),
+    )
+    NOT_READ = MessageTemplate(
+        event="Host kernel.pid_max not read this cycle",
+        reason="HOST_PID_MAX_NOT_READ",
+        severity="info",
+        category="policy",
+        impact="Proceed; the read got no answer, which says nothing about the host's setting",
+    )
+    OK = MessageTemplate(
+        event="Host kernel.pid_max is usable for a rental",
+        reason="HOST_PID_MAX_OK",
         severity="info",
         category="policy",
         impact="Proceed",
@@ -1913,9 +1970,8 @@ class RegistryPullMessages:
     )
 
 
-CONTAINER_DOWNLOAD_SLOW_REMEDIATION = (
-    "a container on this node downloads from PyPI or Hugging Face too slowly or cannot connect, so a renter's "
-    "`pip install` or model download crawls; remove any traffic shaping or extra firewall rules added on docker "
+_CONTAINER_NETWORK_FIX = (
+    "remove any traffic shaping or extra firewall rules added on docker "
     "traffic (keep docker's own NAT rules); "
     "if the uplink MTU (`ip link`) is below 1500, recreate the rentals network with it while no pod container exists, running or stopped: "
     "`docker network rm lium-rentals` then `docker network create -d bridge -o "
@@ -1924,6 +1980,19 @@ CONTAINER_DOWNLOAD_SLOW_REMEDIATION = (
     "https://files.pythonhosted.org/packages/9b/b4/e3c7e6fab0f77fff6194afa173d1f2342073d91b1d3b4b30b17c3fb4407a/"
     "numpy-2.1.2-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl` on the host must finish in seconds"
 )
+
+
+def container_network_remediation(*, upload: bool = False, download: bool = True) -> str:
+    """The provider instructions for the side that failed: downloads, the upload, or both."""
+    sides = [s for s, on in (("downloads from PyPI or Hugging Face", download), ("uploads", upload)) if on]
+    uses = [u for u, on in (("`pip install` or model download", download), ("upload of results", upload)) if on]
+    return (
+        f"a container on this node {' and '.join(sides)} too slowly or cannot connect, so a renter's "
+        f"{' and '.join(uses)} crawls; {_CONTAINER_NETWORK_FIX}"
+    )
+
+
+CONTAINER_DOWNLOAD_SLOW_REMEDIATION = container_network_remediation()
 
 
 class ContainerDownloadSpeedMessages:
@@ -1976,6 +2045,24 @@ class ContainerDownloadSpeedMessages:
     )
 
 
+def rented_throughput_remediation(*, upload: bool = False, download: bool = True) -> str:
+    """RENTED_THROUGHPUT_SLOW's instructions, naming the network side that failed (downloads, the upload, or both)."""
+    sides = (
+        ("downloading from PyPI or Hugging Face below 10 Mbps", download),
+        ("uploading below the upload minimum", upload),
+    )
+    net = [s for s, on in sides if on]
+    return (
+        f"repeated readings found a container on this rented node {', or '.join(net)}, or writing to its disk below "
+        "50 MB/s, while the node's own traffic on that resource stayed "
+        "under its busy threshold (200 Mbps on the network cards, 200 MB/s on the docker disk). Remove any "
+        "traffic shaping or I/O "
+        "throttling on docker traffic and containers, check the docker bridge MTU against the uplink "
+        "(`ip link`), and check the disk under the docker root (`docker info -f '{{.DockerRootDir}}'`) "
+        "for a failing or full drive"
+    )
+
+
 class RentedThroughputMessages:
     """A renter on a node listed at ~3 Gbps downloaded at 0.7-2 MB/s and the disk crawled."""
 
@@ -1985,15 +2072,7 @@ class RentedThroughputMessages:
         severity="error",
         category="runtime",
         impact="Score set to 0",
-        remediation=(
-            "repeated readings found a container on this rented node downloading from PyPI or Hugging Face below "
-            "10 Mbps, or writing to its disk below 50 MB/s, while the node's own traffic on that resource stayed "
-            "under its busy threshold (200 Mbps on the network cards, 200 MB/s on the docker disk). Remove any "
-            "traffic shaping or I/O "
-            "throttling on docker traffic and containers, check the docker bridge MTU against the uplink "
-            "(`ip link`), and check the disk under the docker root (`docker info -f '{{.DockerRootDir}}'`) "
-            "for a failing or full drive"
-        ),
+        remediation=rented_throughput_remediation(),  # the check passes the failed side's version
     )
     # DAH-5453: the reading was due but the earlier checks left too little cycle time, several cycles in a row
     NOT_RUN = MessageTemplate(
