@@ -913,6 +913,22 @@ def test_replay_only_restores_a_kept_journal_and_shifts_no_layer(tmp_path, monke
     assert fs.owners == owners
 
 
+@pytest.mark.parametrize("docker_up", [False, True])
+@pytest.mark.parametrize("flags", [["--dry-run", "--replay-only"], ["--replay-only", "--dry-run"]])
+def test_a_dry_run_replay_only_restores_nothing_and_keeps_the_journal(tmp_path, monkeypatch, flags, docker_up):
+    reset, fs = _fake_fs(tmp_path)
+    sudo = str(fs.upper / "sudo")
+    fs.modes[sudo] = stat.S_IFREG | 0o755
+    os.makedirs(os.path.dirname(reset["JOURNAL"]), exist_ok=True)
+    with open(reset["JOURNAL"], "w") as f:
+        f.write(json.dumps({"p": sudo, "m": 0o4755, "c": None}) + "\n")
+    reset.update(DRY=True, docker_running=lambda: docker_up)
+    monkeypatch.setattr(sys, "argv", ["lium-sysbox-layer-reset", *flags])
+    reset["main"]()
+    assert stat.S_IMODE(fs.modes[sudo]) == 0o755
+    assert os.path.exists(reset["JOURNAL"])
+
+
 def _started(tmp_path, when):
     (tmp_path / "var/lib/docker/containers" / ("a" * 64) / "config.v2.json").write_text(
         json.dumps({"State": {"StartedAt": when}}))

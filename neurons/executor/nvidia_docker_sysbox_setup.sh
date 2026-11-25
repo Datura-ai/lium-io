@@ -431,6 +431,9 @@ def replay_journal():
         lines = open(JOURNAL).read().splitlines()
     except FileNotFoundError:
         return
+    if DRY:  # a dry run writes nothing: no mode or capability restored, the journal kept
+        print(f"would restore {len(lines)} journaled entries; journal kept", flush=True)
+        return
     for line in lines:
         try:
             e = json.loads(line)
