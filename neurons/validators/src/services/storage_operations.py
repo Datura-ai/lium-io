@@ -80,9 +80,9 @@ def _volume_lock_key(volume: str) -> str:
     return f"{STORAGE_VOLUME_LOCK_PREFIX}{volume}"
 
 
-def wipe_token(container_name: str) -> str:
-    """One token per pod's delete: its second wipe (before the kill) runs under the hold its first one kept."""
-    return f"wipe:{container_name}"
+def new_wipe_token() -> str:
+    """One token per delete, passed to both its wipes: the second (before the kill) runs under the hold the first kept."""
+    return f"wipe:{uuid4().hex}"
 
 
 async def take_storage_volume_lock(redis: RedisService, volume: str, token: str, *, exclusive: bool) -> bool:

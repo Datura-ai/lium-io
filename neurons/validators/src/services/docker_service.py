@@ -243,7 +243,7 @@ from services.ssh_connect_timing import connect_with_phase_timing
 from services.storage_operations import (
     REMOTE_OPERATION_DIRECTORY,
     forget_storage_helper,
-    wipe_token,
+    new_wipe_token,
     release_storage_volume_lock,
     take_storage_volume_lock,
     note_started_storage_helper,
@@ -14716,6 +14716,7 @@ class DockerService:
         connect_ssh: Callable[[], AbstractAsyncContextManager[asyncssh.SSHClientConnection]],
         payload: ContainerDeleteRequest,
         log: _BoundLog,
+        token: str,
         stage: str,
     ) -> None:
         # DAH-5101: a pod whose volume holds gigabytes of unwritten data stalls its delete for as
@@ -14727,7 +14728,6 @@ class DockerService:
         # DAH-7077: a backup or restore dispatched on the volume holds it until its marker is on the executor;
         # the command's marker check covers it from there. The wipe's own token, taken only when no dispatch
         # holds the volume, refuses every dispatch from now on.
-        token = wipe_token(payload.container_name)
         try:
             locked = await take_storage_volume_lock(self.redis_service, payload.local_volume, token, exclusive=True)
         except Exception as exc:  # noqa: BLE001
@@ -15212,10 +15212,11 @@ class DockerService:
                     image_id = await docker_client.container_image_id(container=payload.container_name)
 
                 if self._wipes_volume_before_stop(payload):
-                    await self._wipe_volume(connect_ssh, payload, log, stage="before the stop")
+                    wipe_token = new_wipe_token()
+                    await self._wipe_volume(connect_ssh, payload, log, wipe_token, stage="before the stop")
                     stopped = not await self._terminate_and_wait(connect_ssh, payload, log)
                     if not stopped:
-                        await self._wipe_volume(connect_ssh, payload, log, stage="before the kill")
+                        await self._wipe_volume(connect_ssh, payload, log, wipe_token, stage="before the kill")
                 else:
                     stopped = await self._stop_container_gracefully(docker_client, payload, log)
 
