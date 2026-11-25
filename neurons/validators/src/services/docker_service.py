@@ -1871,23 +1871,34 @@ def _registration_label_command(container_id: str) -> str:
     return f"/usr/bin/docker inspect --type container -f {shlex.quote(template)} {shlex.quote(container_id)}"
 
 
-def _own_stopped_leftover_check(container_id: str, owner: str) -> str:
+_OWN_STARTED_LEFTOVER_EXIT = 4
+
+
+def _own_stopped_leftover_check(container_id: str, owner: str, pod_id: str) -> str:
     """Exits 0 only when the container is stopped (created, exited or dead) and carries `owner` or no registration
-    label. Run before its removal is marked as ours, so a refused check leaves no mark."""
-    template = "{{.State.Status}} {{index .Config.Labels \"%s\"}}" % LIUM_EXECUTOR_ID_LABEL
+    label; exits 4 when it carries both this registration (`owner`) and this pod (`pod_id`): the pod's own container on
+    this registration, in any state (a re-sent create meets the one its first attempt already started), removed forced.
+    Run before its removal is marked as ours, so a refused check leaves no mark."""
+    template = "{{.State.Status}} {{index .Config.Labels \"%s\"}} {{index .Config.Labels \"%s\"}}" % (
+        LIUM_EXECUTOR_ID_LABEL,
+        LIUM_POD_ID_LABEL,
+    )
     cid = shlex.quote(container_id)
     return "\n".join(
         [
             f"s=$(/usr/bin/docker inspect --type container -f {shlex.quote(template)} {cid}) || exit 3",
-            'case "${s%% *}" in created|exited|dead) ;; *) exit 3;; esac',
-            f'case "${{s#* }}" in {shlex.quote(owner)}|"") ;; *) exit 3;; esac',
+            'state=${s%% *}; labels=${s#* }; registration=${labels%% *}',
+            f'[ "$labels" = {shlex.quote(f"{owner} {pod_id}")} ] && exit {_OWN_STARTED_LEFTOVER_EXIT}',
+            'case "$state" in created|exited|dead) ;; *) exit 3;; esac',
+            f'case "$registration" in {shlex.quote(owner)}|"") ;; *) exit 3;; esac',
         ]
     )
 
 
-def _own_leftover_rm_command(container_id: str) -> str:
-    """Without force: Docker refuses a container started after the check."""
-    return f"/usr/bin/docker rm -v {shlex.quote(container_id)} >/dev/null"
+def _own_leftover_rm_command(container_id: str, force: bool = False) -> str:
+    """Without force: Docker refuses a container started after the check. Forced only for the pod's own labelled
+    container, removed by the ID checked."""
+    return f"/usr/bin/docker rm -v{' -f' if force else ''} {shlex.quote(container_id)} >/dev/null"
 
 
 def _made_for(result, owner: str) -> bool:
@@ -6010,7 +6021,9 @@ class DockerService:
         running replacement, labelled or made before the labels. Only the same-name conflict's leftover goes, here,
         before disk admission counts its layer: the listed ID, stopped, this registration's or unlabelled, removed
         without force (`_own_stopped_leftover_check`, then `_own_leftover_rm_command`), so a container started meanwhile is
-        refused by Docker; only a removal that passed the check is marked as this sweep's.
+        refused by Docker; or, labelled with this registration and this pod, removed forced in any state (a re-sent
+        create's own first attempt that already started it); only a removal that passed the check is marked as this
+        sweep's.
 
         DAH-5392: an unlisted `pod_*` other than ``pod_name`` is removed (with its volume) only when the
         backend confirms its rental closed: a create that waited may sweep after a newer create on the
@@ -6097,13 +6110,15 @@ class DockerService:
                     # disappearance of that container must not read as this sweep's removal
                     # each bounded on the host and here: an SSH session can stay up while Docker stops answering
                     check = await _run_with_host_timeout(
-                        ssh_client, _own_stopped_leftover_check(own_id, pod_owner), REMOVE_CONFIRM_INSPECT_TIMEOUT_SECONDS
+                        ssh_client,
+                        _own_stopped_leftover_check(own_id, pod_owner, pod_name.removeprefix(POD_CONTAINER_PREFIX)),
+                        REMOVE_CONFIRM_INSPECT_TIMEOUT_SECONDS,
                     )
                     if check.exit_status in (124, 137):
                         # the host's timeout cut the check short: Docker is wedged, so the sweep ends here
                         raise TimeoutError(f"the check of leftover {own_id} hit the host timeout")
                     # read after the check: another create of the pod (any registration) may take the name meanwhile
-                    if check.exit_status == 0 and inflight_creates.is_only_create_on_any_registration(
+                    if check.exit_status in (0, _OWN_STARTED_LEFTOVER_EXIT) and inflight_creates.is_only_create_on_any_registration(
                         pod_name.removeprefix(POD_CONTAINER_PREFIX)
                     ):
                         marked = _MarkOwnRemovalsOnSubmit(ssh_client, [own_id])
@@ -6113,7 +6128,10 @@ class DockerService:
                             asyncio.get_running_loop().time() + rm_timeout + _HOST_TIMEOUT_VALIDATOR_MARGIN_SECONDS
                         ):
                             removal = await marked.run(
-                                _host_bounded_command(_own_leftover_rm_command(own_id), rm_timeout),
+                                _host_bounded_command(
+                                    _own_leftover_rm_command(own_id, force=check.exit_status == _OWN_STARTED_LEFTOVER_EXIT),
+                                    rm_timeout,
+                                ),
                                 check=False,
                                 timeout=rm_timeout + _HOST_TIMEOUT_VALIDATOR_MARGIN_SECONDS,
                             )

@@ -224,41 +224,71 @@ OWN_ID = "a" * 64
 OWNER = "miner-a:exec-a"
 
 
+POD_ID = "target"
+
+
 @pytest.mark.parametrize(
-    ("status", "label", "removed"),
+    ("status", "label", "pod", "removal"),
     [
-        ("exited", OWNER, True),  # this registration's earlier attempt: its layer is freed before disk admission
-        ("created", "", True),  # made before the labels
-        ("dead", OWNER, True),
-        ("running", OWNER, False),
-        ("running", "", False),  # an unlabelled running replacement on a shared daemon
-        ("exited", "miner-b:exec-b", False),  # another registration's
-        (None, None, False),  # the inspect failed
+        ("exited", OWNER, "", "rm -v"),  # this registration's earlier attempt: its layer is freed before disk admission
+        ("created", "", "", "rm -v"),  # made before the labels
+        ("dead", OWNER, "", "rm -v"),
+        ("exited", OWNER, POD_ID, "rm -v -f"),  # the pod's own container on this registration, in any state
+        # lio#2394 (25 Nov): a re-sent create meets the container its first attempt already started, labelled with
+        # this pod and this registration: it is this create's own, so it goes (forced) and the create makes it again
+        ("running", OWNER, POD_ID, "rm -v -f"),
+        ("running", OWNER, "", None),  # this registration's label without the pod's: not proven this pod's
+        ("running", OWNER, "other", None),  # another pod's
+        ("running", "", "", None),  # an unlabelled running replacement on a shared daemon
+        ("running", "miner-b:exec-b", POD_ID, None),  # another registration's running replacement of the pod
+        ("exited", "miner-b:exec-b", POD_ID, None),  # another registration's
+        (None, None, None, None),  # the inspect failed
     ],
 )
-def test_only_a_stopped_leftover_of_this_registration_is_removed_by_its_id_without_force(tmp_path, status, label, removed):
+def test_only_this_registrations_leftover_is_removed_by_its_id_forced_only_when_it_is_the_pods_own(
+    tmp_path, status, label, pod, removal
+):
     import shlex
     import subprocess
 
     from services.docker_service import _own_leftover_rm_command, _own_stopped_leftover_check
 
     log = tmp_path / "calls"
-    inspect = "exit 1" if status is None else f"echo {shlex.quote(f'{status} {label}')}"
+    inspect = "exit 1" if status is None else f"echo {shlex.quote(f'{status} {label} {pod}')}"
     stub = tmp_path / "docker"
     stub.write_text(
         f'#!/bin/sh\necho "$*" >> {shlex.quote(str(log))}\ncase "$1" in inspect) {inspect};; rm) exit 0;; esac\n'
     )
     stub.chmod(0o755)
-    # the sweep sends the removal only after the check exits 0
-    command = f"({_own_stopped_leftover_check(OWN_ID, OWNER)}) && {_own_leftover_rm_command(OWN_ID)}".replace(
-        "/usr/bin/docker", str(stub)
-    )
+    check = _own_stopped_leftover_check(OWN_ID, OWNER, POD_ID).replace("/usr/bin/docker", str(stub))
 
-    done = subprocess.run(["sh", "-c", command], capture_output=True, text=True)
+    done = subprocess.run(["sh", "-c", check], capture_output=True, text=True)
+    # the sweep sends the removal only after a passing check, forced only for the pod's own labelled container
+    if done.returncode in (0, 4):
+        rm = _own_leftover_rm_command(OWN_ID, force=done.returncode == 4).replace("/usr/bin/docker", str(stub))
+        subprocess.run(["sh", "-c", rm], check=True)
 
     calls = log.read_text().splitlines()
-    assert (done.returncode == 0) is removed
-    assert [c for c in calls if c.startswith("rm")] == ([f"rm -v {OWN_ID}"] if removed else [])
+    assert [c for c in calls if c.startswith("rm")] == ([f"{removal} {OWN_ID}"] if removal else [])
+
+
+@pytest.mark.asyncio
+async def test_a_resent_create_removes_the_container_its_first_attempt_started(retry_ssh_mock):
+    """lio#2394 (25 Nov): a create the backend re-sends after a connector restart finds the pod's container that the
+    first attempt started. The check names it the pod's own (exit 4), so the only create of the pod removes it, forced,
+    by its ID, and makes it again; before, it was kept and the re-sent create failed on the name for good."""
+    own_sweep_removals.clear()
+    ssh_client, seen = _sweep_ssh(f"pod_target {OWN_ID}\n", {"check": 4})
+    with ds_module.inflight_creates.track("target", ("miner-a", "exec-a")):
+        removed = await _sweep_service().clean_existing_containers(
+            ssh_client=ssh_client, default_extra={}, pod_name="pod_target", active_container_names=[], pod_owner=OWNER
+        )
+
+    assert [kind for kind, _ in seen] == ["list", "check", "rm"]
+    assert f"rm -v -f {OWN_ID}" in ssh_client.commands[-1]
+    assert removed == ["pod_target"] and own_sweep_removals.sent_rm_for(OWN_ID)
+    assert retry_ssh_mock.await_args_list == []  # no sweep by name, no volume rm
+    own_sweep_removals.clear()
 
 
 def _sweep_ssh(listing: str, answers: dict):
@@ -266,8 +296,10 @@ def _sweep_ssh(listing: str, answers: dict):
     bounded commands. `answers` maps "check"/"rm" to an exit status, or to an Event the command waits on (a stalled
     daemon behind a live transport); `seen` records each command and whether the leftover was marked at that time."""
     seen = []
+    commands = []
 
     async def answer(command, **_):
+        commands.append(command)
         kind = "check" if "docker inspect" in command else "rm" if "docker rm -v" in command else "list"
         seen.append((kind, own_sweep_removals.sent_rm_for(OWN_ID)))
         reply = answers.get(kind, 0)
@@ -282,6 +314,7 @@ def _sweep_ssh(listing: str, answers: dict):
     ssh_client = AsyncMock()
     ssh_client.run = AsyncMock(side_effect=answer)
     ssh_client.create_process = create_process
+    ssh_client.commands = commands
     return ssh_client, seen
 
 
