@@ -230,6 +230,10 @@ class ContainerDeleteOnNodeLeftRequest(ContainerDeleteRequest):
     # the `command_id` of the ContainerCreateRequest that placed the pod on the node it left (the pod's create command
     # id there): the validator removes only a container that create made, never a later placement's on the same boot
     create_command_id: str
+    # the boot id of the node the pod's current placement is on, as the backend read it when it sent this delete. It
+    # proves the pod left this boot only when set and not `expected_boot_id`; empty (unknown) or equal, the validator
+    # removes nothing. The backend sends no delete when it cannot tell the two boots apart
+    pod_placed_on_boot_id: str = ""
 
 
 @BACKEND_MESSAGES.register

@@ -35,15 +35,18 @@ from tests.test_docker_service import (  # noqa: F401
 
 NODE_LEFT_BOOT = "11111111-2222-4333-8444-555555555555"
 HOST_BOOT = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+# the boot the backend read the pod's current placement on when it sent the delete: another node's
+PLACED_ELSEWHERE_BOOT = "99999999-8888-4777-8666-555555555555"
 
 
-def _payload(boot: str = NODE_LEFT_BOOT) -> ContainerDeleteOnNodeLeftRequest:
+def _payload(boot: str = NODE_LEFT_BOOT, placed_on: str = PLACED_ELSEWHERE_BOOT) -> ContainerDeleteOnNodeLeftRequest:
     delete = _delete_payload()
     return ContainerDeleteOnNodeLeftRequest(
         **delete.model_dump(exclude={"message_type", "container_name"}),
         container_name=f"pod_{delete.pod_id}",
         expected_boot_id=boot,
         create_command_id=LEFT_PLACEMENT,
+        pod_placed_on_boot_id=placed_on,
     )
 
 
@@ -290,23 +293,56 @@ def test_the_pods_container_from_another_placement_on_the_same_boot_is_never_tou
     assert "rm" not in calls.replace("inspect", "")
 
 
-@pytest.mark.parametrize("edit_placement", [EDITED_PLACEMENT, ""], ids=["edited", "made-before-the-label"])
-def test_the_parked_and_kept_edit_containers_of_an_edited_pod_go_with_it(tmp_path, edit_placement):
-    # r460 #2: an edit or reboot mints a new create id, so the renter's earlier containers (parked <name>__prev, kept
-    # kept_unmounted_<pod>_*) carry an older one than the live container the move named; they are the left
-    # registration's and the pod's, and go with it (the renter's old writable layer is not left on the node)
+@pytest.mark.parametrize(
+    "other_placement", [EDITED_PLACEMENT, LATER_PLACEMENT, ""], ids=["edited", "placed-back-later", "made-before-the-label"]
+)
+@pytest.mark.parametrize("container_owner", [LEFT_LABEL, None], ids=["live", "no-live-container"])
+def test_parked_and_kept_containers_of_another_placement_are_kept(tmp_path, other_placement, container_owner):
+    # coordinator r460: only a container the left placement's create made goes. One made under another create id (an
+    # edit's, the pod placed back on this boot later, or none) may be a later placement's and is kept, whether or not
+    # a live container is there to tell
     status, calls = _run(
         tmp_path,
         _payload(HOST_BOOT),
+        container_owner=container_owner,
         prev_owner=LEFT_LABEL,
-        prev_placement=edit_placement,
-        kept_placement=edit_placement,
+        prev_placement=other_placement,
+        kept_placement=other_placement,
     )
 
     assert status == 0
-    assert "rm -fv cid pid kept1" in calls
-    assert "label=io.lium.create_command_id" not in calls
-    assert not any((tmp_path / "containers").iterdir()) and not (tmp_path / "kept").exists()
+    removals = [line for line in calls.splitlines() if line.startswith("rm")]
+    assert removals == (["rm -fv cid"] if container_owner else [])
+    assert f"label=io.lium.create_command_id={LEFT_PLACEMENT}" in calls  # the kept listing names the placement
+    assert (tmp_path / "containers" / f"pod_{_run_pod(calls)}__prev").exists() and (tmp_path / "kept").exists()
+
+
+def _run_pod(calls: str) -> str:
+    # the pod id, as the kept listing names it
+    return calls.split("label=io.lium.pod_id=")[1].split()[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("placed_on", [HOST_BOOT, ""], ids=["placed-back-on-this-boot", "cannot-be-told"])
+async def test_a_delete_that_does_not_prove_the_pod_left_this_boot_removes_nothing(
+    docker_service, monkeypatch, tmp_path, placed_on
+):
+    # coordinator r460: the pod placed back on the same boot, no live container, the left placement's parked and kept
+    # edit containers there: only the delete itself can prove the pod left, never a live container's absence
+    payload = _payload(HOST_BOOT, placed_on=placed_on).model_copy(update={"executor_id": LEFT, "miner_hotkey": LEFT_MINER})
+    stub = _daemon_stub(tmp_path, None, pod_id=payload.pod_id, prev_owner=LEFT_LABEL)
+
+    async def the_host_runs_it(command: str):
+        done = subprocess.run(["sh", "-c", command.replace("/usr/bin/docker", str(stub))], capture_output=True)
+        return _make_ssh_command_result(exit_status=done.returncode)
+
+    order = _wire_delete(docker_service, monkeypatch, the_host_runs_it)
+
+    result = await _delete(docker_service, payload)
+
+    assert isinstance(result, FailedContainerRequest) and order == []
+    assert (tmp_path / "containers" / f"pod_{payload.pod_id}__prev").exists() and (tmp_path / "kept").exists()
+    assert not (tmp_path / "calls").exists()
 
 
 @pytest.mark.parametrize("container_owner", [LEFT_LABEL, None])
@@ -333,7 +369,9 @@ def test_a_parked_edit_container_of_another_registration_keeps_everything(tmp_pa
     assert "rm" not in calls.replace("inspect", "")
 
 
-@pytest.mark.parametrize("missing", ["executor_id", "miner_hotkey", "expected_boot_id", "create_command_id"])
+@pytest.mark.parametrize(
+    "missing", ["executor_id", "miner_hotkey", "expected_boot_id", "create_command_id", "pod_placed_on_boot_id"]
+)
 def test_a_delete_naming_no_registration_or_boot_id_is_refused(missing):
     with pytest.raises(ValueError):
         _node_left_delete_command(_payload(HOST_BOOT).model_copy(update={missing: ""}))

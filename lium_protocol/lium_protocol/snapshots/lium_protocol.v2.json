@@ -1373,6 +1373,11 @@
           "title": "Pod Id",
           "type": "string"
         },
+        "pod_placed_on_boot_id": {
+          "default": "",
+          "title": "Pod Placed On Boot Id",
+          "type": "string"
+        },
         "workload_kind": {
           "$ref": "#/$defs/WorkloadKind",
           "default": "CUSTOMER_RENTAL"
