@@ -16,7 +16,7 @@ from services.task.checks import capability
 from services.task.checks.capability import CapabilityCheck
 from services.task.messages import CapabilityMessages as Msg
 
-from tests.helpers import FakeRedis, build_services, build_state
+from tests.helpers import FakeRedis, build_context_config, build_services, build_state
 from tests.test_gpu_memory_health_check import _live_rental
 from tests.test_matmul_allcards import (  # noqa: F401 (svc is a fixture)
     ANSWER,
@@ -27,6 +27,9 @@ from tests.test_matmul_allcards import (  # noqa: F401 (svc is a fixture)
 
 PASS_KEY = "allcards_pass:miner-hotkey:executor-123"
 DEFERRED_KEY = "allcards_deferred:miner-hotkey:executor-123"
+# job_batch_ids of consecutive job cycles, and of cycles later (a rental in between)
+CYCLE_1, CYCLE_2 = "2026-11-25 05:00:00", "2026-11-25 05:15:00"
+CYCLE_LATER, CYCLE_AFTER_LATER = "2026-11-25 07:00:00", "2026-11-25 07:15:00"
 OOM = SimpleNamespace(exit_status=0, stdout="UUID:  None", stderr="Failed to allocate d_A: out of memory")
 NO_DEVICE = SimpleNamespace(exit_status=0, stdout="UUID:  None", stderr="no CUDA-capable device is detected")
 
@@ -79,10 +82,13 @@ def _no_gpu_model_numbers(monkeypatch):
     monkeypatch.setattr(capability.settings, "MATMUL_ALLCARDS_ENFORCEMENT_ENABLED", True)
 
 
-async def _cycle(context_factory, svc, ssh, *, redis, fresh=None, rented_data=None):  # noqa: F811
+async def _cycle(context_factory, svc, ssh, *, redis, fresh=None, rented_data=None, at=None):  # noqa: F811
     services = build_services(validation=svc, redis=redis)
     services.backend.get_rented_executors_now.return_value = fresh
-    ctx = context_factory(services=services, state=build_state(specs=_spec(8), rented_data=rented_data), ssh=ssh)
+    config = build_context_config(job_batch_id=at) if at else None
+    ctx = context_factory(
+        services=services, config=config, state=build_state(specs=_spec(8), rented_data=rented_data), ssh=ssh
+    )
     result = await CapabilityCheck().run(ctx)
     return result, result.updates.get("state", ctx.state)
 
@@ -189,8 +195,8 @@ async def test_a_second_deferral_in_a_row_fails_and_a_pass_resets_it(context_fac
     redis = _proven(FakeRedis())
     busy, _ = _node({i: OOM for i in range(4)})
 
-    first, _ = await _cycle(context_factory, svc, busy, redis=redis, fresh=_filler_on(range(4)))
-    second, _ = await _cycle(context_factory, svc, busy, redis=redis, fresh=_filler_on(range(4)))
+    first, _ = await _cycle(context_factory, svc, busy, redis=redis, fresh=_filler_on(range(4)), at=CYCLE_1)
+    second, _ = await _cycle(context_factory, svc, busy, redis=redis, fresh=_filler_on(range(4)), at=CYCLE_2)
 
     assert first.passed is True
     assert second.passed is False
@@ -203,6 +209,25 @@ async def test_a_second_deferral_in_a_row_fails_and_a_pass_resets_it(context_fac
     assert redis.ttl[PASS_KEY] == capability.ALLCARDS_PASS_VALID_SECONDS
     again, _ = await _cycle(context_factory, svc, busy, redis=redis, fresh=_filler_on(range(4)))
     assert again.passed is True
+
+
+@pytest.mark.asyncio
+async def test_a_deferral_long_after_the_last_one_is_a_new_first_deferral(context_factory, svc):  # noqa: F811
+    """Filler, then a rental, then a filler again: the retry was the cycle right after the first deferral, so a
+    deferral cycles later is judged as a first one, not as the retry."""
+    redis = _proven(FakeRedis())
+    busy, _ = _node({i: OOM for i in range(4)})
+
+    first, _ = await _cycle(context_factory, svc, busy, redis=redis, fresh=_filler_on(range(4)), at=CYCLE_1)
+    later, state = await _cycle(context_factory, svc, busy, redis=redis, fresh=_filler_on(range(4)), at=CYCLE_LATER)
+
+    assert first.passed is True
+    assert later.passed is True
+    assert later.event.what_we_saw["allcards"]["outcome"] == "deferred"
+    assert state.allcards_not_proven is False
+    # the new deferral is the one the next cycle retries
+    again, _ = await _cycle(context_factory, svc, busy, redis=redis, fresh=_filler_on(range(4)), at=CYCLE_AFTER_LATER)
+    assert again.passed is False
 
 
 @pytest.mark.asyncio

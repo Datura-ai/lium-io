@@ -52,9 +52,9 @@ GPU_MODEL_NO_VERDICT_TTL_SECONDS = 24 * 60 * 60
 # (a skip, a busy card or a lost connection never does). A node with no live pass is not offered on a deferral.
 ALLCARDS_PASS_KEY = "allcards_pass:{miner_hotkey}:{executor_uuid}"
 ALLCARDS_PASS_VALID_SECONDS = 24 * 60 * 60
-# A deferral this node already had: the next idle cycle's run is its one retry, and a second deferral fails it.
+# The job cycle of this node's last deferral: the cycle right after it is its one retry, and a deferral there fails it.
+# A deferral in any later cycle is a new first one (the retry already happened, or a rental took that cycle).
 ALLCARDS_DEFERRED_KEY = "allcards_deferred:{miner_hotkey}:{executor_uuid}"
-ALLCARDS_DEFERRED_TTL_SECONDS = 7 * 24 * 60 * 60
 
 
 class CapabilityCheck:
@@ -331,9 +331,10 @@ async def judge_all_cards(
         if not all(uuid and uuid in assigned for uuid in card_uuids):
             return AllCardsVerdict(ALLCARDS_FAILED, probe.failure_reason)
         reason = "lium_workload"
-    if await _redis_flag(ctx, ALLCARDS_DEFERRED_KEY, default=False):
+    cycle = _filler_cycle_index(ctx)
+    if await _deferred_cycle(ctx) in (cycle - 1, cycle):
         return AllCardsVerdict(ALLCARDS_FAILED, f"{probe.failure_reason}; deferred last time too")
-    await _redis_set(ctx, ALLCARDS_DEFERRED_KEY, ALLCARDS_DEFERRED_TTL_SECONDS)
+    await _redis_set(ctx, ALLCARDS_DEFERRED_KEY, _cycle_seconds() * 2, value=str(cycle))
     listed = await _redis_flag(ctx, ALLCARDS_PASS_KEY, default=False)
     return AllCardsVerdict(ALLCARDS_DEFERRED, reason, listed=listed, snapshot=snapshot)
 
@@ -361,11 +362,28 @@ async def _redis_flag(ctx: Context, template: str, *, default: bool) -> bool:
         return default
 
 
-async def _redis_set(ctx: Context, template: str, ttl_seconds: int) -> None:
+async def _deferred_cycle(ctx: Context) -> int | None:
+    """The job cycle of this node's last deferral; None when there is none or it cannot be read (a read error
+    then defers as a first deferral, and the pass expiry still bounds the listing)."""
+    try:
+        raw = await ctx.services.redis.get(_allcards_key(ctx, ALLCARDS_DEFERRED_KEY))
+        return int(raw) if raw is not None else None
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(_m("All-cards state read failed", extra=get_extra_info({**ctx.default_extra, "error": str(exc)})))
+        return None
+
+
+def _cycle_seconds() -> int:
+    return settings.BLOCKS_FOR_JOB * SECONDS_PER_BLOCK
+
+
+async def _redis_set(ctx: Context, template: str, ttl_seconds: int, *, value: str | None = None) -> None:
     if settings.DRY_RUN:
         return
     try:
-        await ctx.services.redis.set(_allcards_key(ctx, template), datetime.now().isoformat(), ex=ttl_seconds)
+        await ctx.services.redis.set(
+            _allcards_key(ctx, template), value if value is not None else datetime.now().isoformat(), ex=ttl_seconds
+        )
     except Exception as exc:  # noqa: BLE001
         logger.warning(_m("All-cards state write failed", extra=get_extra_info({**ctx.default_extra, "error": str(exc)})))
 
@@ -550,7 +568,7 @@ def _filler_cycle_index(ctx: Context) -> int:
         at = datetime.strptime(ctx.config.job_batch_id, "%Y-%m-%d %H:%M:%S").timestamp()
     except (TypeError, ValueError):
         at = time.time()
-    return int(at) // (settings.BLOCKS_FOR_JOB * SECONDS_PER_BLOCK)
+    return int(at) // _cycle_seconds()
 
 
 def _filler_sample_offset(ctx: Context) -> int:
