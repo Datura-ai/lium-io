@@ -76,6 +76,7 @@ def test_the_fields_nodes_answer_with_pass(fields):
         {"port_mappings": "[[1, 70000]]"},
         {"port_mappings": "[[true, 2]]"},
         {"port_mappings": "{"},
+        {"port_mappings": "[" * 1100 + "]" * 1100},
         {"ssh_host_key": f"{KEY} x;id"},
         {"ssh_host_key": "-oProxyCommand=x"},
         {"ssh_host_key": f"{KEY}\n{KEY}"},
@@ -92,8 +93,11 @@ def test_the_validator_leaves_out_a_node_answered_with_such_a_field_and_keeps_it
     # one node out of format does not cost the healthy nodes of the same answer their checks
     node = _info().model_dump(mode="json")
     bad = {**node, "uuid": "bad", "python_path": "/bin/true; id"}
-    answer = AcceptSSHKeyRequest.model_validate({"executors": [node, bad], "known_executor_ids": ["node", "bad"]})
+    deep = {**node, "uuid": "deep", "port_mappings": "[" * 1100 + "]" * 1100}
+    answer = AcceptSSHKeyRequest.model_validate(
+        {"executors": [node, bad, deep], "known_executor_ids": ["node", "bad", "deep"]}
+    )
     assert [e.uuid for e in answer.executors] == ["node"]
-    assert answer.known_executor_ids == ["node", "bad"]
+    assert answer.known_executor_ids == ["node", "bad", "deep"]
     with pytest.raises(pydantic.ValidationError):
         AcceptSSHKeyRequest.model_validate({"executors": "not a list"})

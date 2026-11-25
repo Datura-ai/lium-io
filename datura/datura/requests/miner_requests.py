@@ -118,7 +118,7 @@ class ExecutorSSHInfo(pydantic.BaseModel):
             return value
         try:
             pairs = json.loads(value)
-        except ValueError:
+        except (ValueError, RecursionError):  # deep nesting raises RecursionError, outside pydantic's ValidationError
             pairs = None
         if not isinstance(pairs, list) or not all(
             isinstance(pair, list)
