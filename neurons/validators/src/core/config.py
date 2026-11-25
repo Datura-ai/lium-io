@@ -634,15 +634,7 @@ class Settings(BaseSettings):
     # and the per-executor job-result dump after scoring; asyncssh and sqlalchemy keep their own levels.
     LOG_LEVEL: str = Field(env="LOG_LEVEL", default="INFO", description="Root log level (DEBUG, INFO, WARNING, ...)")
 
-    # DAH-4299: whether an idle provider-chosen spot node is paid is decided as for a secure node
-    # (its GPU model is in the unrented program and every idle-pool gate passes), not by whether a
-    # Lium filler runs on it: a filler Lium did not start is Lium's doing (Fish). Provider-caused
-    # cases stay excluded by the shared rules. The amount is unchanged. False: paid only while a
-    # Lium filler runs on it, as before.
-    SPOT_IDLE_PAY_SECURE_DECISION_ENABLED: bool = Field(
-        env="SPOT_IDLE_PAY_SECURE_DECISION_ENABLED", default=False
-    )
-    # Spot rental incentive, independent of the flag above. True: a rented spot node the backend
+    # Spot rental incentive. True: a rented spot node the backend
     # lists in provider_spot_executor_ids earns rental incentive at 0.5 x what the same node would
     # earn rented as secure (0.5 = SPOT_RENTAL_INCENTIVE_FACTOR); a node that is spot as a
     # restriction earns 0 as before; the free remainder of a partially rented spot node takes spot idle pay instead.
