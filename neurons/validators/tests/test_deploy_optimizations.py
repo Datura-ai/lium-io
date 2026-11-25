@@ -18,6 +18,7 @@ Covers (from the plan's Test Plan):
 
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import AsyncMock, Mock
 from uuid import uuid4
 
@@ -30,6 +31,7 @@ from payload_models.payloads import (
 )
 from services.docker_service import DockerService
 from services.rental_docker_sdk import ContainerExecResult, ContainerStateSnapshot, build_gpu_docker_config
+from ssh_channel_double import create_process_answering_through
 
 # ------------------------------------------------------------------
 # Fixtures / helpers
@@ -339,6 +341,7 @@ def test_the_gpu_share_is_clamped_into_range():
 @pytest.mark.asyncio
 async def test_read_host_gpu_count_counts_device_nodes(svc):
     ssh_client = AsyncMock()
+    ssh_client.create_process = create_process_answering_through(lambda command: ssh_client.run(command))
     ssh_client.run = AsyncMock(return_value=_ssh_result(stdout="8\n"))
     assert await svc._read_host_gpu_count(ssh_client) == 8
 
@@ -346,6 +349,7 @@ async def test_read_host_gpu_count_counts_device_nodes(svc):
 @pytest.mark.asyncio
 async def test_read_host_gpu_count_returns_none_when_zero_or_unreadable(svc):
     ssh_client = AsyncMock()
+    ssh_client.create_process = create_process_answering_through(lambda command: ssh_client.run(command))
     ssh_client.run = AsyncMock(return_value=_ssh_result(stdout="0\n"))
     assert await svc._read_host_gpu_count(ssh_client) is None
     ssh_client.run = AsyncMock(return_value=_ssh_result(exit_status=1))
@@ -355,6 +359,7 @@ async def test_read_host_gpu_count_returns_none_when_zero_or_unreadable(svc):
 @pytest.mark.asyncio
 async def test_read_host_ram_kib_parses_memtotal(svc):
     ssh_client = AsyncMock()
+    ssh_client.create_process = create_process_answering_through(lambda command: ssh_client.run(command))
     ssh_client.run = AsyncMock(return_value=_ssh_result(stdout="MemTotal:       67108864 kB\nMemFree: 1 kB\n"))
     assert await svc._read_host_ram_kib(ssh_client) == 67108864
 
@@ -362,6 +367,7 @@ async def test_read_host_ram_kib_parses_memtotal(svc):
 @pytest.mark.asyncio
 async def test_read_host_ram_kib_returns_none_when_the_read_fails(svc):
     ssh_client = AsyncMock()
+    ssh_client.create_process = create_process_answering_through(lambda command: ssh_client.run(command))
     ssh_client.run = AsyncMock(return_value=_ssh_result(exit_status=1))
     assert await svc._read_host_ram_kib(ssh_client) is None
 
@@ -599,6 +605,7 @@ async def test_a_sent_whole_host_memory_limit_above_host_ram_is_clamped_in_the_r
 )
 async def test_read_host_pid_max_logs_why_it_missed(svc, caplog, result, why):
     ssh_client = AsyncMock()
+    ssh_client.create_process = create_process_answering_through(lambda command: ssh_client.run(command))
     ssh_client.run = AsyncMock(return_value=result)
     with caplog.at_level("WARNING", logger="services.docker_service"):
         assert await svc._read_host_pid_max(ssh_client) is None
@@ -631,3 +638,21 @@ async def test_a_renter_startup_command_that_runs_start_sh_still_gets_the_volume
         volumes=["/workspace"], startup_commands="/start.sh")))
 
     assert _created_run_spec(svc).environment["LIUM_VOLUME_PATH"] == "/workspace"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("read", ["_read_host_pid_max", "_read_host_ram_kib", "_read_host_gpu_count"])
+async def test_a_timed_out_host_read_closes_its_channel_before_it_returns(svc, monkeypatch, read):
+    """Review on lium-io#2364: asyncssh's run(timeout=) does not free the channel when it fires, so on an sshd with
+    MaxSessions=1 the next command (a cancelled filler's cleanup) got no session. The read returns its miss only once
+    its channel is closed."""
+    monkeypatch.setattr("services.docker_service._HOST_READ_TIMEOUT_SECONDS", 0.05)
+    hung = Mock(wait=Mock(side_effect=lambda *a, **k: asyncio.Event().wait()), close=Mock(), wait_closed=AsyncMock())
+    ssh_client = AsyncMock()
+    ssh_client.create_process = AsyncMock(return_value=hung)
+
+    assert await getattr(svc, read)(ssh_client) is None
+
+    hung.close.assert_called_once()
+    hung.wait_closed.assert_awaited_once()
+

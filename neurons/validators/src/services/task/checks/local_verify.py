@@ -1,4 +1,5 @@
-"""liumd phase 1 (DAH-2834): the matmul and VerifyX from one signed call instead of the SSH sequence.
+"""liumd phase 1 (DAH-2834): the matmul from one signed call instead of the SSH sequence; VerifyX runs over
+SSH only, with the validator's own script (services.executor_payload).
 
 For an executor whose `/version` advertises `local_verify/1` and names its `local_verify_port`,
 this check prepares the same two challenges the SSH-driven checks would
@@ -30,7 +31,7 @@ import logging
 from dataclasses import replace
 from typing import Any
 
-from datura.requests.validator_requests import MatmulStep, VerifyXStep
+from datura.requests.validator_requests import MatmulStep
 from services.local_verify_client import (
     CAPABILITY,
     DETAIL_MAX_CHARS,
@@ -48,8 +49,6 @@ from services.matrix_validation_service import (
 )
 from services.verifyx_validation_service import (
     VERIFYX_COMMAND_TIMEOUT_SECONDS,
-    SSHCapture,
-    VerifyXChallenge,
 )
 
 from core.config import settings
@@ -60,7 +59,6 @@ from ..messages import render_message
 from ..pipeline import CheckResult, Context
 from .capability import get_filler_only_container
 from .task_time import task_seconds_left
-from .verifyx import _first_pass_challenge_config
 
 logger = logging.getLogger(__name__)
 
@@ -98,7 +96,9 @@ def _matmul_ssh_reason() -> str | None:
     """
     if settings.MATMUL_ALLCARDS_CHECK_ENABLED:
         return "allcards_ssh"
-    return None
+    # shortcut: the matmul runs over SSH with the validator's own script (services.executor_payload); ask for it
+    # here again once the intent carries that script
+    return "validator_payload"
 
 
 class _NothingToSend(Exception):
@@ -170,10 +170,11 @@ class LocalVerifyCheck:
                 ctx, "call", "no_tunnel_port", "/version names no local_verify_port"
             )
 
+        if matmul_ssh_reason is not None:
+            # VerifyX always runs over SSH with the validator's own script, so no step is left to ask for
+            return self._skipped(ctx, f"no local step ({matmul_ssh_reason})")
         try:
-            matmul_challenge, verifyx_challenge = self._prepare_challenges(
-                ctx, specs, matmul_on_ssh=matmul_ssh_reason is not None
-            )
+            matmul_challenge = self._prepare_challenges(ctx, specs)
         except _NothingToSend as exc:
             return self._fallback(ctx, "call", exc.reason, exc.detail)
         try:
@@ -182,41 +183,26 @@ class LocalVerifyCheck:
                 client,
                 advertised.local_verify_port,
                 matmul_challenge,
-                verifyx_challenge,
                 matmul_ssh_reason=matmul_ssh_reason,
             )
         finally:
             if matmul_challenge is not None:
                 matmul_challenge.close()
 
-    def _prepare_challenges(
-        self, ctx: Context, specs: dict, *, matmul_on_ssh: bool
-    ) -> tuple[MatmulChallenge | None, VerifyXChallenge]:
-        """The same challenges the SSH checks would build, sized the same way (DAH-3011 first pass).
-        Raises _NothingToSend when they cannot be built; a matmul challenge built by then is closed."""
-        first_pass = ctx.config.first_pass
-        matmul_challenge = None
+    def _prepare_challenges(self, ctx: Context, specs: dict) -> MatmulChallenge:
+        """The matmul challenge the SSH check would build, sized the same way (DAH-3011 first pass).
+        Raises _NothingToSend when it cannot be built."""
         try:
-            if not matmul_on_ssh:
-                matmul_challenge = ctx.services.validation.prepare_matmul_challenge(
-                    specs,
-                    ctx.default_extra,
-                    vram_budget_mb=settings.FIRST_PASS_MATMUL_VRAM_MB if first_pass else None,
-                )
-            verifyx_challenge = ctx.services.verifyx.prepare_verifyx_challenge(
-                specs,
-                ctx.default_extra,
-                challenge_config_overrides=(_first_pass_challenge_config() if first_pass else None),
+            matmul_challenge = ctx.services.validation.prepare_matmul_challenge(
+                specs, ctx.default_extra, vram_budget_mb=settings.FIRST_PASS_MATMUL_VRAM_MB
             )
         except Exception as exc:  # a native library error is ours, not the node's
-            if matmul_challenge is not None:
-                matmul_challenge.close()
             raise _NothingToSend("prepare_failed", f"{type(exc).__name__}: {exc}") from exc
-        if matmul_challenge is not None and not matmul_challenge.params.cipher_text:
+        if not matmul_challenge.params.cipher_text:
             # Our own native error (the SSH path reports it the same way); nothing to send.
             matmul_challenge.close()
             raise _NothingToSend("cipher_generation_failed", "matmul cipher text is empty")
-        return matmul_challenge, verifyx_challenge
+        return matmul_challenge
 
     async def _call_and_judge(
         self,
@@ -224,11 +210,9 @@ class LocalVerifyCheck:
         client: LocalVerifyClient,
         local_verify_port: int,
         matmul_challenge: MatmulChallenge | None,
-        verifyx_challenge: VerifyXChallenge,
         *,
         matmul_ssh_reason: str | None,
     ) -> CheckResult:
-        first_pass = ctx.config.first_pass
         matmul_step = None
         if matmul_challenge is not None:
             params = matmul_challenge.params
@@ -242,12 +226,9 @@ class LocalVerifyCheck:
             executor_uuid=ctx.executor.uuid,
             miner_hotkey=ctx.miner_hotkey,
             matmul=matmul_step,
-            verifyx=VerifyXStep(
-                seed=verifyx_challenge.seed, cipher_text=verifyx_challenge.cipher_text
-            ),
-            # Side by side only at first-pass sizes: a full-size VerifyX beside the matmul OOMs
-            # 64–128 GB hosts (SWEEP_provider_verify §3 #6).
-            parallel_gpu=first_pass,
+            # VerifyX runs over SSH only, with the validator's own script
+            verifyx=None,
+            parallel_gpu=ctx.config.first_pass,
             # Shorter than the client's whole-call timeout by a margin, so an answer the
             # executor cut at its deadline (`deadline_hit`, finished steps inside) still arrives
             # before the client gives up and is consumed step by step.
@@ -260,9 +241,7 @@ class LocalVerifyCheck:
         except LocalVerifyUnavailable as exc:
             return self._fallback(ctx, "call", exc.reason, exc.detail)
 
-        outcome = self._judge(
-            ctx, answer, matmul_challenge, verifyx_challenge, matmul_ssh_reason=matmul_ssh_reason
-        )
+        outcome = self._judge(ctx, answer, matmul_challenge, matmul_ssh_reason=matmul_ssh_reason)
         what = {
             "round_trip_ms": outcome.round_trip_ms,
             "executor_elapsed_ms": outcome.executor_elapsed_ms,
@@ -286,7 +265,6 @@ class LocalVerifyCheck:
         ctx: Context,
         answer: LocalVerifyAnswer,
         matmul_challenge: MatmulChallenge | None,
-        verifyx_challenge: VerifyXChallenge,
         *,
         matmul_ssh_reason: str | None,
     ) -> LocalVerifyOutcome:
@@ -331,35 +309,7 @@ class LocalVerifyCheck:
                     ctx, "fallback", "matmul", "local_failed", detail=result.error_message, **common
                 )
 
-        step = answer.step("verifyx")
-        if step.status != "ok" or step.stdout is None:
-            reason = _step_reason(step)
-            outcome.fallbacks["verifyx"] = reason
-            self._metric(ctx, "fallback", "verifyx", reason, detail=step.error or "", **common)
-        elif _over_time("verifyx", answer):
-            outcome.fallbacks["verifyx"] = "step_overtime"
-            self._metric(ctx, "fallback", "verifyx", "step_overtime", **common)
-        elif step.data.get("lib_sha256") != verifyx_challenge.expected_lib_sha256:
-            # The SSH path refuses an outdated libverifyx before running; here the digest rides
-            # along with the answer and the same refusal applies.
-            outcome.fallbacks["verifyx"] = "lib_mismatch"
-            self._metric(ctx, "fallback", "verifyx", "lib_mismatch", **common)
-        else:
-            capture = SSHCapture(
-                stdout=step.stdout, stderr=step.stderr_tail, exit_status=step.exit_status
-            )
-            response = ctx.services.verifyx.evaluate_verifyx_capture(
-                verifyx_challenge, capture, ctx.default_extra
-            )
-            if response.data and response.data.get("success"):
-                outcome.verifyx = response
-                self._metric(ctx, "consumed", "verifyx", "ok", step_ms=step.ms, **common)
-            else:
-                outcome.fallbacks["verifyx"] = "local_failed"
-                # a verdict that decrypts but fails (RAM, disk) has no `error`, only `errors`
-                verdict_errors = (response.data or {}).get("errors") or []
-                detail = response.error or "; ".join(str(e) for e in verdict_errors)
-                self._metric(ctx, "fallback", "verifyx", "local_failed", detail=detail, **common)
+        outcome.fallbacks["verifyx"] = "ssh_only"
         return outcome
 
     def _skipped(self, ctx: Context, why: str) -> CheckResult:

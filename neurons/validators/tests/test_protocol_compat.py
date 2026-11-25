@@ -157,3 +157,14 @@ def test_validator_preserves_command_id(entry: dict) -> None:
         for command_id in ("", "retry"):
             message = {**entry["message"], "command_id": command_id}
             assert payloads.BaseServerRequest.parse(json.dumps(message)).command_id == command_id
+
+
+@pytest.mark.parametrize("value", [None, [], ["executor.validate.rental_probe", "executor.validate.node_account"]])
+def test_the_idle_only_checks_that_passed_read_the_same_on_both_sides(value) -> None:
+    # DAH-6784: lium_protocol 2.21.0 ExecutorSpecRequest.idle_checks_passed
+    [spec, *_] = [e["message"] for e in recorded("validator_to_backend") if e["expect"] == "ExecutorSpecRequest"]
+    message = {**spec, "idle_checks_passed": value}
+    ours = lium_protocol.VALIDATOR_MESSAGES.parse_obj(message)
+    theirs = _validator_parse_validator_message(message)
+    assert ours.idle_checks_passed == theirs.idle_checks_passed == value
+    _same_wire_view(message, ours, theirs)

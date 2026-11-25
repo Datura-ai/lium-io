@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import difflib
 import os
 import re
 import subprocess
@@ -43,9 +44,24 @@ def _read(host_root: Path):
             "NEEDRESTART_GUARD_SERVICES",
             "NEEDRESTART_GUARD_UNITS",
         },
-        {"os": os, "re": re},
+        {"difflib": difflib, "os": os, "re": re},
     )
-    return ns["get_needrestart_guard"](str(host_root))
+    return ns["get_needrestart_guard"](str(host_root))[:2]
+
+
+def _reason(host_root: Path):
+    ns = build_scrape_namespace(
+        SRC / "miner_jobs" / "machine_scrape.py",
+        {
+            "get_needrestart_guard",
+            "needrestart_data_line",
+            "NEEDRESTART_GUARD_FILE",
+            "NEEDRESTART_GUARD_SERVICES",
+            "NEEDRESTART_GUARD_UNITS",
+        },
+        {"difflib": difflib, "os": os, "re": re},
+    )
+    return ns["get_needrestart_guard"](str(host_root))[2]
 
 
 def _host(tmp_path: Path, guard_text: str | None, needrestart: bool = True) -> Path:
@@ -335,6 +351,9 @@ def test_code_in_config_loaded_before_the_guard_makes_it_partial(tmp_path, code,
         (host / "etc/needrestart/conf.d/00-local.conf").write_text(code + "\n")
 
     assert _read(host) == ("partial", ALL)
+    # DAH-6566 follow-up: the event names the file and the line the scrape could not prove
+    path = "needrestart.conf" if where == "main" else "conf.d/00-local.conf"
+    assert re.fullmatch(rf"/etc/needrestart/{re.escape(path)} line [12], loaded before the guard, is not plain data", _reason(host))
 
 
 @pytest.mark.parametrize(
@@ -359,6 +378,7 @@ def test_a_main_config_that_does_not_load_the_guard_last_makes_it_partial(tmp_pa
         (host / "usr/sbin/needrestart").write_text("")
 
     assert _read(host) == ("partial", ALL)
+    assert "needrestart.conf" in _reason(host)
 
 
 @pytest.mark.parametrize(
@@ -444,3 +464,292 @@ def test_no_guard_is_written_without_needrestart(tmp_path):
 
     assert out.stdout == "needrestart_guard_skipped no_needrestart\n"
     assert not (tmp_path / "etc").exists()
+
+
+def test_a_readable_config_gives_no_reason_and_a_guard_line_it_cannot_read_is_named(tmp_path):
+    assert _reason(_host(tmp_path, _setup_script_guard())) is None
+
+    host = _host(tmp_path / "odd", _setup_script_guard() + "\n$nrconf{override_rc}{qr(^x)} = 0;\n")
+
+    assert _read(host) == ("partial", ALL)
+    assert _reason(host) == f"{GUARD} line {len(_setup_script_guard().splitlines()) + 1} is not a guard line"
+
+
+@pytest.mark.asyncio
+async def test_the_partial_reason_reaches_the_event(context_factory):
+    specs = {"needrestart_guard": "partial", "needrestart_guard_unguarded": ALL, "needrestart_guard_reason": "why"}
+    ssh = AsyncMock()
+    ssh.run.return_value = SimpleNamespace(exit_status=0, stdout="needrestart_guard_unchanged\n", stderr="")
+
+    result = await NeedrestartGuardCheck().run(context_factory(state=build_state(specs=specs), ssh=ssh))
+
+    assert result.event.what_we_saw["reason"] == "why"
+
+
+SECRET = "SAMPLE-SECRET-MARKER"  # a fake, recognisable value; it must not reach any output
+
+
+@pytest.mark.parametrize(
+    ("file", "text"),
+    [
+        (GUARD, None),  # appended to the guard file
+        ("/etc/needrestart/needrestart.conf", f"my $webhook_token = '{SECRET}';\n" + STOCK_MAIN),
+        ("/etc/needrestart/needrestart.conf", STOCK_MAIN + f"my $webhook_token = '{SECRET}';\n"),
+        ("/etc/needrestart/conf.d/00-local.conf", f"my $webhook_token = '{SECRET}';\n"),
+        ("/etc/needrestart/conf.d/zz-local.conf", f"my $webhook_token = '{SECRET}';\n"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_secret_on_a_config_line_reaches_neither_the_specs_nor_the_event(tmp_path, context_factory, file, text):
+    # lio#2333 review: a reason names file, line and category, never the line's text
+    host = _host(tmp_path, _setup_script_guard() + (f"\nmy $webhook_token = '{SECRET}';\n" if text is None else ""))
+    if text is not None:
+        (host / file.lstrip("/")).write_text(text)
+    guard, unguarded = _read(host)
+    reason = _reason(host)
+    assert guard == "partial" and file in reason and " line " in reason
+    specs = {"needrestart_guard": guard, "needrestart_guard_unguarded": unguarded, "needrestart_guard_reason": reason}
+    assert SECRET not in repr(specs)
+    ssh = AsyncMock()
+    ssh.run.return_value = SimpleNamespace(exit_status=0, stdout="needrestart_guard_unchanged\n", stderr="")
+
+    result = await NeedrestartGuardCheck().run(context_factory(state=build_state(specs=specs), ssh=ssh))
+
+    assert SECRET not in repr(result.event)
+    assert result.event.what_we_saw["reason"] == reason
+
+
+def _rules(host: Path, *entries: str) -> None:
+    (host / "etc/needrestart/needrestart.conf").write_text(
+        "$nrconf{override_rc} = {\n" + "".join(f"    {e}\n" for e in entries) + "};\n" + LOADER
+    )
+
+
+def test_a_rule_pattern_python_cannot_read_is_named_with_its_line(tmp_path):
+    host = _host(tmp_path, _setup_script_guard())
+    _rules(host, "qr{^sshd\\K} => 1,")
+
+    assert _read(host) == ("partial", ALL)
+    assert _reason(host) == "/etc/needrestart/needrestart.conf line 2 has a rule pattern the scrape cannot evaluate"
+
+
+def test_a_computed_guard_value_is_named_with_its_line(tmp_path):
+    guard = _setup_script_guard().replace("qr(^docker)} = 0;", "qr(^docker)} = (1 - 1);")
+    host = _host(tmp_path, guard)
+    line = next(n for n, ln in enumerate(guard.splitlines(), 1) if "(1 - 1)" in ln)
+
+    assert _read(host) == ("partial", ["docker"])
+    assert _reason(host) == f"{GUARD} line {line} sets docker to a computed value the scrape cannot evaluate"
+
+
+def test_a_proven_overlap_needs_no_reason_and_an_unproven_rule_beside_it_keeps_its_own(tmp_path):
+    host = _host(tmp_path, _setup_script_guard())
+    _rules(host, "qr(^container) => 1,")
+    assert (_read(host), _reason(host)) == (("partial", ["containerd"]), None)
+
+    guard = _setup_script_guard().replace("qr(^docker)} = 0;", "qr(^docker)} = (1 - 1);")
+    (host / GUARD.lstrip("/")).write_text(guard)
+    assert _read(host) == ("partial", ["docker", "containerd"])
+    assert "sets docker to a computed value" in _reason(host)
+
+    _rules(host, "qr(^container) => 1,", "qr{^sshd\\K} => 1,")
+    (host / GUARD.lstrip("/")).write_text(_setup_script_guard())
+    assert _read(host) == ("partial", ALL)
+    assert _reason(host) == "/etc/needrestart/needrestart.conf line 3 has a rule pattern the scrape cannot evaluate"
+
+
+def test_a_changed_loader_line_is_named_and_a_missing_loader_names_the_file(tmp_path):
+    host = _host(tmp_path, _setup_script_guard())
+    main = host / "etc/needrestart/needrestart.conf"
+    glob_line = next(n for n, ln in enumerate(STOCK_MAIN.splitlines(), 1) if "conf.d/*.conf>" in ln)
+    main.write_text(STOCK_MAIN.replace("conf.d/*.conf>", "other/*.conf>"))
+    assert _reason(host) == f"/etc/needrestart/needrestart.conf line {glob_line} differs from the stock conf.d loader"
+
+    # the opener itself edited: the rest of the loader still anchors it, so the opener's line is named
+    opener = next(n for n, ln in enumerate(STOCK_MAIN.splitlines(), 1) if "q(/etc/needrestart/conf.d))" in ln)
+    main.write_text(STOCK_MAIN.replace("q(/etc/needrestart/conf.d))", "'/etc/needrestart/conf.d')"))
+    assert _reason(host) == f"/etc/needrestart/needrestart.conf line {opener} differs from the stock conf.d loader"
+
+    # the opener rewritten to an unrelated condition (an environment flag): it still opens the loader's block, so it
+    # is named, not the unchanged glob below it
+    stock_opener = STOCK_MAIN.splitlines()[opener - 1]
+    main.write_text(STOCK_MAIN.replace(stock_opener, "if (!$ENV{NR_SKIP_CONFD}) {"))
+    assert _reason(host) == f"/etc/needrestart/needrestart.conf line {opener} differs from the stock conf.d loader"
+
+    # the edited opener with a trailing comment still opens the block, so it is named, not the unchanged glob
+    main.write_text(STOCK_MAIN.replace(stock_opener, "if (-d '/etc/needrestart/conf.d') { # local"))
+    assert _reason(host) == f"/etc/needrestart/needrestart.conf line {opener} differs from the stock conf.d loader"
+
+    # the opener's quoting and the glob both changed: the stock log line below still anchors the loader
+    main.write_text(
+        STOCK_MAIN.replace("q(/etc/needrestart/conf.d))", "'/etc/needrestart/conf.d')").replace(
+            "conf.d/*.conf>", "other/*.conf>"
+        )
+    )
+    assert _reason(host) == f"/etc/needrestart/needrestart.conf line {opener} differs from the stock conf.d loader"
+
+    # a verbatim copy of the stock loop for another directory above the conf.d loader: neither its opener nor its log
+    # line anchors the conf.d loader, so the changed conf.d line is named, with or without the opener also changed
+    site_loop = LOADER.replace("/etc/needrestart/conf.d", "/etc/needrestart/site.d")
+    shift = len(site_loop.splitlines())
+    main.write_text(site_loop + STOCK_MAIN.replace("conf.d/*.conf>", "other/*.conf>"))
+    assert _reason(host) == f"/etc/needrestart/needrestart.conf line {glob_line + shift} differs from the stock conf.d loader"
+    quoted = STOCK_MAIN.replace("q(/etc/needrestart/conf.d))", "'/etc/needrestart/conf.d')")
+    main.write_text(site_loop + quoted.replace("conf.d/*.conf>", "other/*.conf>"))
+    assert _reason(host) == f"/etc/needrestart/needrestart.conf line {opener + shift} differs from the stock conf.d loader"
+
+    # the opener edited and a block with an exact stock opener appended below: that block matches one loader line,
+    # the real loader's glob and the lines after it match more, so the edited opener is named, not the appended block
+    main.write_text(quoted + stock_opener + "\n$nrconf{verbosity} = 0;\n}\n")
+    assert _reason(host) == f"/etc/needrestart/needrestart.conf line {opener} differs from the stock conf.d loader"
+
+    lines = STOCK_MAIN.splitlines()
+    # a line inserted inside the loader, after the glob or after the opener: the inserted line is named, not the
+    # unchanged loader line above it
+    glob_text = lines[glob_line - 1]
+    main.write_text(STOCK_MAIN.replace(glob_text, glob_text + "\nnext unless -r $fn;"))
+    assert _reason(host) == f"/etc/needrestart/needrestart.conf line {glob_line + 1} differs from the stock conf.d loader"
+    main.write_text(STOCK_MAIN.replace(stock_opener, stock_opener + "\n$nrconf{verbosity} = 0;"))
+    assert _reason(host) == f"/etc/needrestart/needrestart.conf line {opener + 1} differs from the stock conf.d loader"
+
+    # the opener and the glob swapped: the glob, now first, is named, not the unchanged log line below them
+    main.write_text(STOCK_MAIN.replace(stock_opener + "\n" + glob_text, glob_text + "\n" + stock_opener))
+    assert stock_opener + "\n" + glob_text in STOCK_MAIN
+    assert _reason(host) == f"/etc/needrestart/needrestart.conf line {opener} differs from the stock conf.d loader"
+
+    # a trailing comment on each of the opener, glob and log line: the loader is still found, and its first
+    # commented line is named
+    log_text = lines[glob_line]
+    assert "print STDERR" in log_text
+    commented = STOCK_MAIN
+    for text in (stock_opener, glob_text, log_text):
+        commented = commented.replace(text, text + " # local")
+    main.write_text(commented)
+    assert _reason(host) == f"/etc/needrestart/needrestart.conf line {opener} differs from the stock conf.d loader"
+
+    # the optional log line deleted: the line now in its place (the eval) is named, after the intact opener and glob
+    lines = STOCK_MAIN.splitlines()
+    log_line = next(n for n, ln in enumerate(lines, 1) if "print STDERR" in ln and "eval $fn" in ln)
+    main.write_text("\n".join(ln for n, ln in enumerate(lines, 1) if n != log_line) + "\n")
+    assert _reason(host) == f"/etc/needrestart/needrestart.conf line {log_line} differs from the stock conf.d loader"
+
+    # the directory check and its brace deleted: the glob, where the loader starts, is named, not a setting above it
+    last_brace = max(n for n, ln in enumerate(lines, 1) if ln.strip() == "}")
+    main.write_text("\n".join(ln for n, ln in enumerate(lines, 1) if n not in (opener, last_brace)) + "\n")
+    # the glob moved up into the deleted opener's line number
+    assert _reason(host) == f"/etc/needrestart/needrestart.conf line {opener} differs from the stock conf.d loader"
+    assert "conf.d/*.conf>" in (host / "etc/needrestart/needrestart.conf").read_text().splitlines()[opener - 1]
+
+    # a site loader's eval line above a stock loader whose glob changed: the glob is named, not the site loader
+    site = "my $fn = '/etc/needrestart/site.conf';\nif(-f $fn) {\neval do { local(@ARGV, $/) = $fn; <>};\n}\n"
+    main.write_text(site + STOCK_MAIN.replace("conf.d/*.conf>", "other/*.conf>"))
+    assert _reason(host) == (
+        f"/etc/needrestart/needrestart.conf line {glob_line + 4} differs from the stock conf.d loader"
+    )
+
+    # only a commented opener: it anchors the loader once its comment is stripped, but no line aligns as written,
+    # so it is named (the stand's crash at 409768f)
+    main.write_text("if(-d q(/etc/needrestart/conf.d)) { # c\n")
+    assert _read(host) == ("partial", ALL)
+    assert _reason(host) == "/etc/needrestart/needrestart.conf line 1 differs from the stock conf.d loader"
+    main.write_text("$nrconf{a} = 1;\nforeach my $fn (sort </etc/needrestart/conf.d/*.conf>) { # c\n")
+    assert _reason(host) == "/etc/needrestart/needrestart.conf line 2 differs from the stock conf.d loader"
+
+    main.write_text("$nrconf{restart} = 'a';\nif (1) {\n}\n}\n")  # stray braces are not a loader
+    assert _reason(host) == "/etc/needrestart/needrestart.conf has no stock conf.d loader"
+
+
+def test_only_the_last_assignment_to_a_guard_file_rule_counts(tmp_path):
+    # Perl keeps the last value of a key: a superseded 1 does not prove docker unguarded, so the computed docker
+    # value keeps its reason
+    guard = _setup_script_guard().replace("qr(^docker)} = 0;", "qr(^docker)} = (1 - 1);")
+    guard += "\n$nrconf{override_rc}->{qr(^dock)} = 1;\n$nrconf{override_rc}->{qr(^dock)} = 0;\n"
+    host = _host(tmp_path, guard)
+    line = next(n for n, ln in enumerate(guard.splitlines(), 1) if "(1 - 1)" in ln)
+    assert _read(host) == ("partial", ["docker"])
+    assert _reason(host) == f"{GUARD} line {line} sets docker to a computed value the scrape cannot evaluate"
+
+
+@pytest.mark.parametrize(("value", "perl_true"), [("0.0", False), ("''", False), ("-0", False), ('"0.0"', True)])
+def test_a_broader_rule_proves_the_overlap_only_when_perl_reads_its_value_as_true(tmp_path, value, perl_true):
+    guard = _setup_script_guard().replace("qr(^docker)} = 0;", "qr(^docker)} = (1 - 1);")
+    host = _host(tmp_path, guard)
+    _rules(host, f"qr(^dock) => {value},")
+    assert _read(host) == ("partial", ["docker"])
+    if perl_true:
+        assert _reason(host) is None
+    else:
+        assert "sets docker to a computed value" in _reason(host)
+
+
+def test_a_dotfile_in_conf_d_is_not_loaded_and_never_named(tmp_path):
+    host = _host(tmp_path, _setup_script_guard())
+    (host / "etc/needrestart/conf.d/.backup.conf").write_text("system('true');\n")
+    assert _read(host) == ("present", [])
+    (host / "etc/needrestart/conf.d/00-local.conf").write_text("system('true');\n")
+    assert _reason(host) == "/etc/needrestart/conf.d/00-local.conf line 1, loaded before the guard, is not plain data"
+
+
+def test_a_guard_value_that_runs_code_is_named_with_its_line(tmp_path):
+    # a chained assignment sets another rule as it runs: a later line resetting the first key does not undo that
+    guard = _setup_script_guard() + (
+        "\n$nrconf{override_rc}->{qr(^dock)} = $nrconf{override_rc}->{qr(^docker)} = 1;\n"
+        "$nrconf{override_rc}->{qr(^dock)} = 0;\n"
+    )
+    host = _host(tmp_path, guard)
+    line = next(n for n, ln in enumerate(guard.splitlines(), 1) if "= $nrconf" in ln)
+    assert _read(host) == ("partial", ALL)
+    assert _reason(host) == f"{GUARD} line {line} runs code in its value"
+
+
+
+@pytest.mark.parametrize("value", ["!1", "!0", "~0", "1 ? 1 : 0", "2 * (3 - 1) % 2"])
+def test_an_operator_only_rule_for_another_service_leaves_the_guard_present(tmp_path, value):
+    host = _host(tmp_path, _setup_script_guard() + f"\n$nrconf{{override_rc}}->{{qr(^cron)}} = {value};\n")
+    assert _read(host) == ("present", [])
+
+
+def test_an_operator_only_value_on_a_guarded_service_is_not_proven_zero(tmp_path):
+    guard = _setup_script_guard().replace("qr(^docker)} = 0;", "qr(^docker)} = !1;")
+    host = _host(tmp_path, guard)
+    line = next(n for n, ln in enumerate(guard.splitlines(), 1) if "qr(^docker)} = !1;" in ln)
+    assert _read(host) == ("partial", ["docker"])
+    assert _reason(host) == f"{GUARD} line {line} sets docker to a computed value the scrape cannot evaluate"
+
+def test_a_heredoc_value_that_swallows_the_next_guard_lines_runs_code(tmp_path):
+    # Perl reads the lines after <<'' up to a blank line as the string, so the docker reset below never runs
+    guard = _setup_script_guard() + (
+        "\n$nrconf{override_rc}->{qr(^cron)} = <<'';\n"
+        "$nrconf{override_rc}->{qr(^docker)} = 0;\n\n"
+    )
+    host = _host(tmp_path, guard)
+    line = next(n for n, ln in enumerate(guard.splitlines(), 1) if "<<''" in ln)
+    assert _read(host) == ("partial", ALL)
+    assert _reason(host) == f"{GUARD} line {line} runs code in its value"
+
+
+@pytest.mark.parametrize("value", ["%-", "*+", "/0/", "1 - %+", "1 ** 2", "<STDIN>", "1 x 2"])
+def test_a_sigil_or_match_where_a_term_belongs_runs_code(tmp_path, value):
+    host = _host(tmp_path, _setup_script_guard() + f"\n$nrconf{{override_rc}}->{{qr(^cron)}} = {value};\n")
+    assert _read(host)[0] == "partial"
+
+
+@pytest.mark.parametrize("value", ["0.0", "-0", "''"])
+def test_only_the_guards_own_zeros_keep_a_service_guarded(tmp_path, value):
+    guard = _setup_script_guard().replace("qr(^docker)} = 0;", f"qr(^docker)}} = {value};")
+    host = _host(tmp_path, guard)
+    line = next(n for n, ln in enumerate(guard.splitlines(), 1) if f"qr(^docker)}} = {value};" in ln)
+    assert _read(host) == ("partial", ["docker"])
+    assert _reason(host) == f"{GUARD} line {line} sets docker to a zero other than the guard's 0"
+
+    host = _host(tmp_path / "broader", _setup_script_guard())
+    _rules(host, f"qr(^dock) => {value},")
+    assert _read(host) == ("partial", ["docker"])
+    assert _reason(host) == "/etc/needrestart/needrestart.conf line 2 sets a zero other than the guard's 0"
+
+
+def test_a_quoted_key_keeps_its_inner_quotes(tmp_path):
+    host = _host(tmp_path, _setup_script_guard())
+    _rules(host, '"^docker" => 1,', "\"'^docker'\" => 0,")
+    assert _read(host) == ("partial", ["docker"])
+    assert _reason(host) is None

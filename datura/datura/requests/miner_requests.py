@@ -76,6 +76,10 @@ class AcceptSSHKeyRequest(BaseMinerRequest):
     # could not reach — ExecutorUnreachable on the validator, not InvalidExecutorId. None from a
     # miner that predates the field: the validator then keeps reading a missing executor as invalid.
     known_executor_ids: list[str] | None = None
+    # The known executors that answered the key upload with a refusal, by id, each with the node's own answer
+    # (its `detail`, cut short). Such a node is reachable: the validator names the refusal instead of "could not
+    # reach". None from an older miner.
+    refused_executors: dict[str, str] | None = None
 
 
 class SSHKeyRemoved(BaseMinerRequest):

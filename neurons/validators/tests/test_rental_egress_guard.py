@@ -539,7 +539,7 @@ esac
 rc=$?
 if [ -n "${mutating:-}" ] && [ -n "${DIE_AFTER:-}" ]; then
   n=$(( $(cat "$STATE/count" 2>/dev/null || echo 0) + 1 )); echo $n > "$STATE/count"
-  [ "$n" -eq "$DIE_AFTER" ] && kill -9 $PPID
+  [ "$n" -eq "$DIE_AFTER" ] && kill -9 "$(cat "$STATE/run_pid")"
 fi
 exit $rc
 """
@@ -667,7 +667,10 @@ def test_a_swap_killed_after_any_mutation_is_recovered_without_flushing_the_prot
     env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}", "STATE": str(state)}
     script = link_local_drop_script("br-bbbbbbbbbbbb", [])
 
-    first = subprocess.run(["sh", "-c", script], env={**env, "DIE_AFTER": str(die_after)}, capture_output=True)
+    # the stub kills the pid the run started as, never its own $PPID: a shell that execs its last command (bash -c) makes
+    # that command's parent the test runner itself
+    killable = f'echo $$ > "$STATE/run_pid"; {script}'
+    first = subprocess.run(["sh", "-c", killable], env={**env, "DIE_AFTER": str(die_after)}, capture_output=True)
     in_force = _jumps_and_rules(state)
     assert in_force and in_force[0][1] in (old_rules, new_rules)  # something still protects after the kill
     second = subprocess.run(["sh", "-c", script], env=env, capture_output=True, text=True)

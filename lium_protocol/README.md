@@ -6,7 +6,7 @@ The validator↔backend wire, once. Pydantic v2 models for:
 - `lium_protocol.backend_to_validator` — every message the backend sends down that socket (`BackendMessageType`, 19 types: container lifecycle, ssh keys, backups, Jupyter, the estimate request, the staging-only forced cycle, the one-node recheck), plus the three typeless replies it sends there (`SOCKET_REPLIES`: `Response`, `RentedMachineResponse`, `RevenuePerGpuTypeResponse` — no `message_type`, told apart by the request the validator is waiting for).
 - `lium_protocol.http` — the bodies of the backend HTTP API the validator reads between cycles (`HTTP_MODELS`, 10 bodies).
 
-No application code: nothing here imports the validator or the backend. `PROTOCOL_VERSION` (`2.16.0`) is semver over the wire.
+No application code: nothing here imports the validator or the backend. `PROTOCOL_VERSION` (`2.17.0`) is semver over the wire.
 
 ## Using it
 
@@ -39,9 +39,23 @@ Field types are what a receiver must accept: a field one peer sends and the othe
 Compatibility rules for a change:
 
 - add an optional field or an enum member → minor version bump (`1.0.0` → `1.1.0`, as `FailedContainerRequest.build_log_tail` did);
-- make a field required, remove or rename one, change a type → major version bump and a new `snapshots/lium_protocol.v2.json`.
+- make a field required, remove or rename one, change a type → major version bump (the release moves the snapshot to `snapshots/lium_protocol.v<major>.json`).
 
-Consumers pin a tag `lium-protocol-v<PROTOCOL_VERSION>` of this repository. The plan for lium-platform: vendor the tree — models, snapshot and recordings — under `apps/lium/backend/apps/server/src/lium_protocol/`, with a `PROTOCOL_PIN.json` naming the tag, the commit and the tree's sha256, and a CI check that compares the vendored copy with that commit.
+Consumers pin a tag `lium-protocol-v<PROTOCOL_VERSION>` of this repository.
+
+## Changing the wire, and releasing
+
+A pull request that changes the wire never touches the version. It adds a fragment `lium_protocol/changes/<short-name>.md`: the first line `minor` or `major` (the rules above), then the one-line entry for the version list below. Do not write the coming version number anywhere; nobody knows it until the release.
+
+A release is its own pull request: run `python lium_protocol/scripts/release.py`, commit what it changed and open the PR. It takes the highest bump among the fragments, writes the new version to `__init__.py`, `pyproject.toml`, `uv.lock`, this README and the snapshot, adds one line to the version list and deletes the fragments. When that PR merges, tag its merge commit:
+
+```bash
+git tag lium-protocol-v<version> <merge commit> && git push origin lium-protocol-v<version>
+```
+
+CI (`scripts/check_version.py`, job `protocol`) fails a PR that changes `PROTOCOL_VERSION` without deleting a fragment (deleting fragments is what marks a release PR); a release PR that does not set exactly the version its base's fragments call for, that leaves one of them, or that changes the wire; a PR that edits a fragment already on main, adds one `release.py` cannot read, or puts one in a subfolder of `changes/` (only `changes/*.md` is read); and a PR that changes the wire without adding a fragment. The wire is the committed schema snapshot under `lium_protocol/lium_protocol/snapshots/` apart from its `protocol_version` line; CI holds the snapshot equal to the models, so a change that does not alter the snapshot (a comment, a docstring, a refactor) needs no fragment. Locally: `python lium_protocol/scripts/check_version.py $(git merge-base origin/main HEAD)`.
+
+To undo a wire change that is not released yet, `git revert` alone is not enough: it deletes the change's fragment, and CI reads a deleted fragment as a release. Put the fragment back (`git checkout origin/main -- lium_protocol/changes/<name>.md`) and add a new fragment for the revert itself, with the bump its own wire change calls for. The next release then lists both lines.
 
 ## Versions
 
@@ -72,7 +86,8 @@ Consumers pin a tag `lium-protocol-v<PROTOCOL_VERSION>` of this repository. The 
 - `2.11.0` — `ExecutorSpecRequest.check_started_at` (optional): when an express recheck outside the cycle started. Its `job_batch_id` stays the cycle's, so the uptime and finished-jobs counters do not move; the backend judges the end of a provider maintenance window by this time instead of the cycle's start. None for a cycle's own report and from an older validator.
 - `2.13.0` — `ContainerCreated.command_id` (optional, default empty): the `ContainerCreateRequest`'s `command_id`, echoed. `ExecutorRentFinishedRequest.create_command_id` (optional, default empty): the backend names in it the `ContainerCreated.command_id` the receipt answers. It is not `command_id`, which the validator dedupes requests on. The backend applies a success only for the pod's current create; an older one gets its receipt alone. The validator clears only the pending state of the dispatch a receipt names, and the `ResumedCreatesReport` goes once every success replayed ahead of it has its receipt. Empty on either side: as before.
 - `2.15.0` — `SshPubKeyRemoved.command_id` (optional, default empty): the `RemoveSshPublicKeysRequest`'s `command_id`, echoed, as `SshPubKeyAdded` does since 1.14.0; a removal's `FailedContainerRequest` echoes it too. The backend confirms a removal only on the answer to that send, so a delayed answer to an earlier send cannot confirm a later one. Empty from an older validator.
-- `2.16.0` — `GpuResetErrorCode.GpusLostOnHost`: a renter's GPU reset found the GPUs gone from the host driver (the host GPU listing failed, timed out or came back empty); the provider has to reboot the host. A backend older than 2.16.0 does not know it, so the validator keeps sending `ResetNotSupported` with the same detail for this case until the backend accepts the new code.
+- `2.17.0` — `ExecutorSpecRequest.rented_pod_faults` (optional): the rented pods this cycle's pod checks judged, by pod id, each with the host-side fault codes found on it (`RENTED_POD_PROC_FUSE_DISCONNECTED`: sysbox-fs died or restarted under the pod and its `/proc` answers "Transport endpoint is not connected"); `[]` = judged and clean, a pod not listed was not judged. None from an older validator and for a cycle that judged no pod.
+- `2.16.0` — `GpuResetErrorCode.GpusLostOnHost`: a renter's GPU reset found the GPUs gone from the host driver (the host GPU listing failed, timed out or came back empty); the provider has to reboot the host. The validator sends it once the backend accepts it; a validator released before that sends `ResetNotSupported` with the same detail for this case.
 - `1.0.0` — first release.
 
 ## Tests

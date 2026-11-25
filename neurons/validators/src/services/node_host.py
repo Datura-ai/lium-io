@@ -64,14 +64,20 @@ class _CheckedAddresses(list):
     host: str = ""
 
 
-def _refused(host: str, port: int, reason: str, addresses: list[str] | None = None) -> NodeHostError:
+class NonPublicAddressError(NodeHostError):
+    """The address, or one the name resolves to, is not public. Unlike a failed lookup, retrying does not change it."""
+
+
+def _refused(
+    host: str, port: int, reason: str, addresses: list[str] | None = None, error: type[NodeHostError] = NodeHostError
+) -> NodeHostError:
     logger.warning(
         _m(
             f"Refused hostname node {host}:{port}: {reason}",
             extra=get_extra_info({"host": host, "port": port, "addresses": addresses or [], "reason": reason}),
         )
     )
-    return NodeHostError(f"{host} {reason}")
+    return error(f"{host} {reason}")
 
 
 def _log_dialed(infos: list, sockaddr: tuple) -> None:
@@ -192,6 +198,28 @@ class _QuotaSlotExecutor:
         return future
 
 
+NAT64_PREFIX = ipaddress.ip_network("64:ff9b::/96")  # RFC 6052 well-known prefix: the IPv4 address in the last 32 bits
+
+
+def is_public_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    """Global by the stdlib, and none of what Python before 3.13 also calls global. An IPv4-mapped address and a DNS64
+    answer (64:ff9b::/96, what an IPv6-only host gets for a public A record) are judged as the IPv4 address they carry;
+    multicast, IPv6 site-local (fec0::/10) and the other reserved ranges are not public. Same rule as the miner's
+    services/node_address.py."""
+    ip = getattr(ip, "ipv4_mapped", None) or ip
+    if ip.version == 6 and ip in NAT64_PREFIX:
+        ip = ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF)
+    return ip.is_global and not ip.is_multicast and not ip.is_reserved and not getattr(ip, "is_site_local", False)
+
+
+def _check_literal(host: str, port: int) -> None:
+    """A node registered by IP address is dialled as given, so the address itself must be public: the miner reports it,
+    and 127.0.0.1 or the metadata address would have the validator connect to its own host."""
+    address = host.strip("[]").split("%", 1)[0]
+    if not is_public_ip(ipaddress.ip_address(address)):
+        raise _refused(host, port, "is not a public address", [address], NonPublicAddressError)
+
+
 async def resolve_public_host(host: str, port: int = 22, executor=None) -> list:
     """The getaddrinfo results to dial for ``host``: [] for an IP literal (dial it as is), else every
     address the name resolves to, all of them global; NodeHostError otherwise.
@@ -200,6 +228,7 @@ async def resolve_public_host(host: str, port: int = 22, executor=None) -> list:
     (``loop.getaddrinfo``); a caller whose lookups a miner's DNS can stall passes its own pool, so
     they cannot fill the one every other connection of the validator resolves in."""
     if is_ip_literal(host):
+        _check_literal(host, port)
         return []
     loop = asyncio.get_running_loop()
     try:
@@ -214,9 +243,10 @@ async def resolve_public_host(host: str, port: int = 22, executor=None) -> list:
     addresses = {ipaddress.ip_address(info[4][0]) for info in infos}
     if not addresses:
         raise _refused(host, port, "resolves to no address")
-    blocked = sorted(str(a) for a in addresses if not a.is_global)
+    blocked = sorted(str(a) for a in addresses if not is_public_ip(a))
     if blocked:
-        raise _refused(host, port, f"resolves to a non-public address: {', '.join(blocked)}", blocked)
+        reason = f"resolves to a non-public address: {', '.join(blocked)}"
+        raise _refused(host, port, reason, blocked, NonPublicAddressError)
     checked = _CheckedAddresses(infos)
     checked.host = host
     return checked
@@ -227,6 +257,7 @@ async def resolve_node_host(host: str, port: int) -> list:
     not answered within NODE_DNS_TIMEOUT_SECONDS. A caller's own, shorter deadline still applies.
     Concurrent lookups of one name by one miner share a single lookup, whatever port each dials."""
     if is_ip_literal(host):
+        _check_literal(host, port)
         return []
     loop = asyncio.get_running_loop()
     key = dns_quota_key(host)
@@ -275,7 +306,7 @@ async def _resolve_in_quota(host: str, port: int, key: str) -> list:
 async def public_host_sock(host: str, port: int = 22, connect_timeout: float | None = None) -> dict:
     """Return the extra ``asyncssh.connect`` kwargs that make it dial only a validated address.
 
-    An IP literal needs nothing ({}: unchanged behaviour). A name is resolved once and refused
+    A public IP literal needs nothing ({}); a non-public one is refused (NodeHostError). A name is resolved once and refused
     (NodeHostError) unless every address is global; a TCP socket is then opened to one of those
     addresses and returned as ``{"sock": ...}``. asyncssh runs over that socket instead of
     resolving the name again (which a rebinding DNS server could answer with a private address),
@@ -377,6 +408,16 @@ class PublicHostResolver(AbstractResolver):
         pass
 
 
+class PublicHostConnector(aiohttp.TCPConnector):
+    """aiohttp dials an IP literal as given, without asking the resolver, so the public-address rule for a literal is
+    applied here: for the first request and for any address a response redirects to."""
+
+    async def _resolve_host(self, host: str, port: int, traces=None) -> list[ResolveResult]:
+        if is_ip_literal(host):
+            _check_literal(host, port)
+        return await super()._resolve_host(host, port, traces)
+
+
 def public_host_connector(**kwargs) -> aiohttp.TCPConnector:
-    """A TCPConnector for HTTP requests to a node's address (a hostname is pinned, see above)."""
-    return aiohttp.TCPConnector(resolver=PublicHostResolver(), **kwargs)
+    """A TCPConnector for HTTP requests to a node's address (a hostname is pinned, a literal checked, see above)."""
+    return PublicHostConnector(resolver=PublicHostResolver(), **kwargs)

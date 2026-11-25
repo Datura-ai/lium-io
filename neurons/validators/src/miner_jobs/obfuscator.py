@@ -28,7 +28,7 @@ python_keywords = [
     'c_char_p', 'AttributeError', '_nvmlLib_refcount', 'nvmlLib', 'CDLL', 'os', 'tempfile', 'NVMLError',
     'OSError', 'c_uint', 'c_ulonglong', 'byref', 'create_string_buffer', 'c_int',  'setattr', 'subprocess', 'RuntimeError', 'hashlib',
     'iter', 'next', 'repr', 'exc', 'e', 're', 'psutil', 'shutil', 'b64encode', 'Fernet', 'json', 'machine_specs', 'hasattr', 'bool',
-    'glob', 'socket', 'http'
+    'glob', 'socket', 'http', 'difflib', 'time'
 ]
 
 
@@ -91,6 +91,30 @@ def generate_random_name():
 class FunctionContentObfuscator(ast.NodeTransformer):
     def __init__(self, args_mapping: dict):
         self.name_mapping = {**args_mapping}
+        self.root = None
+
+    def rename(self, name: str) -> str:
+        # one mapping for the whole top-level function, so a binding and its usages always agree
+        if name.startswith('__') or name in python_keywords:
+            return name
+        if name not in self.name_mapping:
+            if hasattr(builtins, name):
+                return name
+            self.name_mapping[name] = generate_random_name()
+        return self.name_mapping[name]
+
+    def visit_FunctionDef(self, node: FunctionDef):
+        # a nested def binds its name and parameters like any local: rename them with their usages,
+        # or the body reads names nothing binds (lium-io#2146, #2333)
+        if self.root is None:
+            self.root = node
+        else:
+            node.name = self.rename(node.name)
+        return self.generic_visit(node)
+
+    def visit_arg(self, node: ast.arg):
+        node.arg = self.rename(node.arg)
+        return self.generic_visit(node)  # its annotation
 
     def visit_Name(self, node: Name):
         # rename a name only when it is ours to rename: renaming a builtin or an untouched
@@ -187,8 +211,7 @@ class FunctionObfuscator(ast.NodeTransformer):
         # Find usages of arguments inside the code content
         args_mapping = {}
         for arg in node.args.args:
-            args_mapping[arg.arg] = generate_random_name()
-            arg.arg = args_mapping[arg.arg]
+            args_mapping[arg.arg] = generate_random_name()  # visit_arg applies it
 
         # generating some random code blocks
         for i in range(len(node.body)):
