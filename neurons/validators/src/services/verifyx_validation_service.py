@@ -318,6 +318,12 @@ class VerifyXValidationService:
             "storage_min_available_gb": settings.verifyx.STORAGE_MIN_AVAILABLE_GB,
             "storage_throughput_test_gb": settings.verifyx.STORAGE_THROUGHPUT_TEST_GB,
             "network_timeout_seconds": settings.verifyx.NETWORK_TIMEOUT_SECONDS,
+            # every run, not only the first pass: without the floor each network step waits the whole timeout
+            # (package try + retry, speed test) and one slow leg stretches the test far past it
+            "network_floor_mbps": min(
+                settings.verifyx.NETWORK_MIN_DOWNLOAD_SPEED_MBPS, settings.verifyx.NETWORK_MIN_PACKAGE_DOWNLOAD_SPEED_MBPS
+            ),
+            "network_min_timeout_seconds": settings.FIRST_PASS_VERIFYX_NETWORK_TIMEOUT_SECONDS,
             "enable_xet_challenge": True,
         }
         if challenge_config_overrides:
