@@ -34,6 +34,7 @@ from core.logger import get_logger
 from services.cache_prefetch_state import STATE_PATH, CachePrefetchState, Outcome
 from services.pre_pull_service import STREAM_READ_TIMEOUT_SECONDS, PrePuller, _remove_ref, rental_activity
 from services.pull_lock import cache_pull_lock
+from services.dial import trusted_session
 
 logger = get_logger(__name__)
 
@@ -89,7 +90,7 @@ def _get_gpu_info() -> tuple[str, str, str | None]:
 
 
 async def _fetch_templates(
-    session: aiohttp.ClientSession, url: str, params: dict
+    session: aiohttp.ClientSession, url: str, params: dict  # type only  # noqa: TID251
 ) -> tuple[list[dict], int | None, str | None]:
     """Return (templates, http_status, error) for the backend recommendation call."""
     async with session.get(url, params=params) as response:
@@ -470,7 +471,7 @@ async def run_cache_template_prefetch(state_path: str | None = STATE_PATH) -> No
     # Bound every backend request so a hung server cannot wedge the prefetch loop;
     # timeouts surface as exceptions and route through the existing error backoff.
     session_timeout = aiohttp.ClientTimeout(total=30)
-    async with aiohttp.ClientSession(timeout=session_timeout) as session:
+    async with trusted_session(timeout=session_timeout) as session:
         try:
             while True:
                 try:

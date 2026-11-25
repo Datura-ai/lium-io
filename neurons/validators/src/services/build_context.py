@@ -12,6 +12,7 @@ import zlib
 from urllib.parse import urlsplit
 
 import aiohttp
+from services.node_host import trusted_session
 
 _FETCH_TIMEOUT_SECONDS = 120
 # tarfile keeps every member it has read, so cap the count, not only the bytes
@@ -121,7 +122,7 @@ async def fetch(
     size = 0
     timeout = aiohttp.ClientTimeout(total=_FETCH_TIMEOUT_SECONDS)
     try:
-        async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with trusted_session(timeout=timeout) as session:
             # no redirects: the host check above is the one the bytes come from
             async with session.get(url, allow_redirects=False) as response:
                 if response.status != 200:

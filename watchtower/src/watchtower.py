@@ -16,6 +16,7 @@ from config import (
 from logger import get_logger, _m
 from models import WatchtowerDigestResponse
 from validator_trust_service import validator_trust
+from dial import trusted_get
 
 logger = get_logger(__name__)
 
@@ -324,7 +325,7 @@ def fetch_verified_digest() -> Optional[str]:
         Verified digest string or None if fetch/verification fails
     """
     try:
-        response = requests.get(
+        response = trusted_get(
             WATCHTOWER_ENDPOINT_URL,
             headers={"User-Agent": WATCHTOWER_USER_AGENT},
             timeout=30,

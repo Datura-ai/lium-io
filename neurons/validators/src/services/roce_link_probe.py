@@ -37,7 +37,7 @@ from pydantic import BaseModel
 from core.config import settings
 from core.utils import _m, get_extra_info
 from services.const import PROBE_CONTAINER_NAME
-from services.node_host import public_host_sock
+from services.node_host import node_ssh_connect
 from services.task.models import JobResult
 
 logger = logging.getLogger(__name__)
@@ -296,10 +296,9 @@ async def _measure_pair(
 async def _connected(
     executor_info: ExecutorSSHInfo, pkey: asyncssh.SSHKey
 ) -> AsyncIterator[asyncssh.SSHClientConnection]:
-    async with asyncssh.connect(
+    async with node_ssh_connect(
         host=executor_info.address,
         port=executor_info.ssh_port,
-        **await public_host_sock(executor_info.address, executor_info.ssh_port),
         username=executor_info.ssh_username,
         client_keys=[pkey],
         known_hosts=None,

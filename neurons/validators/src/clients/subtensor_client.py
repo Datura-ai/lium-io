@@ -25,6 +25,7 @@ from core.config import settings
 from incentive.burn_service import verified_burner_hotkey
 from core.utils import _m, get_extra_info, get_logger
 from services.redis_service import NORMALIZED_SCORE_CHANNEL, RedisService
+from services.node_host import trusted_session
 
 if TYPE_CHECKING:
     from bittensor_wallet import bittensor_wallet
@@ -741,7 +742,7 @@ class SubtensorClient:
                     extra=get_extra_info({"api_url": api_url}),
                 ),
             )
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as session:
+            async with trusted_session(timeout=aiohttp.ClientTimeout(total=5)) as session:
                 url = f"{api_url}"
                 async with session.post(url, json=payload, headers={"Authorization": f"{signature}"}) as response:
                     if response.status >= 400:

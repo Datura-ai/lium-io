@@ -26,6 +26,7 @@ from cryptography.hazmat.primitives.serialization import (
 )
 
 from core.config import settings
+from services.dial import trusted_session
 
 logger = get_logger(__name__)
 
@@ -86,7 +87,7 @@ def _executor_version() -> str | None:
 
 
 async def send_heartbeat(
-    session: aiohttp.ClientSession, url: str, key: Ed25519PrivateKey, version: str | None
+    session: aiohttp.ClientSession, url: str, key: Ed25519PrivateKey, version: str | None  # type only  # noqa: TID251
 ) -> int:
     async with session.post(
         url,
@@ -112,7 +113,7 @@ async def run_node_heartbeat() -> None:
     version = _executor_version()
     # spread a fleet that restarts together over one interval
     await asyncio.sleep(random.uniform(0, interval))
-    async with aiohttp.ClientSession() as session:
+    async with trusted_session() as session:
         await _send_loop(session, url, key, version, interval)
 
 

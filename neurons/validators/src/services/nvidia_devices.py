@@ -45,6 +45,7 @@ from collections.abc import Sequence
 from typing import TYPE_CHECKING, NamedTuple
 
 import asyncssh
+from services.node_host import node_ssh_connect
 from services.rental_docker_sdk import GpuDockerConfig, build_gpu_docker_config
 
 from core.utils import _m
@@ -724,7 +725,7 @@ if __name__ == "__main__":
     USER = "shadeform"
 
     async def _main() -> None:
-        async with asyncssh.connect(HOST, username=USER, known_hosts=None) as ssh:
+        async with node_ssh_connect(HOST, username=USER, known_hosts=None) as ssh:
             print("=" * 60)
             print(f"host: {USER}@{HOST}")
             uuids_raw = await ssh.run(

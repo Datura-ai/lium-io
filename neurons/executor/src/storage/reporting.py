@@ -40,13 +40,14 @@ class StorageEventReporter:
         operation_id: UUID,
         action: StorageAction,
         spec: ReporterSpec,
-        session: requests.Session | None = None,
+        session: requests.Session | None = None,  # type only  # noqa: TID251
         clock: Callable[[], float] = time.monotonic,
         sleeper: Callable[[float], None] = time.sleep,
     ) -> None:
         self._operation_id = operation_id
         self._spec = spec
-        self._session = session or requests.Session()
+        # the reporter URL the backend issued; this package runs on its own, without the executor's dial module
+        self._session = session or requests.Session()  # noqa: TID251
         self._clock = clock
         self._sleeper = sleeper
         self._last_success_at = self._clock()

@@ -3717,7 +3717,7 @@ def _let_starts_succeed(docker_service, monkeypatch):
     monkeypatch.setattr(
         "services.docker_service.asyncssh.connect", Mock(return_value=DummySSHConnectionManager(AsyncMock()))
     )
-    monkeypatch.setattr("services.docker_service.public_host_sock", AsyncMock(return_value={}))
+    monkeypatch.setattr("services.node_host.public_host_sock", AsyncMock(return_value={}))
     docker_service._restore_mount_and_sshd_after_start = AsyncMock()
 
 
@@ -10990,7 +10990,7 @@ async def test_recover_pod_keeps_the_exit_code_when_the_encrypted_remount_hits_a
         Mock(return_value=DummySSHConnectionManager(ssh_client)),
     )
     monkeypatch.setattr("services.docker_service.asyncssh.import_private_key", Mock())
-    monkeypatch.setattr("services.docker_service.public_host_sock", AsyncMock(return_value={}))
+    monkeypatch.setattr("services.node_host.public_host_sock", AsyncMock(return_value={}))
     docker_service.rental_docker_client_factory.client.mount_source_for_destination = AsyncMock(
         return_value="volume_pod-1"
     )

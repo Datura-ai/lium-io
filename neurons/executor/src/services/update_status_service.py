@@ -33,6 +33,7 @@ import requests
 from core.config import VALIDATOR_HOTKEYS_SS58, settings
 from dependencies.auth import match_validator_hotkey
 from services.validator_trust_service import validator_trust
+from services.dial import trusted_get
 
 logger = logging.getLogger(__name__)
 
@@ -105,7 +106,7 @@ class ExpectedDigestCache:
                 self._error = "COMPUTE_REST_API_URL not set"
                 return self._digest, self._error
             try:
-                response = requests.get(url, timeout=ENDPOINT_TIMEOUT_SECONDS)
+                response = trusted_get(url, timeout=ENDPOINT_TIMEOUT_SECONDS)
                 response.raise_for_status()
                 self._digest = verify_signed_digest(response.json())
                 self._error = None

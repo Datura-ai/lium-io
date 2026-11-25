@@ -50,6 +50,7 @@ from datura.validator_trust import (
 )
 
 from core.config import settings
+from services.dial import trusted_session
 
 logger = logging.getLogger(__name__)
 
@@ -68,7 +69,7 @@ async def fetch_json(url: str, body: dict | None = None) -> dict | None:
     most FETCH_LIMIT_BYTES; raises on anything else."""
     # no decompression: the cap counts the bytes as they arrive, so a small compressed reply cannot expand past it
     timeout = aiohttp.ClientTimeout(total=FETCH_TIMEOUT_SECONDS)
-    async with aiohttp.ClientSession(timeout=timeout, auto_decompress=False) as session:
+    async with trusted_session(timeout=timeout, auto_decompress=False) as session:
         headers = {"Accept-Encoding": "identity"}
         async with session.request("GET" if body is None else "POST", url, json=body, headers=headers) as response:
             if response.status == HTTPStatus.NOT_FOUND:

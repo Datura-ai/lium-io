@@ -42,6 +42,7 @@ from sqlmodel import Session, select
 from core.config import BAKED_VALIDATOR_HOTKEYS, settings
 from core.db import engine as db_engine
 from models.validator_trust import ValidatorTrustMessage
+from services.node_address import trusted_session
 
 logger = logging.getLogger(__name__)
 
@@ -58,7 +59,7 @@ async def fetch_json(url: str, body: dict | None = None) -> dict | None:
     most FETCH_LIMIT_BYTES; raises on anything else."""
     # no decompression: the cap counts the bytes as they arrive, so a small compressed reply cannot expand past it
     timeout = aiohttp.ClientTimeout(total=FETCH_TIMEOUT_SECONDS)
-    async with aiohttp.ClientSession(timeout=timeout, auto_decompress=False) as session:
+    async with trusted_session(timeout=timeout, auto_decompress=False) as session:
         headers = {"Accept-Encoding": "identity"}
         async with session.request("GET" if body is None else "POST", url, json=body, headers=headers) as response:
             if response.status == HTTPStatus.NOT_FOUND:

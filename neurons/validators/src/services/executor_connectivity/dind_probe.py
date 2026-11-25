@@ -18,7 +18,7 @@ from services.executor_connectivity.models import (
     PortPair,
 )
 from services.ssh_service import SSHService
-from services.node_host import public_host_sock
+from services.node_host import node_ssh_connect
 
 logger = logging.getLogger(__name__)
 
@@ -456,10 +456,9 @@ class DindVerifier:
                 DIND_SSH_CONNECT_TIMEOUT_SECONDS, deadline - loop.time()
             )
             try:
-                connection = await asyncssh.connect(
+                connection = await node_ssh_connect(
                     host=host,
                     port=port.external,
-                    **await public_host_sock(host, port.external, attempt_timeout_seconds),
                     username="root",
                     client_keys=[pkey],
                     known_hosts=None,

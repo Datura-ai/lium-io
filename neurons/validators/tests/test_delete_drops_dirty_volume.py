@@ -308,7 +308,7 @@ async def test_delete_wipes_again_before_the_kill_when_the_tenant_ignores_sigter
     still_running = _make_ssh_command_result(exit_status=124)
     order = _wire_delete(docker_service, monkeypatch, _host_answers(wait=still_running))
     dial = AsyncMock(return_value={})
-    monkeypatch.setattr(docker_service_module, "public_host_sock", dial)
+    monkeypatch.setattr("services.node_host.public_host_sock", dial)
     payload = _delete_payload()
 
     result = await _delete(docker_service, payload)

@@ -5,6 +5,7 @@ from services.executor_connectivity.models import PortPair
 from services.node_host import resolve_node_host
 
 from core.config import settings
+from services.node_host import trusted_session
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +33,7 @@ class ExternalPortProbe:
             return None
         body = {"targets": [{"host": address, "port": p.external} for p in ports], "timeout": 3}
         try:
-            async with aiohttp.ClientSession(timeout=PROBER_TIMEOUT) as session:
+            async with trusted_session(timeout=PROBER_TIMEOUT) as session:
                 async with session.post(
                     self.url, json=body, headers={"Authorization": f"Bearer {self.token}"}
                 ) as resp:

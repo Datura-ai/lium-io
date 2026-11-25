@@ -1,7 +1,14 @@
-"""A node registered by hostname (dynamic DNS) is resolved before the validator dials it.
+"""The validator's dial helpers: every outbound connection is opened here, by one of two kinds.
 
-The hostname stays the node's address everywhere (its identity does not change when the IP behind
-it does); this check only refuses a name that points anywhere but the public internet.
+- ``trusted_session``: an address from the validator's own settings (the backend, the portal, a registry).
+- the node helpers (``node_session``, ``node_ssh_connect``, ``open_public_connection``, ``public_host_connector``): an
+  address a miner or node supplies. It must be public (datura's ``is_public_ip``), a name is resolved once and the
+  checked address is the one dialled, and a redirect is never followed.
+
+ruff (TID251, root pyproject.toml) refuses the raw constructors anywhere else, so a new call site picks one.
+
+A node registered by hostname (dynamic DNS) keeps the hostname as its address everywhere (its identity does not
+change when the IP behind it does); the check only refuses a name that points anywhere but the public internet.
 """
 
 import asyncio
@@ -15,7 +22,9 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 
 import aiohttp
+import asyncssh
 from aiohttp.abc import AbstractResolver, ResolveResult
+from datura.public_address import is_public_ip
 
 from core.utils import _m, get_extra_info
 
@@ -196,20 +205,6 @@ class _QuotaSlotExecutor:
         self.submitted = True
         future.add_done_callback(lambda _: _give_dns_slot(self.key))
         return future
-
-
-NAT64_PREFIX = ipaddress.ip_network("64:ff9b::/96")  # RFC 6052 well-known prefix: the IPv4 address in the last 32 bits
-
-
-def is_public_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
-    """Global by the stdlib, and none of what Python before 3.13 also calls global. An IPv4-mapped address and a DNS64
-    answer (64:ff9b::/96, what an IPv6-only host gets for a public A record) are judged as the IPv4 address they carry;
-    multicast, IPv6 site-local (fec0::/10) and the other reserved ranges are not public. Same rule as the miner's
-    services/node_address.py."""
-    ip = getattr(ip, "ipv4_mapped", None) or ip
-    if ip.version == 6 and ip in NAT64_PREFIX:
-        ip = ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF)
-    return ip.is_global and not ip.is_multicast and not ip.is_reserved and not getattr(ip, "is_site_local", False)
 
 
 def _check_literal(host: str, port: int) -> None:
@@ -421,3 +416,54 @@ class PublicHostConnector(aiohttp.TCPConnector):
 def public_host_connector(**kwargs) -> aiohttp.TCPConnector:
     """A TCPConnector for HTTP requests to a node's address (a hostname is pinned, a literal checked, see above)."""
     return PublicHostConnector(resolver=PublicHostResolver(), **kwargs)
+
+
+def trusted_session(connector_kwargs: dict | None = None, **kwargs) -> aiohttp.ClientSession:
+    """An aiohttp session for an address from the validator's own settings. Never for an address a miner or node
+    supplies: use ``node_session``."""
+    if connector_kwargs is not None:
+        kwargs["connector"] = aiohttp.TCPConnector(**connector_kwargs)
+    return aiohttp.ClientSession(**kwargs)
+
+
+async def _refuse_redirect(_session, _context, params: aiohttp.TraceRequestRedirectParams) -> None:
+    raise aiohttp.ClientConnectionError(f"{params.url} answered with a redirect, which is not followed")
+
+
+def node_session(connector_kwargs: dict | None = None, **kwargs) -> aiohttp.ClientSession:
+    """An aiohttp session for requests to an address a miner or node supplies: a name is pinned and a literal checked
+    (``public_host_connector``), and a redirect ends the request instead of being followed."""
+    trace = aiohttp.TraceConfig()
+    trace.on_request_redirect.append(_refuse_redirect)
+    return aiohttp.ClientSession(
+        connector=public_host_connector(**(connector_kwargs or {})),
+        trace_configs=[*kwargs.pop("trace_configs", []), trace],
+        **kwargs,
+    )
+
+
+class node_ssh_connect:
+    """``asyncssh.connect`` to a node's address, dialled only at an address checked to be public (``public_host_sock``;
+    known_hosts is still matched against ``host``). Used like ``asyncssh.connect``: awaited for a connection, or as
+    ``async with node_ssh_connect(...) as conn``."""
+
+    def __init__(self, host: str, port: int = 22, **kwargs) -> None:
+        self._host, self._port, self._kwargs = host, port, kwargs
+        self._connect = None
+
+    async def _open(self):
+        pinned = await public_host_sock(self._host, self._port, self._kwargs.get("connect_timeout"))
+        return asyncssh.connect(host=self._host, port=self._port, **pinned, **self._kwargs)
+
+    def __await__(self):
+        async def connected() -> asyncssh.SSHClientConnection:
+            return await (await self._open())
+
+        return connected().__await__()
+
+    async def __aenter__(self) -> asyncssh.SSHClientConnection:
+        self._connect = await self._open()
+        return await self._connect.__aenter__()
+
+    async def __aexit__(self, *exc_info):
+        return await self._connect.__aexit__(*exc_info)

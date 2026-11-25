@@ -288,6 +288,24 @@ async def test_a_node_that_redirects_to_a_non_public_ip_literal_is_not_followed(
 
 
 @pytest.mark.asyncio
+async def test_a_node_session_never_follows_a_redirect_even_to_a_public_address(monkeypatch):
+    target_hits: list = []
+    target, target_port = await _local_server(target_hits)
+    node_hits: list = []
+    node, node_port = await _local_server(node_hits, redirect_to=f"http://127.0.0.1:{target_port}/")
+    monkeypatch.setattr(node_host, "_check_literal", lambda host, port: None)  # both stand in for public addresses
+    try:
+        async with node_host.node_session() as session:
+            with pytest.raises(aiohttp.ClientConnectionError, match="redirect"):
+                await session.get(f"http://127.0.0.1:{node_port}/")
+    finally:
+        await node.cleanup()
+        await target.cleanup()
+    assert node_hits == ["/"]
+    assert target_hits == []
+
+
+@pytest.mark.asyncio
 async def test_the_port_probe_does_not_follow_a_redirect():
     from neurons.validators.src.services.executor_connectivity.models import PortPair
     from neurons.validators.src.services.executor_connectivity.port_tester import PortTester

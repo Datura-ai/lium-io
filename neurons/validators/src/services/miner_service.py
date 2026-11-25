@@ -84,9 +84,10 @@ from services.node_host import (
     NonPublicAddressError,
     for_payload_miner,
     is_ip_literal,
-    public_host_connector,
-    public_host_sock,
+    node_session,
+    node_ssh_connect,
     resolve_node_host,
+    trusted_session,
 )
 from services.redis_service import MACHINE_SPEC_CHANNEL, POD_STATES_CHANNEL, RedisService
 from services.efa_link_probe import measure_and_attach as measure_and_attach_efa
@@ -1793,10 +1794,9 @@ class MinerService:
 
     async def handle_backup_container_req(self, executor_info: ExecutorSSHInfo, payload: BackupContainerRequest, pkey: SSHKey, docker_service: DockerService):
         """Handle backup container request."""
-        async with asyncssh.connect(
+        async with node_ssh_connect(
             host=executor_info.address,
             port=executor_info.ssh_port,
-            **await public_host_sock(executor_info.address, executor_info.ssh_port),
             username=executor_info.ssh_username,
             client_keys=[pkey],
             known_hosts=await _storage_known_hosts(docker_service, executor_info, payload),
@@ -1870,10 +1870,9 @@ class MinerService:
 
     async def handle_restore_container_req(self, executor_info: ExecutorSSHInfo, payload: RestoreContainerRequest, pkey: SSHKey, docker_service: DockerService):
         """Handle restore container request."""
-        async with asyncssh.connect(
+        async with node_ssh_connect(
             host=executor_info.address,
             port=executor_info.ssh_port,
-            **await public_host_sock(executor_info.address, executor_info.ssh_port),
             username=executor_info.ssh_username,
             client_keys=[pkey],
             known_hosts=await _storage_known_hosts(docker_service, executor_info, payload),
@@ -1940,10 +1939,9 @@ class MinerService:
         pkey: SSHKey,
         docker_service: DockerService,
     ) -> None:
-        async with asyncssh.connect(
+        async with node_ssh_connect(
             host=executor_info.address,
             port=executor_info.ssh_port,
-            **await public_host_sock(executor_info.address, executor_info.ssh_port),
             username=executor_info.ssh_username,
             client_keys=[pkey],
             known_hosts=await _storage_known_hosts(docker_service, executor_info, payload),
@@ -2105,8 +2103,7 @@ class MinerService:
             configured = (target.host, target.port) in settings.configured_miner_origins()
             if not configured and target.host and is_ip_literal(target.host):
                 await resolve_node_host(target.host, target.port)
-            connector = aiohttp.TCPConnector() if configured else public_host_connector()
-            async with aiohttp.ClientSession(connector=connector) as session:
+            async with trusted_session() if configured else node_session() as session:
                 async with session.request(
                     method=method,
                     url=url,

@@ -150,7 +150,7 @@ def test_a_failed_refresh_keeps_the_last_good_list(monkeypatch):
     now = int(time.time())
     good = MagicMock(json=MagicMock(return_value={"sources": "198.51.100.7", "timestamp": now, "signature": "0xab"}))
     get = MagicMock(side_effect=[good, OSError("down")])
-    monkeypatch.setattr(ssh_service.requests, "get", get)
+    monkeypatch.setattr(ssh_service, "trusted_get", get)
     cache = ssh_service.SignedSshSources()
 
     cache.refresh()
@@ -169,7 +169,7 @@ def test_a_404_after_a_good_list_turns_the_pin_off(monkeypatch):
     now = int(time.time())
     good = MagicMock(json=MagicMock(return_value={"sources": "198.51.100.7", "timestamp": now, "signature": "0xab"}))
     gone = MagicMock(status_code=404)
-    monkeypatch.setattr(ssh_service.requests, "get", MagicMock(side_effect=[good, gone]))
+    monkeypatch.setattr(ssh_service, "trusted_get", MagicMock(side_effect=[good, gone]))
     cache = ssh_service.SignedSshSources()
 
     cache.refresh()
@@ -181,7 +181,7 @@ def test_a_404_after_a_good_list_turns_the_pin_off(monkeypatch):
 
 def test_a_node_that_never_got_a_list_does_not_pin(monkeypatch):
     monkeypatch.setattr(ssh_service.settings, "COMPUTE_REST_API_URL", "https://backend.test/api")
-    monkeypatch.setattr(ssh_service.requests, "get", MagicMock(side_effect=OSError("down")))
+    monkeypatch.setattr(ssh_service, "trusted_get", MagicMock(side_effect=OSError("down")))
     cache = ssh_service.SignedSshSources()
     cache.refresh()
     assert cache.get() == ""
@@ -206,7 +206,7 @@ def test_no_refresh_where_the_pin_never_applies(monkeypatch, sources, pin_on, cv
     monkeypatch.setattr(ssh_service.settings, "EXECUTOR_SSH_SOURCE_PIN", pin_on)
     monkeypatch.setattr(ssh_service, "_in_cvm", lambda: cvm)
     get = MagicMock()
-    monkeypatch.setattr(ssh_service.requests, "get", get)
+    monkeypatch.setattr(ssh_service, "trusted_get", get)
 
     asyncio.run(asyncio.wait_for(ssh_service.run_ssh_sources_refresh(), timeout=1))  # returns, never loops
 

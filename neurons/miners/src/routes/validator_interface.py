@@ -26,6 +26,7 @@ from dependencies.auth import (
 )
 from services.executor_service import RENTAL_REQUEST_HOOK_TIMEOUT_SECONDS, ExecutorService
 from services.ssh_service import MinerSSHService
+from services.node_address import trusted_session
 
 logger = logging.getLogger(__name__)
 
@@ -127,7 +128,7 @@ async def submit_ssh_pubkey(
             if settings.RENTAL_REQUEST_HOOK:
                 import aiohttp
                 try:
-                    async with aiohttp.ClientSession() as session:
+                    async with trusted_session() as session:
                         async with session.post(
                             settings.RENTAL_REQUEST_HOOK,
                             json={

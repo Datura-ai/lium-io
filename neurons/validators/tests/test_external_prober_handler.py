@@ -145,3 +145,16 @@ async def test_both_probe_paths_judge_an_answer_of_the_same_size_alike(size, pas
         server.shutdown()
     assert outside is passes
     assert inside is passes
+
+
+def test_the_probers_copy_of_the_public_address_rule_agrees_with_datura():
+    # the Lambda ships without datura, so it carries a copy of the rule; this keeps the two in step
+    from datura.public_address import is_public_address
+
+    spec = importlib.util.spec_from_file_location(
+        "datura_public_address_test", Path(__file__).parents[3] / "datura" / "tests" / "test_public_address.py"
+    )
+    table = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(table)
+    for address, public in table.TABLE:
+        assert handler._public(address) is public is is_public_address(address), address

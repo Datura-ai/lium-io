@@ -2,6 +2,7 @@
 
 import socket
 
+import aiohttp
 import pytest
 from aiohttp import web
 
@@ -118,6 +119,9 @@ async def test_a_redirect_from_the_node_is_not_followed(monkeypatch):
             # an IP literal is dialled as given (the node registry only takes public ones)
             async with session.post(f"http://127.0.0.1:{node_port}/upload_ssh_key", json={}, allow_redirects=False) as response:
                 assert response.status == 307
+            # a request that does not pass allow_redirects=False still ends at the redirect
+            with pytest.raises(aiohttp.ClientConnectionError, match="redirect"):
+                await session.post(f"http://127.0.0.1:{node_port}/upload_ssh_key", json={})
         assert inside == []
     finally:
         for runner in runners:

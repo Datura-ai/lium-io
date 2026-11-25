@@ -16,6 +16,7 @@ import aiohttp
 from core.config import settings
 from core.utils import _m, get_extra_info
 from services.redis_service import get_or_adopt_legacy
+from services.node_host import trusted_session
 
 from ..messages import RegistryPullMessages as Msg
 from ..messages import render_message
@@ -380,7 +381,7 @@ async def probe_docker_hub() -> DockerHubAnswer:
     """The validator's own GET of Docker Hub's registry root."""
     try:
         timeout = aiohttp.ClientTimeout(total=_HUB_CONTROL_TIMEOUT_SECONDS)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with trusted_session(timeout=timeout) as session:
             async with session.get(DOCKER_HUB_CONTROL_URL, allow_redirects=False) as response:
                 return DockerHubAnswer(
                     response.status in _HUB_REACHABLE_STATUSES, f"HTTP {response.status}"

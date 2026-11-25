@@ -18,6 +18,7 @@ from core.utils import _m, get_extra_info
 from services.const import TDX_WHITELIST
 from services.node_host import reports_registered_host_key
 from services.redis_service import RedisService
+from services.node_host import trusted_session
 
 logger = logging.getLogger(__name__)
 
@@ -135,7 +136,7 @@ class AttestationService:
         logger.info(f"[VERIFIER REQUEST] Posting to {url} for {executor.address}:{executor.port}")
 
         timeout = aiohttp.ClientTimeout(total=self.quote_timeout)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with trusted_session(timeout=timeout) as session:
             async with session.post(
                 url,
                 data=quote_json.encode("utf-8"),
@@ -375,7 +376,7 @@ class AttestationService:
     async def _post_nras(self, payload: dict, executor: ExecutorSSHInfo) -> Any:
         timeout = aiohttp.ClientTimeout(total=self.quote_timeout)
         try:
-            async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with trusted_session(timeout=timeout) as session:
                 async with session.post(settings.NVIDIA_NRAS_URL, json=payload) as response:
                     if response.status >= 400:
                         snippet = (await response.text())[:200]

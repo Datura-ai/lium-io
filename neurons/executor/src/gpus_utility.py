@@ -7,6 +7,7 @@ import pynvml
 import psutil
 
 from services.pull_lock import cache_pull_lock
+from services.dial import trusted_session
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -98,7 +99,7 @@ async def manage_docker_images(
 
     backend_url = f"{compute_rest_app_url}/executors/default-docker-image?gpu_model={gpu_name}&driver_version={driver_version}"
 
-    async with aiohttp.ClientSession() as session:
+    async with trusted_session() as session:
         while True:
             try:
                 # Get disk space info
