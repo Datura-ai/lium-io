@@ -64,6 +64,7 @@ from .checks import (
     IdleDiskWriteCheck,
     InspectorRentedCheck,
     LocalVerifyCheck,
+    LoginUserCheck,
     MachineSpecScrapeCheck,
     NodeAccountCheck,
     NvlinkFaultCheck,
@@ -326,6 +327,8 @@ class PipelineFactory:
                 HalfStartedStopRetryCheck(),
                 # DAH-5729: before any work on the node, the node must be the registering account's
                 NodeAccountCheck(),
+                # the scripts below run from a root-only directory under /root/app: a non-root login is refused first
+                LoginUserCheck(),
                 StartGPUMonitorCheck(),
                 UploadFilesCheck(),
                 MachineSpecScrapeCheck(),
@@ -540,6 +543,8 @@ class PipelineFactory:
                 HalfStartedStopRetryCheck(),
                 # DAH-5729: before any work on the node, the node must be the registering account's
                 NodeAccountCheck(),
+                # the scripts below run from a root-only directory under /root/app: a non-root login is refused first
+                LoginUserCheck(),
                 StartGPUMonitorCheck(),
                 UploadFilesCheck(),
                 MachineSpecScrapeCheck(),
@@ -651,6 +656,8 @@ class PipelineFactory:
         return cast(
             list[Check],
             [
+                # as in build_checks(): the scrape below runs from a root-only directory, so a non-root login is refused first
+                LoginUserCheck(),
                 # StartGPUMonitorCheck(),  # SKIP: Starts processes on executor
                 UploadFilesCheck(),
                 MachineSpecScrapeCheck(),

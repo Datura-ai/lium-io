@@ -1,5 +1,7 @@
 import inspect
 import json
+import os
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -9,7 +11,7 @@ from uuid import UUID
 
 import pytest
 
-from services import storage_operations
+from services import executor_payload, storage_operations
 
 OPERATION_ID = UUID("11111111-1111-4111-8111-111111111111")
 
@@ -52,55 +54,6 @@ async def test_cancel_fallback_removes_the_helper_container(
         assert subprocess.run(["kill", "-0", str(runner_pid)], capture_output=True).returncode != 0
 
 
-@pytest.mark.parametrize("field", ["bootstrap", "exclude_patterns"])
-def test_workspace_field_probe_finds_the_field_in_this_repo_s_executor_models(field: str) -> None:
-    # The probe imports the executor's own storage.models; run it against this checkout's copy
-    # so a renamed field or a wrong sys.path root fails here, not on every encrypted create.
-    executor_src = Path(__file__).resolve().parents[2] / "executor" / "src"
-    probe = storage_operations._WORKSPACE_FIELD_PROBE.replace("/root/app/src", str(executor_src))
-
-    assert subprocess.run([sys.executable, "-c", probe, field], check=False).returncode == 0
-    assert subprocess.run([sys.executable, "-c", probe, "no_such_field"], check=False).returncode == 3
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("runner_alive", [True, False])
-async def test_a_repeated_dispatch_never_starts_a_second_runner(
-    monkeypatch: pytest.MonkeyPatch, runner_alive: bool
-) -> None:
-    # The first runner has read (and deleted) its spec but has no PID or helper yet: the state is STARTING.
-    monkeypatch.setattr(storage_operations, "supports_storage_operation", AsyncMock(return_value=True))
-    monkeypatch.setattr(storage_operations.asyncio, "sleep", AsyncMock())
-    commands: list[str] = []
-
-    async def run(command: str, check: bool = False) -> SimpleNamespace:
-        commands.append(command)
-        stdout = ""
-        status = 1 if command.startswith("test -e") else 0
-        if "echo STARTING" in command:
-            stdout = "STARTING\n"
-        elif command.startswith("pgrep -f"):
-            status = 0 if runner_alive else 1
-        return SimpleNamespace(exit_status=status, stdout=stdout, stderr="")
-
-    ssh_client = SimpleNamespace(run=run, start_sftp_client=None)
-    if runner_alive:
-        files = await storage_operations.start_storage_operation(
-            ssh_client, "python3", OPERATION_ID, {"engine": "restic"}, retain_terminal_artifacts=False
-        )
-        assert files == storage_operations.StorageOperationFiles.for_operation(OPERATION_ID)
-    else:
-        monkeypatch.setattr(storage_operations, "report_launch_failure", AsyncMock())
-        with pytest.raises(TypeError):  # stops at the sftp spec write, after the stale-helper removal
-            await storage_operations.start_storage_operation(
-                ssh_client, "python3", OPERATION_ID, {"engine": "restic"}, retain_terminal_artifacts=False
-            )
-    probe = next(c for c in commands if c.startswith("pgrep -f"))
-    assert f"[-]-spec {storage_operations.StorageOperationFiles.for_operation(OPERATION_ID).spec}" in probe
-    assert any("docker rm -f" in c for c in commands) is not runner_alive
-    assert any("nohup" in c for c in commands) is False  # never launched a second wrapper
-
-
 @pytest.mark.asyncio
 async def test_a_cancel_reports_with_the_reporter_the_runner_left_in_its_spec(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -123,61 +76,601 @@ async def test_a_cancel_reports_with_the_reporter_the_runner_left_in_its_spec(
     assert "redis" not in inspect.signature(storage_operations.start_storage_operation).parameters
 
 
-@pytest.mark.parametrize("exit_code", [0, 3])
-def test_detached_wrapper_keeps_the_log_only_when_the_runner_fails(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, exit_code: int
-) -> None:
-    # runs the real launch wrapper with a fake runner; a failed run must leave its log behind
-    import asyncio as aio
-
+@pytest.fixture
+def node(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A stand-in executor: the operation directory, the staging parent and the validator's runner payload (a script
+    the test writes per case), with every remote command run by a local shell."""
     monkeypatch.setattr(storage_operations, "REMOTE_OPERATION_DIRECTORY", storage_operations.PurePosixPath(str(tmp_path)))
     monkeypatch.setattr(storage_operations, "supports_storage_operation", AsyncMock(return_value=True))
-    runner = tmp_path / "runner"
-    runner.write_text(f"#!/bin/sh\necho working\nexit {exit_code}\n")
-    runner.chmod(0o755)
-    monkeypatch.setattr(storage_operations, "REMOTE_RUNNER_PATH", str(runner))
-    launched: list[str] = []
+    monkeypatch.setattr(storage_operations, "report_launch_failure", AsyncMock())
+    payloads = tmp_path / "payloads"
+    payloads.mkdir()
+    monkeypatch.setattr(executor_payload, "PAYLOAD_DIR", payloads)
+    monkeypatch.setattr(executor_payload, "STORAGE", ("storage_runner.py",))
+    monkeypatch.setattr(executor_payload, "SERVICE_DIR_PARENT", str(tmp_path / "service"))
+    (tmp_path / "service").mkdir()
+    return tmp_path
 
-    async def run(command: str, check: bool = False) -> SimpleNamespace:
-        if command.startswith("nohup"):
-            launched.append(command)
-            return SimpleNamespace(exit_status=0, stdout="", stderr="")
-        done = subprocess.run(["sh", "-c", command], capture_output=True, text=True)
-        return SimpleNamespace(exit_status=done.returncode, stdout=done.stdout, stderr=done.stderr)
 
-    class Sftp:
-        async def __aenter__(self):
-            return self
+def _runner(node: Path, body: str) -> None:
+    (node / "payloads" / "storage_runner.py").write_text(body)
 
-        async def __aexit__(self, *exc):
-            return False
 
-        def open(self, path, mode):
-            class Handle:
-                async def __aenter__(self):
-                    return self
+async def _run_locally(command: str, check: bool = False, input: str | None = None) -> SimpleNamespace:
+    done = subprocess.run(["sh", "-c", command.replace("/usr/bin/docker", "true")], input=input, capture_output=True, text=True)
+    if check and done.returncode:
+        raise RuntimeError(f"exit {done.returncode}")
+    return SimpleNamespace(exit_status=done.returncode, stdout=done.stdout, stderr=done.stderr)
 
-                async def __aexit__(self, *exc):
-                    return False
 
-                async def write(self, data):
-                    open(path, "w").write(data)
+def _dispatch(spec: dict | None = None, retain: bool = False) -> storage_operations.StorageOperationFiles:
+    import asyncio as aio
 
-            return Handle()
-
-        async def chmod(self, path, mode):
-            return None
-
-    ssh_client = SimpleNamespace(run=run, start_sftp_client=lambda: Sftp())
-    files = aio.run(
+    return aio.run(
         storage_operations.start_storage_operation(
-            ssh_client, "sh", OPERATION_ID, {"engine": "restic"}, retain_terminal_artifacts=False
+            SimpleNamespace(run=_run_locally), sys.executable, OPERATION_ID, spec or {"engine": "restic"},
+            retain_terminal_artifacts=retain,
         )
     )
-    subprocess.run(["sh", "-c", launched[0].removeprefix("nohup ").rsplit(" &", 1)[0]], check=True)
+
+
+def _wait_for(path: Path, gone: bool = False, seconds: float = 10.0) -> None:
+    import time
+
+    deadline = time.time() + seconds
+    while path.exists() is gone:
+        assert time.time() < deadline, f"{path} {'still there' if gone else 'never appeared'}"
+        time.sleep(0.05)
+
+
+def _staged(node: Path) -> list[str]:
+    return [p.name for p in (node / "service").iterdir()]
+
+
+@pytest.mark.parametrize("exit_code", [0, 3])
+def test_an_online_run_leaves_its_done_marker_and_its_log_only_when_it_fails(node: Path, exit_code: int) -> None:
+    _runner(node, f"print('working', flush=True)\nraise SystemExit({exit_code})\n")
+    files = _dispatch()
+    _wait_for(Path(str(files.done)))
     log = Path(str(files.log))
-    assert not Path(str(files.status)).exists()
+    # the log is the wrapper's last step, after the done marker
     if exit_code:
+        import time
+
+        deadline = time.time() + 10
+        while "runner exited" not in log.read_text():
+            assert time.time() < deadline
+            time.sleep(0.05)
         assert log.read_text().splitlines() == ["working", "runner exited 3"]
     else:
-        assert not log.exists()
+        _wait_for(log, gone=True)
+    assert _staged(node) == []   # the staged runner goes when it has exited
+    assert not Path(str(files.status)).exists() and not Path(str(files.spec)).exists()
+    assert not Path(str(files.pid)).exists()
+
+
+def test_a_re_dispatch_after_an_online_run_finished_never_runs_it_again(node: Path) -> None:
+    # the online wrapper removes its spec and status when the run ends; a re-dispatch (its terminal report not landed
+    # yet) must still find the operation finished
+    runs = node / "runs"
+    _runner(node, f"open({str(runs)!r}, 'a').write('run\\n')\n")
+    files = _dispatch()
+    _wait_for(Path(str(files.done)))
+    _wait_for(Path(str(files.pid)), gone=True)
+    assert _dispatch() == files
+    import time
+
+    time.sleep(0.5)
+    assert runs.read_text() == "run\n" and _staged(node) == []
+    assert not Path(str(files.spec)).exists()   # the re-dispatch's credentials were never written
+
+
+def test_a_re_dispatch_while_the_runner_works_launches_nothing_once_the_runner_removed_its_spec(node: Path) -> None:
+    # the runner reads and removes its spec at once, before any PID of its own: the launcher recorded under the lock
+    # is what a second dispatch finds, so it neither overwrites the spec nor starts a second wrapper
+    runs, release = node / "runs", node / "release"
+    _runner(node, (
+        "import pathlib, sys, time\n"
+        "spec = pathlib.Path(sys.argv[sys.argv.index('--spec') + 1]); spec.unlink()\n"
+        f"open({str(runs)!r}, 'a').write('run\\n')\n"
+        f"while not pathlib.Path({str(release)!r}).exists(): time.sleep(0.05)\n"
+    ))
+    files = _dispatch()
+    _wait_for(runs)
+    _wait_for(Path(str(files.spec)), gone=True)
+    try:
+        assert _dispatch({"engine": "restic", "second": True}) == files
+        assert not Path(str(files.spec)).exists() and len(_staged(node)) == 1   # only the first run's runner
+    finally:
+        release.write_text("")
+    _wait_for(Path(str(files.done)))
+    assert runs.read_text() == "run\n"
+
+
+def test_two_dispatches_at_once_launch_one_wrapper(node: Path) -> None:
+    # both pass staging together; the operation's lock lets one launch and the other find its launcher
+    from concurrent.futures import ThreadPoolExecutor
+
+    runs, release = node / "runs", node / "release"
+    _runner(node, (
+        "import pathlib, time\n"
+        f"open({str(runs)!r}, 'a').write('run\\n')\n"
+        f"while not pathlib.Path({str(release)!r}).exists(): time.sleep(0.05)\n"
+    ))
+    try:
+        with ThreadPoolExecutor(4) as pool:
+            results = list(pool.map(lambda _: _dispatch(), range(4)))
+        _wait_for(runs)
+        import time
+
+        time.sleep(0.5)
+        assert runs.read_text() == "run\n" and len(_staged(node)) == 1
+    finally:
+        release.write_text("")
+    assert len(set(results)) == 1
+    _wait_for(Path(str(results[0].done)))
+
+
+def test_a_dead_runs_leftovers_are_removed_and_the_operation_launched_again(node: Path) -> None:
+    # a launcher that died without a result (the node rebooted): its PID no longer runs this operation's wrapper
+    runs = node / "runs"
+    _runner(node, f"open({str(runs)!r}, 'a').write('run\\n')\n")
+    files = storage_operations.StorageOperationFiles.for_operation(OPERATION_ID)
+    Path(str(files.launcher)).write_text(f"{os.getpid()}\n")   # a live PID, but not this operation's wrapper
+    Path(str(files.spec)).write_text("stale")
+    _dispatch()
+    _wait_for(Path(str(files.done)))
+    assert runs.read_text() == "run\n"
+
+
+@pytest.mark.parametrize("bad_archive", ["not a tar", "changed runner"])
+def test_a_failed_unpack_leaves_no_spec_and_no_staging_directory(
+    node: Path, monkeypatch: pytest.MonkeyPatch, bad_archive: str
+) -> None:
+    # the spec carries the repository credentials: it must not exist on the node unless a runner is there to take it
+    import base64
+    import io
+    import tarfile
+
+    _runner(node, "raise SystemExit(0)\n")
+    if bad_archive == "not a tar":
+        monkeypatch.setattr(executor_payload, "archive", lambda files: base64.b64encode(b"not a tar"))
+    else:
+        buffer = io.BytesIO()
+        with tarfile.open(fileobj=buffer, mode="w:gz") as tar:
+            data = b"print('not the validator runner')\n"
+            entry = tarfile.TarInfo("storage_runner.py")
+            entry.size = len(data)
+            tar.addfile(entry, io.BytesIO(data))
+        monkeypatch.setattr(executor_payload, "archive", lambda files: base64.b64encode(buffer.getvalue()))
+    spec = {"engine": "restic", "repository": {"s3_access_key_id": "AKIA-TEST", "password": "restic-test"}}
+    with pytest.raises(RuntimeError):
+        _dispatch(spec)
+    files = storage_operations.StorageOperationFiles.for_operation(OPERATION_ID)
+    assert not Path(str(files.spec)).exists() and not Path(str(files.launcher)).exists()
+    assert _staged(node) == []   # the partial staging directory is gone
+    storage_operations.report_launch_failure.assert_awaited_once()
+
+
+def _legacy_runner(files: storage_operations.StorageOperationFiles) -> subprocess.Popen:
+    """A runner an older validator launched: its PID file only (no launcher record), running this operation's spec."""
+    runner = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)", "--spec", str(files.spec), "--cancel-file", str(files.cancel)]
+    )
+    Path(str(files.pid)).write_text(f"{runner.pid}\n")
+    return runner
+
+
+def test_a_re_dispatch_after_the_upgrade_leaves_the_older_validators_live_runner_alone(node: Path) -> None:
+    runs = node / "runs"
+    _runner(node, f"open({str(runs)!r}, 'a').write('run\\n')\n")
+    files = storage_operations.StorageOperationFiles.for_operation(OPERATION_ID)
+    legacy_runner = _legacy_runner(files)
+    try:
+        assert _dispatch() == files
+        import time
+
+        time.sleep(0.5)
+        assert legacy_runner.poll() is None
+        assert not runs.exists() and _staged(node) == []   # no second wrapper, nothing staged
+        assert Path(str(files.pid)).read_text() == f"{legacy_runner.pid}\n"
+    finally:
+        legacy_runner.kill()
+        legacy_runner.wait()
+
+
+# legacy_lock_uncreatable: an older validator's run (no lock file) on a node whose disk cannot create one
+@pytest.mark.parametrize(
+    "incumbent", ["launcher_before", "legacy_before", "launched_during_staging", "legacy_lock_uncreatable"]
+)
+def test_a_repeat_dispatch_whose_staging_fails_never_fails_the_running_operation(node: Path, incumbent: str) -> None:
+    import asyncio as aio
+
+    _runner(node, "raise SystemExit(0)\n")
+    files = storage_operations.StorageOperationFiles.for_operation(OPERATION_ID)
+    runners: list[subprocess.Popen] = []
+
+    def start_incumbent() -> None:
+        runners.append(_legacy_runner(files))
+        if incumbent == "legacy_lock_uncreatable":
+            Path(str(files.lock)).mkdir()   # opening it for writing fails, as on a full disk
+        elif incumbent != "legacy_before":   # this validator's launch: a launcher record, the PID as the runner
+            Path(str(files.launcher)).write_text(Path(str(files.pid)).read_text())
+
+    if incumbent != "launched_during_staging":
+        start_incumbent()
+
+    async def run(command: str, check: bool = False, input: str | None = None) -> SimpleNamespace:
+        if "printf \"%s\" \"$d\"" in command:   # the staging step: the disk is full
+            if incumbent == "launched_during_staging":
+                start_incumbent()
+            raise OSError(28, "No space left on device")
+        return await _run_locally(command, check, input)
+
+    try:
+        returned_files = aio.run(storage_operations.start_storage_operation(
+            SimpleNamespace(run=run), sys.executable, OPERATION_ID, {"engine": "restic"}, retain_terminal_artifacts=False
+        ))
+        assert returned_files == files
+        storage_operations.report_launch_failure.assert_not_awaited()
+        assert all(r.poll() is None for r in runners)
+    finally:
+        for r in runners:
+            r.kill()
+            r.wait()
+
+
+def test_a_dispatch_whose_staging_fails_with_no_run_reports_the_failure(node: Path) -> None:
+    import asyncio as aio
+
+    _runner(node, "raise SystemExit(0)\n")
+    async def run(command: str, check: bool = False, input: str | None = None) -> SimpleNamespace:
+        if "printf \"%s\" \"$d\"" in command:
+            raise OSError(28, "No space left on device")
+        return await _run_locally(command, check, input)
+
+    with pytest.raises(OSError):
+        aio.run(storage_operations.start_storage_operation(
+            SimpleNamespace(run=run), sys.executable, OPERATION_ID, {"engine": "restic"}, retain_terminal_artifacts=False
+        ))
+    storage_operations.report_launch_failure.assert_awaited_once()
+
+
+@pytest.mark.parametrize("retain_terminal_artifacts", [False, True])
+def test_a_failed_dispatch_records_its_failure_before_reporting_so_no_later_dispatch_launches(
+    node: Path, retain_terminal_artifacts: bool
+) -> None:
+    # the "no run" read and the failure's record are one step under the operation's lock: a dispatch that takes the lock
+    # once the failed one released it finds that result and launches nothing, so the FAILED report is the operation's
+    import asyncio as aio
+
+    _runner(node, "raise SystemExit(0)\n")
+    files = storage_operations.StorageOperationFiles.for_operation(OPERATION_ID)
+    launches: list[str] = []
+
+    async def failing(command: str, check: bool = False, input: str | None = None) -> SimpleNamespace:
+        if "printf \"%s\" \"$d\"" in command:
+            raise OSError(28, "No space left on device")
+        return await _run_locally(command, check, input)
+
+    async def recording(command: str, check: bool = False, input: str | None = None) -> SimpleNamespace:
+        result = await _run_locally(command, check, input)
+        if "nohup" in command:
+            launches.append((result.stdout or "").strip())
+        return result
+
+    with pytest.raises(OSError):
+        aio.run(storage_operations.start_storage_operation(
+            SimpleNamespace(run=failing), sys.executable, OPERATION_ID, {"engine": "restic"},
+            retain_terminal_artifacts=retain_terminal_artifacts,
+        ))
+    storage_operations.report_launch_failure.assert_awaited_once()
+    recorded = files.status if retain_terminal_artifacts else files.done
+    assert Path(str(recorded)).exists() and not Path(str(files.launcher)).exists()
+
+    returned_files = aio.run(storage_operations.start_storage_operation(
+        SimpleNamespace(run=recording), sys.executable, OPERATION_ID, {"engine": "restic"},
+        retain_terminal_artifacts=retain_terminal_artifacts,
+    ))
+    assert returned_files == files and launches == []
+    assert not Path(str(files.launcher)).exists() and not Path(str(files.spec)).exists()
+    storage_operations.report_launch_failure.assert_awaited_once()
+
+
+def test_a_staging_failure_during_another_dispatchs_launch_handoff_waits_for_its_launcher(node: Path) -> None:
+    # F-59: the other dispatch holds the launch lock and has started its wrapper, but neither its launcher nor the
+    # runner's PID is recorded yet when this dispatch's staging fails: the recheck waits for the lock and finds the run
+    import asyncio as aio
+    import fcntl
+    import threading
+
+    _runner(node, "raise SystemExit(0)\n")
+    files = storage_operations.StorageOperationFiles.for_operation(OPERATION_ID)
+    runners: list[subprocess.Popen] = []
+
+    def finish_handoff(lock) -> None:
+        import time
+
+        time.sleep(0.5)
+        runners.append(_legacy_runner(files))
+        Path(str(files.launcher)).write_text(Path(str(files.pid)).read_text())
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        lock.close()
+
+    async def run(command: str, check: bool = False, input: str | None = None) -> SimpleNamespace:
+        if "printf \"%s\" \"$d\"" in command:
+            lock = open(str(files.lock), "a")
+            fcntl.flock(lock, fcntl.LOCK_EX)   # the other dispatch's launch, mid-handoff
+            threading.Thread(target=finish_handoff, args=(lock,)).start()
+            raise OSError(28, "No space left on device")
+        return await _run_locally(command, check, input)
+
+    try:
+        returned_files = aio.run(storage_operations.start_storage_operation(
+            SimpleNamespace(run=run), sys.executable, OPERATION_ID, {"engine": "restic"}, retain_terminal_artifacts=False
+        ))
+        assert returned_files == files
+        storage_operations.report_launch_failure.assert_not_awaited()
+    finally:
+        for r in runners:
+            r.kill()
+            r.wait()
+
+
+def test_a_run_that_ends_between_the_checks_is_still_found(node: Path) -> None:
+    # the wrapper publishes its end as: status, PID record removed, done marker, status removed, exit. A stand-in grep
+    # ends the run at the first liveness check, as if it finished between two reads: the later checks find it
+    files = storage_operations.StorageOperationFiles.for_operation(OPERATION_ID)
+    for path in (files.launcher, files.pid):
+        Path(str(path)).write_text(f"{os.getpid()}\n")
+    fake_bin, ended = node / "bin", node / "ended"
+    fake_bin.mkdir()
+    q = lambda path: shlex.quote(str(path))  # noqa: E731
+    (fake_bin / "grep").write_text(
+        "#!/bin/sh\n"
+        f"if [ ! -e {q(ended)} ]; then : > {q(ended)}; printf '0\\n' > {q(files.status)}; rm -f {q(files.pid)}; "
+        f": > {q(files.done)}; rm -f {q(files.status)}; cat > /dev/null; exit 1; fi\n"
+        'exec /usr/bin/grep "$@"\n'
+    )
+    (fake_bin / "grep").chmod(0o755)
+    check = f"if {storage_operations._incumbent_condition(files)}; then echo YES; fi"
+    done = subprocess.run(["sh", "-c", check], capture_output=True, text=True, env={**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}"})
+    assert ended.exists() and done.stdout.strip() == "YES"
+
+
+def _staging_fails(node: Path):
+    async def run(command: str, check: bool = False, input: str | None = None) -> SimpleNamespace:
+        if "printf \"%s\" \"$d\"" in command:
+            raise OSError(28, "No space left on device")
+        return await _run_locally(command, check, input)
+
+    return run
+
+
+def test_a_launch_whose_log_cannot_be_opened_leaves_no_spec_and_no_staged_runner(node: Path) -> None:
+    # the log is opened before the spec is written: a node that cannot create it gets no credentials left behind
+    _runner(node, "raise SystemExit(0)\n")
+    files = storage_operations.StorageOperationFiles.for_operation(OPERATION_ID)
+    Path(str(files.log)).mkdir()
+    with pytest.raises(storage_operations.StorageOperationLaunchError):
+        _dispatch()
+    assert not Path(str(files.spec)).exists() and not Path(str(files.launcher)).exists()
+    assert _staged(node) == []
+    assert Path(str(files.done)).exists()   # the failure is the operation's recorded result
+    storage_operations.report_launch_failure.assert_awaited_once()
+
+
+def test_a_launch_that_cannot_record_its_launcher_runs_nothing_and_removes_its_spec(node: Path) -> None:
+    ran = node / "ran"
+    _runner(node, f"open({str(ran)!r}, 'w').close()\n")
+    files = storage_operations.StorageOperationFiles.for_operation(OPERATION_ID)
+    Path(str(files.launcher)).mkdir()
+    with pytest.raises(storage_operations.StorageOperationLaunchError):
+        _dispatch()
+    import time
+
+    time.sleep(1.0)   # a wrapper that did start would have run the runner by now
+    assert not ran.exists() and not Path(str(files.spec)).exists()
+    assert _staged(node) == []
+
+
+def test_a_dispatch_that_cannot_settle_its_failure_reports_nothing(node: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import asyncio as aio
+
+    _runner(node, "raise SystemExit(0)\n")
+    monkeypatch.setattr(storage_operations, "_settle_failed_dispatch", AsyncMock(side_effect=OSError("connection lost")))
+    with pytest.raises(storage_operations.StorageDispatchOutcomeUnknown):
+        aio.run(storage_operations.start_storage_operation(
+            SimpleNamespace(run=_staging_fails(node)), sys.executable, OPERATION_ID, {"engine": "restic"},
+            retain_terminal_artifacts=False,
+        ))
+    storage_operations.report_launch_failure.assert_not_awaited()
+
+
+def test_a_recorded_failure_the_backend_did_not_take_is_reported_again_by_the_next_dispatch(
+    node: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import asyncio as aio
+
+    _runner(node, "raise SystemExit(0)\n")
+    files = storage_operations.StorageOperationFiles.for_operation(OPERATION_ID)
+    storage_operations.report_launch_failure.return_value = False   # the backend did not take the report
+    with pytest.raises(OSError):
+        aio.run(storage_operations.start_storage_operation(
+            SimpleNamespace(run=_staging_fails(node)), sys.executable, OPERATION_ID, {"engine": "restic"},
+            retain_terminal_artifacts=False,
+        ))
+    assert "No space left on device" in Path(str(files.done)).read_text()
+
+    status = AsyncMock(return_value=True)
+    monkeypatch.setattr(storage_operations, "_report_operation_status", status)
+    _dispatch()
+    assert status.await_args.kwargs["status"] == "FAILED"
+    assert "No space left on device" in status.await_args.kwargs["message"]
+    assert Path(str(files.done)).read_text() == ""   # taken: an ordinary finished run now
+    assert not Path(str(files.launcher)).exists() and _staged(node) == []
+
+
+def test_a_finished_runner_whose_wrapper_is_still_publishing_reads_as_running_then_as_its_status(node: Path) -> None:
+    import asyncio as aio
+
+    files = storage_operations.StorageOperationFiles.for_operation(OPERATION_ID)
+    Path(str(files.pid)).write_text("999999999\n")   # the runner is gone
+    wrapper = subprocess.Popen(["sh", "-c", f"sleep 30 # --spec {files.spec} "])
+    try:
+        Path(str(files.launcher)).write_text(f"{wrapper.pid}\n")
+        ssh = SimpleNamespace(run=_run_locally)
+        assert aio.run(storage_operations._operation_state(ssh, files)) == "RUNNING"
+    finally:
+        wrapper.kill()
+        wrapper.wait()
+    Path(str(files.status)).write_text("0\n")
+    assert aio.run(storage_operations._operation_state(ssh, files)) == "STATUS:0"
+
+
+# the wrapper publishes the status and removes the pid after the status read: before the pid read (review at 4e85079),
+# or after it, the pid then read whole, part-written or not yet removed
+@pytest.mark.parametrize("pid_content, publish_at", [
+    ("999999999\n", "before"), ("999999999\n", "after"), ("", "after"), ("99x", "after"),
+])
+def test_a_wrapper_that_publishes_between_the_two_reads_gives_the_status_not_starting(
+    node: Path, pid_content: str, publish_at: str
+) -> None:
+    import asyncio as aio
+    import shlex
+
+    files = storage_operations.StorageOperationFiles.for_operation(OPERATION_ID)
+    status, pid = shlex.quote(str(files.status)), shlex.quote(str(files.pid))
+    Path(str(files.pid)).write_text(pid_content)
+    Path(f"{files.status}.tmp").write_text("0\n")
+    publish = f"mv {shlex.quote(str(files.status) + '.tmp')} {status}; rm -f {pid}; "
+
+    async def run_with_publication_between_the_reads(command: str, check: bool = False) -> SimpleNamespace:
+        probe = f"pid=$(cat {pid} 2>/dev/null); "
+        assert probe in command
+        moved = f"{publish}{probe}" if publish_at == "before" else f"{probe}{publish}"
+        return await _run_locally(command.replace(probe, moved, 1), check)
+
+    ssh = SimpleNamespace(run=run_with_publication_between_the_reads)
+    assert aio.run(storage_operations._operation_state(ssh, files)) == "STATUS:0"
+
+
+def test_a_dispatch_never_sweeps_another_operations_lock(node: Path) -> None:
+    _runner(node, "raise SystemExit(0)\n")
+    other = node / "22222222-2222-4222-8222-222222222222.lock"
+    other.touch()
+    os.utime(other, (0, 0))
+    _dispatch()
+    assert other.exists()
+
+
+@pytest.mark.parametrize("written", ["whole", "partly"])
+def test_a_launch_shell_that_exits_after_writing_the_spec_leaves_no_spec(node: Path, written: str) -> None:
+    # the launch shell ends after (or while) writing the spec and before starting the wrapper: the failure the dispatch
+    # records under the lock removes that spec, and a later dispatch, which accepts the record, finds none either
+    import asyncio as aio
+
+    ran = node / "ran"
+    _runner(node, f"open({str(ran)!r}, 'w').close()\n")
+    files = storage_operations.StorageOperationFiles.for_operation(OPERATION_ID)
+    spec = shlex.quote(str(files.spec))
+
+    async def ends_after_the_spec(command: str, check: bool = False, input: str | None = None) -> SimpleNamespace:
+        if "nohup" in command:
+            if written == "whole":
+                command = command.replace(" nohup ", " kill -9 $$; nohup ", 1)
+            else:
+                command = command.replace(f"cat > {spec}", f"head -c 5 > {spec}; kill -9 $$", 1)
+        return await _run_locally(command, check, input)
+
+    with pytest.raises(storage_operations.StorageOperationLaunchError):
+        aio.run(storage_operations.start_storage_operation(
+            SimpleNamespace(run=ends_after_the_spec), sys.executable, OPERATION_ID, {"engine": "restic", "k": "secret"},
+            retain_terminal_artifacts=False,
+        ))
+    assert not Path(str(files.spec)).exists() and Path(str(files.done)).exists()
+    storage_operations.report_launch_failure.assert_awaited_once()
+
+    assert _dispatch() == files
+    assert not Path(str(files.spec)).exists() and not ran.exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("starts", [True, False])
+async def test_an_executor_whose_interpreter_cannot_start_does_not_support_storage_operations(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, starts: bool
+) -> None:
+    runner = tmp_path / "storage_runner.py"
+    runner.touch()
+    monkeypatch.setattr(storage_operations, "REMOTE_RUNNER_PATH", str(runner))
+    monkeypatch.setattr(executor_payload, "EXECUTOR_PYTHON", sys.executable if starts else str(tmp_path / "python"))
+
+    async def run(command: str, check: bool = False) -> SimpleNamespace:
+        return await _run_locally(command.replace("/usr/local/bin/restic", "/bin/sh"), check)
+
+    assert await storage_operations.supports_storage_operation(SimpleNamespace(run=run), "restic") is starts
+
+
+def test_an_online_runner_that_ends_before_reading_its_spec_leaves_its_failure_for_the_next_dispatch(
+    node: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import asyncio as aio
+
+    _runner(node, "raise SystemExit(0)\n")
+    files = storage_operations.StorageOperationFiles.for_operation(OPERATION_ID)
+    spec = {"engine": "restic", "reporter": {"api_url": "https://api.example", "auth_token": "t0k", "resource": "backup"}}
+    # the interpreter is gone by the time the wrapper starts the runner: the child exits 127
+    aio.run(storage_operations.start_storage_operation(
+        SimpleNamespace(run=_run_locally), str(node / "no-python"), OPERATION_ID, spec, retain_terminal_artifacts=False
+    ))
+    _wait_for(Path(str(files.done)))
+    _wait_for(Path(str(files.spec)), gone=True)
+    marker = Path(str(files.done)).read_text()
+    assert "exited 127" in marker and "t0k" not in marker and _staged(node) == []
+
+    status = AsyncMock(return_value=True)
+    monkeypatch.setattr(storage_operations, "_report_operation_status", status)
+    _dispatch(spec)
+    assert status.await_args.kwargs["status"] == "FAILED" and "exited 127" in status.await_args.kwargs["message"]
+    assert Path(str(files.done)).read_text() == ""
+
+
+@pytest.mark.parametrize("exit_code", [0, 3])
+def test_an_online_runner_that_read_its_spec_leaves_an_empty_done_marker(node: Path, exit_code: int) -> None:
+    # it reports its own result: the marker carries nothing for a later dispatch to report again
+    _runner(node, f"import os, sys\nos.unlink(sys.argv[sys.argv.index('--spec') + 1])\nraise SystemExit({exit_code})\n")
+    files = _dispatch({"engine": "restic"})
+    _wait_for(Path(str(files.done)))
+    assert Path(str(files.done)).read_text() == ""
+
+
+@pytest.mark.parametrize("dispatch", ["launch", "failed_staging"])
+def test_an_older_validators_live_runner_without_any_pid_file_is_the_operations_run(node: Path, dispatch: str) -> None:
+    # an older validator's wrapper started its runner but recorded neither a PID nor a launcher
+    import asyncio as aio
+
+    runs = node / "runs"
+    _runner(node, f"open({str(runs)!r}, 'a').write('run\\n')\n")
+    files = storage_operations.StorageOperationFiles.for_operation(OPERATION_ID)
+    legacy_runner = subprocess.Popen([
+        sys.executable, "-c", "import time; time.sleep(60)", storage_operations.REMOTE_RUNNER_PATH,
+        "--spec", str(files.spec), "--cancel-file", str(files.cancel),
+    ])
+    Path(str(files.spec)).write_text("{}")
+    try:
+        if dispatch == "launch":
+            assert _dispatch() == files
+        else:
+            assert aio.run(storage_operations.start_storage_operation(
+                SimpleNamespace(run=_staging_fails(node)), sys.executable, OPERATION_ID, {"engine": "restic"},
+                retain_terminal_artifacts=False,
+            )) == files
+            storage_operations.report_launch_failure.assert_not_awaited()
+        import time
+
+        time.sleep(0.5)
+        assert legacy_runner.poll() is None and not runs.exists() and _staged(node) == []
+        assert Path(str(files.spec)).exists() and not Path(str(files.done)).exists()
+    finally:
+        legacy_runner.kill()
+        legacy_runner.wait()
