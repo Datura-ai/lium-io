@@ -28,7 +28,7 @@ from tests.test_matmul_allcards import (  # noqa: F401 (svc is a fixture)
 PASS_KEY = "allcards_pass:miner-hotkey:executor-123"
 DEFERRED_KEY = "allcards_deferred:miner-hotkey:executor-123"
 # job_batch_ids of consecutive job cycles, and of cycles later (a rental in between)
-CYCLE_1, CYCLE_2 = "2026-11-25 05:00:00", "2026-11-25 05:15:00"
+CYCLE_1, CYCLE_2, CYCLE_3 = "2026-11-25 05:00:00", "2026-11-25 05:15:00", "2026-11-25 05:30:00"
 CYCLE_LATER, CYCLE_AFTER_LATER = "2026-11-25 07:00:00", "2026-11-25 07:15:00"
 OOM = SimpleNamespace(exit_status=0, stdout="UUID:  None", stderr="Failed to allocate d_A: out of memory")
 NO_DEVICE = SimpleNamespace(exit_status=0, stdout="UUID:  None", stderr="no CUDA-capable device is detected")
@@ -228,6 +228,35 @@ async def test_a_deferral_long_after_the_last_one_is_a_new_first_deferral(contex
     # the new deferral is the one the next cycle retries
     again, _ = await _cycle(context_factory, svc, busy, redis=redis, fresh=_filler_on(range(4)), at=CYCLE_AFTER_LATER)
     assert again.passed is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "deferred_first, failing",
+    [
+        (True, {i: ConnectionResetError("connection lost") for i in range(8)}),
+        (False, {0: SimpleNamespace(exit_status=0, stdout="UUID: someone-elses", stderr="")}),
+    ],
+    ids=["failed-retry", "wrong-answer"],
+)
+async def test_a_failed_proof_keeps_the_node_off_offers_until_a_new_pass(context_factory, svc, deferred_first, failing):  # noqa: F811
+    """arhangel66 review 6052994856: once a proof fails, a deferral in a later cycle never lists the node on the pass
+    from before the failure; only a new full pass does."""
+    redis = _proven(FakeRedis())
+    lost, _ = _node({i: ConnectionResetError("connection lost") for i in range(8)})
+    bad, _ = _node(failing)
+
+    if deferred_first:
+        await _cycle(context_factory, svc, lost, redis=redis, at=CYCLE_1)
+    failed, _ = await _cycle(context_factory, svc, bad, redis=redis, fresh=_filler_on(range(8)), at=CYCLE_2)
+    later, state = await _cycle(context_factory, svc, lost, redis=redis, at=CYCLE_3)
+
+    assert failed.passed is False
+    assert later.passed is True and later.event.what_we_saw["allcards"]["outcome"] == "deferred"
+    assert state.allcards_not_proven is True
+    healthy, _ = _node({})
+    passed, state = await _cycle(context_factory, svc, healthy, redis=redis)
+    assert passed.passed is True and state.allcards_not_proven is False
 
 
 @pytest.mark.asyncio

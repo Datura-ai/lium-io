@@ -318,7 +318,7 @@ async def judge_all_cards(
         return AllCardsVerdict(ALLCARDS_PASSED)
     unanswered = probe.unanswered_cards
     if probe.wrong_answer or not unanswered:
-        return AllCardsVerdict(ALLCARDS_FAILED, probe.failure_reason)
+        return await _all_cards_failed(ctx, probe.failure_reason)
     snapshot = None
     if probe.connection_lost:
         reason = "connection_lost"
@@ -329,14 +329,25 @@ async def judge_all_cards(
             ((details[i].get("uuid") or "") if i < len(details) else "").strip().lower() for i in unanswered
         ]
         if not all(uuid and uuid in assigned for uuid in card_uuids):
-            return AllCardsVerdict(ALLCARDS_FAILED, probe.failure_reason)
+            return await _all_cards_failed(ctx, probe.failure_reason)
         reason = "lium_workload"
     cycle = _filler_cycle_index(ctx)
     if await _deferred_cycle(ctx) in (cycle - 1, cycle):
-        return AllCardsVerdict(ALLCARDS_FAILED, f"{probe.failure_reason}; deferred last time too")
+        return await _all_cards_failed(ctx, f"{probe.failure_reason}; deferred last time too")
     await _redis_set(ctx, ALLCARDS_DEFERRED_KEY, _cycle_seconds() * 2, value=str(cycle))
     listed = await _redis_flag(ctx, ALLCARDS_PASS_KEY, default=False)
     return AllCardsVerdict(ALLCARDS_DEFERRED, reason, listed=listed, snapshot=snapshot)
+
+
+async def _all_cards_failed(ctx: Context, reason: str) -> AllCardsVerdict:
+    """A failed proof ends the last pass: a deferral in any later cycle then keeps the node off offers until a new
+    full pass, instead of listing it on the pass from before the failure (arhangel66 review 6052994856)."""
+    if not settings.DRY_RUN:
+        try:
+            await ctx.services.redis.delete(_allcards_key(ctx, ALLCARDS_PASS_KEY))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(_m("All-cards pass clear failed", extra=get_extra_info({**ctx.default_extra, "error": str(exc)})))
+    return AllCardsVerdict(ALLCARDS_FAILED, reason)
 
 
 async def record_all_cards_pass(ctx: Context) -> None:
