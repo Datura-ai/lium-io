@@ -696,17 +696,19 @@ async def test_a_carried_work_proof_failure_clears_on_a_right_answer_with_no_num
 
 @pytest.mark.asyncio
 async def test_an_out_of_turn_retry_moves_to_the_next_card_each_cycle(context_factory, monkeypatch):
-    # lio#2456 review: a node with no verdict is retried every cycle; on the next card, not one card for a day
+    # lio#2456 review: a node with no verdict is retried every cycle on the next card, its turn included
     picked = []
 
     async def card_sample(ctx, specs, card_index, sample):
-        picked.append(card_index)
+        picked.append(card_index)  # no numbers and no answer: no verdict, so the next cycle retries
 
     monkeypatch.setattr(capability, "_card_matmul_sample", card_sample)
+    monkeypatch.setattr(capability, "_filler_sample_offset", lambda ctx: 23)
     monkeypatch.setattr(capability.settings, "FILLER_MATMUL_SAMPLE_EVERY_N_CYCLES", 24)
-    ctx = context_factory()
-    specs = {"gpu": {"details": [{"uuid": f"GPU-{i}"} for i in range(4)]}}
-    for cycle in range(100, 104):
-        await capability._filler_matmul_sample(ctx, specs, cycle, on_turn=False)
+    redis = FakeRedis()
+    for cycle in (96, 97):  # 97 is the node's turn: (97 + 23) % 24 == 0
+        monkeypatch.setattr(capability, "_filler_cycle_index", lambda ctx, cycle=cycle: cycle)
+        ctx, _ = _filler_ctx(context_factory, redis, REAL_H100[1], specs=_two_card_specs())
+        await CapabilityCheck().run(ctx)
 
-    assert sorted(picked) == [0, 1, 2, 3]
+    assert picked == [1, 0]  # a day-step index at the turn would pick card 1 again

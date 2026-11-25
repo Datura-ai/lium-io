@@ -81,7 +81,11 @@ class CapabilityCheck:
             on_turn = _filler_matmul_sample_due(ctx, cycle)
             if failed_cards or unjudged or on_turn:
                 sample, found = await _filler_matmul_sample(
-                    ctx, specs, cycle, failed_cards[0] if failed_cards else None, on_turn=on_turn and seen
+                    ctx,
+                    specs,
+                    cycle,
+                    failed_cards[0] if failed_cards else None,
+                    rotate_every_cycle=not (on_turn and seen),
                 )
                 what_filler["matmul_sample"] = sample
                 card = sample.get("card_index", 0)
@@ -403,7 +407,7 @@ def _filler_matmul_sample_due(ctx: Context, cycle: int) -> bool:
 
 
 async def _filler_matmul_sample(
-    ctx: Context, specs: dict, cycle: int, card_index: int | None = None, on_turn: bool = True
+    ctx: Context, specs: dict, cycle: int, card_index: int | None = None, *, rotate_every_cycle: bool
 ) -> tuple[dict, list[GpuModelMismatch] | None]:
     """A filler-only node skips the matmul for as long as the filler runs, so a card that left the
     node after the filler started is never challenged. This runs the same challenge on a small VRAM
@@ -419,7 +423,7 @@ async def _filler_matmul_sample(
     details = (specs.get("gpu") or {}).get("details") or []
     if details:
         every = max(settings.FILLER_MATMUL_SAMPLE_EVERY_N_CYCLES, 1)
-        sample_index = (cycle + _filler_sample_offset(ctx)) // (every if on_turn else 1)
+        sample_index = (cycle + _filler_sample_offset(ctx)) // (1 if rotate_every_cycle else every)
         if card_index is None or not 0 <= card_index < len(details):
             card_index = sample_index % len(details)
         found = await _card_matmul_sample(ctx, specs, card_index, sample)
