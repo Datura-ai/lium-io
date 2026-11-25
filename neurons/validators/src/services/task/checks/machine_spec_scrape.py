@@ -645,8 +645,8 @@ class MachineSpecScrapeCheck:
         # (upload up to UPLOAD_TIMEOUT, then the scrape's own timeout)
         if ctx.config.machine_scrape_binary_build is None:
             return True
-        retry_seconds = timeout + UPLOAD_TIMEOUT
-        wait_seconds = task_seconds_left(ctx) - retry_seconds
+        seconds_the_retry_needs = timeout + UPLOAD_TIMEOUT
+        wait_seconds = task_seconds_left(ctx) - seconds_the_retry_needs
         if wait_seconds <= 0:
             return False
         try:
@@ -658,7 +658,7 @@ class MachineSpecScrapeCheck:
                 ))
             )
             return False
-        return task_seconds_left(ctx) >= retry_seconds
+        return task_seconds_left(ctx) >= seconds_the_retry_needs
 
     async def _retry_scrape_with_uploaded_binary(
         self,
