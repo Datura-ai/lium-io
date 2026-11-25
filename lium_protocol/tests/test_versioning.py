@@ -254,7 +254,8 @@ def test_the_readme_revert_path_for_an_unreleased_wire_change_passes(repo: Path)
     change_wire(repo)
     fragment(repo, "new-field", "minor")
     commit(repo, "a wire change, not released")
-    run(repo, "git", "revert", "--no-edit", "HEAD")
+    reverted = run(repo, "git", "-c", "user.name=t", "-c", "user.email=t@t", "revert", "--no-edit", "HEAD")
+    assert reverted.returncode == 0, reverted.stderr
     alone = run(repo / "lium_protocol", sys.executable, str(SCRIPTS / "check_version.py"), "HEAD^")
     assert alone.returncode == 1   # a bare revert deletes the fragment, which reads as a release
     run(repo, "git", "checkout", "HEAD^", "--", "lium_protocol/changes/new-field.md")
