@@ -112,6 +112,7 @@ class ExecutorApiWatcher:
         self.next_restart_at = 0.0
         self.restarting = False
         self.legacy_autoheal_gone = False
+        self.answers = 0
 
     def _url(self, target: Target) -> str:
         return f"http://{target.ip}:{self.port}/version"
@@ -148,6 +149,7 @@ class ExecutorApiWatcher:
             pass  # Docker busy or the removal failed: the next tick tries again
 
     def _healthy(self) -> None:
+        self.answers += 1  # a restart decided before this answer is void
         self.failures = 0
         self.backoff = BACKOFF_FIRST_S
         self.next_restart_at = 0.0
@@ -185,12 +187,18 @@ class ExecutorApiWatcher:
         self.restarting = True
         self.next_restart_at = self.monotonic() + self.backoff
         self.backoff = min(self.backoff * 2, BACKOFF_MAX_S)
-        self.spawn(lambda: self._restart(current))
+        decided_at = self.answers
+        self.spawn(lambda: self._restart(current, decided_at))
         return "restart"
 
-    def _restart(self, target: Target) -> None:
+    def _restart(self, target: Target, decided_at: int) -> None:
         try:
-            self.client.containers.get(target.container_id).restart(timeout=RESTART_STOP_TIMEOUT_S)
+            container = self.client.containers.get(target.container_id)
+            # the worker can run long after the decision (a slow Docker): an answer seen since, or one now, voids it
+            if self.answers != decided_at or self.probe(self._url(target)) == ALIVE:
+                self.report("executor_api_restart_skipped", f"{target.name}: the API answered again")
+                return
+            container.restart(timeout=RESTART_STOP_TIMEOUT_S)
             self.report("executor_api_restart", f"{target.name}: API did not answer for {self.failures} probes")
         except Exception as ex:
             self.report("executor_api_restart_failed", f"{target.name}: {ex}")

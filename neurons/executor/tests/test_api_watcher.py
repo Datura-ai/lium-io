@@ -274,3 +274,33 @@ def test_an_environment_proxy_never_answers_for_the_executor(monkeypatch):
     finally:
         proxy.shutdown()
         proxy.server_close()
+
+
+def test_a_pending_restart_is_dropped_once_the_watcher_saw_the_api_answer():
+    """Review 6057409851: a worker held up (a slow Docker) restarted a node whose API had answered meanwhile."""
+    h = Harness()
+    h.answers = [DOWN]
+    pending = []
+    h.watcher.spawn = pending.append
+
+    h.ticks(5)
+    h.answers = [ALIVE]
+    h.ticks(1)  # the watcher sees the API answer
+    h.answers = [DOWN]  # and it is down again when the worker finally runs
+    pending[0]()
+
+    assert h.executor.restarts == 0
+    assert h.reports == ["executor_api_restart_skipped"]
+
+
+def test_a_pending_restart_probes_once_more_before_it_calls_docker():
+    h = Harness()
+    h.answers = [DOWN]
+    pending = []
+    h.watcher.spawn = pending.append
+
+    h.ticks(5)
+    h.answers = [ALIVE]  # recovered before the watcher's next tick
+    pending[0]()
+
+    assert h.executor.restarts == 0
