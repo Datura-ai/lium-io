@@ -5,11 +5,14 @@
 - a node rented at the cycle snapshot runs no all-cards proof that cycle and is not offered until its cards prove
   themselves, even when the rental ended mid-cycle;
 - a deferral is bounded: one retry in the next idle cycle, and the node is offered meanwhile only on a live last pass;
-- only a lost connection to the whole node defers; a run that ended without an exit status is the card's verdict.
+- only a lost connection to the whole node defers; a run that ended without an exit status on a live connection is the
+  card's verdict.
 """
 
+import asyncio
 from types import SimpleNamespace
 
+import asyncssh
 import pytest
 from protocol.vc_protocol.compute_requests import RentedExecutor, RentedExecutorsResponse, RentedPod
 from services.task.checks import capability
@@ -290,6 +293,73 @@ async def test_a_lost_connection_to_the_whole_node_defers(context_factory, svc, 
     assert state.allcards_not_proven is False
     # the pass from before stays, with its expiry
     assert redis.store[PASS_KEY] == "2026-11-23T11:00:00" and redis.ttl[PASS_KEY] == 3600
+
+
+class _OpenServer(asyncssh.SSHServer):
+    def connection_made(self, conn):
+        self.conn = conn
+
+    def begin_auth(self, username):
+        return False
+
+
+async def _real_node(drop: str):
+    """A real asyncssh node: card 0 answers right; every other card's run is pending until card 0's answer reached
+    the client, then `drop` == "connection" aborts the whole SSH connection, "channel" closes only that card's
+    channel (no exit status) on a live connection."""
+    servers: list[_OpenServer] = []
+    answered = asyncio.Event()
+
+    def factory():
+        servers.append(_OpenServer())
+        return servers[-1]
+
+    async def handle(process):
+        command = process.command or ""
+        if "CUDA_VISIBLE_DEVICES=" not in command:
+            process.exit(0)
+            return
+        if _card_index(command) == 0:
+            process.stdout.write(ANSWER)
+            process.exit(0)
+            await asyncio.sleep(0.2)  # the answer reaches the client first
+            answered.set()
+            return
+        await answered.wait()
+        if drop == "connection":
+            servers[0].conn.abort()
+        else:
+            process.close()
+
+    key = asyncssh.generate_private_key("ssh-ed25519")
+    server = await asyncssh.listen(
+        "127.0.0.1", 0, server_host_keys=[key], server_factory=factory, process_factory=handle
+    )
+    port = server.sockets[0].getsockname()[1]
+    return server, await asyncssh.connect("127.0.0.1", port, known_hosts=None, username="root")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("drop, deferred", [("connection", True), ("channel", False)])
+async def test_a_real_ssh_connection_dropping_after_a_card_answered_defers_and_keeps_the_pass(
+    context_factory, svc, drop, deferred  # noqa: F811
+):
+    # arhangel66 review 6055346146: an aborted connection ends the pending runs with no exit status, not an SSH error
+    server, ssh = await _real_node(drop)
+    redis = _proven(FakeRedis())
+    redis.ttl[PASS_KEY] = 3600
+    try:
+        result, _ = await _cycle(context_factory, svc, ssh, redis=redis)
+    finally:
+        ssh.close()
+        server.close()
+
+    if deferred:
+        assert result.event.what_we_saw["allcards"]["outcome"] == "deferred"
+        assert redis.store[PASS_KEY] == "2026-11-23T11:00:00" and redis.ttl[PASS_KEY] == 3600
+    else:
+        assert result.passed is False
+        assert result.event.what_we_saw["allcards"]["outcome"] == "failed"
 
 
 @pytest.mark.asyncio

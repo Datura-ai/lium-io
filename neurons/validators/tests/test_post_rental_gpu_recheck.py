@@ -218,6 +218,8 @@ async def test_no_all_cards_matmul_is_inconclusive_on_a_multi_card_node(
         _all_cards("ssh_error: connection lost", "ssh_error: connection lost"),
         # the connection closed after card 0 answered (arhangel66 review 6054371012)
         _all_cards("", "ssh_error: connection lost", connection_closed=True),
+        # the connection was aborted while card 1 ran: asyncssh ends that run with no exit status (review 6055346146)
+        _all_cards("", "exit_status=None", connection_closed=True),
         _all_cards("", "", over_wall_clock=True),
         # review (17 Nov): a multi-card claim the probe could not run (no card details or size, our own cipher
         # failed) ran no card, so it says nothing about them: inconclusive as before
@@ -255,7 +257,7 @@ async def test_a_card_that_times_out_again_on_the_retry_fails_the_recheck(contex
 @pytest.mark.parametrize(
     "all_cards",
     [
-        # a run that ended without an exit status: the channel answered, so it is the card's verdict
+        # a run that ended without an exit status on a live connection: the channel answered, so it is the card's verdict
         _all_cards("exit_status=None", "exit_status=None"),
         # one card's channel failed while the other answered: not a lost connection to the node
         _all_cards("ssh_error: channel closed", ""),

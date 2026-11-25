@@ -123,9 +123,9 @@ async def record_gpu_drop(ctx: Context, missing_uuids: list[str]) -> None:
 
 
 def _all_cards_no_verdict(probe: AllCardsProbe) -> bool:
-    # Only a lost connection to the whole node (every card's run raised an SSH error) and the wall clock with every
+    # Only a lost connection to the whole node (`AllCardsProbe.connection_lost`) and the wall clock with every
     # card answering say nothing about the cards, as CapabilityCheck judges them. A timeout, a timeout again on the
-    # probe's retry (`timeout_after_retry`) or a run that ended without an exit status is a verdict and fails the
+    # probe's retry (`timeout_after_retry`) or a run that ended without an exit status on a live connection is a verdict and fails the
     # recheck (an 8x node's GPU 0 timed out every recheck 10-16 Nov and re-listed each time).
     if not probe.per_card:
         # not probed (no card details or size, our own cipher failed): no card was run, inconclusive as before

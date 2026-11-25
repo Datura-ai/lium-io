@@ -237,13 +237,17 @@ class AllCardsProbe:
 
     @property
     def connection_lost(self) -> bool:
-        """The SSH connection to the whole node was lost: every card that failed raised an SSH error, and either every
-        card did or the connection itself was closed (it dropped after some cards answered). One card's channel failing
-        on a live connection, or a run that ended without an exit status, is not this: it says something about the card."""
+        """The SSH connection to the whole node was lost: every card's run raised an SSH error, or the connection itself
+        was closed when the run ended and every card that failed lost its run to it (an SSH error, or no exit status:
+        asyncssh ends a run pending on an aborted connection with exit_status None, not an exception). One card's
+        channel failing on a live connection, or a run that ended without an exit status there, is the card's verdict."""
         failed = [c for c in self.per_card if not c.get("ok")]
-        if not failed or not all((c.get("reason") or "").startswith("ssh_error") for c in failed):
+        if not failed:
             return False
-        return len(failed) == len(self.per_card) or self.connection_closed
+        reasons = [c.get("reason") or "" for c in failed]
+        if not self.connection_closed:
+            return len(failed) == len(self.per_card) and all(r.startswith("ssh_error") for r in reasons)
+        return all(r.startswith("ssh_error") or r == "exit_status=None" for r in reasons)
 
 
 def _not_probed(reason: str) -> AllCardsProbe:
