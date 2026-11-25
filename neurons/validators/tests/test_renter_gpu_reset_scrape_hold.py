@@ -81,6 +81,7 @@ from neurons.validators.src.services.task.checks.machine_spec_scrape import Mach
 from neurons.validators.src.services.task.checks.rented_machine import TenantEnforcementCheck
 from neurons.validators.src.services.task.messages import MachineSpecMessages as Msg
 from neurons.validators.src.services.task.messages import RentalVerificationMessages
+from neurons.validators.src.services.task.messages import TenantEnforcementMessages as TenantMsg
 from neurons.validators.src.services.task.pipeline import Pipeline
 from neurons.validators.src.services.task.result_handler import ResultHandler
 
@@ -698,6 +699,24 @@ async def test_the_gpu_reset_carry_still_needs_the_node_rented():
 
     assert kept == {"5Miner": []}
     assert [w.result.executor_info.uuid for w in withheld] == ["node-idle"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("previous", ["idle", "rented"])
+@pytest.mark.parametrize("rented_at_end", [frozenset({"node-1"}), frozenset()])
+async def test_a_run_stopped_for_a_renters_create_is_withheld_and_spends_the_kept_result(previous, rented_at_end):
+    # review at 588cafb: the create stop goes through rental_state_unchanged as RENTED_SINCE_THE_SNAPSHOT does; the
+    # node's rentals changed during the cycle (or the create failed), so no verdict, and nothing is left to carry later
+    service = _redis_service()
+    kept_result = _idle_scored("node-1") if previous == "idle" else _rented_scored("node-1")
+    await remember_rented_scored_results({"5Miner": [kept_result]}, service, job_block=PREV_BLOCK)
+    held = _failed("node-1", TenantMsg.RENTED_SINCE_CYCLE_START.reason)
+
+    kept, withheld = await _carry_then_withhold(service, [held], rented_executor_ids=rented_at_end)
+
+    assert kept == {"5Miner": []}
+    assert [w.result.executor_info.uuid for w in withheld] == ["node-1"]
+    assert ("5Miner", "node-1") not in _idle_passes
 
 
 @pytest.mark.asyncio
