@@ -36,6 +36,6 @@ class MinerIdentityResponse(BaseModel):
     host_key_proofs: dict[str, str] | None = None
     # the renting ports this machine declares, as configured (`RENTING_PORT_RANGE`, `RENTING_PORT_MAPPINGS`;
     # both empty means the validator's default range), and the SSH port it reports to validators (`ssh_port`), which
-    # they never rent out. Always sent, so its absence marks an older executor: an Edit
-    # Address onto this machine checks that it declares every port its pods publish.
+    # they never rent out. Sent whenever the caller asks (`declared_ports=1`), so its absence then marks an older
+    # executor: an Edit Address onto this machine checks that it declares every port its pods publish.
     declared_ports: dict[str, str | int | None] | None = None

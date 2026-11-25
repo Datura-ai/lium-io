@@ -482,6 +482,8 @@ MINER_IDENTITY_NONCE_PATTERN = r"^[0-9a-fA-F]{32,128}$"
 @apis_router.get("/miner-identity", response_model_exclude_none=True)
 async def get_miner_identity(
     nonce: Annotated[str, Query(pattern=MINER_IDENTITY_NONCE_PATTERN)],
+    # only on request: a long mapping list would overrun the answer size a caller that does not read it allows
+    declared_ports: Annotated[bool, Query()] = False,
 ) -> MinerIdentityResponse:
     """
     The miner hotkey this executor is configured for (`MINER_HOTKEY_SS58_ADDRESS`), with the
@@ -500,12 +502,16 @@ async def get_miner_identity(
         nonce=nonce,
         account_claim=claim,
         ssh_host_key_port=port,
-        declared_ports={
-            "port_range": settings.RENTING_PORT_RANGE,
-            "port_mappings": settings.RENTING_PORT_MAPPINGS,
-            # the SSH port this executor reports to validators (miner_service), which they exclude from rental ports
-            "ssh_port": settings.SSH_PUBLIC_PORT or settings.SSH_PORT,
-        },
+        declared_ports=(
+            {
+                "port_range": settings.RENTING_PORT_RANGE,
+                "port_mappings": settings.RENTING_PORT_MAPPINGS,
+                # the SSH port this executor reports to validators (miner_service), which they exclude from rental ports
+                "ssh_port": settings.SSH_PUBLIC_PORT or settings.SSH_PORT,
+            }
+            if declared_ports
+            else None
+        ),
         # off the event loop: an RSA signature still costs ~ms, and this endpoint is public
         host_key_proofs=(
             await asyncio.to_thread(_host_key_proofs, nonce, settings.MINER_HOTKEY_SS58_ADDRESS, claim) if port else None
