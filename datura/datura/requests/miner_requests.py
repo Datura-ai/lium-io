@@ -1,4 +1,6 @@
 import enum
+import json
+import re
 
 import pydantic
 from datura.requests.base import BaseRequest
@@ -39,6 +41,27 @@ class DeclineJobRequest(BaseMinerRequest):
     message_type: RequestType = RequestType.DeclineJobRequest
 
 
+# The formats of the fields a node returns about itself. They reach shell commands and SSH options, so anything that
+# is not a plain user name, absolute path, port list or SSH public key is refused here, for the miner and the
+# validator alike. Every value the prod fleet returned on 25 Nov fits them. "" is "not reported": the validator's own
+# rows for a node that gave no answer carry it, and it has no meaning to a shell.
+SSH_USERNAME_RE = re.compile(r"(?:[A-Za-z_][A-Za-z0-9._-]{0,31})?")
+ABSOLUTE_PATH_RE = re.compile(r"(?:/[A-Za-z0-9._+/-]{0,4095})?")
+# only the characters a port range is written with: the validator reads the numbers itself and tells the provider
+# when the range is malformed, which a node refused here would never hear
+PORT_RANGE_RE = re.compile(r"(?!-)[0-9A-Za-z_ ,:-]{0,8192}")
+SSH_PUBLIC_KEY_RE = re.compile(
+    r"(?:ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(?:256|384|521)|sk-ssh-ed25519@openssh\.com"
+    r"|sk-ecdsa-sha2-nistp256@openssh\.com) [A-Za-z0-9+/]{1,16384}={0,3}(?: [A-Za-z0-9@._:+=-]{1,255})?"
+)
+
+
+def _require(pattern: re.Pattern, value: str, field: str) -> str:
+    if not pattern.fullmatch(value):
+        raise ValueError(f"{field} is not in the expected format")
+    return value
+
+
 class ExecutorSSHInfo(pydantic.BaseModel):
     uuid: str
     address: str
@@ -65,6 +88,46 @@ class ExecutorSSHInfo(pydantic.BaseModel):
     # registration. The validator requires the machine it reached to be set up for them. None from an older miner.
     expected_node_hotkeys: list[str] | None = None
     expected_account_claim: str | None = None
+
+    @pydantic.field_validator("ssh_username")
+    @classmethod
+    def _plain_user_name(cls, value: str) -> str:
+        return _require(SSH_USERNAME_RE, value, "ssh_username")
+
+    @pydantic.field_validator("python_path", "root_dir")
+    @classmethod
+    def _absolute_path(cls, value: str, info: pydantic.ValidationInfo) -> str:
+        return _require(ABSOLUTE_PATH_RE, value, info.field_name)
+
+    @pydantic.field_validator("port_range")
+    @classmethod
+    def _port_list(cls, value: str | None) -> str | None:
+        return value if value is None else _require(PORT_RANGE_RE, value, "port_range")
+
+    @pydantic.field_validator("port_mappings")
+    @classmethod
+    def _port_pairs(cls, value: str | None) -> str | None:
+        if not value:
+            return value
+        try:
+            pairs = json.loads(value)
+        except ValueError:
+            pairs = None
+        if not isinstance(pairs, list) or not all(
+            isinstance(pair, list)
+            and len(pair) == 2
+            and all(type(port) is int and 0 <= port <= 65535 for port in pair)
+            for pair in pairs
+        ):
+            raise ValueError("port_mappings is not in the expected format")
+        return value
+
+    @pydantic.field_validator("ssh_host_key")
+    @classmethod
+    def _ssh_public_key(cls, value: str | None) -> str | None:
+        # a key file's padding is not part of the key, and a blank one is no key
+        value = value.strip() if value is not None else None
+        return _require(SSH_PUBLIC_KEY_RE, value, "ssh_host_key") if value else None
 
 
 class AcceptSSHKeyRequest(BaseMinerRequest):

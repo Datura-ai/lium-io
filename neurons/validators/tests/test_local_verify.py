@@ -657,7 +657,7 @@ async def test_client_reports_absent_route_dead_tunnel_and_dead_host_as_fallback
         port=9,
         ssh_username="r",
         ssh_port=22,
-        python_path="p",
+        python_path="/p",
         root_dir="/r",
     )
     assert await client.advertised(dead) == Advertised(set(), None)
