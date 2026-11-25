@@ -81,7 +81,7 @@ class CapabilityCheck:
             on_turn = _filler_matmul_sample_due(ctx, cycle)
             if failed_cards or unjudged or on_turn:
                 sample, found = await _filler_matmul_sample(
-                    ctx, specs, cycle, failed_cards[0] if failed_cards else None, on_turn=on_turn
+                    ctx, specs, cycle, failed_cards[0] if failed_cards else None, on_turn=on_turn and seen
                 )
                 what_filler["matmul_sample"] = sample
                 card = sample.get("card_index", 0)
