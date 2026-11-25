@@ -226,7 +226,8 @@ async def test_a_successful_edit_runs_the_same_host_commands(svc, monkeypatch):
         "'( timeout -s KILL 15 nvidia-smi -i GPU-test -rac >/dev/null 2>&1; echo GPU-test -rac $?; "
         "timeout -s KILL 15 nvidia-smi -i GPU-test -rmc >/dev/null 2>&1; echo GPU-test -rmc $? ) & wait'",
         host_key,
-        "nohup /usr/bin/python /root/app/src/inspector_executor.py --start-collector >/dev/null 2>&1 &",
+        # the validator's own collector starter (services.executor_payload), not the executor's reported paths
+        DockerService._build_inspector_collector_command(_executor_info(payload), "start"),
         f"/usr/bin/docker rm -fv id-{name}",
     ]
 

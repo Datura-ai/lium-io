@@ -82,6 +82,7 @@ from payload_models.payloads import (
 from daos.recovery_stop import UnmarkedRecoveryStopDao
 from services.attestation_service import AttestationError, AttestationService
 from services import build_context as build_context_service
+from services import executor_payload
 from services.const import (
     EDIT_PARKED_SUFFIX,
     PARKED_SUFFIXES,
@@ -3810,11 +3811,16 @@ class DockerService:
             "start": "--start-collector",
             "stop": "--stop-collector",
         }[action]
-        script = f"{executor_info.root_dir.rstrip('/')}/src/inspector_executor.py"
-        command = f"{shlex.quote(executor_info.python_path)} {shlex.quote(script)} {flag}"
+        # the script and interpreter are the validator's (services.executor_payload), not executor_info's paths
+        run = f"{executor_payload.run(executor_payload.INSPECTOR)} {flag}"
         if action == "start":
-            command = f"nohup {command} >/dev/null 2>&1 &"
-        return command
+            # the starter exits once the library's collector runs: earlier starters' directories go first
+            return (
+                f"rm -rf {shlex.quote(executor_payload.service_dir_glob('inspector-collector'))}*; "
+                f"{executor_payload.install('inspector-collector', executor_payload.INSPECTOR)}; "
+                f"nohup {run} >/dev/null 2>&1 &"
+            )
+        return executor_payload.run_once("inspector", executor_payload.INSPECTOR, flag)
 
     async def _run_inspector_collector_lifecycle(
         self,
@@ -3826,7 +3832,7 @@ class DockerService:
         command = self._build_inspector_collector_command(executor_info, action)
         log_extra = {
             **default_extra,
-            "command": command,
+            "command": executor_payload.label(executor_payload.INSPECTOR, action),
             "executor_uuid": executor_info.uuid,
             "inspector_action": action,
         }

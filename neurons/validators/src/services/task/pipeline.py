@@ -135,9 +135,7 @@ class ContextServices:
 
 @dataclass(frozen=True)
 class ContextConfig:
-    executor_root: str
     compute_rest_app_url: str
-    gpu_monitor_script_relative: str
     machine_scrape_filename: str
     machine_scrape_timeout: int
     obfuscation_keys: Any

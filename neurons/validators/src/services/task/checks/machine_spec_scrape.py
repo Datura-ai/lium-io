@@ -10,6 +10,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass, fields, replace
 from typing import Any, Literal
 
+from services import executor_payload
 from services.file_encrypt_service import ORIGINAL_KEYS
 from services.gpu_spec_table import classify_gpu_model, list_sxm_on_pcie_adapter_as_pcie
 
@@ -398,7 +399,7 @@ async def scrape_gpu_details(ctx: Context, timeout: int) -> list[dict[str, Any]]
     DAH-6469: GpuThermalThrottleCheck reads the cards under its own load with it. It writes nothing to ctx.state, so
     the checks after it keep the cycle's own scrape."""
     if ctx.config.machine_scrape_source:
-        command, stdin_text = f"{shlex.quote(ctx.executor.python_path)} -I -", ctx.config.machine_scrape_source
+        command, stdin_text = f"{shlex.quote(executor_payload.EXECUTOR_PYTHON)} -I -", ctx.config.machine_scrape_source
     elif ctx.state.remote_dir and ctx.config.machine_scrape_filename:
         command, stdin_text = _binary_command(ctx.state.remote_dir, ctx.config.machine_scrape_filename), None
     else:
@@ -666,7 +667,7 @@ class MachineSpecScrapeCheck:
         # from sys.path, so a file left next to the SSH login shell cannot shadow psutil or
         # json. It does not disable site processing: a .pth or sitecustomize inside the image
         # still runs and prints, which is what `_decrypt_payload` searches through.
-        command = f"{shlex.quote(ctx.executor.python_path)} -I -"
+        command = f"{shlex.quote(executor_payload.EXECUTOR_PYTHON)} -I -"
         scrape_run = await ctx.runner.run(
             command,
             timeout=timeout,
