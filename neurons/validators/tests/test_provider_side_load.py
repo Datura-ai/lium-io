@@ -1054,8 +1054,12 @@ async def test_a_record_older_than_any_backup_is_dropped(context_factory):
         age=5 * 3600,
     )
 
+    ctx.services.redis.delete = AsyncMock()
+
     assert await _provider_cores(ctx) == 8.9
     assert store == set()
+    # the reporter token goes with the record
+    ctx.services.redis.delete.assert_awaited_with(f"storage_reporter:{OPERATION}")
 
 
 @pytest.mark.asyncio

@@ -176,6 +176,8 @@ async def settle_excused_storage_helper_keys(
     async def drop_ended_records() -> None:
         for raw in ended:
             await redis.srem(_key(executor_id), raw)
+            if record := records.get(raw):
+                await redis.delete(_reporter_key(record.operation_id))
 
     if ended:
         await _redis_call(f"drop ended helpers of {executor_id}", drop_ended_records)
