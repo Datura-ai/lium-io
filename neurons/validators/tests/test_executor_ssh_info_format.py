@@ -35,6 +35,8 @@ def _info(**fields) -> ExecutorSSHInfo:
         {"port_mappings": "[[30000,40001],[30001,40002]]"},
         {"port_mappings": "[[60006, 60006]]"},
         {"port_mappings": ""},
+        # older executors send a port as a digit string
+        {"port_mappings": '[[22, "30001"]]'},
         {"ssh_host_key": KEY},
         {"ssh_host_key": f"{KEY} root@node-host_1"},
         {"ssh_host_key": None},
@@ -68,7 +70,9 @@ def test_the_fields_nodes_answer_with_pass(fields):
         {"port_range": "-oProxyCommand=x"},
         {"port_range": "1-2 $(id)"},
         {"port_mappings": "[[1, 2], [3]]"},
-        {"port_mappings": '[["1", 2]]'},
+        {"port_mappings": '[["1;id", 2]]'},
+        {"port_mappings": '[["-1", 2]]'},
+        {"port_mappings": '[["123456", 2]]'},
         {"port_mappings": "[[1, 70000]]"},
         {"port_mappings": "[[true, 2]]"},
         {"port_mappings": "{"},
@@ -83,9 +87,13 @@ def test_a_field_outside_its_format_is_refused(fields):
         _info(**fields)
 
 
-def test_the_validator_refuses_a_miner_answer_carrying_such_a_field():
-    # the validator parses the miner's answer with the same model, so a miner that skips the check gains nothing
+def test_the_validator_leaves_out_a_node_answered_with_such_a_field_and_keeps_its_siblings():
+    # the validator parses the miner's answer with the same model, so a miner that skips the check gains nothing;
+    # one node out of format does not cost the healthy nodes of the same answer their checks
     node = _info().model_dump(mode="json")
-    AcceptSSHKeyRequest.model_validate({"executors": [node]})
+    bad = {**node, "uuid": "bad", "python_path": "/bin/true; id"}
+    answer = AcceptSSHKeyRequest.model_validate({"executors": [node, bad], "known_executor_ids": ["node", "bad"]})
+    assert [e.uuid for e in answer.executors] == ["node"]
+    assert answer.known_executor_ids == ["node", "bad"]
     with pytest.raises(pydantic.ValidationError):
-        AcceptSSHKeyRequest.model_validate({"executors": [{**node, "python_path": "/bin/true; id"}]})
+        AcceptSSHKeyRequest.model_validate({"executors": "not a list"})

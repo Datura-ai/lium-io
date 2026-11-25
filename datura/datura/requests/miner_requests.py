@@ -56,6 +56,13 @@ SSH_PUBLIC_KEY_RE = re.compile(
 )
 
 
+def _is_port(port: object) -> bool:
+    # older executors send a port as a digit string; the validator's port_utils converts it with int()
+    if isinstance(port, str) and re.fullmatch(r"[0-9]{1,5}", port):
+        port = int(port)
+    return type(port) is int and 0 <= port <= 65535
+
+
 def _require(pattern: re.Pattern, value: str, field: str) -> str:
     if not pattern.fullmatch(value):
         raise ValueError(f"{field} is not in the expected format")
@@ -116,7 +123,7 @@ class ExecutorSSHInfo(pydantic.BaseModel):
         if not isinstance(pairs, list) or not all(
             isinstance(pair, list)
             and len(pair) == 2
-            and all(type(port) is int and 0 <= port <= 65535 for port in pair)
+            and all(_is_port(port) for port in pair)
             for pair in pairs
         ):
             raise ValueError("port_mappings is not in the expected format")
@@ -134,6 +141,22 @@ class AcceptSSHKeyRequest(BaseMinerRequest):
     message_type: RequestType = RequestType.AcceptSSHKeyRequest
     # The executors that accepted the validator's key.
     executors: list[ExecutorSSHInfo]
+
+    @pydantic.field_validator("executors", mode="before")
+    @classmethod
+    def _drop_malformed_executors(cls, value: object) -> object:
+        # an older miner forwards node answers unchecked: a node whose fields are out of format is left out alone,
+        # its siblings still get checked; it stays in known_executor_ids, so it reads as a node the miner could not use
+        if not isinstance(value, list):
+            return value
+        kept = []
+        for item in value:
+            try:
+                kept.append(ExecutorSSHInfo.model_validate(item))
+            except pydantic.ValidationError:
+                continue
+        return kept
+
     # DAH-3338: every executor the miner lists for this validator (and executor_id filter), whether
     # or not it accepted the key. An id here but not in `executors` is a node the miner knows and
     # could not reach — ExecutorUnreachable on the validator, not InvalidExecutorId. None from a
