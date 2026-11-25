@@ -181,6 +181,14 @@ async def unattachable_gpu_uuids(ctx: Context, reported_uuids: list[str]) -> lis
     return missing_gpu_uuids(reported_uuids, attachable) if attachable else []
 
 
+
+def _mark_unattachable(kernel_check_fields: dict, unattachable: list[str]) -> None:
+    kernel_check_fields["kernel_verdict"] = "unattachable"
+    kernel_check_fields["unattachable_uuids"] = unattachable
+    # also an availability entry: on a split node with a live pod the free card stayed listed
+    kernel_check_fields["reach_source"] = str(ReachSource.VALIDATOR)
+    kernel_check_fields["reach_target"] = str(ReachTarget.GPU)
+
 class GpuKernelCountCheck:
     """Cross-check the reported GPU list against the kernel's view of the cards.
 
@@ -240,8 +248,9 @@ class GpuKernelCountCheck:
             kernel_uuids=kernel_uuids,
         ).as_fields()
         kernel_check_fields["kernel_view_source"] = source
-        # a short list from the host stands (one host inventory per cycle, a later read never overrides it).
-        # As on main, it fails when the container list is short too; otherwise it is the host-view verdict,
+        # a short list from the host stands (one host inventory per cycle, a later read never overrides it) and
+        # gets main's verdict for what the container showed: a short container list fails (count_lower); one withheld
+        # behind a foreign mount gets the DAH-5519 attach lookup (unattachable); otherwise it is the host-view verdict,
         # enforced only behind the setting
         if kernel_check_fields["kernel_verdict"] == "count_lower" and source == KERNEL_VIEW_SOURCE_HOST:
             container_short = container.uuids is not None and evaluate_kernel_view(
@@ -249,7 +258,14 @@ class GpuKernelCountCheck:
             ).kernel_verdict == "count_lower"
             if container.uuids is not None:
                 kernel_check_fields["container_kernel_gpu_count"] = len(container.uuids)
-            if not container_short:
+            unattachable = (
+                await unattachable_gpu_uuids(ctx, reported_uuids)
+                if container.uuids is None and container.foreign_mounts
+                else []
+            )
+            if unattachable:
+                _mark_unattachable(kernel_check_fields, unattachable)
+            elif not container_short:
                 kernel_check_fields["kernel_verdict"] = "count_lower_host_view"
         if kernel_check_fields["kernel_verdict"] == "count_lower" and source != KERNEL_VIEW_SOURCE_HOST:
             kernel_check_fields["container_kernel_gpu_count"] = kernel_check_fields[
@@ -270,11 +286,8 @@ class GpuKernelCountCheck:
                 await unattachable_gpu_uuids(ctx, reported_uuids) if foreign_mounts else []
             )
             if unattachable:
-                verdict = kernel_check_fields["kernel_verdict"] = "unattachable"
-                kernel_check_fields["unattachable_uuids"] = unattachable
-                # also an availability entry: on a split node with a live pod the free card stayed listed
-                kernel_check_fields["reach_source"] = str(ReachSource.VALIDATOR)
-                kernel_check_fields["reach_target"] = str(ReachTarget.GPU)
+                _mark_unattachable(kernel_check_fields, unattachable)
+                verdict = "unattachable"
             else:
                 # DAH-6273: no container list, so the host's list decides
                 host_view = await host_view_verdict(

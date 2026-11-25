@@ -917,3 +917,46 @@ async def test_a_short_list_read_from_the_host_first_fails_when_enforced(
     assert result.updates == {"gpu_kernel_count_passed": False}
     assert result.event.reason_code == Msg.COUNT_MISMATCH.reason
     assert result.event.what_we_saw["kernel_verdict"] == "count_lower_host_view"
+
+
+STALE_CONTAINER_MOUNT = "/proc/driver/nvidia/gpus/0000:03:00.0 proc:/driver/nvidia/gpus/0000:03:00.0//deleted"
+
+
+def _host_short_container_withheld(context_factory, attachable):
+    ctx = _ctx(context_factory, reported=REAL[:2], kernel=REAL[:1], attachable=attachable)
+    state = replace(
+        ctx.state,
+        kernel_gpu_view_source="host_pid1_root",
+        container_kernel_gpu_uuids=None,
+        container_kernel_gpu_foreign_mounts=[STALE_CONTAINER_MOUNT],
+    )
+    return ctx.model_copy(update={"state": state})
+
+
+@pytest.mark.asyncio
+async def test_a_short_host_list_with_a_withheld_container_list_keeps_the_unattachable_verdict(
+    context_factory, check_enabled
+):
+    # DAH-5519 as on main: the container list behind a foreign mount, a card the create step cannot attach fails
+    ctx = _host_short_container_withheld(context_factory, attachable=REAL[:1])
+
+    result = await GpuKernelCountCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.updates == {"gpu_kernel_count_passed": False, "gpu_kernel_unattachable": True}
+    what = result.event.what_we_saw
+    assert what["kernel_verdict"] == "unattachable"
+    assert what["unattachable_uuids"] == [REAL[1]]
+    assert what["kernel_view_source"] == "host_pid1_root"
+
+
+@pytest.mark.asyncio
+async def test_a_short_host_list_with_a_withheld_container_list_and_every_card_attachable_is_gated(
+    context_factory, check_enabled
+):
+    ctx = _host_short_container_withheld(context_factory, attachable=REAL[:2])
+
+    result = await GpuKernelCountCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.what_we_saw["kernel_verdict"] == "count_lower_host_view"
