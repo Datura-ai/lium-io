@@ -6,7 +6,7 @@ The validator↔backend wire, once. Pydantic v2 models for:
 - `lium_protocol.backend_to_validator` — every message the backend sends down that socket (`BackendMessageType`, 19 types: container lifecycle, ssh keys, backups, Jupyter, the estimate request, the staging-only forced cycle, the one-node recheck), plus the three typeless replies it sends there (`SOCKET_REPLIES`: `Response`, `RentedMachineResponse`, `RevenuePerGpuTypeResponse` — no `message_type`, told apart by the request the validator is waiting for).
 - `lium_protocol.http` — the bodies of the backend HTTP API the validator reads between cycles (`HTTP_MODELS`, 10 bodies).
 
-No application code: nothing here imports the validator or the backend. `PROTOCOL_VERSION` (`2.22.0`) is semver over the wire.
+No application code: nothing here imports the validator or the backend. `PROTOCOL_VERSION` (`2.17.0`) is semver over the wire.
 
 ## Using it
 
@@ -88,7 +88,6 @@ To undo a wire change that is not released yet, `git revert` alone is not enough
 - `2.15.0` — `SshPubKeyRemoved.command_id` (optional, default empty): the `RemoveSshPublicKeysRequest`'s `command_id`, echoed, as `SshPubKeyAdded` does since 1.14.0; a removal's `FailedContainerRequest` echoes it too. The backend confirms a removal only on the answer to that send, so a delayed answer to an earlier send cannot confirm a later one. Empty from an older validator.
 - `2.17.0` — `ExecutorSpecRequest.rented_pod_faults` (optional): the rented pods this cycle's pod checks judged, by pod id, each with the host-side fault codes found on it (`RENTED_POD_PROC_FUSE_DISCONNECTED`: sysbox-fs died or restarted under the pod and its `/proc` answers "Transport endpoint is not connected"); `[]` = judged and clean, a pod not listed was not judged. None from an older validator and for a cycle that judged no pod.
 - `2.16.0` — `GpuResetErrorCode.GpusLostOnHost`: a renter's GPU reset found the GPUs gone from the host driver (the host GPU listing failed, timed out or came back empty); the provider has to reboot the host. The validator sends it once the backend accepts it; a validator released before that sends `ResetNotSupported` with the same detail for this case.
-- `2.22.0` — `PodGpuResetResult.pod_stopped`: whether the pod's container was down during the reset (its `docker stop` was sent, or an earlier reset had left it stopped); `false` when it was seen running and never touched (it runs as before, so `container_restarted` false does not mean it is stopped); `null` when not known (refused before its state was read, a lost session, or a validator before 2.22.0). A reset whose GPUs were all reset and whose container did not start again still goes with no `error_code` (`ok` false, each GPU `reset`, `container_restarted` false).
 - `1.0.0` — first release.
 
 ## Tests

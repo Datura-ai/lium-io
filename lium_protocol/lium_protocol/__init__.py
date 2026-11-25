@@ -8,12 +8,9 @@ Schema of all of it; `python -m lium_protocol.schema --check` fails when the mod
 Versioning: PROTOCOL_VERSION is semver over the wire, not over this code. Adding an optional field or an
 enum member is a minor bump; making a field required, removing one, or changing a type is a major bump
 (and a new snapshot file). Consumers pin a tag `lium-protocol-v<PROTOCOL_VERSION>` of lium-io.
-PRs that change the wire at the same time each take the next version above the base branch when they merge (CI's
-schema `--check` refuses an equal or lower one), and a validator that sends a new version's fields is released only
-after a backend that accepts that version is deployed.
 """
 
-PROTOCOL_VERSION = "2.22.0"
+PROTOCOL_VERSION = "2.17.0"
 
 from .backend_to_validator import BACKEND_MESSAGES, BackendMessage, BackendMessageType  # noqa: E402
 from .base import DeliveryStamps, Message, ProtocolError, Registry, WorkloadKind  # noqa: E402
