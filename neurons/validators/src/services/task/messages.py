@@ -413,32 +413,30 @@ class DiskHealthMessages:
 
 class GpuThermalThrottleMessages:
     THROTTLED = MessageTemplate(
-        event="GPU thermal throttling under load",
+        # the check names the cause in the event and remediation (gpu_thermal_throttle.CAUSES)
+        event="GPU throttled under load",
         reason="GPU_THERMAL_THROTTLE",
         severity="warning",
         category="env",
         impact="Proceed; score not changed (observation only)",
-        remediation="A busy GPU is held far below its clock by a thermal or hardware slowdown, or by a power cap "
-        "while its power limit is at the default (see gpus[]: temperature_c, graphics_clock_mhz, "
-        "max_graphics_clock_mhz, clocks_event_reasons, reasons). Check `nvidia-smi -q -d "
-        "PERFORMANCE,TEMPERATURE,POWER`, the fans, airflow, the power supply and the datacenter cooling; the "
-        "renter is getting a fraction of the card's speed.",
+        remediation="See gpus[]: causes, temperature_c, graphics_clock_mhz, max_graphics_clock_mhz, "
+        "clocks_event_reasons. A renter on this card gets a fraction of its speed. On a rented node, pause new "
+        "rentals and wait for running ones to end before work that shuts the node down.",
     )
     COLLAPSED = MessageTemplate(
-        event="GPU clock collapsed by thermal throttling",
+        event="GPU clock collapsed under load",
         reason="GPU_THERMAL_COLLAPSE",
         severity="error",
         # an availability error: the backend hides the node and refuses new rentals at once
         category=AVAILABILITY_CATEGORY,
         impact="Node hidden, job skipped and score set to 0 until the hold ends (see remediation)",
-        remediation="A busy GPU runs below half its max clock with a thermal or hardware slowdown set (see "
-        "gpus[], held_gpu_uuids: temperature_c, graphics_clock_mhz, max_graphics_clock_mhz, reasons). Fix the "
-        "cooling (fans, airflow, datacenter temperature; `nvidia-smi -q -d PERFORMANCE,TEMPERATURE`). The hold "
-        "ends when the card runs busy at half its max clock or more with no thermal slowdown (for example under "
-        "the Lium filler or the host's own load), or after 7 days, or when the card is replaced.",
+        remediation="A busy GPU runs below half its max clock with a slowdown the driver reports (see gpus[], "
+        "held_gpu_uuids: causes, temperature_c, graphics_clock_mhz, max_graphics_clock_mhz, reasons). The hold "
+        "ends when the card runs busy at half its max clock or more with no slowdown (for example under the Lium "
+        "filler or the host's own load), or after 7 days, or when the card is replaced.",
     )
     OK = MessageTemplate(
-        event="GPU clocks not thermally throttled",
+        event="GPU clocks not throttled",
         reason="GPU_THERMAL_THROTTLE_OK",
         severity="info",
         category="env",
@@ -605,13 +603,6 @@ class PostRentalGpuRecheckMessages:
         severity="info",
         category="env",
         impact="Proceed",
-    )
-    FILLER_SKIPPED = MessageTemplate(
-        event="Post-rental GPU recheck waits: active filler",
-        reason="POST_RENTAL_GPU_RECHECK_SKIPPED_ACTIVE_FILLER",
-        severity="info",
-        category="policy",
-        impact="Proceed; the recheck runs on a cycle without a filler, or after a few filler cycles anyway.",
     )
     INCONCLUSIVE = MessageTemplate(
         event="Post-rental GPU recheck gave no verdict",
@@ -780,6 +771,18 @@ class SpecChangeMessages:
         impact="Verification reset; score set to 0",
         remediation="Keep GPU configuration stable between checks.",
     )
+    SPEC_MODEL_CHANGED = MessageTemplate(
+        event="Other GPUs of another model",
+        reason="SPEC_CHANGED",
+        severity="warning",
+        category="env",
+        impact="Node stays unverified; score set to 0",
+        remediation=(
+            "Restore this node's original GPUs or point it back to its original machine. To register another machine "
+            "at the same IP and port, first free that address by updating the existing node's address or deleting "
+            "the existing node. A rented node cannot be deleted."
+        ),
+    )
     SPEC_UNCHANGED = MessageTemplate(
         event="GPU inventory stable",
         reason="SPEC_UNCHANGED",
@@ -790,8 +793,8 @@ class SpecChangeMessages:
 
 
 class GpuFingerprintMessages:
-    # A set that lost or gained cards (a full set of other cards is re-anchored, not this). Its what_we_saw carries
-    # `anchor_hard_would_be`: GPU_MISSING (only anchored cards missing) or ANCHOR_BROKEN (other cards among them).
+    # A set with cards outside the anchor (a full set of other cards is re-anchored, not this). Its what_we_saw
+    # carries `anchor_hard_would_be`: ANCHOR_BROKEN.
     UUID_CHANGED = MessageTemplate(
         event="GPU fingerprints changed",
         reason="GPU_UUID_CHANGED",
@@ -801,7 +804,7 @@ class GpuFingerprintMessages:
         remediation="Ensure every GPU of the node stays attached and visible. A node that comes back with the same "
         "number of GPUs, all of them other cards, is verified again on its own.",
     )
-    # Hard mode: the scrape lists a strict subset of the anchored set. Transient by definition: the node
+    # The scrape lists a strict subset of the anchored set. Transient by definition: the node
     # scores again on the first cycle that shows the full set.
     GPU_MISSING = MessageTemplate(
         event="GPU missing from the listed set",
@@ -1041,6 +1044,76 @@ class NeedrestartGuardMessages:
     OK = MessageTemplate(
         event="Host needrestart guard ok",
         reason="NEEDRESTART_GUARD_OK",
+        severity="info",
+        category="env",
+        impact="Proceed",
+    )
+
+
+class SysboxLayerResetMessages:
+    OUTDATED = MessageTemplate(
+        event="Host boot-time layer reset missing or old",
+        reason="SYSBOX_LAYER_RESET_OUTDATED",
+        severity="info",
+        category="env",
+        impact="Proceed; score not changed",
+        remediation=(
+            "After a power loss or hard reset, rented pods on this host come back with their files owned by the "
+            "host's root, so sudo and apt fail inside them. Run `sudo bash nvidia_docker_sysbox_setup.sh "
+            "--install-layer-reset` from lium-io neurons/executor on the host: it installs "
+            "lium-sysbox-layer-reset.service, runs nothing and restarts nothing."
+        ),
+    )
+    INSTALLED = MessageTemplate(
+        event="Host boot-time layer reset installed",
+        reason="SYSBOX_LAYER_RESET_INSTALLED",
+        severity="info",
+        category="env",
+        impact="Proceed",
+    )
+    INSTALL_FAILED = MessageTemplate(
+        event="Host boot-time layer reset could not be installed",
+        reason="SYSBOX_LAYER_RESET_INSTALL_FAILED",
+        severity="warning",
+        category="env",
+        impact="Proceed; score not changed",
+        remediation=OUTDATED.remediation,
+    )
+    REMOVE_PENDING = MessageTemplate(
+        event="Host boot-time layer reset to be removed",
+        reason="SYSBOX_LAYER_RESET_REMOVE_PENDING",
+        severity="info",
+        category="env",
+        impact="Proceed",
+    )
+    REMOVED = MessageTemplate(
+        event="Host boot-time layer reset removed",
+        reason="SYSBOX_LAYER_RESET_REMOVED",
+        severity="info",
+        category="env",
+        impact="Proceed",
+    )
+    REMOVE_FAILED = MessageTemplate(
+        event="Host boot-time layer reset could not be removed",
+        reason="SYSBOX_LAYER_RESET_REMOVE_FAILED",
+        severity="warning",
+        category="env",
+        impact="Proceed; score not changed",
+        remediation=(
+            "Run `sudo bash nvidia_docker_sysbox_setup.sh --remove-layer-reset` from lium-io neurons/executor on the "
+            "host: it removes lium-sysbox-layer-reset.service and Docker's drop-in for it, and restarts nothing."
+        ),
+    )
+    UNKNOWN = MessageTemplate(
+        event="Host boot-time layer reset not reported",
+        reason="SYSBOX_LAYER_RESET_UNKNOWN",
+        severity="info",
+        category="env",
+        impact="Proceed",
+    )
+    OK = MessageTemplate(
+        event="Host boot-time layer reset ok",
+        reason="SYSBOX_LAYER_RESET_OK",
         severity="info",
         category="env",
         impact="Proceed",
@@ -1430,9 +1503,23 @@ class InspectorMessages:
 
 
 class TenantEnforcementMessages:
+    HALF_STARTED_STOPS_RETRIED = MessageTemplate(
+        event="Pending stops of half-started pods retried",
+        reason="HALF_STARTED_STOPS_RETRIED",
+        severity="info",
+        category="runtime",
+        impact="Proceed",
+    )
     NOT_RENTED = MessageTemplate(
         event="Executor not rented",
         reason="EXECUTOR_NOT_RENTED",
+        severity="info",
+        category="policy",
+        impact="Proceed",
+    )
+    STILL_NOT_RENTED = MessageTemplate(
+        event="Executor still not rented after the parallel checks",
+        reason="EXECUTOR_STILL_NOT_RENTED",
         severity="info",
         category="policy",
         impact="Proceed",
@@ -1754,7 +1841,7 @@ NO_OUTBOUND_INTERNET_REMEDIATION = (
 
 
 class OutboundInternetMessages:
-    # the rental probe's egress step, under NO_OUTBOUND_INTERNET_ENFORCEMENT_ENABLED
+    # the rental probe's egress step
     NO_OUTBOUND_INTERNET = MessageTemplate(
         event="Containers cannot reach the internet",
         reason="NO_OUTBOUND_INTERNET",
@@ -1997,6 +2084,20 @@ class VerifyXMessages:
         severity="info",
         category="policy",
         impact="Rental probe gets this cycle's time to clear its standing failure; reused last-known VerifyX EMA",
+    )
+    NO_TASK_TIME = MessageTemplate(
+        event="VerifyX not finished: not enough task time left",
+        reason="VERIFYX_NO_TASK_TIME",
+        severity="warning",
+        category="policy",
+        impact=(
+            "No verdict this cycle; the node's last scored result stands. The validator's budget, not the node, "
+            "ended it"
+        ),
+        remediation=(
+            "The checks before VerifyX used most of the executor task's time, and VerifyX gets only what the checks "
+            "after it can spare. The next cycle runs it again."
+        ),
     )
     NO_SPECS = MessageTemplate(
         event="VerifyX validation skipped (no specs)",
@@ -2483,6 +2584,29 @@ class RentalVerificationMessages:
         category="policy",
         impact="Proceed",
     )
+    # the backend found a customer rental on the node, started after this cycle's snapshot: the node is scored as
+    # rented and no further check puts load on it
+    RENTED_SINCE_THE_SNAPSHOT = MessageTemplate(
+        event="Node rented during this check",
+        reason="RENTAL_STARTED_DURING_CHECK",
+        severity="info",
+        category="policy",
+        impact=(
+            "No verdict this cycle: the node's rentals changed during it, so no earlier result stands in; the next "
+            "cycle scores the node rented"
+        ),
+        remediation="No action needed.",
+    )
+    # the backend skipped its probe for a pod it still holds but no longer lists as a rental (one it is removing): no
+    # probe ran and the node is not rented, so the check fails instead of being held as a new rental
+    PROBE_SKIPPED_FOR_AN_UNLISTED_POD = MessageTemplate(
+        event="Rental probe skipped for a pod that is not a listed rental",
+        reason="RENTAL_PROBE_SKIPPED_UNLISTED_POD",
+        severity="warning",
+        category="policy",
+        impact="This cycle fails: the rental probe did not run, and the node has no listed rental",
+        remediation="No action needed if a rental on this node just ended; the next cycle probes the node again.",
+    )
     FAILED = MessageTemplate(
         event="Rental verification failed",
         reason="RENTAL_NOT_VERIFIED",
@@ -2547,6 +2671,17 @@ class RentalVerificationMessages:
         category="policy",
         impact="Proceed with existing rental status",
         remediation="Check backend API connectivity and logs",
+    )
+    NO_TASK_TIME = MessageTemplate(
+        event="Rental verification not run: not enough task time left",
+        reason="RENTAL_CHECK_NO_TASK_TIME",
+        severity="warning",
+        category="policy",
+        impact="This cycle fails; the backend's rental probe was not sent, so this is not a backend or API error",
+        remediation=(
+            "The checks before the rental verification used the executor task's time. A slow VerifyX download is "
+            "the usual cause: check the host's download speed. The next cycle runs it again."
+        ),
     )
     FILLER_VERIFIED = MessageTemplate(
         event="Lium default job runtime verified",
@@ -2725,13 +2860,6 @@ class SpecFloorMessages:
             "Report the machine's real specs: at least one CPU core, 4 GB of RAM per GPU, one card per "
             "counted GPU, and each card's own GPU UUID."
         ),
-    )
-    WARNING = MessageTemplate(
-        event="Hardware specs below the floor",
-        reason="SPEC_FLOOR_REJECTED",
-        severity="warning",
-        category="env",
-        impact="Warning only: score unchanged",
     )
 
 
@@ -3018,9 +3146,10 @@ class RentedPodResourcesMessages:
         category="runtime",
         impact="Proceed without penalty; the renter's pod cannot read /proc/sys",
         remediation=(
-            "The FUSE service behind the container's /proc (sysbox-fs) stopped or restarted, so the running "
-            "pod answers 'Transport endpoint is not connected'. Check `systemctl status sysbox`, restart it if "
-            "needed, then restart the pod container; tell the renter first."
+            "The pod's /proc/sys answers 'Transport endpoint is not connected': its FUSE connection to "
+            "sysbox-fs is gone. This read does not show why; a sysbox-fs restart under the pod is reported "
+            "separately as RENTED_POD_OWNERSHIP_RUNTIME_RESTARTED. Restarting sysbox breaks every other "
+            "running pod: contact support before changing anything on the host."
         ),
     )
     RESOURCES_UNKNOWN = MessageTemplate(
@@ -3126,7 +3255,9 @@ class RentedPodOwnershipMessages:
         severity="warning",
         category="runtime",
         impact="Proceed; pods running across a sysbox or NVIDIA fabric manager restart can lose /proc paths or NVLink",
-        remediation="A runtime service listed in runtime_restarted_under_pods started after the listed pods. "
+        remediation="A runtime service listed in runtime_restarted_under_pods started after the listed pods, at the "
+        "time in runtime_started_at (which can be days before this report; \"unknown\" when the host's boot time "
+        "could not be read). "
         "Contact support before changing anything on the host; restarting the pod alone does not repair it.",
     )
     UNREAD = MessageTemplate(
@@ -3208,7 +3339,8 @@ SSHD_BOOTSTRAP_REMEDIATION = (
     "\"/run/sshd must be owned by root and not group or world-writable\"). Fix the runtime/image setup so "
     "a fresh container gets a root-owned /run/sshd with mode 755, then check that `docker run --rm ubuntu sh -c "
     "'apt-get update -qq && apt-get install -y -qq openssh-server && mkdir -p /run/sshd && /usr/sbin/sshd -t'` "
-    "succeeds. The node is validated again once a new container on it starts sshd."
+    "succeeds. Each validation cycle starts sshd in a fresh container on the node again; the node is validated again the "
+    "cycle sshd starts there."
 )
 
 
@@ -3254,3 +3386,15 @@ class SshdAuthLogMessages:
         category="runtime",
         impact="Proceed; observation only",
     )
+
+
+# DAH-5933: the run left the backend's rental probe, or VerifyX, too little time; the validator's budget, not the
+# node, decides that, so it is no failed check: an idle node carries its last scored result too
+NO_TASK_TIME_REASONS = (RentalVerificationMessages.NO_TASK_TIME.reason, VerifyXMessages.NO_TASK_TIME.reason)
+# results the cycle's snapshot cannot score, held for the cycle-end rented read: a budget stop (above), or a node the
+# backend found rented after the snapshot listed it idle (its GPU count and pool come from that read, never the snapshot)
+CYCLE_END_READ_REASONS = (*NO_TASK_TIME_REASONS, RentalVerificationMessages.RENTED_SINCE_THE_SNAPSHOT.reason)
+# DAH-5933 review at ea74f37: a budget stop after a check that already zeroed the cycle's score. Its own code, since
+# the last event before the stop can be one a rollout withholds (a warn-only EXECUTOR_IMAGE_OUTDATED): no rule withholds
+# or carries this one, so the zero is published as it is
+ZEROED_BEFORE_THE_BUDGET_STOP = "SCORE_ZEROED_BEFORE_THE_TASK_TIME_RAN_OUT"

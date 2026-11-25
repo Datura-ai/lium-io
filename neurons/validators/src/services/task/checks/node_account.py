@@ -22,6 +22,7 @@ fails, times out or closes without an exit status (a relay can stall it) is refu
 from __future__ import annotations
 
 from core.utils import _m, get_extra_info, get_logger
+from clients.validator_portal_api import portal_owner_hotkeys
 from services.node_host import host_key_body, is_ip_literal, registered_host_keys
 
 from ..messages import NodeAccountMessages as Msg, render_message
@@ -96,7 +97,9 @@ class NodeAccountCheck:
             # the read worked and found no host files: an older executor, no evidence either way
             logger.info(_m("NODE_ACCOUNT_BINDING_UNVERIFIED", extra=get_extra_info({**what, "unread": "hotkey"})))
             return None
-        if hotkey not in executor.expected_node_hotkeys:
+        if hotkey not in executor.expected_node_hotkeys and hotkey not in portal_owner_hotkeys(ctx.miner_hotkey):
+            # DAH-6740: the listing owner's other accounts, as this validator read them from the portal itself; the
+            # list a miner relays is never widened
             what["binding_mismatch"] = "hotkey"
         elif expected_claim and hotkey == ctx.miner_hotkey and claim and claim != expected_claim:
             # a node set up for the listing (pool) hotkey proves its account only by the claim; one set up for the

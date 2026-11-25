@@ -198,6 +198,8 @@ sudo ./nvidia_docker_sysbox_setup.sh
 
 The installer also gives `sysbox-fs` and `sysbox-mgr` 90 s to start and restarts them on failure (`/etc/systemd/system/<service>.service.d/lium-restart.conf`), so a slow boot no longer leaves Sysbox down. On a node set up before this, run the installer again; adding these files restarts no service. If Sysbox is down after a reboot, run `sudo systemctl restart sysbox`.
 
+The installer also installs `lium-sysbox-layer-reset.service`: after a power loss or hard reset it gives each pod's files back to the pod before Docker starts, so sudo and apt keep working inside rented pods. Validators will install it on Sysbox nodes that lack it or run an older one, while no pod is rented on them (not released yet); to install it now, run `sudo ./nvidia_docker_sysbox_setup.sh --install-layer-reset`. It only writes the unit and a Docker drop-in: it runs no reset and restarts nothing, so running pods are not touched. It needs `/usr/bin/python3` on the host. Docker starts after the reset whether it worked or not, and a reset gets 15 minutes at most, so it never keeps Docker or the executor down. To take it out, run `sudo ./nvidia_docker_sysbox_setup.sh --remove-layer-reset`: it disables and removes the unit and Docker's drop-in, and restarts nothing.
+
 Verify sysbox is working correctly with gpu
 ```shell
 docker run --rm --runtime=sysbox-runc --gpus all daturaai/compute-subnet-executor:latest nvidia-smi

@@ -125,6 +125,8 @@ ORIGINAL_KEYS = {
     # DAH-5059: kB per container name (writable layer + its anonymous volumes) and per volume name
     'hard_disk_by_container': "by_container",
     'hard_disk_by_volume': "by_volume",
+    # DAH-6981: containers with a volume no read could size this scrape (their size is unknown, not partial)
+    'hard_disk_unsized_containers': "unsized_containers",
     'data_os': "os",
     'data_kernel': "kernel",
     'kernel_scrape_error': "kernel_scrape_error",
@@ -152,6 +154,7 @@ ORIGINAL_KEYS = {
     'each_container_id': "container_id",
     'each_digest': "digest",
     'each_name': "name",
+    'each_repository': "repository",
     'each_cpu_percent': "cpu_percent",
     'each_net_rx_bytes': "net_rx_bytes",
     'each_net_tx_bytes': "net_tx_bytes",
@@ -191,7 +194,10 @@ ORIGINAL_KEYS = {
     'data_executor_pid_mode': "executor_pid_mode",
     'data_needrestart_guard_scrape_error': "needrestart_guard_scrape_error",
     'data_needrestart_guard_unguarded': "needrestart_guard_unguarded",
+    'data_needrestart_guard_reason': "needrestart_guard_reason",
     'data_needrestart_guard': "needrestart_guard",
+    'data_sysbox_layer_reset_version': "sysbox_layer_reset_version",
+    'data_sysbox_layer_reset_scrape_error': "sysbox_layer_reset_scrape_error",
     'data_nvidiactl_owner_uid': "nvidiactl_owner_uid",
     'data_power_cap_probe_error': "power_cap_probe_error",
     # DAH-2922: GPU interconnect summary (nvidia-smi topo). The scrape
@@ -218,6 +224,27 @@ ORIGINAL_KEYS = {
     'dh_read_only_mounts': "read_only_mounts",
     'dh_write_probe_error': "write_probe_error",
     'dh_write_probe': "write_probe",
+    # DAH-6379: host memory facts, same prefix rule (longer key first)
+    'data_host_memory_scrape_error': "host_memory_scrape_error",
+    'data_host_memory': "host_memory",
+    'hm_errors': "errors",
+    'hm_mem_total_kb': "mem_total_kb",
+    'hm_mem_available_kb': "mem_available_kb",
+    'hm_swap_total_kb': "swap_total_kb",
+    'hm_swap_used_kb': "swap_used_kb",
+    'hm_shmem_kb': "shmem_kb",
+    'hm_page_cache_kb': "page_cache_kb",
+    'hm_hugepages_total': "hugepages_total",
+    'hm_hugepages_free': "hugepages_free",
+    'hm_hugepage_size_kb': "hugepage_size_kb",
+    'hm_mapped_outside_workloads_kb': "mapped_outside_workloads_kb",
+    'hm_mapped_kb': "mapped_kb",
+    'hm_workload_containers': "workload_containers",
+    'hm_outside_workloads_no_cache_kb': "outside_workloads_no_cache_kb",
+    'hm_outside_workloads_kb': "outside_workloads_kb",
+    'hm_oom_kills_since_boot': "oom_kills_since_boot",
+    'hm_last_oom_kind': "last_oom_kind",
+    'hm_last_oom_at': "last_oom_at",
 }
 
 
@@ -344,6 +371,7 @@ class FileEncryptService:
             'hard_disk_engy_cache_used_gb': "",
             'hard_disk_by_container': "",
             'hard_disk_by_volume': "",
+            'hard_disk_unsized_containers': "",
             'data_os': "",
             'data_kernel': "",
             'kernel_scrape_error': "",
@@ -376,6 +404,7 @@ class FileEncryptService:
             'each_container_id': "",
             'each_digest': "",
             'each_name': "",
+            'each_repository': "",
             'each_cpu_percent': "",
             'each_net_rx_bytes': "",
             'each_net_tx_bytes': "",
@@ -414,7 +443,10 @@ class FileEncryptService:
             'data_executor_pid_mode': "",
             'data_needrestart_guard_scrape_error': "",
             'data_needrestart_guard_unguarded': "",
+            'data_needrestart_guard_reason': "",
             'data_needrestart_guard': "",
+            'data_sysbox_layer_reset_version': "",
+            'data_sysbox_layer_reset_scrape_error': "",
             'data_nvidiactl_owner_uid': "",
             'data_power_cap_probe_error': "",
             # DAH-2922 - longer keys before the key they extend (prefix rule above)
@@ -438,6 +470,27 @@ class FileEncryptService:
             'dh_read_only_mounts': "",
             'dh_write_probe_error': "",
             'dh_write_probe': "",
+            # DAH-6379 - longer keys before the key they extend (prefix rule above)
+            'data_host_memory_scrape_error': "",
+            'data_host_memory': "",
+            'hm_errors': "",
+            'hm_mem_total_kb': "",
+            'hm_mem_available_kb': "",
+            'hm_swap_total_kb': "",
+            'hm_swap_used_kb': "",
+            'hm_shmem_kb': "",
+            'hm_page_cache_kb': "",
+            'hm_hugepages_total': "",
+            'hm_hugepages_free': "",
+            'hm_hugepage_size_kb': "",
+            'hm_mapped_outside_workloads_kb': "",
+            'hm_mapped_kb': "",
+            'hm_workload_containers': "",
+            'hm_outside_workloads_no_cache_kb': "",
+            'hm_outside_workloads_kb': "",
+            'hm_oom_kills_since_boot': "",
+            'hm_last_oom_kind': "",
+            'hm_last_oom_at': "",
         }
 
         # Names must be unique: the validator reverses this map, so a shared name loses a key.
@@ -489,8 +542,6 @@ class FileEncryptService:
 
         Returns: MinerJobEnryptedFiles
         """
-        tmp_directory = self.fresh_job_files_directory(keep_directories)
-
         # file pathes
         machine_scrape_file_path = str(
             Path(__file__).parent / ".." / "miner_jobs/machine_scrape.py"
@@ -504,7 +555,11 @@ class FileEncryptService:
 
         # run obfuscator.py to generate obfuscated_machine_scrape.py
         command = [sys.executable, obfuscator_machine_scrape_file_path, machine_scrape_file_path]
-        subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)  # noqa
+        # a failed run must not leave the previous build's output to be read below
+        Path(obfuscated_machine_scrape_file_path).unlink(missing_ok=True)
+        subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)  # noqa
+        # after the run: a failed one leaves the previous cycle's directory in place
+        tmp_directory = self.fresh_job_files_directory(keep_directories)
 
         with open(obfuscated_machine_scrape_file_path) as file:
             obfuscated_content = file.read()

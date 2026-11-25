@@ -1,0 +1,487 @@
+name: Pinned actions
+
+# no path filter: an action manifest can live anywhere in the repo, and a required check must report on every PR
+# the check that judges a PR or a merge-queue candidate must come from the protected main branch, never from the candidate:
+# the organization ruleset in .github/rulesets/pinned-actions-required-workflow.json requires this file at refs/heads/main
+# on pull_request and merge_group in this repository, so GitHub runs main's copy whatever a PR or queued group changes here.
+# The candidate's tree is checked out as data only (nothing from it runs, and the token is read-only)
+on:
+  pull_request:
+    # edited: a retarget to main (a stacked PR) with no new push still gets this repository run. The ruleset-required run
+    # ignores these types, so a retarget starts no required run: a PR whose head has no required result yet (one opened
+    # against another branch) waits, unmergeable, until a push or a close and reopen starts it. It never merges unscanned
+    # (.github/rulesets/README.md)
+    types: [opened, synchronize, reopened, edited]
+  merge_group:
+    types: [checks_requested]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# no concurrency group: a ruleset-required run that GitHub cancels before it reports leaves the required check pending
+
+jobs:
+  check:
+    # GitHub runs a ruleset workflow on pull_request in a repository other than its source (lium) only when the job has a
+    # condition (docs: Troubleshooting rules, Supported directory); this one is always true
+    if: true
+    name: pinned-actions  # carries the ruleset's up-to-date (strict) rule only; trust comes from the required run itself
+    runs-on: ubuntu-24.04  # its /usr/bin/python3 ships the distro PyYAML the check imports below
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        # the commit that will land: a PR's HEAD commit, not its merge ref (a merge ref depends on the base, and a retarget
+        # changes the base without a new run; with main required to be an ancestor of the head, the merged tree IS the head's
+        # tree), the queued group's commit, or main. A fork's head commit is fetched from this repository's pull refs
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      # every workflow and action this run can execute pins third-party code to a commit and images to a digest, never to a
+      # movable tag: the tracked files at this commit, then every pinned action or reusable workflow they call, fetched at
+      # its pinned commit. This repository's own actions and reusable workflows are called at the running commit ($/ or a
+      # job-level ./) and scanned here. The files are parsed as YAML so quoting and spacing cannot hide a reference
+      - name: All actions are pinned to commit SHAs
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          # the runner image's own distro PyYAML (Ubuntu's python3-yaml): no package index and no copied parser in this
+          # repo, so an index outage cannot stop the scan; a runner without it fails red on the import, never unscanned
+          /usr/bin/python3 -I - <<'PY'
+          import os, pathlib, posixpath, re, subprocess, sys, urllib.error, urllib.parse, urllib.request, yaml
+
+          class Loader(yaml.SafeLoader):
+              """GitHub's YAML: only true/false are booleans (PyYAML's 1.1 rules make yes/on/no/off booleans too,
+              so the job IDs yes and on both became True and one job replaced the other), and a repeated key is
+              an error, not a silent replacement."""
+              def construct_mapping(self, node, deep=False):
+                  keys = [self.construct_object(k, deep=deep) for k, _ in node.value]
+                  dup = {repr(k) for k in keys if keys.count(k) > 1}
+                  if dup:
+                      raise yaml.constructor.ConstructorError(None, None, f"duplicate key(s) {', '.join(sorted(dup))}", node.start_mark)
+                  return super().construct_mapping(node, deep=deep)
+          Loader.yaml_implicit_resolvers = {
+              ch: [(tag, rx) for tag, rx in rs if tag != "tag:yaml.org,2002:bool"]
+              for ch, rs in yaml.SafeLoader.yaml_implicit_resolvers.items()
+          }
+          for ch in "tTfF":
+              Loader.yaml_implicit_resolvers.setdefault(ch, []).insert(0, ("tag:yaml.org,2002:bool", re.compile(r"^(?:true|True|TRUE|false|False|FALSE)$")))
+
+          digest = r"docker://[^@\s]+@sha256:[0-9a-f]{64}"
+          remote = re.compile(r"([^/@\s]+/[^/@\s]+)(?:/([^@\s]+))?@([0-9a-f]{40})")
+          # the runner reads the scheme case-insensitively, so DOCKER:// must not slip past the checks
+          norm = lambda ref: re.sub(r"^docker://", "docker://", str(ref), flags=re.I)
+          is_digest = lambda img: re.fullmatch(digest, "docker://" + re.sub(r"^docker://", "", str(img), flags=re.I)) is not None
+          # a pinned action's own calls are followed this many levels down, and at most this many remote files are read in all:
+          # past either bound the check fails, it never passes what it did not read. The read budget is sized to the real
+          # graph (14 reads in lium-io, 9 in lium at the time of writing) so one run cannot spend much of the shared token quota
+          MAX_DEPTH, MAX_FETCHES = 5, 50
+
+          class TooMany(Exception):
+              pass
+
+          class Unreadable(Exception):
+              """a file that exists but cannot be read as text: reported as not checkable, never skipped"""
+
+          def flat(steps, odd):
+              """Each step and every step in a parallel group under it, at any depth: GitHub runs those children with the job's
+              permissions too. A steps value that is not a list of mappings goes to odd()."""
+              if steps is None:
+                  return
+              if not isinstance(steps, list):
+                  odd(f"steps {steps!r:.80}")
+                  return
+              for step in steps:
+                  if not isinstance(step, dict):
+                      odd(f"step {step!r:.80}")
+                      continue
+                  yield step
+                  group = step.get("parallel")
+                  yield from flat(group.get("steps") if isinstance(group, dict) else group, odd)
+
+          def scan(files, fetch, own):
+              """files: workflows and action manifests tracked at this commit. fetch(repo, path, sha) returns a file's text, or None
+              when it does not exist; repo None is this commit's tree. own is this repository (owner/name). A pinned third-party
+              action or reusable workflow is fetched at its commit and scanned by the same rules, so a tag anywhere in what a run
+              executes fails the check."""
+              cache = {}
+              def get(repo, path, at):
+                  if (repo, path, at) not in cache:
+                      if repo is not None and sum(k[0] is not None for k in cache) >= MAX_FETCHES:
+                          raise TooMany
+                      try:
+                          cache[(repo, path, at)] = fetch(repo, path, at)
+                      except Unreadable as e:
+                          cache[(repo, path, at)] = e  # it exists: a lookup finds it, and the scan reports it as not checkable
+                  return cache[(repo, path, at)]
+              bad, queue, seen = [], [(None, str(f), None, 0, None) for f in files], set()
+              # one rule for every input the scan cannot read or does not recognise: it fails as not checkable, never passes
+              odd = lambda what: bad.append(f"{where}: not checkable: {what}")
+              try:
+                  while queue:
+                      repo, path, at, depth, want = queue.pop(0)
+                      if (repo, path, at, want) in seen:
+                          continue
+                      seen.add((repo, path, at, want))
+                      where = f"{repo}/{path}@{at}" if repo else path
+                      text = get(repo, path, at)
+                      if isinstance(text, Unreadable):
+                          odd(text)
+                          continue
+                      try:
+                          doc = yaml.load(text, Loader=Loader) if text is not None else None
+                      except Exception as e:
+                          bad.append(f"{where}: not checkable: {e}".replace("\n", " "))
+                          continue
+                      if not isinstance(doc, dict):
+                          bad.append(f"{where}: not a readable workflow or action manifest")
+                          continue
+                      # a fetched file counts only when it holds what the runner takes from it (runs: for an action, jobs: for
+                      # a reusable workflow); any other mapping is not that file, so it fails rather than passing with nothing to scan
+                      if repo is not None and want and not isinstance(doc.get(want), dict):
+                          bad.append(f"{where}: not checkable: no {want} mapping")
+                          continue
+                      jobs, runs = doc.get("jobs"), doc.get("runs")
+                      if jobs is not None and not isinstance(jobs, dict):
+                          odd(f"jobs {jobs!r:.80}")
+                          jobs = None
+                      if runs is not None and not isinstance(runs, dict):
+                          odd(f"runs {runs!r:.80}")
+                          runs = None
+                      for name, job in (jobs or {}).items():
+                          if not isinstance(job, dict):
+                              odd(f"job {name} {job!r:.80}")
+                      jobs, runs = [j for j in (jobs or {}).values() if isinstance(j, dict)], runs or {}
+                      steps = [step for job in jobs for step in flat(job.get("steps"), odd)] + list(flat(runs.get("steps"), odd))
+                      # these actions start a registry image that their own default names by a mutable tag
+                      # (buildkit:buildx-stable-1, binfmt:latest). They are accepted in one shape only, the one this
+                      # repository uses: an allowlist, not a model of their parsers. setup-buildx-action (8d2750c)
+                      # trims the input, splits records at LF, CRLF and CR (csv-parse, quote off), and passes each
+                      # record as a --driver-opt; Buildx then splits it again as CSV with quotes into key=value, the
+                      # last key winning. Its other inputs (driver, endpoint, append, version, ...) choose a builder
+                      # or binary this scan cannot pin. So with: holds driver-opts alone: one option per line, exactly
+                      # one image=<ref>@sha256:<digest> and any env.<NAME>=<value> (Buildx keeps env.* apart from the
+                      # image). The reference follows Docker's grammar (lowercase path, optional registry port, a tag of
+                      # up to 128 word characters); no allowed character is a separator, quote, space or dollar
+                      comp = r"[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*"
+                      pinned = (r"(?:[a-zA-Z0-9-]+(?:\.[a-zA-Z0-9-]+)*(?::[0-9]+)?/)?" + comp + r"(?:/" + comp + r")*"
+                                r"(?::[A-Za-z0-9_][A-Za-z0-9_.-]{0,127})?@sha256:[0-9a-f]{64}")
+                      env = r"env\.[A-Za-z_][A-Za-z0-9_]*=[A-Za-z0-9._/:@+=-]*"
+                      for step in steps:
+                          # the action the runner resolves (repository and normalized directory, as the manifest lookup
+                          # below reads it), not the literal uses text, so every spelling of the root gets the input check
+                          m = remote.fullmatch(str(step.get("uses") or ""))
+                          name = m[1].lower() if m and posixpath.normpath(m[2] or ".") == "." else None
+                          args = step.get("with")
+                          if name == "docker/setup-buildx-action":
+                              opts = args.get("driver-opts") if isinstance(args, dict) else None
+                              lines = [ln.strip(" ") for ln in opts.strip(" \n").split("\n")] if isinstance(opts, str) else []
+                              ok = (set(args or {}) == {"driver-opts"} and sum(bool(re.fullmatch("image=" + pinned, ln)) for ln in lines) == 1
+                                    and all(re.fullmatch("image=" + pinned, ln) or re.fullmatch(env, ln) for ln in lines))
+                              if not ok:
+                                  bad.append(f"{where}: {name}: with: driver-opts: image=<image>@sha256:<digest> and env.* lines only")
+                          elif name == "docker/setup-qemu-action":
+                              # setup-qemu-action (c7c5346) passes with.image as one docker argument and platforms after --install
+                              ok = (isinstance(args, dict) and "image" in args and set(args) <= {"image", "platforms"}
+                                    and isinstance(args["image"], str) and re.fullmatch(pinned, args["image"])
+                                    and re.fullmatch(r"[A-Za-z0-9/_.,-]+", str(args.get("platforms", "all"))))
+                              if not ok:
+                                  bad.append(f"{where}: {name}: with: image: <image>@sha256:<digest> (and platforms) only")
+                      refs = [("job", job.get("uses")) for job in jobs] + [("step", step.get("uses")) for step in steps]
+                      for level, ref in refs:
+                          if ref is None:
+                              continue
+                          ref = str(ref)
+                          if "\\" in ref:
+                              # the runner and this scan would read a backslash differently, so the manifest checked may not be the one run
+                              odd(f"{ref}: a backslash in uses")
+                              continue
+                          if ref.startswith(("./", "$/")):
+                              # the file's own repository at the file's commit: this commit here, the pinned commit in a fetched file
+                              p = posixpath.normpath(ref[2:])
+                              if level == "job":
+                                  if get(repo, p, at) is None:
+                                      bad.append(f"{where}: {ref} is not a workflow at that commit")
+                                  else:
+                                      queue.append((repo, p, at, depth, "jobs"))
+                              elif ref.startswith("./"):
+                                  # the runner resolves a step's ./ in the job's workspace at run time, which any earlier step
+                                  # can change; $/ resolves at the running commit instead
+                                  bad.append(f"{where}: {ref}: a step-level ./ action is not accepted, use $/{p}")
+                              else:
+                                  man = next((n for n in (posixpath.normpath(f"{p}/{n}") for n in ("action.yml", "action.yaml")) if get(repo, n, at) is not None), None)
+                                  if man:
+                                      queue.append((repo, man, at, depth, "runs"))
+                                  else:
+                                      bad.append(f"{where}: {ref} has no action manifest at that commit")
+                              continue
+                          if norm(ref).startswith("docker://"):
+                              if not re.fullmatch(digest, norm(ref)):
+                                  bad.append(f"{where}: {ref}")
+                              continue
+                          m = remote.fullmatch(ref)
+                          if not m:
+                              bad.append(f"{where}: {ref}")
+                              continue
+                          if repo is None and m[1].lower() == own.lower():
+                              # a commit of this repository may never reach main (a squash merge), and is not scanned here
+                              bad.append(f"{where}: {ref}: call this repository's own code as $/{posixpath.normpath(m[2] or '.')}")
+                              continue
+                          if depth >= MAX_DEPTH:
+                              bad.append(f"{where}: {ref}: nested more than {MAX_DEPTH} levels deep")
+                              continue
+                          r, sub, sha = m[1], posixpath.normpath(m[2] or "."), m[3]
+                          names = [sub] if level == "job" else [posixpath.normpath(f"{sub}/{n}") for n in ("action.yml", "action.yaml")]
+                          man = next((n for n in names if get(r, n, sha) is not None), None)
+                          if man:
+                              queue.append((r, man, sha, depth + 1, "jobs" if level == "job" else "runs"))
+                          else:
+                              bad.append(f"{where}: {ref} has no readable workflow or action manifest at that commit")
+                      # a Docker action runs a registry image by digest, written docker://...@sha256: (the runner prepares any other
+                      # value as a Dockerfile build, which pulls what its file says, unread here)
+                      image = runs.get("image")
+                      if image is not None and not re.fullmatch(digest, norm(image)):
+                          bad.append(f"{where}: runs.image {image}: docker://<image>@sha256:<digest> only")
+                      # job containers and services start before the steps, with the job's token: digest only
+                      for job in jobs:
+                          container, services = job.get("container"), job.get("services")
+                          images = [container.get("image") if isinstance(container, dict) else container]
+                          # a service is a mapping with image: or the image itself as a scalar; the runner accepts both
+                          if isinstance(services, dict):
+                              images += [svc.get("image") if isinstance(svc, dict) else svc for svc in services.values()]
+                          elif services is not None:
+                              odd(f"services {services!r:.80}")
+                          for img in images:
+                              # GitHub skips a service (and the runner a job container) whose image is empty: nothing starts
+                              if img is None or img == "":
+                                  continue
+                              if not isinstance(img, str):
+                                  odd(f"container/service image {img!r:.80}")
+                              elif not is_digest(img):
+                                  bad.append(f"{where}: container/service image {img}")
+              except TooMany:
+                  bad.append(f"more than {MAX_FETCHES} pinned actions and workflows to read: not checked, so not accepted")
+              return bad
+
+          # regression self-test on an in-memory tree (repo, path, commit) -> text, before the real scan
+          sha, s2, s3, dig = "a" * 40, "b" * 40, "c" * 40, "@sha256:" + "0" * 64
+          comp = "runs:\n  using: composite\n  steps:\n"
+          img = "runs:\n  using: docker\n  image: "
+          node = "runs:\n  using: node20\n  main: index.js\n"
+          base = {
+              (None, ".github/actions/ok/action.yml", None): comp + "    - uses: acme/act@" + sha + "\n",
+              (None, ".github/actions/yaml/action.yaml", None): "runs: {}\n",
+              (None, ".github/workflows/ok.yml", None): "on: push\n",
+              (None, "action.yml", None): comp + "    - uses: acme/act@" + sha + "\n",
+              (None, ".github/actions/bin/action.yml", None): Unreadable("not UTF-8"),
+              ("acme/bin", "action.yml", sha): Unreadable("not UTF-8"),
+              ("acme/act", "action.yml", sha): node,
+              ("actions/checkout", "action.yml", sha): node,
+              ("docker/setup-buildx-action", "action.yml", sha): node,
+              ("docker/setup-qemu-action", "action.yml", sha): node,
+              ("acme/act", "action.yml", s2): comp + "    - uses: acme/leaf@v1\n",
+              ("vendor/comp", "sub/action.yml", sha): comp + "    - uses: acme/act@" + s2 + "\n",
+              ("vendor/comp", "ws/action.yml", sha): comp + "    - uses: ./x\n",
+              ("vendor/comp", "own/action.yml", sha): comp + "    - uses: $/lib\n",
+              ("vendor/comp", "lib/action.yml", sha): comp + "    - uses: acme/act@" + s2 + "\n",
+              ("acme/wf", ".github/workflows/outer.yml", sha): "jobs:\n  a:\n    uses: ./.github/workflows/inner.yml\n",
+              ("acme/wf", ".github/workflows/inner.yml", sha): "jobs:\n  a:\n    steps:\n      - uses: acme/act@v1\n",
+              ("acme/loop", "action.yml", s3): comp + "    - uses: acme/loop@" + s3 + "\n",
+              ("acme/img", "action.yml", sha): img + "Dockerfile\n",
+              ("acme/img", "action.yml", s2): img + "docker://alpine" + dig + "\n",
+              ("acme/img", "action.yml", s3): img + "alpine" + dig + "\n",
+              # a mapping that is neither manifest: an API answer about a path, not the file the runner loads
+              ("acme/meta", "action.yml", sha): '{"type": "dir", "name": "action.yml"}\n',
+              ("acme/wf", ".github/workflows/meta.yml", sha): '{"type": "dir", "name": "meta.yml"}\n',
+              ("acme/wf", ".github/workflows/clean.yml", sha): "jobs:\n  a:\n    steps:\n      - uses: acme/act@" + sha + "\n",
+          }
+          for i in range(MAX_DEPTH + 1):
+              base[(f"acme/deep{i}", "action.yml", sha)] = comp + f"    - uses: acme/deep{i + 1}@{sha}\n"
+          base[(f"acme/deep{MAX_DEPTH + 1}", "action.yml", sha)] = node
+          fan = "".join(f"    - uses: acme/fan{i}@{sha}\n" for i in range(MAX_FETCHES + 1))
+          base.update({(f"acme/fan{i}", "action.yml", sha): node for i in range(MAX_FETCHES + 1)})
+          step = lambda ref: "jobs:\n  a:\n    steps:\n      - uses: " + ref + "\n"
+          par = lambda ref: "jobs:\n  a:\n    steps:\n      - parallel:\n          - run: x\n          - parallel:\n              - uses: " + ref + "\n"
+          cases = {
+              "jobs:\n  yes:\n    steps:\n      - uses: acme/act@v1\n  on:\n    steps:\n      - uses: acme/act@" + sha + "\n": 1,
+              "jobs:\n  a:\n    steps:\n      - uses: acme/act@v1\n  a:\n    steps:\n      - uses: acme/act@" + sha + "\n": 1,
+              "jobs:\n  yes:\n    steps:\n      - uses: acme/act@" + sha + "\n  on:\n    steps:\n      - uses: acme/act@" + sha + "\n": 0,
+              # a step-level ./ action always fails (here and in a pinned composite); a same-commit reusable workflow must be tracked
+              "jobs:\n  a:\n    steps:\n      - uses: ./.github/actions/ok\n      - uses: ./.github/actions/ok/\n  b:\n    uses: ./.github/workflows/ok.yml\n  c:\n    uses: ./.github/workflows/gen.yml\n": 3,
+              comp + "    - uses: actions/checkout@" + sha + "\n      with:\n        ref: main\n    - uses: ./tools/release\n": 1,
+              "jobs:\n  b:\n    uses: ./.github/workflows/ok.yml\n  c:\n    uses: $/.github/workflows/ok.yml\n": 0,
+              step("$/.github/actions/ok"): 0,
+              step("$/.github/actions/yaml/"): 0,
+              step("$/.github/actions/none"): 1,
+              step("$/../outside"): 1,
+              step("acme/self/.github/actions/ok@" + sha): 1,  # own code by commit: $/ instead
+              step("acme/act@" + sha): 0,
+              step("acme/act@v1"): 1,
+              step("acme/act@" + s2): 1,  # its own step uses a tag, whoever owns the action
+              step("vendor/comp/sub@" + sha): 1,  # two levels down
+              step("vendor/comp/ws@" + sha): 1,  # a workspace action inside a pinned one
+              step("vendor/comp/own@" + sha): 1,  # its $/ child, at its commit, uses a tag
+              step("acme/none@" + sha): 1,
+              step("acme/meta@" + sha): 1,  # no runs: mapping
+              "jobs:\n  a:\n    uses: acme/wf/.github/workflows/meta.yml@" + sha + "\n": 1,  # no jobs: mapping
+              "jobs:\n  a:\n    uses: acme/wf/.github/workflows/clean.yml@" + sha + "\n": 0,
+              step("acme/loop@" + s3): 0,  # a cycle ends
+              step("acme/deep0@" + sha): 1,  # deeper than the bound
+              "jobs:\n  a:\n    uses: acme/wf/.github/workflows/outer.yml@" + sha + "\n": 1,  # its ./ child, at that commit
+              comp + fan: 1,  # more remote files than the bound: fails closed
+              par("acme/act@v1"): 1,  # a tag in a nested parallel group
+              par("acme/act@" + sha): 0,
+              comp.replace("steps:", "steps:\n    - parallel:\n        steps:\n          - uses: acme/act@v1"): 1,
+              step("acme/img@" + sha): 1,
+              step("acme/img@" + s2): 0,
+              step("acme/img@" + s3): 1,  # a digest without docker:// is prepared as a build
+              step("docker://alpine:3"): 1,
+              step("DOCKER://alpine" + dig): 0,
+              img + "alpine\n": 1,
+              img + "alpine" + dig + "\n": 1,
+              img + "ghcr.io/acme/img" + dig + "\n": 1,
+              img + "docker://ghcr.io/acme/img" + dig + "\n": 0,
+              img + "DOCKER://ghcr.io/acme/img" + dig + "\n": 0,
+              img + "Dockerfile\n": 1,
+              img + "docker/build.DOCKERFILE\n": 1,
+              img + "Dockerfile.x" + dig + "\n": 1,
+              # job containers and services keep bare digests: the runner pulls those from a registry as written
+              "jobs:\n  a:\n    container: alpine:3\n    services:\n      db:\n        image: postgres" + dig + "\n": 1,
+              "jobs:\n  a:\n    container: alpine" + dig + "\n": 0,
+              # a scalar service image is checked like the mapping form
+              "jobs:\n  a:\n    services:\n      db: postgres:16\n": 1,
+              "jobs:\n  a:\n    services:\n      db: postgres" + dig + "\n": 0,
+              step("$/."): 0,  # the repository's root action
+              step("$/./"): 0,
+              # an empty image starts nothing (GitHub skips the service, the runner skips the job container)
+              "jobs:\n  a:\n    services:\n      db:\n        image: ''\n": 0,
+              "jobs:\n  a:\n    container: ''\n": 0,
+              "jobs:\n  a:\n    container:\n      image: ''\n": 0,
+              # a value that is not an image string is not checkable, never skipped
+              "jobs:\n  a:\n    container: false\n": 1,
+              "jobs:\n  a:\n    container: 0\n": 1,
+              "jobs:\n  a:\n    container:\n      image: false\n": 1,
+              "jobs:\n  a:\n    services:\n      db: 0\n": 1,
+              "jobs:\n  a:\n    services:\n      db:\n        image: 0\n": 1,
+              # \x24 spells the dollar sign: a literal dollar-brace-brace here is evaluated by Actions and breaks the template
+              "jobs:\n  a:\n    services: \x24{{ fromJSON(vars.S) }}\n": 1,
+              "jobs: x\n": 1,
+              "jobs:\n  a: x\n": 1,
+              "jobs:\n  a:\n    steps: x\n": 1,
+              "jobs:\n  a:\n    steps:\n      - x\n": 1,
+              step("$/.github/actions/bin"): 1,  # a manifest that is not text
+              step("acme/bin@" + sha): 1,
+              step("$/.\\sub"): 1,  # a backslash in a ref
+              step("$/x\\..\\sub"): 1,
+              step("$/sub\\"): 1,
+              # BuildKit and binfmt images by digest, in the one accepted shape (one case per parser rule below)
+              step("docker/setup-buildx-action@" + sha + "\n        with:\n          driver-opts: image=moby/buildkit:v0.33.1" + dig): 0,
+              step("docker/setup-buildx-action@" + sha + "\n        with:\n          driver-opts: |\n            image=ghcr.io/acme/buildkit-image" + dig): 0,  # a block scalar's newline
+              step("docker/setup-buildx-action@" + sha): 1,  # the default image tag
+              step("docker/setup-buildx-action@" + sha + "\n        with:\n          driver-opts: image=moby/buildkit:v1"): 1,
+              step("docker/setup-buildx-action@" + sha + "\n        with:\n          driver-opts: image=moby/buildkit" + dig[:-1]): 1,  # a short digest
+              # records: LF, CRLF and CR each start another --driver-opt
+              step("docker/setup-buildx-action@" + sha + "\n        with:\n          driver-opts: |\n            image=moby/buildkit" + dig + "\n            image=acme/buildkit" + dig): 1,
+              step("docker/setup-buildx-action@" + sha + "\n        with:\n          driver-opts: \"image=moby/buildkit" + dig + "\\r\\nimage=acme/buildkit" + dig + "\""): 1,
+              step("docker/setup-buildx-action@" + sha + "\n        with:\n          driver-opts: \"image=moby/buildkit" + dig + "\\rimage=acme/buildkit" + dig + "\""): 1,
+              # fields: Buildx splits a record at commas, honours quotes, and keeps the last key
+              step("docker/setup-buildx-action@" + sha + "\n        with:\n          driver-opts: image=moby/buildkit" + dig + ",image=acme/buildkit" + dig): 1,
+              step("docker/setup-buildx-action@" + sha + "\n        with:\n          driver-opts: '\"image=moby/buildkit" + dig + "\"'"): 1,
+              step("docker/setup-buildx-action@" + sha + "\n        with:\n          driver-opts: image=moby/buildkit" + dig + " network=host"): 1,
+              step("docker/setup-buildx-action@" + sha + "\n        with:\n          driver-opts: |\n            image=moby/buildkit" + dig + "\n            env.IMAGE_MODE=debug"): 0,  # env.* is kept apart from the image
+              step("docker/setup-buildx-action@" + sha + "\n        with:\n          driver-opts: |\n            env.A=x,image=acme/buildkit" + dig + "\n            image=moby/buildkit" + dig): 1,  # a comma inside an env value
+              step("docker/setup-buildx-action@" + sha + "\n        with:\n          driver-opts: |\n            image=moby/buildkit" + dig + "\n            cgroup-parent=x"): 1,  # any other option
+              # keys are matched exactly, as Buildx does
+              step("docker/setup-buildx-action@" + sha + "\n        with:\n          driver-opts: IMAGE=moby/buildkit" + dig): 1,
+              step("docker/setup-buildx-action@" + sha + "\n        with:\n          driver-opts: image =moby/buildkit" + dig): 1,
+              # characters the YAML value can carry that a parser could read as a separator, and expressions
+              step("docker/setup-buildx-action@" + sha + "\n        with:\n          driver-opts: \"image=moby/buildkit" + dig + "\\t\""): 1,
+              step("docker/setup-buildx-action@" + sha + "\n        with:\n          driver-opts: \"image=moby/buildkit" + dig + "\\u2028\""): 1,
+              # \x24 spells the dollar sign: an expression is expanded after this scan
+              step("docker/setup-buildx-action@" + sha + "\n        with:\n          driver-opts: image=moby/buildkit\x24{{ vars.D }}"): 1,
+              step("docker/setup-buildx-action@" + sha + "\n        with:\n          driver-opts: \x24{{ vars.BUILDKIT_OPT }}"): 1,
+              # every other input chooses a builder or binary this scan cannot pin
+              step("docker/setup-buildx-action@" + sha + "\n        with:\n          driver-opts: image=moby/buildkit" + dig + "\n          driver: remote\n          endpoint: tcp://acme:1234"): 1,
+              step("docker/setup-buildx-action@" + sha + "\n        with:\n          driver-opts: image=moby/buildkit" + dig + "\n          append: |\n            - driver-opts: image=acme/buildkit:latest"): 1,
+              step("docker/setup-buildx-action@" + sha + "\n        with:\n          driver-opts: image=moby/buildkit" + dig + "\n          version: latest"): 1,
+              step("docker/setup-buildx-action@" + sha + "\n        with:\n          driver: docker"): 1,
+              "jobs:\n  a:\n    steps:\n      - uses: docker/setup-buildx-action@" + sha + "\n        with: \x24{{ fromJSON(vars.W) }}\n": 1,
+              step("docker/setup-qemu-action@" + sha): 1,
+              step("docker/setup-qemu-action@" + sha + "\n        with:\n          image: docker.io/tonistiigi/binfmt:qemu-v10.2.3" + dig): 0,
+              step("docker/setup-qemu-action@" + sha + "\n        with:\n          image: tonistiigi/binfmt:latest"): 1,
+              step("docker/setup-qemu-action@" + sha + "\n        with:\n          image: tonistiigi/binfmt" + dig + "\n          platforms: arm64,riscv64"): 0,
+              step("docker/setup-qemu-action@" + sha + "\n        with:\n          image: tonistiigi/binfmt" + dig + "\n          platforms: arm64 --x"): 1,
+              step("docker/setup-qemu-action@" + sha + "\n        with:\n          image: tonistiigi/binfmt" + dig + "\n          cache-image: false"): 1,
+              step("docker/setup-qemu-action@" + sha + "\n        with:\n          image: ghcr.io/acme/binfmt:RC1" + dig): 0,  # a tag may hold upper case
+              step("docker/setup-buildx-action@" + sha + "\n        with:\n          driver-opts: image=ghcr.io/example/buildkit:RC1" + dig): 0,
+              step("docker/setup-buildx-action@" + sha + "\n        with:\n          driver-opts: image=localhost:5000/buildkit" + dig): 0,  # a registry port
+              step("docker/setup-buildx-action@" + sha + "\n        with:\n          driver-opts: image=ghcr.io/Acme/buildkit" + dig): 1,  # the path is lower case
+              step("docker/setup-buildx-action@" + sha + "\n        with:\n          driver-opts: image=moby/buildkit:v1:v2" + dig): 1,
+              # an equivalent spelling of the action's root is the same action: same input check, same result
+              step("docker/setup-buildx-action/.@" + sha): 1,
+              step("docker/setup-buildx-action/x/..@" + sha): 1,
+              step("docker/setup-buildx-action/.@" + sha + "\n        with:\n          driver-opts: image=moby/buildkit" + dig): 0,
+              step("docker/setup-qemu-action/.@" + sha): 1,
+              step("docker/setup-qemu-action/x/..@" + sha): 1,
+              step("docker/setup-qemu-action/.@" + sha + "\n        with:\n          image: tonistiigi/binfmt" + dig): 0,
+          }
+          for i, (text, want) in enumerate(cases.items()):
+              tree = {**base, (None, f"w/case{i}.yml", None): text}
+              def tfetch(r, p, at):
+                  v = tree.get((r, p, at))
+                  if isinstance(v, Unreadable):
+                      raise v
+                  return v
+              got = scan([f"w/case{i}.yml"], tfetch, "acme/self")
+              assert len(got) == want, (i, got)
+
+          # the organization ruleset requires this exact file on lium-io's main (.github/rulesets/
+          # pinned-actions-required-workflow.json): a lium-io candidate that renames or removes it would leave every later
+          # candidate in lium-io and lium without the required run, so it fails here. Other repositories have no such file
+          SOURCE_REPO, SOURCE_PATH = "datura-ai/lium-io", ".github/workflows/pinned-actions.yml"
+          source_missing = lambda tracked, repo: repo.lower() == SOURCE_REPO and SOURCE_PATH not in tracked
+          assert source_missing(set(), "Datura-ai/lium-io") and not source_missing({SOURCE_PATH}, "Datura-ai/lium-io")
+          assert not source_missing(set(), "Datura-ai/lium")
+
+          tracked = set(subprocess.run(["git", "ls-files", "-z"], capture_output=True, text=True, check=True).stdout.split("\0"))
+          root = pathlib.Path.cwd().resolve()
+
+          def local(path):
+              """A tracked file's text, read as data: a symlink (to a file outside the tree or inside it) fails the check, so a
+              PR's tree can never make this step read anything but its own regular files."""
+              p = root / path
+              if any(q.is_symlink() for q in [p, *p.parents] if q != root and root in q.parents) or not p.resolve().is_relative_to(root):
+                  sys.exit(f"{path}: a symlink in the tree; workflows and action manifests must be regular files")
+              try:
+                  return p.read_text()
+              except UnicodeDecodeError:
+                  raise Unreadable(f"{path} is not UTF-8 text") from None
+
+          reads = []
+          def fetch(repo, path, at):
+              if repo is None:
+                  return local(path) if path in tracked else None
+              reads.append(path)
+              url = f"https://api.github.com/repos/{repo}/contents/{urllib.parse.quote(path)}?ref={at}"
+              req = urllib.request.Request(url, headers={"Accept": "application/vnd.github.raw", "Authorization": f"Bearer {os.environ['GITHUB_TOKEN']}"})
+              try:
+                  with urllib.request.urlopen(req, timeout=30) as resp:
+                      return resp.read().decode()
+              except urllib.error.HTTPError as e:
+                  if e.code != 404:  # only a missing file may fall back (action.yml -> action.yaml); anything else fails the check
+                      sys.exit(f"cannot read {repo}/{path}@{at}: HTTP {e.code}")
+                  return None  # not found: the scan reports it, never skips it
+              except UnicodeDecodeError:
+                  raise Unreadable(f"{repo}/{path}@{at} is not UTF-8 text") from None
+              except (urllib.error.URLError, TimeoutError) as e:
+                  sys.exit(f"cannot read {repo}/{path}@{at}: {e}")
+
+          # every tracked action manifest, wherever it lives, and every workflow
+          actions = sorted(p for p in tracked if posixpath.basename(p) in ("action.yml", "action.yaml"))
+          files = sorted(str(p) for p in pathlib.Path(".github/workflows").glob("*.y*ml")) + actions
+          bad = scan(files, fetch, os.environ["GITHUB_REPOSITORY"])
+          if source_missing(tracked, os.environ["GITHUB_REPOSITORY"]):
+              bad.append(f"{SOURCE_PATH}: the ruleset's required workflow must stay at this path in {SOURCE_REPO}")
+          print("\n".join(bad) or f"all pinned ({len(files)} files, {len(reads)} remote reads)")
+          sys.exit(1 if bad else 0)
+          PY

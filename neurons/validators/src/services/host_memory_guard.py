@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import logging
 import shlex
+from collections.abc import Awaitable, Callable
+from typing import Any
 
 from core.utils import _m, get_extra_info
 
@@ -22,7 +24,7 @@ logger = logging.getLogger(__name__)
 TIMEOUT_SECONDS = 30
 MIB = 1024 * 1024
 # protection per host unit, MiB. Only what a unit really uses is protected, so a generous value costs
-# nothing; the sum stays under the pod's minimum host RAM reserve (4 GiB).
+# nothing; the sum stays under the pod's minimum host RAM reserve (8 GiB).
 UNIT_MEMORY_MIN_MIB = {
     "ssh.service": 128,
     "sshd.service": 128,
@@ -82,12 +84,22 @@ def parse_guard_output(stdout: str) -> dict:
     return result
 
 
-async def apply_host_memory_guard(ssh, log_extra: dict | None = None) -> dict:
-    """Never raises: a host this cannot reach keeps running as before. Returns parse_guard_output's dict."""
+async def apply_host_memory_guard(
+    ssh,
+    log_extra: dict | None = None,
+    run: Callable[[str], Awaitable[Any]] | None = None,
+    reraise: tuple[type[BaseException], ...] = (),
+) -> dict:
+    """Never raises, except an error in `reraise`: a host this cannot reach keeps running as before. `run` replaces
+    ssh.run(script, timeout=TIMEOUT_SECONDS), e.g. with a run that frees the channel on a timeout. Returns
+    parse_guard_output's dict."""
     extra = log_extra or {}
     try:
-        res = await ssh.run(host_memory_guard_script(), timeout=TIMEOUT_SECONDS)
+        script = host_memory_guard_script()
+        res = await (run(script) if run is not None else ssh.run(script, timeout=TIMEOUT_SECONDS))
         result = parse_guard_output(getattr(res, "stdout", "") or "")
+    except reraise:
+        raise
     except Exception as exc:  # noqa: BLE001
         result = {"set": [], "failed": [f"ssh {exc!r}"]}
     if result["set"]:

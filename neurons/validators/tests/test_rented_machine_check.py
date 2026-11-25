@@ -16,6 +16,7 @@ from neurons.validators.src.core.docker_utils import DockerCommand, _collect_hos
 from neurons.validators.src.services.task.checks.rented_machine import (
     RENTAL_STATE_UNKNOWN_MAX_HELD,
     RENTAL_STATE_UNKNOWN_PREFIX,
+    HalfStartedStopRetryCheck,
     TenantEnforcementCheck,
     _collect_pod_diagnostics,
 )
@@ -465,6 +466,90 @@ async def test_tenant_enforcement_skips_pod_not_running_when_backend_says_inacti
     assert backend.called_with == ["pod-1"]
     assert "clear_verified_job_info" not in result.updates
     assert "clear_verified_job_reason" not in result.updates
+
+
+@pytest.mark.asyncio
+async def test_a_pod_a_halt_judged_closed_is_not_judged_again_later_in_the_run(context_factory):
+    """DAH-5933 review: a later rented halt in the same run looked the closed pod up again, and an unanswered lookup
+    then read as a live rental. A pod an earlier halt judged closed is not judged again."""
+    from neurons.validators.src.services.task.checks.rented_machine import RentedSinceStartCheck
+
+    rented_data = build_rented_data(
+        "executor-123", {"containers": [{"name": "tenant-123", "pod_id": "pod-1"}], "owner_flag": False}
+    )
+    backend = DummyBackendClient(active=False)
+    services = build_services(
+        score_calculator=DummyScoreCalculator(actual_score=1.0, job_score=1.0, warning=""),
+        container_cleanup=MockContainerCleanup(),
+        backend=backend,
+    )
+    ctx = context_factory(
+        services=services,
+        config=build_context_config(),
+        state=build_state(gpu_processes=[], gpu_details=[], gpu_model="NVIDIA RTX 4090", rented_data=rented_data),
+        ssh=DummySSHClient(pod_running=False),
+        collateral_deposited=True,
+        is_rental_succeed=True,
+        contract_version="v1.0.0",
+    )
+    halt = RentedSinceStartCheck(TenantEnforcementCheck())
+
+    first = await halt.run(ctx)
+    assert first.event.reason_code == Msg.STALE_POD_NOT_RUNNING.reason
+    ctx = ctx.model_copy(update=first.updates)
+    backend.active = None  # the next lookup would go unanswered
+
+    second = await halt.run(ctx)
+
+    assert second.passed is True and not second.halt
+    assert second.event.reason_code == "EXECUTOR_STILL_NOT_RENTED"
+    assert ctx.rented is False
+    assert backend.called_with == ["pod-1"]
+
+
+@pytest.mark.asyncio
+async def test_a_pod_judged_closed_that_a_fresh_rental_read_lists_again_is_halted(context_factory):
+    """DAH-5933 review: a pod judged closed (rental active, pod stopped) that the renter restarts during the run, and
+    that a later rental read lists again running, must be halted before the next GPU workload; the earlier verdict
+    stands only for the listing it judged."""
+    from dataclasses import replace
+
+    from neurons.validators.src.services.task.checks.rented_machine import RentedSinceStartCheck
+
+    rented_data = build_rented_data(
+        "executor-123", {"containers": [{"name": "tenant-123", "pod_id": "pod-1"}], "owner_flag": False}
+    )
+    backend = DummyBackendClient(active=False)
+    services = build_services(
+        score_calculator=DummyScoreCalculator(actual_score=1.0, job_score=1.0, warning=""),
+        container_cleanup=MockContainerCleanup(),
+        backend=backend,
+    )
+    ctx = context_factory(
+        services=services,
+        config=build_context_config(),
+        state=build_state(gpu_processes=[], gpu_details=[], gpu_model="NVIDIA RTX 4090", rented_data=rented_data),
+        ssh=DummySSHClient(pod_running=False),
+        collateral_deposited=True,
+        is_rental_succeed=True,
+        contract_version="v1.0.0",
+    )
+    halt = RentedSinceStartCheck(TenantEnforcementCheck())
+
+    first = await halt.run(ctx)
+    assert first.event.reason_code == Msg.STALE_POD_NOT_RUNNING.reason
+    ctx = ctx.model_copy(update=first.updates)
+    # the renter restarted the pod; a later check's rental read lists it again, running
+    backend.active = True
+    fresh_read = rented_data.model_copy(deep=True)
+    ctx = ctx.model_copy(
+        update={"state": replace(ctx.state, rented_data=fresh_read), "ssh": DummySSHClient(pod_running=True)}
+    )
+
+    second = await halt.run(ctx)
+
+    assert second.halt is True
+    assert second.event.reason_code != "EXECUTOR_STILL_NOT_RENTED"
 
 
 @pytest.mark.asyncio
@@ -1439,6 +1524,28 @@ async def test_tenant_enforcement_defers_a_pod_its_own_restore_stopped_to_the_ne
     docker.recover_parked_pod_container.assert_not_awaited()
     assert result.updates["default_extra"]["pods_stopped_by_validator"] == ["pod-1"]
     assert _pod_states(result)["pod-1"] == "exited"
+
+
+@pytest.mark.asyncio
+async def test_the_half_started_stop_check_retries_the_nodes_pending_stops_and_never_fails(context_factory):
+    # F-31: a failed start whose stop and kill failed left a pod possibly running unmounted, rented or not
+    docker = AsyncMock()
+    docker.retry_pending_half_started_stops.side_effect = ConnectionError("redis down")
+    ctx = build_recovery_context(context_factory, DummySSHClient(pod_running=True, ssh_keys=[]), docker)
+
+    result = await HalfStartedStopRetryCheck().run(ctx)
+
+    assert result.passed and not result.halt
+    assert docker.retry_pending_half_started_stops.await_args.kwargs["executor_info"] is ctx.executor
+
+
+@pytest.mark.parametrize("build", [PipelineFactory.build_checks, PipelineFactory.build_fast_path_checks])
+def test_pending_half_started_stops_are_retried_before_any_check_that_can_halt_the_cycle(build):
+    # gateway review: a fatal check before TenantEnforcementCheck (a maintenance window) skipped the retry all window
+    checks = build()
+    at = next(i for i, check in enumerate(checks) if isinstance(check, HalfStartedStopRetryCheck))
+    assert not any(getattr(check, "fatal", True) for check in checks[:at])
+    assert not any(isinstance(check, HalfStartedStopRetryCheck) for check in PipelineFactory.build_dry_run_checks())
 
 
 @pytest.mark.parametrize("stop_outcome", ["failed", "unknown"])
