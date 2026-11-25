@@ -209,12 +209,12 @@ async def test_a_successful_edit_runs_the_same_host_commands(svc, monkeypatch):
         # the layer read again on the stopped container, before the replacement exists
         _layer_data_check(f"id-{name}", "/root"),
         '/usr/bin/docker volume ls --format "{{.Name}}"',
-        # the hung-GPU check on the stopped pod first reads which host services an earlier GPU reset left stopped
-        # (DAH-6741): a reset whose restore never ran must not leave Fabric Manager down until a GPU hangs again
-        STOPPED_UNITS_READ_COMMAND,
         # the live power floor read twice: beside the volume create, and again right before docker run
         "nvidia-smi --query-gpu=uuid,power.limit,power.default_limit,power.min_limit,power.max_limit"
         " --format=csv,noheader,nounits",
+        # the hung-GPU check on the stopped pod first reads which host services an earlier GPU reset left stopped
+        # (DAH-6741): a reset whose restore never ran must not leave Fabric Manager down until a GPU hangs again
+        STOPPED_UNITS_READ_COMMAND,
         # no parsed probe here: one inspect asks whether the pod (or its parked copy) is on the host
         f"/usr/bin/docker container inspect {name} >/dev/null 2>&1"
         f" || /usr/bin/docker container inspect {name}{EDIT_PARKED_SUFFIX} >/dev/null 2>&1"
