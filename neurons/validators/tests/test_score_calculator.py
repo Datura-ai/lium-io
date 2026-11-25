@@ -4,7 +4,13 @@ via integration in test_score_check.py and test_pipeline_default_scenarios.py.
 """
 import pytest
 
-from neurons.validators.src.services.task.score_calculator import calculate_scores
+from dataclasses import replace
+from types import SimpleNamespace
+
+from protocol.vc_protocol.compute_requests import NetworkEMA
+
+from services.executor_image_policy import ImageVerdict
+from neurons.validators.src.services.task.score_calculator import calculate_scores, zero_score_gate_failed
 from neurons.validators.src.services.task.checks.verifyx import MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS
 from helpers import build_context_config, build_services, build_state, default_executor, make_context
 
@@ -218,3 +224,48 @@ def test_node_account_flag_zeroes_a_rented_score(passed):
     actual_score, _, warning = calculate_scores(ctx, rented=True)
     assert actual_score == (1.0 if passed else 0.0)
     assert ("not on the machine its account registered" in warning) is not passed
+
+
+_GATE_FLAGS = (
+    "cpu_truth_passed", "spec_floor_passed", "provider_side_load_passed", "rented_pod_resources_passed",
+    "rented_throughput_passed", "gpu_attestation_identity_passed", "cc_vbios_passed", "hardware_identity_passed",
+    "kernel_gpu_view_passed", "gpu_kernel_count_passed", "gpu_model_passed", "node_account_passed",
+)
+
+
+def _unofficial(ctx):
+    report = SimpleNamespace(status=ImageVerdict.UNOFFICIAL)
+    return ctx.model_copy(update={"state": replace(ctx.state, executor_image_report=report)})
+
+
+@pytest.mark.parametrize(
+    "zeroed",
+    [
+        *[lambda ctx, f=flag: ctx.model_copy(update={f: False}) for flag in _GATE_FLAGS],
+        # review at 4d7bf12: zero-score branches that are no boolean flag
+        lambda ctx: ctx.model_copy(update={"executor": ctx.executor.model_copy(update={"price_per_gpu": 1e9})}),
+        _unofficial,
+    ],
+)
+@pytest.mark.parametrize("rented", [False, True])
+def test_every_zero_score_branch_leaves_a_budget_stop_nothing_to_carry(zeroed, rented):
+    # zero_score_gate_failed tells a budget stop it has no pass to stand in for: it must see every branch that zeroes
+    passing = _ctx(500.0).model_copy(update={"rented": rented})
+    ctx = zeroed(passing)
+    assert not zero_score_gate_failed(passing)
+    assert calculate_scores(ctx, rented=rented)[0] == 0.0
+    assert zero_score_gate_failed(ctx)
+
+
+@pytest.mark.parametrize("ema_on_record", [False, True])
+def test_a_verifyx_speed_not_on_record_is_no_failure_for_a_budget_stop(ema_on_record):
+    # review at ea74f37: a new node reaches the stop before VerifyX measured it, or the backend snapshot omits its
+    # EMA; the score check still zeroes a full run without one, the budget stop does not count it as a failure
+    ctx = _ctx_without_specs({})
+    if ema_on_record:
+        ctx = ctx.model_copy(
+            update={"state": replace(ctx.state, rented_data=SimpleNamespace(network_ema={ctx.executor.uuid: NetworkEMA(
+                ema_verifyx_download_speed=500.0, ema_verifyx_upload_speed=None)}))}
+        )
+    assert calculate_scores(ctx, rented=False)[0] == 0.0
+    assert not zero_score_gate_failed(ctx)

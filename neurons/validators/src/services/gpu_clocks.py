@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING, Literal
 
 from payload_models.payloads import GpuClockOutcome, GpuResetErrorCode
 from services.gpu_reset import (
+    _QUERY_TIMEOUT_SECONDS,
     DOCKER,
     HOST_GPUS_COMMAND,
     GpuResetRefused,
@@ -44,11 +45,25 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 CLOCK_LOCK_KEY_PREFIX = "gpu_clock_lock:"
-# its own budget, after the -rgc batch: a stalled -rac/-rmc never costs the -rgc results (review)
+# its own budget, after the -rgc batch in the same call: the host kills a stalled -rac/-rmc (half each), so it never
+# costs the -rgc results (review)
 APP_MEM_CLOCK_RESET_TIMEOUT_SECONDS = 30
+# the -rgc batch's budget, then the -rac/-rmc one, with a margin: the call answers before the runner gives up
+_RESET_CALL_TIMEOUT_SECONDS = _QUERY_TIMEOUT_SECONDS + APP_MEM_CLOCK_RESET_TIMEOUT_SECONDS + 10
 # 3 = "not supported": a GPU without application or memory clock control
 _APP_MEM_RESET_OK_EXITS = {"0", "3"}
 CLOCK_LOCK_POD_KEY_PREFIX = "gpu_clock_lock_pod:"
+
+
+def _rgc_failure(code: str) -> str:
+    return f"nvidia-smi -rgc failed (exit {code})"
+
+
+# a completed -rgc refusal by a GPU whose clocks cannot be changed from here: 3 "not supported", 4 "insufficient
+# permissions" (a passthrough VM), as -lgc answers for the lock (_record_and_lock): no clock lock to undo
+_NO_CLOCK_CONTROL = {_rgc_failure("3"), _rgc_failure("4")}
+# no "<uuid> <exit>" line for the GPU: the SSH call timed out or lost its answer (the runner answers -1, no output)
+_NO_ANSWER = "nvidia-smi -rgc gave no answer"
 # one per GPU uuid this validator ever changed; a few thousand at most, never freed
 _GPU_LOCKS: dict[str, asyncio.Lock] = {}
 
@@ -114,27 +129,35 @@ def build_clock_command(
     return f"nvidia-smi -i {shlex.quote(uuid)} -lgc {int(min_mhz)},{int(max_mhz)}"
 
 
-def _reset_app_and_memory_clocks(uuid: str) -> str:
-    q = shlex.quote(uuid)
-    return "; ".join(f"nvidia-smi -i {q} {flag} >/dev/null 2>&1; echo {q} {flag} $?" for flag in ("-rac", "-rmc"))
-
-
-async def _reset_app_and_memory_clocks_of(runner: SSHCommandRunner, uuids: list[str]) -> None:
+def _reset_app_and_memory_clocks(uuids: list[str]) -> str:
     """Application clocks (-ac, or any process once the host ran -acp UNRESTRICTED) and locked memory clocks (-lmc)
-    back to default, so a create never hands a renter clocks the host or the last pod lowered. Best effort, after the
-    -rgc batch and in its own call: it never changes a GPU's -rgc verdict or its lock record. Exits other than 0 and 3
-    (not supported), a timeout and a lost answer are logged."""
-    try:
-        result = await _run(
-            runner,
-            "; ".join(_reset_app_and_memory_clocks(u) for u in uuids),
-            timeout=APP_MEM_CLOCK_RESET_TIMEOUT_SECONDS,
-        )
-        stdout = result.stdout or ""
-    except Exception as exc:
-        stdout = ""
-        logger.warning("gpu_clock_action=rac_rmc_failed error=%s", exc)
-    exits = {(p[0], p[1]): p[2] for p in (line.split() for line in stdout.splitlines()) if len(p) >= 3}
+    back to default, so a create never hands a renter clocks the host or the last pod lowered. Each GPU's -rac then
+    -rmc runs in the background so every GPU resets at once: one after another, the 16 nvidia-smi runs of an 8-GPU
+    H200/B300 node outlast the budget and no clock is reset (prod, 18-19 Nov). The batch runs after the -rgc batch in
+    the same SSH call (one round trip on the create's path), so a stalled reset never costs the -rgc results and none
+    outlives the call: each nvidia-smi is the direct child of its own SIGKILL timeout (half the budget, -rac then
+    -rmc), because uutils timeout (Ubuntu 26.04) signals only its direct child, so one timeout around the batch left
+    the background resets running (lio#2362 merge queue). No timeout wraps the batch: GNU timeout gives each inner
+    timeout its own process group, so an outer kill ended only the shell and the call returned while the -rmc runs
+    were still alive (lio#2362 review). `wait` returns only once every reset has exited, at most the budget. Not
+    TERM then -k: an nvidia-smi ignoring TERM keeps changing clocks after the handoff (review). Each reset echoes
+    "<uuid> <flag> <exit>", 137 when killed."""
+    per_reset = f"{APP_MEM_CLOCK_RESET_TIMEOUT_SECONDS / 2:g}"
+    resets = " ".join(
+        "( "
+        + "; ".join(f"timeout -s KILL {per_reset} nvidia-smi -i {shlex.quote(u)} {flag} >/dev/null 2>&1; "
+                    f"echo {shlex.quote(u)} {flag} $?"
+                    for flag in ("-rac", "-rmc"))
+        + " ) &"
+        for u in uuids
+    ) + " wait"
+    return f"sh -c {shlex.quote(resets)}"
+
+
+def _log_app_and_memory_resets(lines: list[list[str]], uuids: list[str]) -> None:
+    """Best effort: never changes a GPU's -rgc verdict or its lock record. Exits other than 0 and 3 (not supported)
+    are logged; a reset with no line (killed by the timeout, or the call's answer lost) logs exit=unknown."""
+    exits = {(p[0], p[1]): p[2] for p in lines if len(p) >= 3}
     for uuid in uuids:
         for flag in ("-rac", "-rmc"):
             code = exits.get((uuid, flag), "unknown")
@@ -217,8 +240,8 @@ async def _reset_gpu_clocks(
     *,
     forget: bool = True,
 ) -> dict[str, str | None]:
-    """`-rgc` each GPU in one SSH call (a create runs this on every GPU); the record goes only once its reset
-    succeeded (forget=False: the caller drops it). uuid -> failure (None = reset)."""
+    """`-rgc` each GPU, then `-rac`/`-rmc` every GPU in parallel, in one SSH call (a create runs this on every GPU);
+    the record goes only once its -rgc succeeded (forget=False: the caller drops it). uuid -> failure (None = reset)."""
     if not uuids:
         return {}
     # each reset echoes "<uuid> <exit>", so one GPU's failure never hides another's result
@@ -226,13 +249,14 @@ async def _reset_gpu_clocks(
         f"{build_clock_command('reset', uuid, pod_gpu_uuids=pod_gpu_uuids)} >/dev/null 2>&1; echo {shlex.quote(uuid)} $?"
         for uuid in uuids
     )
-    result = await _run(runner, cmd)
-    exits = dict(line.split()[:2] for line in (result.stdout or "").splitlines() if len(line.split()) >= 2)
+    result = await _run(runner, f"{cmd}; {_reset_app_and_memory_clocks(uuids)}", timeout=_RESET_CALL_TIMEOUT_SECONDS)
+    lines = [line.split() for line in (result.stdout or "").splitlines()]
+    exits = {p[0]: p[1] for p in lines if len(p) == 2}  # the -rgc lines; a -rac/-rmc line has 3 fields
     failures: dict[str, str | None] = {
-        uuid: None if exits.get(uuid) == "0" else f"nvidia-smi -rgc failed (exit {exits.get(uuid, 'unknown')})"
+        uuid: None if exits.get(uuid) == "0" else _rgc_failure(exits[uuid]) if uuid in exits else _NO_ANSWER
         for uuid in uuids
     }
-    await _reset_app_and_memory_clocks_of(runner, uuids)
+    _log_app_and_memory_resets(lines, uuids)
     if forget:
         await _forget(redis, [uuid for uuid, failure in failures.items() if failure is None])
     return failures
@@ -434,11 +458,11 @@ async def reset_leftover_clock_locks(
     expected: dict[str, str] | None = None,
 ) -> list[str]:
     """Safety net before a create: `-rgc` every GPU of the new pod (None/empty = every host GPU), with or
-    without a lock record, so a lost record never hands a renter another's locked clocks (as
-    raise_low_power_limits_to_default does for power). Answers the GPUs with a lock record whose reset failed
-    (their records stay): the create must not start on them. A failed reset of a GPU with no record (one that
-    does not support -rgc, never locked here) is not counted; while Redis cannot say which GPUs have a record,
-    every failed reset counts. A GPU whose record names `keep_pod_id` (the pod's own edit or reboot) keeps its lock and
+    without a lock record, so neither a lost record nor a lock set outside Lium hands a renter locked clocks (as
+    raise_low_power_limits_to_default does for power). Answers the GPUs whose reset failed (records stay): the
+    create must not start on them. A GPU with no record that refuses -rgc as having no clock control here (exit 3
+    or 4: nobody locked it from here) is not counted; any other failure is, record or not. While Redis cannot say
+    which GPUs have a record, every failed reset counts. A GPU whose record names `keep_pod_id` (the pod's own edit or reboot) keeps its lock and
     record (review). `expected` (uuid -> the record read before the GPU lock) resets only a GPU whose record is
     still that one: a new renter's lock taken meanwhile is left alone (review F-83)."""
     if not gpu_uuids:
@@ -465,17 +489,27 @@ async def _reset_leftovers(
     except Exception:
         recorded, own = set(gpu_uuids), set()  # unknown (review): every failed reset counts, never a silent pass
     gpu_uuids = [uuid for uuid in gpu_uuids if uuid not in own]
+    ran = True
     try:
         failures = await _reset_gpu_clocks(runner, redis, gpu_uuids, forget=False)
     except Exception:
         if not recorded:
             raise
-        failures = dict.fromkeys(gpu_uuids, "the reset did not run")
+        # the SSH call failed: no verdict on any GPU, so only the recorded ones count, as when nothing is recorded
+        ran, failures = False, dict.fromkeys(gpu_uuids, "the reset did not run")
+    if gpu_uuids and all(failure == _NO_ANSWER for failure in failures.values()):
+        ran = False  # the whole batch gave no answer (timeout, lost output): no verdict on any GPU, as above
     try:
         await _forget(redis, [uuid for uuid, failure in failures.items() if failure is None])
     except Exception:
         pass  # the GPUs are reset; a record left over costs the next create one more -rgc (review)
-    return [uuid for uuid in gpu_uuids if uuid in recorded and failures[uuid] is not None]
+    unrecorded = [u for u in gpu_uuids if ran and failures[u] is not None and u not in recorded]
+    for uuid in unrecorded:
+        logger.warning("gpu_clock_action=rgc_failed gpu=%s recorded=false failure=%s", uuid, failures[uuid])
+    return [
+        uuid for uuid in gpu_uuids
+        if failures[uuid] is not None and (uuid in recorded or (uuid in unrecorded and failures[uuid] not in _NO_CLOCK_CONTROL))
+    ]
 
 
 async def clock_locked_gpu_uuids(redis: RedisService, gpu_uuids: list[str]) -> set[str]:

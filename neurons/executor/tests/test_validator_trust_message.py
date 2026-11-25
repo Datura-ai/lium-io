@@ -440,3 +440,17 @@ def test_a_staging_build_follows_only_its_own_owner_key_and_never_reads_the_chai
     )
     third.load()
     assert third.report()["revision"] == 1   # the release-signed kept message is refused; the build's own message holds
+
+
+def test_a_staging_build_reads_its_owner_messages_from_its_own_backend(tmp_path, monkeypatch, owner, new_validator):
+    # the host's backend setting (default: production) must not decide where a staging owner's messages come from
+    monkeypatch.setattr(trust_service.settings, "COMPUTE_REST_API_URL", "https://lium.io/api")
+    asked = []
+    signed = _signed(owner, new_validator, 2)
+    _backend(monkeypatch, lambda url: asked.append(url) or MagicMock(status_code=200, json=MagicMock(return_value=signed._asdict())))
+    trust = ValidatorTrust(state_dir=tmp_path, image_message=tmp_path / "absent.json", owner=owner.ss58_address,
+                           read_chain=False, api_url="https://staging.example/api")
+    trust.load()
+    asyncio.run(trust.refresh_message())
+    assert asked == ["https://staging.example/api/watchtower/validator-message"]
+    assert trust.held.validator == new_validator.ss58_address

@@ -19,10 +19,12 @@ from payload_models.payloads import MinerJobRequestPayload
 from protocol.vc_protocol.compute_requests import NetworkEMA, RentedExecutorsResponse
 from protocol.vc_protocol.validator_requests import ValidationEvent
 from services.attestation_service import HostPolicyResult
+from services.liumd_binary_refresh import LiumdRefresh
 from services.liumd_exec_client import LiumdRefusal
 from services.local_verify_client import (
     DETAIL_MAX_CHARS,
     SCHEMA,
+    LocalVerifyAnswer,
     LocalVerifyUnavailable,
     parse_answer,
 )
@@ -688,6 +690,79 @@ async def test_a_failed_post_scrape_read_is_logged_unavailable(
     record = await _shadow(ctx, FakeLiumd())
 
     assert (record["outcome"], record["reason"]) == ("unavailable", "transport")
+
+
+@pytest.mark.asyncio
+async def test_a_skipped_repair_keeps_the_stale_answer(keypair, monkeypatch, verifyx_service):
+    monkeypatch.setattr(settings, "LIUMD_BINARY_REFRESH_ENABLED", True)
+    monkeypatch.setattr(settings, "VALIDATOR_LIUMD_SPECS", True)
+    repair = AsyncMock(
+        return_value=LiumdRefresh(False, "old-build", "download failed", skipped=True)
+    )
+    monkeypatch.setattr(liumd_shadow, "refresh_liumd_from_answer", repair)
+    ctx = _ctx(keypair, monkeypatch, verifyx_service)
+    early = FakeLiumd()
+
+    answer = await liumd_shadow._facts_only(ctx, early.factory)
+
+    assert isinstance(answer, LocalVerifyAnswer)
+    repair.assert_awaited_once()
+    assert len(early.intents) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_failed_repair_under_specs_mode_does_not_use_the_stale_answer(
+    keypair, monkeypatch, verifyx_service
+):
+    monkeypatch.setattr(settings, "LIUMD_BINARY_REFRESH_ENABLED", True)
+    monkeypatch.setattr(settings, "VALIDATOR_LIUMD_SPECS", True)
+    repair = AsyncMock(
+        return_value=LiumdRefresh(False, None, "no task budget for the liumd download")
+    )
+    monkeypatch.setattr(liumd_shadow, "refresh_liumd_from_answer", repair)
+    ctx = _ctx(keypair, monkeypatch, verifyx_service)
+    early = FakeLiumd()
+
+    answer = await liumd_shadow._facts_only(ctx, early.factory)
+
+    assert isinstance(answer, LocalVerifyUnavailable)
+    assert answer.reason == "binary_refresh_failed"
+    repair.assert_awaited_once()
+    assert len(early.intents) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_changed_repair_reruns_the_read(keypair, monkeypatch, verifyx_service):
+    monkeypatch.setattr(settings, "LIUMD_BINARY_REFRESH_ENABLED", True)
+    repair = AsyncMock(return_value=LiumdRefresh(True, "new-build", changed=True))
+    monkeypatch.setattr(liumd_shadow, "refresh_liumd_from_answer", repair)
+    ctx = _ctx(keypair, monkeypatch, verifyx_service)
+    early = FakeLiumd()
+
+    answer = await liumd_shadow._facts_only(ctx, early.factory)
+
+    assert isinstance(answer, LocalVerifyAnswer)
+    assert len(early.intents) == 2
+
+
+@pytest.mark.asyncio
+async def test_a_read_without_a_build_checks_the_installed_binary(
+    keypair, monkeypatch, verifyx_service
+):
+    monkeypatch.setattr(settings, "LIUMD_BINARY_REFRESH_ENABLED", True)
+    check = AsyncMock(return_value=None)
+    monkeypatch.setattr(liumd_shadow, "ensure_liumd_binary", check)
+    repair = AsyncMock()
+    monkeypatch.setattr(liumd_shadow, "refresh_liumd_from_answer", repair)
+    ctx = _ctx(keypair, monkeypatch, verifyx_service)
+    early = FakeLiumd(result=LocalVerifyUnavailable("transport", "closed"))
+
+    answer = await liumd_shadow._facts_only(ctx, early.factory)
+
+    assert isinstance(answer, LocalVerifyUnavailable)
+    check.assert_awaited_once()
+    repair.assert_not_awaited()
+    assert len(early.intents) == 1
 
 
 @pytest.mark.asyncio

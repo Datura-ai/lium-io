@@ -54,6 +54,14 @@ _subtensor_patcher = patch(
 _subtensor_patcher.start()
 
 
+@pytest.fixture(autouse=True)
+def _fresh_validator_process_idle_passes():
+    """DAH-5933: idle passes live in the validator process (executor_rollout._idle_passes); each test is a new one."""
+    from services.executor_rollout import _idle_passes
+
+    _idle_passes.clear()
+
+
 @pytest.fixture
 def make_pcc_job() -> Callable[..., "JobResult"]:
     """Factory for a rental-price `JobResult` (one node, one GPU model, N cards) with the fields the

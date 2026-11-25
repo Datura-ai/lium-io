@@ -5,6 +5,7 @@ import shlex
 from pathlib import Path
 from typing import Any
 
+from services import executor_payload
 from services.gpu_spec_table import is_sxm_on_pcie_adapter, normalize_gpu_model
 
 from ..messages import NvlinkFaultMessages as Msg
@@ -81,7 +82,7 @@ class NvlinkFaultCheck:
                 passed=True, event=render_message(Msg.SKIPPED, ctx=ctx, check_id=self.check_id)
             )
         run = await ctx.runner.run(
-            f"{shlex.quote(ctx.executor.python_path)} -I -",
+            f"{shlex.quote(executor_payload.EXECUTOR_PYTHON)} -I -",
             timeout=PROBE_TIMEOUT_SECONDS,
             retryable=False,
             stdin_text=PROBE_SOURCE,

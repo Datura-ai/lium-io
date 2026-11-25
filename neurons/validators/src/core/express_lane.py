@@ -36,6 +36,7 @@ from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from services.executor_image_policy import ExpectedImageSnapshot
 from services.miner_service import EXPRESS_LANE, MinerService
 from services.redis_service import EXPRESS_REDIS_SLOT
+from services.task.messages import CYCLE_END_READ_REASONS, RentalVerificationMessages
 from services.task_service import JobResult
 
 from core.config import settings
@@ -71,6 +72,8 @@ SESSION_LOST_IN_PORT_CHECK = "the validator's SSH session closed during the port
 # miner's snapshot misses may already have used). Its own bound keeps a node whose session always
 # drops from staying queued, and hidden from the wave, for good: ~20 min at RETRY_SECONDS.
 SESSION_LOST_MAX_RUNS = 10
+NO_TASK_TIME_FOR_THE_RENTAL_PROBE = "the task had no time left for the rental probe or VerifyX"
+RENTED_DURING_THE_CHECK = "the backend found the node rented during the check"
 # Self-hosted miners' executor lists: how often, how many miners at once, and the longest a miner
 # that keeps not answering is skipped (one miss skips one interval, doubling per further miss).
 # Each ask is bounded by REST_EXECUTOR_LIST_TIMEOUT (miner_service).
@@ -687,6 +690,13 @@ class ExpressLane:
                     with suppress(Exception):
                         await self._end_recheck(pending)
             self._defer(pending, SESSION_LOST_IN_PORT_CHECK)
+            return
+        if result.failure_reason_code in CYCLE_END_READ_REASONS:
+            # DAH-5933: a result the scored cycle holds for its cycle-end rented read (a budget stop, a rental the
+            # backend found during the check) has no verdict: no failed first pass goes out; asked again within
+            # MAX_ATTEMPTS, then the cycle carries or withholds it
+            rented = result.failure_reason_code == RentalVerificationMessages.RENTED_SINCE_THE_SNAPSHOT.reason
+            self._defer(pending, RENTED_DURING_THE_CHECK if rented else NO_TASK_TIME_FOR_THE_RENTAL_PROBE)
             return
         passed = result.score > 0 or result.job_score > 0
         should_run_first_pass_again = (

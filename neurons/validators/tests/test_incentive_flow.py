@@ -82,7 +82,9 @@ async def _run_set_weights_and_capture(
     return captured
 
 
-async def _run_sync_with_jobs(validator, miners, job_results_by_hotkey, *, job_batch_id="2024-01-01 00:00:00"):
+async def _run_sync_with_jobs(
+    validator, miners, job_results_by_hotkey, *, job_batch_id="2024-01-01 00:00:00", refreshed_miners=None
+):
     async def request_job_side_effect(
         payload,
         encrypted_files,
@@ -99,6 +101,10 @@ async def _run_sync_with_jobs(validator, miners, job_results_by_hotkey, *, job_b
         }
 
     validator.subtensor_client.get_miners = AsyncMock(return_value=miners)
+    if refreshed_miners is not None:
+        # the background refresh replaces the list after the cycle's first read
+        later = iter([miners])
+        validator.subtensor_client.get_miners = AsyncMock(side_effect=lambda: next(later, refreshed_miners))
     validator.subtensor_client.should_set_weights = AsyncMock(return_value=False)
     validator.subtensor_client.get_time_from_block = AsyncMock(return_value=job_batch_id)
     validator.miner_service.request_job_to_miner = AsyncMock(side_effect=request_job_side_effect)
@@ -1683,3 +1689,52 @@ async def test_an_express_pass_during_the_spec_publish_is_in_the_cycles_reported
         await _run_sync_with_jobs(validator, miners, {"miner1": [create_job_result()]}, job_batch_id=job_batch_id)
 
     assert seen_reported and express_node in seen_reported[-1]
+
+
+@pytest.mark.asyncio
+async def test_the_cycle_vector_covers_every_miner_the_cycle_asked_even_if_the_list_refreshes_mid_cycle(
+    validator_with_mocks,
+    mock_settings,
+    create_job_result,
+    create_neuron_info,
+):
+    """A miner list refreshed while the cycle runs must not drop a hotkey from the vector whose node rows the
+    cycle still reports: rows and vector come from the one miner snapshot the cycle started with."""
+    validator = validator_with_mocks
+    validator.miner_scores = {}
+    at_start = [
+        create_neuron_info(uid=100, hotkey="burner1"),
+        create_neuron_info(uid=2, hotkey="staying_miner"),
+        create_neuron_info(uid=3, hotkey="leaving_miner"),
+    ]
+    all_job_results = {
+        "staying_miner": [create_job_result(gpu_model="H100", gpu_count=1)],
+        "leaving_miner": [create_job_result(gpu_model="H100", gpu_count=1)],
+    }
+
+    await _run_sync_with_jobs(
+        validator, at_start, all_job_results, refreshed_miners=[m for m in at_start if m.hotkey != "leaving_miner"]
+    )
+
+    assert validator.miner_scores.get("leaving_miner", 0.0) > 0
+
+
+@pytest.mark.asyncio
+async def test_wave_finish_line_carries_the_wave_duration_cpu_and_miner_counts(
+    validator_with_mocks, create_job_result, create_neuron_info, caplog
+):
+    # Arrange
+    validator = validator_with_mocks
+    validator.miner_scores = {}
+    miners = [create_neuron_info(uid=2, hotkey="miner1"), create_neuron_info(uid=3, hotkey="miner2")]
+    job_results = {"miner1": [create_job_result(score=0.0, gpu_model="H100", gpu_count=1)]}
+
+    # Act
+    with caplog.at_level("INFO"):
+        await _run_sync_with_jobs(validator, miners, job_results)
+
+    # Assert
+    [record] = [r for r in caplog.records if r.getMessage() == "[sync] All Jobs finished"]
+    extra = record.msg.extra
+    assert (extra["miners"], extra["timed_out_miners"]) == (2, 0)
+    assert extra["wave_duration_seconds"] >= 0 and extra["wave_cpu_seconds"] >= 0
