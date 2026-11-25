@@ -37,7 +37,12 @@ from ..availability import ReachSource, ReachTarget
 from ..messages import GpuFaultProbeMessages, render_message
 from ..messages import PostRentalGpuRecheckMessages as Msg
 from ..pipeline import CheckResult, Context
-from .capability import get_filler_only_container, judge_gpu_model, record_all_cards_pass
+from .capability import (
+    get_filler_only_container,
+    judge_gpu_model,
+    record_all_cards_pass,
+    unanswered_cards_on_lium_workload,
+)
 from .gpu_fault_probe import GpuFaultProbeCheck
 from .gpu_model_truth import (
     expected_cc_and_sm,
@@ -122,17 +127,20 @@ async def record_gpu_drop(ctx: Context, missing_uuids: list[str]) -> None:
     )
 
 
-def _all_cards_no_verdict(probe: AllCardsProbe) -> bool:
-    # Only a lost connection to the whole node (`AllCardsProbe.connection_lost`) and the wall clock with every
-    # card answering say nothing about the cards, as CapabilityCheck judges them. A timeout, a timeout again on the
-    # probe's retry (`timeout_after_retry`) or a run that ended without an exit status on a live connection is a verdict and fails the
-    # recheck (an 8x node's GPU 0 timed out every recheck 10-16 Nov and re-listed each time).
+async def _all_cards_no_verdict(ctx: Context, probe: AllCardsProbe) -> bool:
+    # Only a lost connection to the whole node (`AllCardsProbe.connection_lost`), unanswered cards the backend has a
+    # Lium workload on now, and the wall clock with every card answering say nothing about the cards, as
+    # CapabilityCheck judges them. Otherwise a timeout, a timeout again on the probe's retry (`timeout_after_retry`) or
+    # a run that ended without an exit status on a live connection is a verdict and fails the recheck (an 8x node's
+    # GPU 0 timed out every recheck 10-16 Nov and re-listed each time).
     if not probe.per_card:
         # not probed (no card details or size, our own cipher failed): no card was run, inconclusive as before
         return True
     if all(c.get("ok") for c in probe.per_card):
         return probe.over_wall_clock
-    return probe.connection_lost
+    if probe.connection_lost:
+        return True
+    return not probe.wrong_answer and (await unanswered_cards_on_lium_workload(ctx, ctx.state.specs or {}, probe))[0]
 
 
 class PostRentalGpuRecheckCheck:
@@ -279,7 +287,7 @@ class PostRentalGpuRecheckCheck:
         if all_cards_probe is not None and all_cards_probe.passed:
             await record_all_cards_pass(ctx)
         if all_cards_probe is not None and not all_cards_probe.passed:
-            if _all_cards_no_verdict(all_cards_probe):
+            if await _all_cards_no_verdict(ctx, all_cards_probe):
                 inconclusive = True
             else:
                 failures.append(f"all-cards matmul: {all_cards_probe.failure_reason}")

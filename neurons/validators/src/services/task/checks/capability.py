@@ -36,7 +36,7 @@ from .sshd_bootstrap import remove_lium_fillers
 
 if TYPE_CHECKING:
     from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
-    from services.matrix_validation_service import ValidationResult
+    from services.matrix_validation_service import AllCardsProbe, ValidationResult
 
 logger = logging.getLogger(__name__)
 
@@ -323,12 +323,8 @@ async def judge_all_cards(
     if probe.connection_lost:
         reason = "connection_lost"
     else:
-        assigned, snapshot = await _lium_workload_gpu_uuids(ctx)
-        details = (specs.get("gpu") or {}).get("details") or []
-        card_uuids = [
-            ((details[i].get("uuid") or "") if i < len(details) else "").strip().lower() for i in unanswered
-        ]
-        if not all(uuid and uuid in assigned for uuid in card_uuids):
+        on_workload, snapshot = await unanswered_cards_on_lium_workload(ctx, specs, probe)
+        if not on_workload:
             return await _all_cards_failed(ctx, probe.failure_reason)
         reason = "lium_workload"
     cycle = _filler_cycle_index(ctx)
@@ -397,6 +393,20 @@ async def _redis_set(ctx: Context, template: str, ttl_seconds: int, *, value: st
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning(_m("All-cards state write failed", extra=get_extra_info({**ctx.default_extra, "error": str(exc)})))
+
+
+async def unanswered_cards_on_lium_workload(
+    ctx: Context, specs: dict, probe: AllCardsProbe
+) -> tuple[bool, RentedExecutorsResponse | None]:
+    """Whether every card that gave no answer has a Lium workload assigned to it by the backend now (that card was
+    not the node's to give this cycle), and the fresh snapshot read. Shared by CapabilityCheck and the post-rental
+    recheck, so both judge the same run the same way."""
+    assigned, snapshot = await _lium_workload_gpu_uuids(ctx)
+    details = (specs.get("gpu") or {}).get("details") or []
+    card_uuids = [
+        ((details[i].get("uuid") or "") if i < len(details) else "").strip().lower() for i in probe.unanswered_cards
+    ]
+    return bool(card_uuids) and all(uuid and uuid in assigned for uuid in card_uuids), snapshot
 
 
 async def _lium_workload_gpu_uuids(ctx: Context) -> tuple[set[str], RentedExecutorsResponse | None]:

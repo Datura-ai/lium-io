@@ -274,6 +274,28 @@ async def test_a_run_without_a_status_or_one_lost_channel_fails_the_recheck(cont
     assert KEY in ctx.services.redis.store
 
 
+@pytest.mark.parametrize(("assigned", "inconclusive"), [([0], True), ([1], False)], ids=["on-that-card", "on-another"])
+@pytest.mark.asyncio
+async def test_a_card_our_own_workload_holds_now_gives_no_verdict(context_factory, assigned, inconclusive):
+    # review of lio#2440: the backend assigned a Lium workload to GPU 0 during the run and GPU 0 timed out. As in
+    # CapabilityCheck, that card is not the node's to give this cycle; a workload on another card says nothing about it
+    specs = {"gpu": {"count": 2, "details": [{"uuid": "GPU-0"}, {"uuid": "GPU-1"}]}}
+    ctx = _idle_ctx(
+        context_factory, FakeRunner(probe_stdout("ok")), FakeValidation(_all_cards("timeout", "")), specs=specs
+    )
+    ctx.services.backend.get_rented_executors_now.return_value = RentedExecutorsResponse(
+        executors={},
+        all_filler_containers_by_executor={ctx.executor.uuid: ["filler_e741"]},
+        filler_gpu_uuids_by_executor={ctx.executor.uuid: [f"GPU-{i}" for i in assigned]},
+    )
+
+    result = await PostRentalGpuRecheckCheck().run(ctx)
+
+    expected = Msg.INCONCLUSIVE.reason if inconclusive else Msg.FAILED.reason
+    assert (result.passed, result.event.reason_code) == (inconclusive, expected)
+    assert KEY in ctx.services.redis.store
+
+
 @pytest.mark.asyncio
 async def test_a_node_rented_at_the_cycle_snapshot_is_not_probed_this_cycle(context_factory):
     """The A6000 case (DAH-6978): the rental ended mid-cycle and its workload still loaded the cards. The cards prove
