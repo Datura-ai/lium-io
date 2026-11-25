@@ -299,7 +299,8 @@ async def start_storage_operation(
         # this dispatch, which still reports, instead of ending before it reads its operation
         staged = await ssh_client.run(
             f"{executor_payload.unpack('storage')}; {executor_payload.verify(executor_payload.STORAGE)}; "
-            f"{shlex.quote(python_path)} -E -s -c {shlex.quote(_RUNNER_IMPORT_PROBE)} \"$d\" || "
+            # -I: the check sees only the standard library and the staged directory it adds, never the working directory
+            f"{shlex.quote(python_path)} -I -c {shlex.quote(_RUNNER_IMPORT_PROBE)} \"$d\" || "
             '{ rm -rf -- "$d"; exit 1; }; printf "%s" "$d"',
             input=executor_payload.archive(executor_payload.STORAGE).decode(),
             check=False,

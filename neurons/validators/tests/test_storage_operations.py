@@ -77,41 +77,28 @@ async def test_a_cancel_reports_with_the_reporter_the_runner_left_in_its_spec(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("runner_alive", [True, False])
-async def test_a_repeated_dispatch_never_starts_a_second_runner(
-    monkeypatch: pytest.MonkeyPatch, runner_alive: bool
-) -> None:
+async def test_a_repeated_dispatch_never_starts_a_second_runner(monkeypatch: pytest.MonkeyPatch) -> None:
     # The first runner has read (and deleted) its spec but has no PID or helper yet: the state is STARTING.
     monkeypatch.setattr(storage_operations, "supports_storage_operation", AsyncMock(return_value=True))
     monkeypatch.setattr(storage_operations.asyncio, "sleep", AsyncMock())
     commands: list[str] = []
 
-    async def run(command: str, check: bool = False) -> SimpleNamespace:
+    async def run(command: str, check: bool = False, **_) -> SimpleNamespace:
         commands.append(command)
         stdout = ""
         status = 1 if command.startswith("test -e") else 0
         if "echo STARTING" in command:
             stdout = "STARTING\n"
-        elif command.startswith("pgrep -f"):
-            status = 0 if runner_alive else 1
         return SimpleNamespace(exit_status=status, stdout=stdout, stderr="")
 
-    ssh_client = SimpleNamespace(run=run, start_sftp_client=None)
-    if runner_alive:
-        files = await storage_operations.start_storage_operation(
-            ssh_client, "python3", OPERATION_ID, {"engine": "restic"}, retain_terminal_artifacts=False
-        )
-        assert files == storage_operations.StorageOperationFiles.for_operation(OPERATION_ID)
-    else:
-        monkeypatch.setattr(storage_operations, "report_launch_failure", AsyncMock())
-        with pytest.raises(TypeError):  # stops at the sftp spec write, after the stale-helper removal
-            await storage_operations.start_storage_operation(
-                ssh_client, "python3", OPERATION_ID, {"engine": "restic"}, retain_terminal_artifacts=False
-            )
+    files = await storage_operations.start_storage_operation(
+        SimpleNamespace(run=run, start_sftp_client=None), "python3", OPERATION_ID, {"engine": "restic"},
+        retain_terminal_artifacts=False,
+    )
+    assert files == storage_operations.StorageOperationFiles.for_operation(OPERATION_ID)
     probe = next(c for c in commands if c.startswith("pgrep -f"))
-    assert f"[-]-spec {storage_operations.StorageOperationFiles.for_operation(OPERATION_ID).spec}" in probe
-    assert any("docker rm -f" in c for c in commands) is not runner_alive
-    assert any("nohup" in c for c in commands) is False  # never launched a second wrapper
+    assert f"[-]-spec {files.spec}" in probe
+    assert not any("docker rm -f" in c or "nohup" in c for c in commands)  # never a second wrapper, the helper stays
 
 
 @pytest.fixture
@@ -323,4 +310,43 @@ def test_a_runner_that_cannot_start_fails_the_dispatch_while_it_can_report(node:
             OPERATION_ID, spec, retain_terminal_artifacts=False,
         ))
     storage_operations.report_launch_failure.assert_awaited_once()
+    assert not Path(str(files.spec)).exists() and _staged(node) == []
+
+
+def test_a_dispatch_with_no_live_run_removes_the_stale_helper_then_writes_the_spec_then_starts_the_runner(
+    node: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import asyncio as aio
+
+    runs = node / "runs"
+    _runner(node, f"open({str(runs)!r}, 'a').write('run\\n')\n")
+    steps: list[str] = []
+
+    async def run(command: str, check: bool = False, input: str | None = None) -> SimpleNamespace:
+        steps.extend(s for s, hit in (("helper", "docker rm -f" in command), ("launch", "nohup" in command)) if hit)
+        return await _run_locally(command, check, input)
+
+    class _Recording(_LocalSFTP):
+        def open(self, path: str, mode: str):
+            steps.append("spec")
+            return super().open(path, mode)
+
+    aio.run(storage_operations.start_storage_operation(
+        SimpleNamespace(run=run, start_sftp_client=_Recording), sys.executable, OPERATION_ID, {"engine": "restic"},
+        retain_terminal_artifacts=False,
+    ))
+    _wait_for(runs)
+    assert steps == ["helper", "spec", "launch"]
+
+
+def test_the_runner_start_check_never_imports_from_the_working_directory(node: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """a module beside the SSH session's working directory must not stand in for one the staged runner lacks"""
+    cwd = node / "cwd"
+    cwd.mkdir()
+    (cwd / "planted_dependency.py").write_text("")
+    monkeypatch.chdir(cwd)
+    _runner(node, "pass\n", at_import="import planted_dependency\n")
+    with pytest.raises(storage_operations.StorageOperationLaunchError, match="runner cannot start"):
+        _dispatch()
+    files = storage_operations.StorageOperationFiles.for_operation(OPERATION_ID)
     assert not Path(str(files.spec)).exists() and _staged(node) == []
