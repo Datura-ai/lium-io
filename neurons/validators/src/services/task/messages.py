@@ -2811,6 +2811,14 @@ class RentalProbeMessages:
             "it is listed after the first rental probe that passes."
         ),
     )
+    NOT_RUN_ON_VALIDATOR = MessageTemplate(
+        event="Rental probe could not run: the validator lacks what it needs for this node",
+        reason="RENTAL_PROBE_NOT_RUN_ON_VALIDATOR",
+        severity="warning",
+        category="runtime",
+        impact="No score this cycle; the listing stays as the last cycle left it",
+        remediation="Nothing to do on the node; the probe runs once the validator has what it needs.",
+    )
     PROOF_UNREADABLE = MessageTemplate(
         event="Rental probe record could not be read",
         reason="RENTAL_PROBE_PROOF_UNREADABLE",

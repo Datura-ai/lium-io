@@ -1951,11 +1951,6 @@ async def test_the_teardown_wait_never_outlasts_the_job():
     "make_ctx, late, no_verdict",
     [
         (
-            lambda redis: make_probe_context(redis=redis, images=()),
-            0,
-            "inconclusive: no default renter image for this GPU and driver",
-        ),
-        (
             lambda redis: make_probe_context(redis=redis, image_present=False),
             0,
             "skipped: default renter image is not pulled on the node",
@@ -1988,6 +1983,23 @@ async def test_a_node_no_probe_has_passed_on_is_not_listed_by_a_cycle_without_a_
     later = render_message(Msg.SKIPPED, ctx=ctx, check_id="executor.validate.later", what={})
     errors = run_availability_errors(False, [*result.extra_events, result.event, later])
     assert [e["reason_code"] for e in errors] == ["VERIFICATION_FAILED"]
+
+
+@pytest.mark.asyncio
+async def test_a_node_the_validator_cannot_probe_keeps_its_stored_listing():
+    """Review of lio#2442: the validator has no default renter image for the node's GPU and driver, so the probe
+    never starts. Nothing is wrong with the node: it is not hidden as unproven, its listing stays as stored."""
+    redis = FakeRedis(last_ok=None)
+    ctx, docker, _ = make_probe_context(redis=redis, images=())
+    with probe_settings():
+        result = await RentalProbeCheck().run(ctx)
+    assert result.event.reason_code == Msg.NOT_RUN_ON_VALIDATOR.reason
+    assert result.event.what_we_saw["no_verdict_this_cycle"] == (
+        "inconclusive: no default renter image for this GPU and driver"
+    )
+    assert result.updates == {"score": 0.0, "job_score": 0.0} and result.extra_events == []
+    assert run_availability_errors(False, [result.event]) is None
+    assert redis.standing_failure() is None and not redis.stamped() and docker.create_calls == []
 
 
 @pytest.mark.asyncio

@@ -274,7 +274,9 @@ class RentalProbeCheck:
     it never penalises on missing data alone. A node with no passed probe on record is the exception:
     a cycle without a verdict hides it (RENTAL_PROBE_NOT_YET_PROVEN, score 0, nothing cleared), so a node
     is first listed by a probe that passed, never by a skip. A record that cannot be read scores nothing
-    and leaves the listing as stored (RENTAL_PROBE_PROOF_UNREADABLE).
+    and leaves the listing as stored (RENTAL_PROBE_PROOF_UNREADABLE), as does a probe the validator cannot
+    run for a reason on its own side (RENTAL_PROBE_NOT_RUN_ON_VALIDATOR: no default renter image for the
+    GPU and driver, no input, no create lock).
 
     An idle node running a Lium filler is probed too, beside the filler rather than in its place:
     create_container is told `beside_fillers`, so it
@@ -425,13 +427,13 @@ class RentalProbeCheck:
         missing = _missing_inputs(ctx)
         if missing:
             return self._inconclusive(
-                ctx, f"validator has no {missing} for this executor", steps=[], standing=standing
+                ctx, f"validator has no {missing} for this executor", steps=[], standing=standing, validator_side=True
             )
 
         image_ref = await _default_renter_image(ctx)
         if image_ref is None:
             return self._inconclusive(
-                ctx, "no default renter image for this GPU and driver", steps=[], standing=standing
+                ctx, "no default renter image for this GPU and driver", steps=[], standing=standing, validator_side=True
             )
         image_present = await _image_present_on_host(ctx, image_ref)
         if image_present is None:
@@ -462,7 +464,7 @@ class RentalProbeCheck:
         create_lock = await _take_create_lock(ctx)
         if create_lock is None:
             return self._inconclusive(
-                ctx, "could not take the node's create lock", steps=[], standing=standing
+                ctx, "could not take the node's create lock", steps=[], standing=standing, validator_side=True
             )
         if not create_lock.held:
             # a renter's create: rented, as far as the standing failure is concerned
@@ -543,9 +545,22 @@ class RentalProbeCheck:
             },
         )
 
-    def _carried(self, ctx: Context, standing: _Failure, *, no_verdict: str) -> CheckResult:
+    def _carried(
+        self, ctx: Context, standing: _Failure, *, no_verdict: str, validator_side: bool = False
+    ) -> CheckResult:
         """This cycle reached no verdict of its own and the last probe failed: fail the node again with
         that step (review). `no_verdict` is what this cycle would otherwise have reported."""
+        if standing is _NEVER_PASSED and validator_side:
+            # the probe could not start for a reason on the validator's side (no default renter image for the
+            # GPU and driver, no input, no create lock): that says nothing about the node, so it is not hidden as
+            # unproven; like an unreadable record, no score and the stored listing stays (review of lio#2442)
+            event = render_message(
+                Msg.NOT_RUN_ON_VALIDATOR,
+                ctx=ctx,
+                check_id=self.check_id,
+                what={"executor_uuid": ctx.executor.uuid, "no_verdict_this_cycle": no_verdict},
+            )
+            return CheckResult(passed=False, event=event, updates={"score": 0.0, "job_score": 0.0})
         if standing is _NEVER_PASSED or standing is _PROOF_UNREADABLE:
             # nothing failed, so nothing is recorded or cleared. Never passed: the reason hides the node
             # (REASONS_THAT_HIDE_AT_ONCE) until its first pass. Unreadable: no score, and the backend keeps
@@ -602,9 +617,12 @@ class RentalProbeCheck:
         steps: list[_Step],
         what: dict[str, Any] | None = None,
         standing: _Failure | None = None,
+        validator_side: bool = False,
     ) -> CheckResult:
         if standing is not None:
-            return self._carried(ctx, standing, no_verdict=f"inconclusive: {reason}")
+            return self._carried(
+                ctx, standing, no_verdict=f"inconclusive: {reason}", validator_side=validator_side
+            )
         event = render_message(
             Msg.INCONCLUSIVE,
             ctx=ctx,
