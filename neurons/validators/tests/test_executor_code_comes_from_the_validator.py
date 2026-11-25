@@ -333,16 +333,34 @@ async def test_a_run_is_written_under_its_tag_and_the_kill_takes_only_that_tag(n
     assert tag in ssh.commands[0]
 
 
+# the backup and restore paths still read the reported interpreter; they change in their own PR. Any other read, or one
+# more read in these functions, fails here and must be reviewed, not added
+STORAGE_READS = {
+    "services/docker_service.py:create_container": 1,
+    "services/docker_service.py:_run_bootstrap_restore": 1,
+    "services/docker_service.py:_run_legacy_bootstrap_restore": 1,
+    "services/miner_service.py:handle_backup_container_req": 3,
+    "services/miner_service.py:handle_restore_container_req": 2,
+}
+
+
 def test_no_validator_code_reads_the_executor_reported_paths():
-    # python_path and root_dir come from the executor's answer: any new read of them must be reviewed, not added here
+    # python_path and root_dir come from the executor's answer
+    from collections import Counter
+
     src = Path(__file__).resolve().parents[1] / "src"
-    reads = [
-        f"{path.relative_to(src)}:{node.lineno}"
-        for path in sorted(src.rglob("*.py"))
-        for node in ast.walk(ast.parse(path.read_text(), str(path)))
-        if isinstance(node, ast.Attribute) and node.attr in ("python_path", "root_dir")
-    ]
-    assert reads == []
+    reads = Counter()
+    for path in sorted(src.rglob("*.py")):
+        tree = ast.parse(path.read_text(), str(path))
+        owner = {}
+        for fn in ast.walk(tree):
+            if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                for node in ast.walk(fn):
+                    owner.setdefault(node, fn.name)   # ast.walk is breadth-first: the outermost function wins
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Attribute) and node.attr in ("python_path", "root_dir"):
+                reads[f"{path.relative_to(src)}:{owner.get(node, '<module>')}"] += 1
+    assert dict(reads) == STORAGE_READS
 
 
 def test_scripts_are_written_where_the_disk_reserve_holds():

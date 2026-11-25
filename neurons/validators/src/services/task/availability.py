@@ -434,7 +434,7 @@ class RunningOutageTally:
 
 
 # DAH-5395: the failure reasons that hide the node at once. Any other failed run keeps the backend's usual rule.
-REASONS_THAT_HIDE_AT_ONCE = frozenset({"GPU_DETAILS_MISMATCH", "GPU_UUID_CHANGED", "LOGIN_USER_NOT_ROOT", "NVLINK_FAULT"})
+REASONS_THAT_HIDE_AT_ONCE = frozenset({"GPU_DETAILS_MISMATCH", "GPU_UUID_CHANGED", "NVLINK_FAULT"})
 
 
 # runs that stop before the checks that re-read the stored restrictions: [] would clear what those checks keep
