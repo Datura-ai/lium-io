@@ -55,7 +55,9 @@ def test_a_hung_card_is_skipped_and_the_rest_are_read():
             SimpleNamespace(c_nvmlProcessInfo_v2_t_pid=100 + handle)
         ],
     }
-    scrape = build_scrape_namespace(SCRAPE, {"read_gpu_details", "safeNvmlValue"}, stubs)
+    scrape = build_scrape_namespace(
+        SCRAPE, {"read_gpu_details", "read_gpu_memory_mb", "UNIFIED_MEMORY_GPU_NAMES", "safeNvmlValue"}, stubs
+    )
     pids: set[int] = set()
 
     details, error = scrape["read_gpu_details"](4, pids)

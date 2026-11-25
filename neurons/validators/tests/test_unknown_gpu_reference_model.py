@@ -56,7 +56,8 @@ def test_every_candidate_is_a_scored_model_with_the_registry_sizes():
         assert model in GPU_MODEL_RATES
         reference_sizes_mb = set(GPU_VRAM_SIZES_MB[model]) - MOD_ONLY_SIZES_MB.get(model, set())
         assert sorted(size * 1024 for size in sizes_gb) == sorted(reference_sizes_mb)
-    assert set(GPU_MODEL_RATES) <= set(GPU_REFERENCE_TABLE)
+    # DAH-5863: the GB10 is scored but never a reference: its unified memory says nothing about a discrete card's
+    assert set(GPU_MODEL_RATES) - set(GPU_REFERENCE_TABLE) == {"NVIDIA GB10"}
 
 
 @pytest.mark.parametrize("vram_mb", [8000, 15352, 23028, 46068, 81559, 140000, 183359, 275040])
