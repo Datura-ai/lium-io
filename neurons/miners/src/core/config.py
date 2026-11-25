@@ -109,8 +109,9 @@ class Settings(BaseSettings):
     MINER_PORTAL_URI: str = Field(env="MINER_PORTAL_URI", default="wss://provider-api.lium.io")
     MINER_PORTAL_API_URL: str | None = Field(env="MINER_PORTAL_API_URL", default="https://provider-api.lium.io/api")
     CENTRAL_MODE: bool = Field(env="CENTRAL_MODE", default=False)
-    # A /temp-dev copy's nodes have only a private address; production leaves it off (services/node_address.py).
-    NODE_ALLOW_PRIVATE_ADDRESS: bool = Field(env="NODE_ALLOW_PRIVATE_ADDRESS", default=False)
+    # Comma-separated CIDRs: a /temp-dev copy names its VPC, where its nodes have only a private address. Unset in
+    # production, where a node address must be public (services/node_address.py).
+    NODE_ADDRESS_ALLOWED_NETWORKS: str = Field(env="NODE_ADDRESS_ALLOWED_NETWORKS", default="")
 
     # Debug settings - loaded from DEBUG_* environment variables
     debug: DebugSettings = Field(default_factory=DebugSettings)

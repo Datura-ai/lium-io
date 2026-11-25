@@ -120,12 +120,13 @@ def test_addresses_python_calls_global_but_are_not_public(address):
     assert not node_host.is_public_ip(ipaddress.ip_address(address))
 
 
-def test_a_dev_stack_admits_private_node_addresses_only(monkeypatch):
-    monkeypatch.setattr(node_host, "ALLOW_PRIVATE", True)
+def test_a_dev_stack_admits_only_its_own_private_network(monkeypatch):
+    monkeypatch.setattr(node_host, "ALLOWED_PRIVATE_NETWORKS", (ipaddress.ip_network("10.20.0.0/16"),))  # secret-scan: allow
     node_host._check_literal("10.20.30.40", 2200)  # secret-scan: allow
-    assert node_host.is_public_ip(ipaddress.ip_address("172.16.9.9"))  # secret-scan: allow
-    for address in ("127.0.0.1", "169.254.169.254", "::1", "0.0.0.0"):
+    for address in ("10.21.0.1", "172.16.9.9", "127.0.0.1", "169.254.169.254", "::1"):  # secret-scan: allow
         assert not node_host.is_public_ip(ipaddress.ip_address(address))
+    with pytest.raises(node_host.NodeHostError):
+        node_host._check_literal("10.21.0.1", 2200)  # secret-scan: allow
 
 
 def test_public_addresses_stay_public():

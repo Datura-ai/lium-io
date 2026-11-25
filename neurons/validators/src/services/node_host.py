@@ -194,7 +194,9 @@ class _QuotaSlotExecutor:
 
 
 NAT64_PREFIX = ipaddress.ip_network("64:ff9b::/96")  # RFC 6052 well-known prefix: the IPv4 address in the last 32 bits
-ALLOW_PRIVATE = os.environ.get("NODE_ALLOW_PRIVATE_ADDRESS", "").lower() in ("1", "true")
+ALLOWED_PRIVATE_NETWORKS = tuple(  # comma-separated CIDRs
+    ipaddress.ip_network(n.strip()) for n in os.environ.get("NODE_ADDRESS_ALLOWED_NETWORKS", "").split(",") if n.strip()
+)
 
 
 def is_public_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
@@ -205,8 +207,10 @@ def is_public_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
     ip = getattr(ip, "ipv4_mapped", None) or ip
     if ip.version == 6 and ip in NAT64_PREFIX:
         ip = ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF)
-    # a dev stack (a /temp-dev copy) whose own nodes sit on its private network, by design; never set in production
-    if ALLOW_PRIVATE and ip.is_private and not (ip.is_loopback or ip.is_link_local or ip.is_unspecified):
+    # a dev stack (a /temp-dev copy) names its own private network, where its nodes sit by design; unset in production
+    if any(ip in network for network in ALLOWED_PRIVATE_NETWORKS) and ip.is_private and not (
+        ip.is_loopback or ip.is_link_local or ip.is_unspecified
+    ):
         return True
     return ip.is_global and not ip.is_multicast and not ip.is_reserved and not getattr(ip, "is_site_local", False)
 
