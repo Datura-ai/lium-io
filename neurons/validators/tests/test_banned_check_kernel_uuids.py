@@ -181,6 +181,8 @@ async def test_a_stale_bind_after_a_gpu_reset_is_read_through_the_host_and_passe
     [stale] = result.event.what_we_saw["container_kernel_gpu_foreign_mounts"]
     assert stale.endswith("proc:/driver/nvidia/gpus/0001:00:00.0//deleted")
     assert result.event.what_we_saw["kernel_gpu_foreign_mounts"] == []
+    # a list read through the stale bind is withheld, never a short container list
+    assert result.updates["state"].container_kernel_gpu_uuids is None
 
 
 @pytest.mark.asyncio

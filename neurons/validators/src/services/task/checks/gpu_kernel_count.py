@@ -198,7 +198,8 @@ class GpuKernelCountCheck:
     mount) is replaced by the host's list (DAH-6273): one that covers the reported cards is
     match_host_view; one that is shorter is count_lower_host_view, which fails only with
     GPU_KERNEL_COUNT_HOST_FALLBACK_ENFORCEMENT_ENABLED. A short list read from the host first
-    (kernel_view_source host_pid1_root) is count_lower_host_view too. With neither list there is no failure:
+    (kernel_view_source host_pid1_root) is count_lower_host_view too, unless the container's list
+    is short as well: then it is count_lower and fails, as on main. With neither list there is no failure:
     the verdict is GPU_KERNEL_COUNT_NOT_EVALUATED. One exception
     (DAH-5519): behind a foreign mount, a reported card the create step cannot attach fails like a
     short list (verdict unattachable), since no renter can start a container on it. That failure is
@@ -231,7 +232,7 @@ class GpuKernelCountCheck:
     async def _evaluate(self, ctx: Context) -> CheckResult:
         reported_uuids = reported_gpu_uuids(ctx)
         reported_count = reported_gpu_count(ctx, reported_uuids)
-        (kernel_uuids, foreign_mounts), source, container_mounts = await kernel_gpu_view_with_source(ctx)
+        (kernel_uuids, foreign_mounts), source, container = await kernel_gpu_view_with_source(ctx)
 
         kernel_check_fields = evaluate_kernel_view(
             reported_count=reported_count,
@@ -239,11 +240,18 @@ class GpuKernelCountCheck:
             kernel_uuids=kernel_uuids,
         ).as_fields()
         kernel_check_fields["kernel_view_source"] = source
-        # a short list from the host stands (one host inventory per cycle, a later read never
-        # overrides it) and is judged as a short host list: enforced only behind the setting
+        # a short list from the host stands (one host inventory per cycle, a later read never overrides it).
+        # As on main, it fails when the container list is short too; otherwise it is the host-view verdict,
+        # enforced only behind the setting
         if kernel_check_fields["kernel_verdict"] == "count_lower" and source == KERNEL_VIEW_SOURCE_HOST:
-            kernel_check_fields["kernel_verdict"] = "count_lower_host_view"
-        if kernel_check_fields["kernel_verdict"] == "count_lower":
+            container_short = container.uuids is not None and evaluate_kernel_view(
+                reported_count=reported_count, reported_uuids=reported_uuids, kernel_uuids=container.uuids
+            ).kernel_verdict == "count_lower"
+            if container.uuids is not None:
+                kernel_check_fields["container_kernel_gpu_count"] = len(container.uuids)
+            if not container_short:
+                kernel_check_fields["kernel_verdict"] = "count_lower_host_view"
+        if kernel_check_fields["kernel_verdict"] == "count_lower" and source != KERNEL_VIEW_SOURCE_HOST:
             kernel_check_fields["container_kernel_gpu_count"] = kernel_check_fields[
                 "kernel_gpu_count"
             ]
@@ -290,7 +298,7 @@ class GpuKernelCountCheck:
                 "reported_uuids": reported_uuids,
                 "kernel_gpu_uuids": kernel_uuids,
                 "kernel_gpu_foreign_mounts": foreign_mounts,
-                "container_kernel_gpu_foreign_mounts": container_mounts,
+                "container_kernel_gpu_foreign_mounts": container.foreign_mounts,
                 "would_fail": would_fail,
             }
         )

@@ -865,17 +865,42 @@ async def test_an_unattachable_card_marks_its_own_score_flag(context_factory, ch
 @pytest.mark.asyncio
 async def test_a_short_host_list_stands_and_the_host_is_not_read_again(context_factory, check_enabled):
     # DAH-7076 review: one host inventory per cycle; a later read listing every card must not override it
-    ctx = _ctx(context_factory, reported=REAL[:2], kernel=REAL[:1], host=_host_stdout(REAL[:2]))
-    ctx = ctx.model_copy(update={"state": replace(ctx.state, kernel_gpu_view_source="host_pid1_root")})
+    # host list short, container list full: main's host-view verdict, failing only behind the setting
+    ctx = _host_sourced(
+        _ctx(context_factory, reported=REAL[:2], kernel=REAL[:1], host=_host_stdout(REAL[:2])), container=REAL[:2]
+    )
 
     result = await GpuKernelCountCheck().run(ctx)
 
-    # a short host list is judged as on main: recorded, failing only behind the enforcement setting
     assert result.passed is True
     assert result.event.reason_code == Msg.COUNT_MISMATCH_HOST_SHADOW.reason
     assert result.event.what_we_saw["kernel_verdict"] == "count_lower_host_view"
     assert result.event.what_we_saw["kernel_view_source"] == "host_pid1_root"
     assert result.event.what_we_saw["would_fail"] is True
+    ctx.ssh.run.assert_not_awaited()
+
+
+def _host_sourced(ctx: Context, *, container) -> Context:
+    state = replace(ctx.state, kernel_gpu_view_source="host_pid1_root", container_kernel_gpu_uuids=container)
+    return ctx.model_copy(update={"state": state})
+
+
+@pytest.mark.asyncio
+async def test_a_short_host_list_with_a_short_container_list_fails_as_on_main(context_factory, check_enabled):
+    # the enforcement setting stays off: main fails a short container list the host does not cover
+    ctx = _host_sourced(
+        _ctx(context_factory, reported=REAL[:2], kernel=REAL[:1], host=_host_stdout(REAL[:2])), container=REAL[:1]
+    )
+
+    result = await GpuKernelCountCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.updates == {"gpu_kernel_count_passed": False}
+    assert result.event.reason_code == Msg.COUNT_MISMATCH.reason
+    what = result.event.what_we_saw
+    assert what["kernel_verdict"] == "count_lower"
+    assert what["kernel_view_source"] == "host_pid1_root"
+    assert what["container_kernel_gpu_count"] == 1
     ctx.ssh.run.assert_not_awaited()
 
 
