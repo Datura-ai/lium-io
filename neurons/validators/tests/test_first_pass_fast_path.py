@@ -401,7 +401,7 @@ async def test_verifyx_service_applies_overrides_to_the_challenge_config_only():
     # every cycle sizes its network waits from the acceptance floor, first pass or not
     assert default_config["network_floor_mbps"] == settings.verifyx.NETWORK_MIN_PACKAGE_DOWNLOAD_SPEED_MBPS == 50.0
     assert default_config["network_floor_mbps"] <= settings.verifyx.NETWORK_MIN_DOWNLOAD_SPEED_MBPS
-    assert default_config["network_min_timeout_seconds"] == settings.FIRST_PASS_VERIFYX_NETWORK_TIMEOUT_SECONDS == 45
+    assert default_config["network_min_timeout_seconds"] == settings.VERIFYX_NETWORK_MIN_TIMEOUT_SECONDS == 45
 
 
 @pytest.mark.skipif(platform.machine() != "x86_64", reason="the vendored libverifyx.so is the x86_64 build")
