@@ -2392,6 +2392,21 @@
           "default": null,
           "title": "Host Runtime Fault"
         },
+        "idle_checks_passed": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Idle Checks Passed"
+        },
         "incentive": {
           "anyOf": [
             {
@@ -5843,6 +5858,11 @@
           ],
           "default": null,
           "title": "Sent At"
+        },
+        "unrented_only": {
+          "default": false,
+          "title": "Unrented Only",
+          "type": "boolean"
         },
         "validator_hotkey": {
           "title": "Validator Hotkey",

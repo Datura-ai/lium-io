@@ -371,7 +371,8 @@ class BackendClient:
         answer within the 30 s timeout returns None, and the caller decides what that means;
         nothing waits 60 s for two more attempts inside a running pipeline.
         """
-        return await self._signed_request(
+        read_at = time.time()
+        rented = await self._signed_request(
             "GET",
             "/internal/executors/rented"
             if cycle_snapshot_block is None
@@ -379,6 +380,9 @@ class BackendClient:
             RentedExecutorsResponse,
             timeout=30,
         )
+        if rented is not None:
+            rented.read_at = read_at
+        return rented
 
     async def get_default_docker_image(
         self, gpu_model: str, driver_version: str

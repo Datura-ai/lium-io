@@ -2,6 +2,7 @@ import asyncio
 import re
 import contextlib
 import contextvars
+import dataclasses
 import json
 from datetime import datetime
 import logging
@@ -27,6 +28,7 @@ from services.attestation_service import AttestationError
 from services.image_flatten import FLATTEN_NO_DISK_RENTER_SENTENCE, ImageFlattenNoDisk
 import services.image_flatten as image_flatten_module
 from services.cvm_quote_broker import DSTACK_GUEST_SOCKET_PATH, QUOTE_BROKER_SOCKET_PATH
+from services.prerun_host_probe import PrerunHostProbe
 from services.docker_service import (
     CONTAINER_STOP_GRACE_SECONDS,
     FILLER_CONTAINER_STOP_GRACE_SECONDS,
@@ -36,6 +38,7 @@ from services.docker_service import (
     VolumeMinSizeError,
     _LIUM_CIPHER_MOUNT,
     _build_gocryptfs_setup_and_mount_script,
+    _docker_root_dir_shell,
     _is_docker_container_removal_in_progress_error,
     _is_docker_read_timeout_error,
     _is_docker_volume_in_use_error,
@@ -2516,12 +2519,14 @@ async def test_inspector_lifecycle_command_quotes_executor_paths(docker_service)
         "stop",
     )
 
-    assert start_command == (
-        "nohup /usr/bin/python3 '/root/app dir/src/inspector_executor.py'"
-        " --start-collector >/dev/null 2>&1 &"
+    # the validator's own script and interpreter run; the executor's reported paths select nothing
+    for command in (start_command, stop_command):
+        assert "/usr/bin/python3" not in command and "/root/app dir" not in command
+    assert start_command.endswith(
+        "nohup /root/app/.venv/bin/python -E -s \"$d\"/inspector_executor.py --start-collector >/dev/null 2>&1 &"
     )
-    assert stop_command == (
-        "/usr/bin/python3 '/root/app dir/src/inspector_executor.py' --stop-collector"
+    assert stop_command.endswith(
+        '/root/app/.venv/bin/python -E -s "$d"/inspector_executor.py --stop-collector'
     )
 
 
@@ -6717,22 +6722,29 @@ async def _another_create_live(pod_id: str, live: bool):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "conflict_name, live_creates, status, expected_events",
+    "conflict_name, live_creates, status, expected_events, resumed",
     [
         # 26 Oct 2026: a re-sent create met its earlier attempt's container under the pod's own name
-        ("pod_test", 1, "created", ["run", "rm pod_test", "run"]),
-        ("pod_test", 1, "exited", ["run", "rm pod_test", "run"]),
+        ("pod_test", 1, "created", ["run", "rm pod_test force=False", "run"], False),
+        ("pod_test", 1, "exited", ["run", "rm pod_test force=False", "run"], False),
         # the earlier attempt already started the pod: a running (or unreadable) container is never removed
-        ("pod_test", 1, "running", ["run"]),
-        ("pod_test", 1, "restarting", ["run"]),
-        ("pod_test", 1, RuntimeError("inspect failed"), ["run"]),
+        ("pod_test", 1, "running", ["run"], False),
+        ("pod_test", 1, "restarting", ["run"], False),
+        ("pod_test", 1, RuntimeError("inspect failed"), ["run"], False),
         # the earlier attempt is still live (its start may fail later and clean up by name): touch nothing
-        ("pod_test", 2, "created", ["run"]),
-        ("pod_other", 1, "created", ["run"]),
+        ("pod_test", 2, "created", ["run"], False),
+        ("pod_other", 1, "created", ["run"], False),
+        # DAH-6992: the re-send of a create a connector restart cut off: that attempt never replied, so its
+        # container, started or not, is replaced (forced: it may be running)
+        ("pod_test", 1, "running", ["run", "rm pod_test force=True", "run"], True),
+        ("pod_test", 1, RuntimeError("inspect failed"), ["run", "rm pod_test force=True", "run"], True),
+        # even resumed: a live second attempt, or another name, is never touched
+        ("pod_test", 2, "running", ["run"], True),
+        ("pod_other", 1, "running", ["run"], True),
     ],
 )
 async def test_rental_create_removes_only_its_own_leftover_container_on_a_name_conflict(
-    docker_service, monkeypatch, conflict_name, live_creates, status, expected_events,
+    docker_service, monkeypatch, conflict_name, live_creates, status, expected_events, resumed,
 ):
     events: list[str] = []
 
@@ -6752,10 +6764,11 @@ async def test_rental_create_removes_only_its_own_leftover_container_on_a_name_c
             return status
 
         async def remove_container(self, *, container_name, force, remove_volumes):
-            events.append(f"rm {container_name}")
+            events.append(f"rm {container_name} force={force}")
 
     monkeypatch.setattr(docker_service, "stream_log", AsyncMock())
     registry = docker_service_module.inflight_creates
+    resumed_token = docker_service_module.resumed_create.set(resumed)
     async with _another_create_live("test", live_creates == 2):
         # production registers one create twice: the job runner, then the miner handler
         with registry.track("test", ("miner", "exec")), registry.track("test", ("miner", "exec")):
@@ -6767,11 +6780,12 @@ async def test_rental_create_removes_only_its_own_leftover_container_on_a_name_c
                 default_extra={},
                 pod_id="test",
             )
-            if "rm pod_test" in expected_events:
+            if "run" in expected_events[1:]:
                 assert await run == "cid"
             else:
                 with pytest.raises(Exception, match="already in use"):
                     await run
+    docker_service_module.resumed_create.reset(resumed_token)
     assert events == expected_events
     assert not registry.is_running("test")
 
@@ -7040,7 +7054,7 @@ async def test_repair_stale_vloopback_mountpoint_uses_rmdir_helper(docker_servic
 
     assert repaired is True
     commands = _vloopback_repair_commands(ssh_client)
-    assert commands[2] == "/usr/bin/docker info --format '{{.DockerRootDir}}'"
+    assert commands[2] == _docker_root_dir_shell() + "printf '%s\\n' \"$root\""
     assert commands[3] == (
         "/usr/bin/findmnt /var/lib/docker/plugins/plugin123/propagated-mount/volume_test "
         ">/dev/null 2>&1"
@@ -7440,6 +7454,126 @@ async def test_wait_for_port_check_filter_includes_health_check(docker_service):
     # the port verifier's host-network container holds the range's host ports
     assert "name=^port_test_" in ps_cmd
 
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("filler", [True, False])
+async def test_wait_for_port_check_filler_leaves_backend_health_check_running(docker_service, filler):
+    """DAH-6756: a filler create force-removed the backend's running health_check_* probe, which
+    then failed ('sshd binary not found', SSH auth) and failed the node. A filler removes no probe;
+    a customer rental still does (DAH-2272)."""
+    commands: list[str] = []
+
+    class FakeSSHClient:
+        async def run(self, cmd):
+            commands.append(cmd)
+            return MagicMock(stdout="health_check_abc\n", stderr="", exit_status=0)
+
+    removed, message = await docker_service.wait_for_port_check_containers(
+        executor_info=MagicMock(),
+        miner_hotkey="5TestMiner",
+        keypair=MagicMock(),
+        private_key="encrypted-private-key",
+        ssh_client=FakeSSHClient(),
+        probed_container_names=("health_check_abc",),
+        is_filler_create=filler,
+    )
+
+    removes = [c for c in commands if "docker rm" in c]
+    if filler:
+        assert (removed, message) == (False, "Filler create leaves probe containers running")
+        assert commands == []
+    else:
+        assert removed is True
+        assert len(removes) == 1 and "name=^health_check_" in removes[0]
+
+
+
+@pytest.mark.asyncio
+async def test_filler_create_container_removes_no_probe_and_has_no_live_re_removal(docker_service, monkeypatch):
+    """DAH-6756 (review): through `create_container`, a filler issues no probe `docker rm`, and the
+    bind-refusal retry gets no live re-removal to run."""
+    commands: list[str] = []
+
+    async def run(cmd, *args, **kwargs):
+        commands.append(cmd)
+        return _make_ssh_command_result(stdout="health_check_abc\n")
+
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(side_effect=run)
+    monkeypatch.setattr(
+        "services.docker_service.asyncssh.connect",
+        Mock(return_value=DummySSHConnectionManager(ssh_client)),
+    )
+    monkeypatch.setattr("services.docker_service.asyncssh.import_private_key", Mock())
+    monkeypatch.setattr(
+        "services.docker_service.build_gpu_docker_config_for_executor",
+        AsyncMock(return_value=build_gpu_docker_config(["GPU-test"])),
+    )
+    docker_service.ssh_service.decrypt_payload = Mock(return_value="private-key")
+    docker_service.redis_service.add_pending_pod = AsyncMock()
+    docker_service.redis_service.remove_pending_pod = AsyncMock()
+    docker_service.redis_service.add_rented_pod = AsyncMock()
+    monkeypatch.setattr(docker_service, "_prepare_known_hosts_policy", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        docker_service, "generate_portMappings", AsyncMock(return_value=([(20000, 20020, 20020)], None))
+    )
+    # nothing removed, so the probe's port-check listing reaches the pre-run step
+    for name in ("clean_existing_containers", "clean_stale_vloopback_volumes"):
+        monkeypatch.setattr(docker_service, name, AsyncMock(return_value=[]))
+    monkeypatch.setattr(docker_service, "create_local_volume", AsyncMock())
+    monkeypatch.setattr(docker_service, "check_container_running", AsyncMock(return_value=True))
+    for name in ("execute_and_stream_logs", "stream_log", "finish_stream_logs", "handle_stream_logs"):
+        monkeypatch.setattr(docker_service, name, AsyncMock())
+    # every other section None: its consumer runs its own command
+    probe = PrerunHostProbe(
+        **{f.name: None for f in dataclasses.fields(PrerunHostProbe) if f.name != "container_ids"}
+    )
+    probe = dataclasses.replace(probe, port_check_container_names=("health_check_abc",))
+    monkeypatch.setattr(docker_service, "probe_prerun_host", AsyncMock(return_value=probe))
+    retry_kwargs: dict = {}
+
+    async def create_with_retry(**kwargs):
+        retry_kwargs.update(kwargs)
+        return "container-id"
+
+    monkeypatch.setattr(docker_service, "_run_rental_docker_create_with_port_retry", create_with_retry)
+
+    payload = ContainerCreateRequest(
+        miner_hotkey="miner",
+        executor_id=str(uuid4()),
+        pod_id=str(uuid4()),
+        workload_kind=WorkloadKind.FILLER,
+        docker_image="daturaai/dlph:test",
+        user_public_keys=["ssh-ed25519 test-key"],
+        gpu_uuids=["GPU-test"],
+        cpu_count=1,
+        memory_gb=1,
+        volume_limit_gb=2,
+        storage_limit_gb=1,
+        available_ports=[PayloadPortMapping(internal_port=20020, external_port=20020)],
+        pod_mapping=[],
+        active_container_names=[],
+        active_volume_names=[],
+    )
+    executor_info = ExecutorSSHInfo(
+        uuid=payload.executor_id,
+        address="127.0.0.1",
+        port=8080,
+        ssh_username="root",
+        ssh_port=2200,
+        python_path="/usr/bin/python",
+        root_dir="/root/app",
+        ssh_host_key=FAKE_SSH_HOST_KEY,
+    )
+
+    await docker_service.create_container(
+        payload=payload, executor_info=executor_info, keypair=Mock(ss58_address="v"), private_key="encrypted"
+    )
+
+    docker_service.probe_prerun_host.assert_awaited()
+    assert "remove_port_checks_listed_live" in retry_kwargs
+    assert retry_kwargs["remove_port_checks_listed_live"] is None
+    assert not [c for c in commands if "docker rm" in c and "health_check" in c]
 
 @pytest.mark.asyncio
 async def test_wait_for_port_check_does_not_block_other_miner(docker_service):
