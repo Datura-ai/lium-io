@@ -204,6 +204,9 @@ class ContextState:
     # the mounts are evidence only, a short container list still fails a short host list
     container_kernel_gpu_uuids: list[str] | None = None
     container_kernel_gpu_foreign_mounts: list[str] = field(default_factory=list)
+    # with the host's list: the same read's list of every card on the host (a shared host has other executors' cards);
+    # the subset-container check (DAH-6273) and the identity evidence use it, never the bans or specs
+    host_all_kernel_gpu_uuids: list[str] | None = None
     verified_port_count: int = 0
     # verified_port_count is out of the ports probed this cycle (at most BATCH_PORT_VERIFICATION_SIZE,
     # the lowest free ones), never the declared range: declared - probed were not probed at all,

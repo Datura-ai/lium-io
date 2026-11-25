@@ -132,15 +132,18 @@ async def test_overlaid_kernel_view_on_a_live_rental_is_not_fatal(context_factor
     assert result.updates["kernel_gpu_view_passed"] is False  # zeroes the score instead
 
 
-def _view_stdout(lines, mounts, info_file):
+def _view_stdout(lines, mounts, info_file, *, host_all=None):
+    """A view's output; `host_all` makes it the host view's: `lines` are this executor's cards, then the whole list."""
+    rows = len(host_all) if host_all is not None else len(lines)
     return "\n".join(
         [
             *mounts,
             nvidia_devices.KERNEL_GPU_FS_SEPARATOR,
-            *(f"{info_file} proc" for _ in lines),
-            *(f"{info_file}|regular empty file" for _ in lines),
+            *(f"{info_file} proc" for _ in range(rows)),
+            *(f"{info_file}|regular empty file" for _ in range(rows)),
             nvidia_devices.KERNEL_GPU_VIEW_SEPARATOR,
             *lines,
+            *([nvidia_devices.HOST_ALL_CARDS_SEPARATOR, *host_all] if host_all is not None else []),
         ]
     )
 
@@ -164,7 +167,9 @@ def _ssh_host_and_container(host_stdout: str, container_stdout: str) -> AsyncMoc
 
 @pytest.mark.asyncio
 async def test_a_stale_bind_after_a_gpu_reset_is_read_through_the_host_and_passes(context_factory):
-    host = _view_stdout([f"{REAL}, 0"], [], nvidia_devices.HOST_PID1_ROOT + INFO_FILE)
+    host = _view_stdout(
+        [f"{REAL}, 0"], [], nvidia_devices.HOST_PID1_ROOT + INFO_FILE, host_all=[f"{REAL}, 0"]
+    )
     container = _view_stdout([f"{REAL}, 0"], [CONTAINER_MOUNTS[0], STALE_BIND], INFO_FILE)
     ctx = context_factory(
         state=build_state(gpu_uuids=REAL, rented_data=RentedExecutorsResponse(executors={})),
@@ -201,3 +206,35 @@ async def test_an_unusable_host_view_falls_back_to_the_container_and_an_overlay_
     assert result.event.what_we_saw["kernel_view_source"] == "container"
     assert result.event.what_we_saw["container_kernel_gpu_foreign_mounts"] == []
     assert result.updates["kernel_gpu_view_passed"] is False
+
+
+NEIGHBOUR = "GPU-0c3d9a51-77e2-4b10-9f6e-2d8a1b4c6e01"  # the other executor's card on the same host
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("own", "banned"), [(REAL, True), (NEIGHBOUR, False)])
+async def test_two_executors_on_one_host_each_take_only_their_own_card_from_the_host_list(
+    context_factory, own, banned
+):
+    # review 6053925574: the host's list has both executors' cards; the ban on one card fails only its executor
+    whole_host = [f"{REAL}, 0", f"{NEIGHBOUR}, 1"]
+    host = _view_stdout(
+        [f"{own}, {0 if own == REAL else 1}"],
+        [],
+        nvidia_devices.HOST_PID1_ROOT + INFO_FILE,
+        host_all=whole_host,
+    )
+    container = _view_stdout([f"{own}, 0"], [CONTAINER_MOUNTS[0]], INFO_FILE)
+    rented = RentedExecutorsResponse(executors={}, banned_provider_guids=[REAL])
+    ctx = context_factory(
+        state=build_state(gpu_uuids=own, rented_data=rented),
+        ssh=_ssh_host_and_container(host, container),
+    )
+
+    result = await BannedProviderCheck().run(ctx)
+
+    assert result.passed is not banned
+    assert result.event.what_we_saw["kernel_view_source"] == "host_pid1_root"
+    if not banned:
+        assert result.updates["state"].kernel_gpu_uuids == [NEIGHBOUR]
+        assert result.updates["state"].host_all_kernel_gpu_uuids == [REAL, NEIGHBOUR]

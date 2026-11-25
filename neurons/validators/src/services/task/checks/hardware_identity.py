@@ -181,7 +181,7 @@ class HardwareIdentityCheck:
 
     async def run(self, ctx: Context) -> CheckResult:
         reported = sorted(set(reported_gpu_uuids(ctx)))
-        (kernel_uuids, _), source, _ = await kernel_gpu_view_with_source(ctx)
+        (kernel_uuids, _), source, _, host_all = await kernel_gpu_view_with_source(ctx)
         kernel = sorted(set(kernel_uuids)) if kernel_uuids is not None else None
         gpus = kernel or reported
 
@@ -215,8 +215,10 @@ class HardwareIdentityCheck:
             logger.warning("hardware identity record unavailable", exc_info=True, extra=ctx.default_extra)
 
         host_kernel = None
-        # the cycle's list already is the host's: one host inventory per cycle, never re-read
-        if gpu_sources_disagree(reported, kernel) and ctx.ssh is not None and source != KERNEL_VIEW_SOURCE_HOST:
+        if gpu_sources_disagree(reported, kernel) and source == KERNEL_VIEW_SOURCE_HOST:
+            # one host inventory per cycle, never re-read: its whole list came with this executor's cards
+            host_kernel = sorted(set(host_all)) if host_all else None
+        elif gpu_sources_disagree(reported, kernel) and ctx.ssh is not None:
             # a container handed some of the host's cards lists only those; the host's own list is the full one
             host_uuids, _ = await read_kernel_gpu_view(ctx.ssh, host_view=True)
             host_kernel = sorted(set(host_uuids)) if host_uuids else None

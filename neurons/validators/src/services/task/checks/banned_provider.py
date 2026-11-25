@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import replace
+from typing import NamedTuple
 
-from services.nvidia_devices import KernelGpuView, read_kernel_gpu_view
+from services.nvidia_devices import KernelGpuView, read_host_kernel_gpu_views, read_kernel_gpu_view
 
 from ..messages import BannedProviderMessages as Msg, render_message
 from ..pipeline import CheckResult, Context
@@ -30,32 +31,43 @@ async def kernel_gpu_view(ctx: Context) -> KernelGpuView:
 _NO_SECOND_VIEW = KernelGpuView(uuids=None, foreign_mounts=[])
 
 
-async def kernel_gpu_view_with_source(ctx: Context) -> tuple[KernelGpuView, str, KernelGpuView]:
-    """The kernel list, the view it came from, and the container's own view when the host list decided.
+class KernelGpuViews(NamedTuple):
+    view: KernelGpuView  # this executor's cards: what bans, specs and the count check use
+    source: str
+    container: KernelGpuView  # the container's own view when the host list decided, else _NO_SECOND_VIEW
+    host_all_uuids: list[str] | None  # every card on the host, same read; None unless the host list decided
 
-    The list is the host's, read through PID 1's root, when that read is the host's own procfs
-    (read_kernel_gpu_view's host rules); otherwise the executor container's, as before. Both are read at once; when
-    the host list decides, what the container view showed (a stale bind after a reset) is still reported as evidence.
+
+async def kernel_gpu_view_with_source(ctx: Context) -> KernelGpuViews:
+    """This executor's kernel list, the view it came from, the container's own view, and the host's whole list.
+
+    The list is the host's entries for the cards under the container's own /proc/driver/nvidia/gpus, read through
+    PID 1's root, when that read is the host's own procfs (read_kernel_gpu_view's host rules); otherwise the
+    executor container's, as before. Both are read at once; when the host list decides, what the container view
+    showed (a stale bind after a reset) is still reported as evidence.
 
     DAH-7076: the container's binds under /proc/driver/nvidia/gpus are made when the executor starts. A GPU reset
     re-creates the card's host entry, the bind keeps pointing at the deleted one, and the container's list reads
-    as overlaid until the executor restarts. Where the PID namespace is not shared, PID 1's mount table is the
-    container's, the host rules refuse it, and the container read runs exactly as before.
+    as overlaid until the executor restarts. The bind's name (the card's PCI bus id) stays, so the host's entry at
+    that name is the card's current one. A host shared by several executors lists all their cards; only this
+    executor's are its list (review 6053925574: each executor took both cards and both were banned for one).
+    Where the PID namespace is not shared, PID 1's mount table is the container's, the host rules refuse it, and
+    the container read runs exactly as before.
     """
     state = ctx.state
     if state.kernel_gpu_uuids_read_attempted:
         view = KernelGpuView(state.kernel_gpu_uuids, state.kernel_gpu_foreign_mounts)
         container = KernelGpuView(state.container_kernel_gpu_uuids, state.container_kernel_gpu_foreign_mounts)
-        return view, state.kernel_gpu_view_source, container
+        return KernelGpuViews(view, state.kernel_gpu_view_source, container, state.host_all_kernel_gpu_uuids)
     if ctx.ssh is None:
-        return KernelGpuView(uuids=None, foreign_mounts=[]), KERNEL_VIEW_SOURCE_CONTAINER, _NO_SECOND_VIEW
+        return KernelGpuViews(_NO_SECOND_VIEW, KERNEL_VIEW_SOURCE_CONTAINER, _NO_SECOND_VIEW, None)
     # neither read raises: a failed read is an unusable (None) list
-    host, container = await asyncio.gather(
-        read_kernel_gpu_view(ctx.ssh, host_view=True), read_kernel_gpu_view(ctx.ssh)
+    (host_own, host_all), container = await asyncio.gather(
+        read_host_kernel_gpu_views(ctx.ssh), read_kernel_gpu_view(ctx.ssh)
     )
-    if host.uuids:
-        return host, KERNEL_VIEW_SOURCE_HOST, container
-    return container, KERNEL_VIEW_SOURCE_CONTAINER, _NO_SECOND_VIEW
+    if host_own.uuids:
+        return KernelGpuViews(host_own, KERNEL_VIEW_SOURCE_HOST, container, host_all.uuids)
+    return KernelGpuViews(container, KERNEL_VIEW_SOURCE_CONTAINER, _NO_SECOND_VIEW, None)
 
 
 async def kernel_gpu_uuids(ctx: Context) -> list[str] | None:
@@ -87,7 +99,7 @@ class BannedProviderCheck:
         rented_data = ctx.state.rented_data
         gpu_uuids = reported_gpu_uuids(ctx)
         # DAH-2662: match bans against the kernel's GPU list too (shapes: kernel_gpu_view)
-        (kernel_uuids, foreign_mounts), source, container = await kernel_gpu_view_with_source(ctx)
+        (kernel_uuids, foreign_mounts), source, container, host_all = await kernel_gpu_view_with_source(ctx)
         is_banned = bool(
             rented_data
             and rented_data.is_provider_banned(
@@ -130,6 +142,7 @@ class BannedProviderCheck:
                 kernel_gpu_view_source=source,
                 container_kernel_gpu_uuids=container.uuids,
                 container_kernel_gpu_foreign_mounts=container.foreign_mounts,
+                host_all_kernel_gpu_uuids=host_all,
                 specs=specs,
             )
         }

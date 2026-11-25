@@ -21,6 +21,7 @@ from services.nvidia_devices import (
     HOST_PID1_ROOT,
     KERNEL_GPU_FS_SEPARATOR,
     KERNEL_GPU_VIEW_CMD,
+    HOST_ALL_CARDS_SEPARATOR,
     KERNEL_GPU_VIEW_SEPARATOR,
     HOST_PROC_GPU_INFO_CMD,
 )
@@ -55,8 +56,9 @@ class _Sink:
         pass
 
 
-def _host_stdout(uuids, *, mounts=(), fstype="proc", kind="regular empty file"):
-    """What HOST_KERNEL_GPU_VIEW_CMD prints: PID 1's mounts, the stat rows, then the UUID rows."""
+def _host_stdout(uuids, *, own=None, mounts=(), fstype="proc", kind="regular empty file"):
+    """What HOST_KERNEL_GPU_VIEW_CMD prints: PID 1's mounts, the stat rows, the UUID rows of this executor's cards
+    (`own`, default every card), then the host's whole list."""
     files = [
         f"{HOST_PID1_ROOT}/proc/driver/nvidia/gpus/0000:00:{i + 7:02x}.0/information"
         for i in range(len(uuids))
@@ -68,6 +70,11 @@ def _host_stdout(uuids, *, mounts=(), fstype="proc", kind="regular empty file"):
             *(f"{path} {fstype}" for path in files),
             *(f"{path}|{kind}" for path in files),
             KERNEL_GPU_VIEW_SEPARATOR,
+            *(
+                f"{gpu_uuid}, {uuids.index(gpu_uuid)}"
+                for gpu_uuid in (uuids if own is None else own)
+            ),
+            HOST_ALL_CARDS_SEPARATOR,
             *(f"{gpu_uuid}, {i}" for i, gpu_uuid in enumerate(uuids)),
         ]
     )
@@ -235,9 +242,14 @@ CONTAINER_MOUNTS_OF_ONE_CARD = (
 def test_container_read_is_the_same_command_and_the_host_read_goes_through_pid_1():
     assert "/proc/1/" not in KERNEL_GPU_VIEW_CMD
     assert "/proc/self/mountinfo" in KERNEL_GPU_VIEW_CMD
-    assert HOST_KERNEL_GPU_VIEW_CMD == KERNEL_GPU_VIEW_CMD.replace(
+    head, _, rows = HOST_KERNEL_GPU_VIEW_CMD.partition(HOST_ALL_CARDS_SEPARATOR)
+    container_head = KERNEL_GPU_VIEW_CMD.replace(
         "/proc/self/mountinfo", "/proc/1/mountinfo"
     ).replace("/proc/driver/nvidia/gpus/*", "/proc/1/root/proc/driver/nvidia/gpus/*")
+    # this executor's cards: PID 1's entry at each name under the container's own gpus path, then the whole list
+    assert 'for d in /proc/driver/nvidia/gpus/*; do f="/proc/1/root$d/information"' in head
+    assert rows.removeprefix("; ") == container_head.rpartition(KERNEL_GPU_VIEW_SEPARATOR + "; ")[2]
+    assert head.startswith(container_head.rpartition(KERNEL_GPU_VIEW_SEPARATOR)[0])
 
 
 @pytest.mark.asyncio
@@ -960,3 +972,24 @@ async def test_a_short_host_list_with_a_withheld_container_list_and_every_card_a
 
     assert result.passed is True
     assert result.event.what_we_saw["kernel_verdict"] == "count_lower_host_view"
+
+
+@pytest.mark.asyncio
+async def test_a_container_handed_a_subset_is_judged_against_the_same_reads_whole_host_list(
+    context_factory, check_enabled
+):
+    # this executor's cards (one) are short of the two reported, the same host read lists both: main's
+    # DAH-6273 verdict for a container handed a subset of the host's cards, without a second read
+    ctx = _host_sourced(
+        _ctx(context_factory, reported=REAL[:2], kernel=REAL[:1]), container=REAL[:1]
+    )
+    ctx = ctx.model_copy(update={"state": replace(ctx.state, host_all_kernel_gpu_uuids=REAL[:2])})
+
+    result = await GpuKernelCountCheck().run(ctx)
+
+    assert result.passed is True
+    what = result.event.what_we_saw
+    assert what["kernel_verdict"] == "match_host_view"
+    assert what["host_kernel_gpu_count"] == 2
+    assert what["container_kernel_gpu_count"] == 1
+    ctx.ssh.run.assert_not_awaited()

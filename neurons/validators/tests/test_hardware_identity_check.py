@@ -356,3 +356,27 @@ async def test_a_short_host_list_stands_and_the_host_is_not_read_again(context_f
     assert result.passed is False
     assert result.event.what_we_saw["findings"] == ["gpu_sources_disagree"]
     assert result.event.what_we_saw["kernel_view_source"] == "host_pid1_root"
+
+
+@pytest.mark.asyncio
+async def test_the_whole_host_list_of_the_same_read_is_the_host_evidence(
+    context_factory, monkeypatch
+):
+    # review 6053925574: the cycle's list is this executor's cards; the same read's whole host list is the evidence
+    ctx = _container_with_one_of_two_cards(
+        context_factory, monkeypatch, host_uuids=["GPU-a", "GPU-b"]
+    )
+    state = replace(
+        ctx.state,
+        kernel_gpu_view_source="host_pid1_root",
+        host_all_kernel_gpu_uuids=["GPU-b", "GPU-a"],
+    )
+    ctx = ctx.model_copy(update={"state": state})
+
+    async def no_second_read(ssh, *, host_view=False):
+        raise AssertionError("the host list is read once per cycle")
+
+    monkeypatch.setattr(hardware_identity, "read_kernel_gpu_view", no_second_read)
+    result = await _run(ctx)
+    assert result.event.what_we_saw["host_kernel_gpu_uuids"] == ["GPU-a", "GPU-b"]
+    assert "gpu_sources_disagree" not in result.event.what_we_saw["findings"]

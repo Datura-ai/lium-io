@@ -148,6 +148,19 @@ async def host_view_verdict(
         host_uuids, host_foreign_mounts = await read_kernel_gpu_view(ctx.ssh, host_view=True)
     except Exception as exc:
         return HostViewResult(host_kernel_view_error=repr(exc)[:300])
+    return judge_host_list(
+        host_uuids, host_foreign_mounts, reported_count=reported_count, reported_uuids=reported_uuids
+    )
+
+
+def judge_host_list(
+    host_uuids: list[str] | None,
+    host_foreign_mounts: list[str],
+    *,
+    reported_count: int,
+    reported_uuids: list[str],
+) -> HostViewResult:
+    """host_view_verdict's judgement of a host list already read."""
     if not host_uuids:
         return HostViewResult(host_kernel_gpu_foreign_mounts=host_foreign_mounts)
     judged = evaluate_kernel_view(
@@ -240,7 +253,7 @@ class GpuKernelCountCheck:
     async def _evaluate(self, ctx: Context) -> CheckResult:
         reported_uuids = reported_gpu_uuids(ctx)
         reported_count = reported_gpu_count(ctx, reported_uuids)
-        (kernel_uuids, foreign_mounts), source, container = await kernel_gpu_view_with_source(ctx)
+        (kernel_uuids, foreign_mounts), source, container, host_all = await kernel_gpu_view_with_source(ctx)
 
         kernel_check_fields = evaluate_kernel_view(
             reported_count=reported_count,
@@ -252,7 +265,17 @@ class GpuKernelCountCheck:
         # gets main's verdict for what the container showed: a short container list fails (count_lower); one withheld
         # behind a foreign mount gets the DAH-5519 attach lookup (unattachable); otherwise it is the host-view verdict,
         # enforced only behind the setting
-        if kernel_check_fields["kernel_verdict"] == "count_lower" and source == KERNEL_VIEW_SOURCE_HOST:
+        whole_host = (
+            judge_host_list(host_all, [], reported_count=reported_count, reported_uuids=reported_uuids)
+            if kernel_check_fields["kernel_verdict"] == "count_lower" and source == KERNEL_VIEW_SOURCE_HOST
+            else HostViewResult()
+        )
+        if whole_host.kernel_verdict is not None:
+            # this executor's cards are short but the same read's whole host list covers the reported ones: a
+            # container handed a subset of the host's cards, judged against the host's list as on main (DAH-6273)
+            kernel_check_fields["container_kernel_gpu_count"] = kernel_check_fields["kernel_gpu_count"]
+            kernel_check_fields.update(whole_host.as_fields())
+        elif kernel_check_fields["kernel_verdict"] == "count_lower" and source == KERNEL_VIEW_SOURCE_HOST:
             container_short = container.uuids is not None and evaluate_kernel_view(
                 reported_count=reported_count, reported_uuids=reported_uuids, kernel_uuids=container.uuids
             ).kernel_verdict == "count_lower"

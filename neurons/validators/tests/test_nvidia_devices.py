@@ -152,14 +152,18 @@ def test_shared_nodes_keep_nvswitch_nodes_on_a_host_with_nvswitch(tmp_path):
     assert nodes == ["/dev/nvidiactl", "/dev/nvidia-uvm", "/dev/nvidia-nvswitchctl", "/dev/nvidia-nvswitch0"]
 
 
-def test_the_minor_lookup_reads_through_pid_1_and_uses_the_container_path_only_when_that_lists_nothing(tmp_path):
-    # DAH-7076: after a reset the executor's own bind of the card points at the deleted entry
+def test_the_minor_lookup_reads_this_executors_cards_through_pid_1_and_the_container_path_only_when_that_lists_nothing(
+    tmp_path,
+):
+    # DAH-7076: after a reset the executor's own bind of the card points at the deleted entry; the host's entry
+    # at the bind's name (the PCI bus id) is the card's current one, and a neighbour's card on the host is not ours
     import subprocess
 
     gpus = "/proc/driver/nvidia/gpus"
-    host, container = tmp_path / "host", tmp_path / "container"
-    cmd = HOST_PROC_GPU_INFO_CMD.replace(HOST_PID1_ROOT + gpus, str(host)).replace(gpus, str(container))
+    host_root, container = tmp_path / "host", tmp_path / "container" / "gpus"
+    cmd = HOST_PROC_GPU_INFO_CMD.replace(HOST_PID1_ROOT, str(host_root)).replace(gpus, str(container))
     assert HOST_PID1_ROOT not in cmd and gpus not in cmd  # both paths were redirected
+    host = host_root / str(container).lstrip("/")  # PID 1's root seen at the container's own path names
 
     def card(root, bus, uuid, minor):
         (root / bus).mkdir(parents=True)
@@ -169,8 +173,8 @@ def test_the_minor_lookup_reads_through_pid_1_and_uses_the_container_path_only_w
         res = subprocess.run(["sh", "-c", cmd], capture_output=True, text=True, check=False)
         return res.returncode, res.stdout
 
-    card(container, "0000:01:00.0", "GPU-aaa", 0)  # the container's stale view lists one card
-    assert run() == (0, "GPU-aaa, 0\n")
+    card(container, "0000:01:00.0", "GPU-old", 0)  # the container's stale view of its one card
+    assert run() == (0, "GPU-old, 0\n")
     card(host, "0000:01:00.0", "GPU-aaa", 0)
-    card(host, "0000:02:00.0", "GPU-bbb", 1)
-    assert run() == (0, "GPU-aaa, 0\nGPU-bbb, 1\n")
+    card(host, "0000:02:00.0", "GPU-bbb", 1)  # another executor's card on the same host
+    assert run() == (0, "GPU-aaa, 0\n")
