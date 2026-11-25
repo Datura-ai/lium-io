@@ -42,6 +42,8 @@ _REFRESH_DETAIL_CHARS = 400
 # the collector's start may wait 75 s for health and 10 s for the container index on a busy host, plus its canary
 INSPECTOR_COMMAND_TIMEOUT_SECONDS = 120
 INSPECTOR_STDERR_CAPTURE_TIMEOUT_SECONDS = 10
+# each step of ending a stream whose reply was not read whole waits this long for the channel to close
+PROCESS_CLOSE_WAIT_SECONDS = 5
 INSPECTOR_STDERR_CAPTURE_MAX_BYTES = 8192
 # One protocol response is one line. asyncssh's readline() hands back a PARTIAL line once a single
 # line outgrows the channel receive window (2 MiB by default: the session pauses reading and
@@ -303,6 +305,10 @@ class InspectorValidationService:
                 await self._send_message(process, {"cmd": "start-collector"})
             except Exception as exc:
                 diagnostics["collector_ensure_error"] = str(exc)
+                if not isinstance(exc, InspectorInteractiveError):
+                    # its reply was not read whole and may still arrive: on this stream it would answer the handshake
+                    await self._end_process(process)
+                    process = await ssh.create_process(command)
 
             open_json = validator.handshake_start()
             handshake_reply = await self._send_message(
@@ -713,13 +719,30 @@ class InspectorValidationService:
         stderr_text = "".join(captured).strip()
         return stderr_text or None
 
+    @staticmethod
+    def _terminate(process) -> None:
+        terminate = getattr(process, "terminate", None)
+        if terminate:
+            terminate()
+
+    async def _end_process(self, process) -> None:
+        """End `process` without another command and wait until its channel is closed: a host allowing one
+        session at a time refuses the next one while it is open. TERM, then KILL, then a local channel close."""
+        for escalate in ("terminate", "kill", "close"):
+            step = getattr(process, escalate, None)
+            if step:
+                step()
+            try:
+                await asyncio.wait_for(process.wait_closed(), timeout=PROCESS_CLOSE_WAIT_SECONDS)
+                return
+            except TimeoutError:
+                continue
+
     async def _close_process(self, process) -> None:
         try:
             await self._send_message(process, {"cmd": "quit"})
         except Exception:
-            terminate = getattr(process, "terminate", None)
-            if terminate:
-                terminate()
+            self._terminate(process)
         wait = getattr(process, "wait", None)
         if wait:
             try:

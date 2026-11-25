@@ -115,6 +115,62 @@ download_os_image() {
     return 0
 }
 
+# The PCI slots `new` passes through: CVM_GPUS from .env, or every NVIDIA GPU and NVSwitch for "all"
+passthrough_slots() {
+    local gpus="${CVM_GPUS:-}"
+    if [ -f .env ]; then
+        # read it the way `new` does (sources .env over the environment), so the same devices are checked
+        gpus=$(set +u; source ./.env >/dev/null 2>&1; echo "${CVM_GPUS:-}")
+    fi
+    [ -z "$gpus" ] && return 0
+    if [ "$gpus" = "all" ]; then
+        lspci -d 10de: -nn 2>/dev/null | grep -E "3D controller|Bridge" | awk '{print $1}'
+    else
+        tr ',' '\n' <<<"$gpus" | xargs -n1
+    fi
+}
+
+check_vfio_devices() {
+    local slot dev driver group ok=true
+    local slots
+    slots=$(passthrough_slots)
+    if [ -z "$slots" ]; then
+        log_warning "CVM_GPUS is not set in .env; no GPU will be passed through"
+        return 0
+    fi
+    if [ -z "$(ls -A /sys/kernel/iommu_groups 2>/dev/null)" ]; then
+        log_error "No IOMMU groups: the IOMMU is off (enable VT-d in BIOS and intel_iommu=on, docs/host-setup.md section 2)"
+        return 1
+    fi
+    for slot in $slots; do
+        dev="/sys/bus/pci/devices/$slot"
+        [ -e "$dev" ] || dev="/sys/bus/pci/devices/0000:$slot"
+        if [ ! -e "$dev" ]; then
+            log_error "Passthrough device $slot not found (check CVM_GPUS against 'lspci -d 10de:')"
+            ok=false
+            continue
+        fi
+        driver=""
+        group=""
+        [ -e "$dev/driver" ] && driver=$(basename "$(readlink -f "$dev/driver")")
+        [ -e "$dev/iommu_group" ] && group=$(basename "$(readlink -f "$dev/iommu_group")")
+        if [ "$driver" != "vfio-pci" ]; then
+            if [ -z "$driver" ] && [ ! -d /sys/module/vfio_pci ]; then
+                log_error "$slot has no driver: the vfio-pci module is not loaded (docs/host-setup.md section 2: load it at boot)"
+            else
+                log_error "$slot uses driver '${driver:-none}', not vfio-pci (docs/host-setup.md section 2: vfio-pci.ids, then reboot)"
+            fi
+            ok=false
+        elif [ -z "$group" ] || [ ! -e "/dev/vfio/$group" ]; then
+            log_error "$slot has no /dev/vfio/${group:-<group>} (IOMMU off? docs/host-setup.md section 2)"
+            ok=false
+        else
+            log_success "$slot is bound to vfio-pci (/dev/vfio/$group)"
+        fi
+    done
+    [ "$ok" = true ]
+}
+
 # Check command - verify system requirements
 check_requirements() {
     log_info "Checking system requirements for DStack CVM..."
@@ -146,12 +202,23 @@ check_requirements() {
         all_good=false
     fi
 
-    # Check QEMU
+    # Check QEMU: the binary the launcher runs ([qemu] path in client.conf), not whatever is on PATH
     log_info "Checking QEMU installation..."
-    if command_exists qemu-system-x86_64; then
-        log_success "QEMU is installed: $(qemu-system-x86_64 --version | head -n1)"
+    local qemu_path qemu_version
+    # no fallback: a client.conf that new/run cannot load must fail check too (the loader supplies the default path)
+    if ! qemu_path=$(python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); import dstack; print(dstack.DStackConfig.load().qemu_path)' "$SCRIPTS_DIR"); then
+        log_error "Cannot read the [qemu] path from the dstack client.conf (error above); new and run would fail the same way"
+        all_good=false
+    elif command_exists "$qemu_path"; then
+        qemu_version=$("$qemu_path" --version | head -n1)
+        if [[ "$qemu_version" == *"version 9.2.1"* ]]; then
+            log_success "QEMU used for CVMs ($qemu_path): $qemu_version"
+        else
+            log_warning "QEMU used for CVMs ($qemu_path) is not the dstack 9.2.1 build: $qemu_version"
+            log_warning "Attestation will fail on this QEMU. Build it and set [qemu] path in /etc/dstack/client.conf (docs/host-setup.md section 3)"
+        fi
     else
-        log_error "QEMU (qemu-system-x86_64) is not installed"
+        log_error "QEMU ($qemu_path) is not installed"
         all_good=false
     fi
 
@@ -219,6 +286,10 @@ check_requirements() {
         log_error "Python3 is not installed"
         all_good=false
     fi
+
+    # Check passthrough devices: QEMU opens /dev/vfio/<group> for each one, so each must be bound to vfio-pci
+    log_info "Checking GPU passthrough (vfio-pci)..."
+    check_vfio_devices || all_good=false
 
     # Summary
     echo
@@ -383,9 +454,9 @@ new_cvm() {
             fi
         done
     elif [ -n "$RENTING_PORT_RANGE" ]; then
-        # Parse RENTING_PORT_RANGE: "40000-65535" or "9001,9002,9003"
+        # Comma list only: each port becomes its own QEMU forward
         if [[ "$RENTING_PORT_RANGE" == *"-"* ]]; then
-            log_error "Range format is not supported"
+            log_error "RENTING_PORT_RANGE takes a comma list (e.g. \"19001,19002,19003\"), not a dash range"
             return 1
         else
             # Comma-separated format: "9001,9002,9003"

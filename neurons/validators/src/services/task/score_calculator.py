@@ -12,9 +12,25 @@ from services.gpu_spec_table import normalize_gpu_model, reference_gpu_model
 from services.task.pipeline import Context
 
 
+def zero_score_gate_failed(ctx: Context) -> bool:
+    """What the run read before it stopped has already zeroed this cycle's score, whatever the checks after it find.
+
+    The same calculate_scores the score check runs, so no zero-score branch is left out. A VerifyX speed not on
+    record is no failure here: the stop may have cut the sample off, or the node is too new to have one (review at
+    ea74f37); a measured speed below the floor already failed VerifyXCheck itself."""
+    return calculate_scores(ctx, ctx.rented, verifyx_ema_required=False)[0] <= 0
+
+
+def _tdx_gate_failed(ctx: Context) -> bool:
+    # GPU attestation is observe-only: tdx_attestation_passed also drops on a verified-bad GPU verdict
+    tdx_passed = ctx.tdx_attestation_passed or ctx.gpu_attestation_passed is False
+    return bool(settings.ENABLE_TCB_ENFORCEMENT and ctx.executor.tdx_quote and not tdx_passed)
+
+
 def calculate_scores(
     ctx: Context,
     rented: bool = False,
+    verifyx_ema_required: bool = True,
 ) -> Tuple[float, float, str]:
     """Calculate actual and job scores for an executor validation.
 
@@ -66,8 +82,7 @@ def calculate_scores(
     # known CVM is rejected upstream by the attestation ratchet. GPU attestation is
     # observe-only: tdx_attestation_passed also drops on a verified-bad GPU verdict
     # (only verified beside a TDX digest, so False implies one), and that alone must not zero the score.
-    tdx_passed = ctx.tdx_attestation_passed or ctx.gpu_attestation_passed is False
-    if settings.ENABLE_TCB_ENFORCEMENT and ctx.executor.tdx_quote and not tdx_passed:
+    if _tdx_gate_failed(ctx):
         actual_score = 0.0
         job_score = 0.0
         warning_messages.append("CVM attestation not passed (TDX attestation required)")
@@ -93,14 +108,6 @@ def calculate_scores(
         actual_score = 0.0
         job_score = 0.0
         warning_messages.append("Provider-side workload consumes the machine's CPU or disk")
-
-    # Rental-sensor blind-streak gate (DAH-4271): same mechanics as the CPU-truth gate above,
-    # the check is non-fatal, so only this line zeroes the score, and shadow leaves the flag True.
-    # It reads only whether the sensor saw the rental at all, never what it found.
-    if not ctx.inspector_blind_streak_passed:
-        actual_score = 0.0
-        job_score = 0.0
-        warning_messages.append("Rental sensor saw nothing of the rental too many cycles in a row")
 
     # Rented-pod resources gate (DAH-4564): same mechanics as the CPU-truth gate above.
     if not ctx.rented_pod_resources_passed:
@@ -139,13 +146,6 @@ def calculate_scores(
         job_score = 0.0
         warning_messages.append("Host hardware identity does not match the hardware")
 
-    # Host-write gate (DAH-4548): same mechanics; it reads only the sensor's verdict that the host
-    # wrote into a rented pod under enforcement, and shadow leaves the flag True.
-    if not ctx.inspector_host_write_passed:
-        actual_score = 0.0
-        job_score = 0.0
-        warning_messages.append("The host wrote into a renter's container")
-
     # Kernel GPU view gate: BannedProviderCheck is non-fatal on a live rental, so only this
     # line zeroes the score there.
     if not ctx.kernel_gpu_view_passed:
@@ -164,11 +164,18 @@ def calculate_scores(
         job_score = 0.0
         warning_messages.append("A GPU is not the model the node reports")
 
+    # Node account gate (DAH-6539): a rented node on another account's machine scores 0; its renter's pod runs on and
+    # is billed as usual.
+    if not ctx.node_account_passed:
+        actual_score = 0.0
+        job_score = 0.0
+        warning_messages.append("The node is not on the machine its account registered")
+
     # EMA verifyx download speed check — threshold enforced upstream in VerifyXCheck
     ema_verifyx_download = ((ctx.state.specs or {}).get("network") or {}).get(
         "ema_verifyx_download_speed"
     )
-    if not rented and ema_verifyx_download is None:
+    if verifyx_ema_required and not rented and ema_verifyx_download is None:
         actual_score = 0.0
         job_score = 0.0
         warning_messages.append(

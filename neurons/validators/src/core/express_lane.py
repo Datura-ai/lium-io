@@ -30,12 +30,13 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
 import bittensor
-from clients.validator_portal_api import PortalExecutor, ValidatorPortalAPI
+from clients.validator_portal_api import PortalExecutor, ValidatorPortalAPI, start_owner_hotkeys_read
 from payload_models.payloads import MinerJobEnryptedFiles, MinerJobRequestPayload
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from services.executor_image_policy import ExpectedImageSnapshot
 from services.miner_service import EXPRESS_LANE, MinerService
 from services.redis_service import EXPRESS_REDIS_SLOT
+from services.task.messages import CYCLE_END_READ_REASONS, RentalVerificationMessages
 from services.task_service import JobResult
 
 from core.config import settings
@@ -71,6 +72,8 @@ SESSION_LOST_IN_PORT_CHECK = "the validator's SSH session closed during the port
 # miner's snapshot misses may already have used). Its own bound keeps a node whose session always
 # drops from staying queued, and hidden from the wave, for good: ~20 min at RETRY_SECONDS.
 SESSION_LOST_MAX_RUNS = 10
+NO_TASK_TIME_FOR_THE_RENTAL_PROBE = "the task had no time left for the rental probe or VerifyX"
+RENTED_DURING_THE_CHECK = "the backend found the node rented during the check"
 # Self-hosted miners' executor lists: how often, how many miners at once, and the longest a miner
 # that keeps not answering is skipped (one miss skips one interval, doubling per further miss).
 # Each ask is bounded by REST_EXECUTOR_LIST_TIMEOUT (miner_service).
@@ -211,6 +214,7 @@ class ExpressLane:
         self._self_hosted_misses: Counter[str] = Counter()  # miner hotkey -> misses in a row
         self._next_self_hosted_listing = 0.0  # monotonic
         self._listing: asyncio.Task | None = None
+        self._owner_refresh: asyncio.Future | None = None  # DAH-6740
         # DAH-5716: runs started per queued recheck request.
         # shortcut: in memory, so a restart restarts the budget; the request's TTL still bounds it.
         self._recheck_runs: Counter[str] = Counter()
@@ -255,6 +259,10 @@ class ExpressLane:
 
     async def tick(self) -> int:
         """One pass: discover, select under the caps, launch. Returns how many were launched."""
+        # DAH-6740: every upload this validator signs reads the owner map, so it refreshes even when no wave runs; in the
+        # background, so a slow portal never holds discovery
+        if self._owner_refresh is None or self._owner_refresh.done():
+            self._owner_refresh = start_owner_hotkeys_read()  # the same read the upload gate waits on
         inputs = self.cycle_inputs()
         if inputs is None:
             return 0
@@ -288,6 +296,7 @@ class ExpressLane:
             )
         if not chosen:
             return 0
+        # after a restart each run's upload waits for the first owner read (first_owner_hotkeys_read), in every lane
         return await self._launch(chosen)
 
     async def _restore_first_seen(self) -> None:
@@ -664,6 +673,7 @@ class ExpressLane:
             # An earlier pass in this batch must not keep the fallback off (review 4558893416).
             self.miner_service.express_published.pop(executor_id.lower(), None)
             self.miner_service.express_published_miner.pop(executor_id.lower(), None)
+            self.miner_service.express_passed_at.pop(executor_id.lower(), None)
         if result.session_lost_in_port_check:
             # The run has no verdict: its findings still go out, and it is retried without spending one of
             # MAX_ATTEMPTS (bounded by SESSION_LOST_MAX_RUNS), neither a failed first pass nor validated.
@@ -681,6 +691,13 @@ class ExpressLane:
                         await self._end_recheck(pending)
             self._defer(pending, SESSION_LOST_IN_PORT_CHECK)
             return
+        if result.failure_reason_code in CYCLE_END_READ_REASONS:
+            # DAH-5933: a result the scored cycle holds for its cycle-end rented read (a budget stop, a rental the
+            # backend found during the check) has no verdict: no failed first pass goes out; asked again within
+            # MAX_ATTEMPTS, then the cycle carries or withholds it
+            rented = result.failure_reason_code == RentalVerificationMessages.RENTED_SINCE_THE_SNAPSHOT.reason
+            self._defer(pending, RENTED_DURING_THE_CHECK if rented else NO_TASK_TIME_FOR_THE_RENTAL_PROBE)
+            return
         passed = result.score > 0 or result.job_score > 0
         should_run_first_pass_again = (
             not passed
@@ -697,6 +714,7 @@ class ExpressLane:
             # result-missing fallback in place (review 4558671509).
             self.miner_service.express_published[executor_id.lower()] = job_batch_id
             self.miner_service.express_published_miner[executor_id.lower()] = miner.hotkey
+            self.miner_service.express_passed_at[executor_id.lower()] = time.monotonic()
         pending.recheck_deadline = None
         if not should_run_first_pass_again:
             # A failed first pass that runs again keeps the request: the next tick selects it.

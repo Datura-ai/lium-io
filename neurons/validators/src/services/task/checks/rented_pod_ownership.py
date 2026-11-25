@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import shlex
+from datetime import datetime, timezone
 
 import asyncssh
 
@@ -13,6 +14,10 @@ from .rented_pod_resources import running_rented_container_names
 READ_TIMEOUT_SECONDS = 30
 # docker starts a restart-policy container within a few minutes of boot; one started later was restarted alone
 CONTAINER_RESTART_AFTER_BOOT_SECONDS = 600
+# a creation time up to this long after the boot (whole seconds on both sides, clock slew) is read as before it: no
+# container is created seconds after the kernel boots (dockerd and the validator come up later), so it is one
+# created just before the stop
+BOOT_TIME_UNCERTAINTY_SECONDS = 5
 
 
 # a restart of these under a running pod breaks it while it looks healthy: sysbox-fs serves the pod's /proc
@@ -51,6 +56,32 @@ def _num(text: str) -> int | None:
     # of at most 10 (a uid or pid fits in 32 bits; a huge string hits int()'s digit limit and raises)
     text = text.strip()
     return int(text) if len(text) <= 10 and text.isascii() and text.isdigit() else None
+
+
+def _epoch(stamp: str) -> int | None:
+    """Seconds since the epoch of docker's `.Created` (UTC, `2026-11-17T19:44:26.123456789Z`); None when it is not
+    one (the provider controls the SSH endpoint)."""
+    try:
+        return int(
+            datetime.strptime(stamp.strip()[:19], "%Y-%m-%dT%H:%M:%S")
+            .replace(tzinfo=timezone.utc)
+            .timestamp()
+        )
+    except ValueError:
+        return None
+
+
+def _shift_cause(pod: dict) -> str | None:
+    """"host" when the pod's container was on the host when it stopped (created before the boot) or came back right
+    after the boot; "container" when it was created after the boot, or started long after it with its creation time
+    unknown (created or restarted on the running host); None when neither is read."""
+    before = pod.get("created_before_boot")
+    if before is not None:
+        return "host" if before else "container"
+    after = pod.get("started_after_boot_s")
+    if after is None:
+        return None
+    return "container" if after >= CONTAINER_RESTART_AFTER_BOOT_SECONDS else "host"
 
 
 def judge(line: str) -> dict | None:
@@ -144,9 +175,11 @@ class RentedPodOwnershipCheck:
         unread = sorted(set(names) - {p["container"] for p in pods.values()})
         what = {"pods": list(pods.values())}
         if pods:
-            restarted = await self._runtime_restarted_under(ctx, list(pods.values()))
+            restarted, started_at = await self._runtime_restarted_under(ctx, list(pods.values()))
             if restarted:
                 what["runtime_restarted_under_pods"] = restarted
+                # when each flagged runtime started: a notice must date the restart, not the day the check first saw it
+                what["runtime_started_at"] = started_at
         shifted = [p for p in pods.values() if p["outside_namespace"]]
         if shifted:
             template = await self._shift_template(ctx, shifted)
@@ -166,73 +199,117 @@ class RentedPodOwnershipCheck:
 
     async def _shift_template(self, ctx: Context, shifted: list[dict]):
         """A container restarted long after the host booted was not brought back by a host reboot: say so,
-        instead of blaming an unclean host shutdown. Sets `started_after_boot_s` on each pod read."""
+        instead of blaming an unclean host shutdown. One created before this boot was already there when the host
+        stopped, however late it was started again (the validator's own stale-mount recovery starts it minutes
+        after boot). Sets `started_after_boot_s` and `created_before_boot` on each pod read."""
         try:
             res = await asyncio.wait_for(
                 ctx.ssh.run(
                     # pid beside its age: a pid gone since the read prints nothing, so ages cannot pair by line
                     "cut -d' ' -f1 /proc/uptime; ps -o pid=,etimes= -p "
-                    + ",".join(str(int(p["pid"])) for p in shifted),
+                    + ",".join(str(int(p["pid"])) for p in shifted)
+                    # btime: the kernel's boot epoch, taken in one read (not a clock and an uptime sampled apart)
+                    + "; echo --; awk '/^btime /{print $2}' /proc/stat; /usr/bin/docker inspect --format '{{.Name}} {{.Created}}' "
+                    + " ".join(shlex.quote(p["container"]) for p in shifted),
                     check=False,
                 ),
                 timeout=READ_TIMEOUT_SECONDS,
             )
         except (asyncssh.Error, OSError, TimeoutError):
             return Msg.SHIFTED
-        uptime, *lines = (res.stdout or "").splitlines() or [""]
+        head, _, tail = (res.stdout or "").partition("\n--\n")
+        uptime, *lines = head.splitlines() or [""]
         uptime_s = _num(uptime.partition(".")[0])
         ages = {}
         for line in lines:
             pid, _, age = line.strip().partition(" ")
             ages[_num(pid)] = _num(age.strip())
+        btime, *created_lines = tail.splitlines() or [""]
+        boot_s = _num(btime)
+        created = {}
+        for line in created_lines:
+            name, _, stamp = line.strip().partition(" ")
+            created[name.lstrip("/")] = _epoch(stamp)
         for pod in shifted:
             age_s = ages.get(int(pod["pid"]))
             if uptime_s is not None and age_s is not None:
                 pod["started_after_boot_s"] = uptime_s - age_s
-        after = [p.get("started_after_boot_s") for p in shifted]
-        late = [a is not None and a >= CONTAINER_RESTART_AFTER_BOOT_SECONDS for a in after]
-        if all(late):
+            created_s = created.get(pod["container"])
+            if boot_s is not None and created_s is not None:
+                pod["created_before_boot"] = created_s <= boot_s + BOOT_TIME_UNCERTAINTY_SECONDS
+        causes = [_shift_cause(p) for p in shifted]
+        if all(c == "container" for c in causes):
             return Msg.SHIFTED_AFTER_CONTAINER_RESTART
-        if any(late) and None not in after:
-            # some pods restarted on a running host, others came back with it: neither cause fits every pod
+        if None not in causes and "container" in causes:
+            # some pods were created or restarted on a running host, others came back with it
             return Msg.SHIFTED_MIXED
         return Msg.SHIFTED
 
-    async def _runtime_restarted_under(self, ctx: Context, pods: list[dict]) -> dict[str, list[str]]:
-        """Each runtime process that started after a pod's container: {process: [containers]}. Observe-only,
-        for the support sweep; an unread age flags nothing."""
+    async def _runtime_restarted_under(
+        self, ctx: Context, pods: list[dict]
+    ) -> tuple[dict[str, list[str]], dict[str, str]]:
+        """Each runtime process that started after a pod's container: {process: [containers]}, and when each of
+        those started ({process: UTC time, or "unknown"}). Both come from the kernel's start time of each process
+        (/proc/<pid>/stat field 22, ticks since boot, plus the boot epoch), not from ages and a clock sampled
+        apart, so a slow read cannot move a date. Observe-only, for the support sweep; an unread start flags
+        nothing."""
+        start = "$(sed 's/.*) //' /proc/$p/stat 2>/dev/null | cut -d' ' -f20)"  # after "pid (comm) ": field 22
         try:
             res = await asyncio.wait_for(
                 ctx.ssh.run(
                     # comm is cut to 15 characters (nv-fabricmanage)
-                    "ps -eo comm=,etimes= | grep -E '^("
+                    "ps -eo pid=,ppid=,comm= | grep -E ' ("
                     + "|".join(n[:15] for n in RUNTIME_PROCESSES)
-                    + ") '; echo --; ps -o pid=,etimes= -p "
-                    + ",".join(str(int(p["pid"])) for p in pods),
+                    + ")$' | while read -r p pp c; do echo \"$p $pp $c "
+                    + start
+                    + '"; done; echo --; for p in '
+                    + " ".join(str(int(p["pid"])) for p in pods)
+                    + '; do echo "$p '
+                    + start
+                    + "\"; done; echo --; awk '/^btime /{print $2}' /proc/stat; getconf CLK_TCK",
                     check=False,
                 ),
                 timeout=READ_TIMEOUT_SECONDS,
             )
         except (asyncssh.Error, OSError, TimeoutError):
-            return {}
-        services, _, pod_lines = (res.stdout or "").partition("--")
-        youngest: dict[str, int] = {}
+            return {}, {}
+        services, _, rest = (res.stdout or "").partition("--")
+        pod_lines, _, clock = rest.partition("--")
+        boot_s, ticks_per_s = ([_num(x) for x in clock.split()] + [None, None])[:2]
+        procs = []
         for line in services.splitlines():
-            comm, _, age = line.strip().partition(" ")
+            fields = line.split()
+            if len(fields) != 4:
+                continue
+            pid, ppid, comm, ticks = fields
             name = next((n for n in RUNTIME_PROCESSES if n[:15] == comm), None)
-            age_s = _num(age)
-            if name and age_s is not None:
-                youngest[name] = min(age_s, youngest.get(name, age_s))
-        pod_age = {}
+            if name and None not in (_num(pid), _num(ppid), _num(ticks)):
+                procs.append((name, _num(pid), _num(ppid), _num(ticks)))
+        pids = {(name, pid) for name, pid, _, _ in procs}
+        latest: dict[str, int] = {}
+        for name, _, ppid, ticks in procs:
+            # sysbox-fs and sysbox-mgr re-exec themselves for short-lived helpers (e.g. while serving
+            # a pod's /proc): a child of the same daemon is not a restart of it
+            if (name, ppid) not in pids:
+                latest[name] = max(ticks, latest.get(name, ticks))
+        pod_start = {}
         for line in pod_lines.splitlines():
-            pid, _, age = line.strip().partition(" ")
-            pod_age[_num(pid)] = _num(age.strip())
-        restarted = {}
-        for name, age_s in sorted(youngest.items()):
-            under = sorted(p["container"] for p in pods if (pod_age.get(p["pid"]) or 0) > age_s)
+            pid, _, ticks = line.strip().partition(" ")
+            pod_start[_num(pid)] = _num(ticks.strip())
+        restarted, started_at = {}, {}
+        for name, ticks in sorted(latest.items()):
+            under = sorted(
+                p["container"] for p in pods if pod_start.get(p["pid"]) is not None and pod_start[p["pid"]] < ticks
+            )
             if under:
                 restarted[name] = under
-        return restarted
+                # stated, not left out: a reader must not take a missing time for "today"
+                started_at[name] = (
+                    datetime.fromtimestamp(boot_s + ticks // ticks_per_s, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                    if boot_s and ticks_per_s
+                    else "unknown"
+                )
+        return restarted, started_at
 
     def _event(self, ctx: Context, template, what: dict) -> CheckResult:
         what = {"executor_uuid": ctx.executor.uuid, **what}

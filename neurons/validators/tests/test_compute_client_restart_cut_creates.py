@@ -620,7 +620,7 @@ async def test_a_delete_before_the_creates_record_write_is_not_undone_by_it() ->
     async def fake_drive_miner_job(job_request: ContainerCreateRequest) -> None:
         seen.append(await redis_service.inflight_backend_creates())
 
-    with inflight_creates.track("pod-1"):  # the create is picked up, its record write still to come
+    with inflight_creates.track("pod-1", ("miner-hk", "exec-1")):  # the create is picked up, its record write still to come
         await client._run_miner_job(
             ContainerDeleteRequest.model_construct(pod_id="pod-1", miner_hotkey="miner-hk", executor_id="exec-1")
         )
@@ -629,6 +629,30 @@ async def test_a_delete_before_the_creates_record_write_is_not_undone_by_it() ->
 
     assert seen == [{}]
     assert await redis_service.inflight_backend_creates() == {}
+
+
+@pytest.mark.asyncio
+async def test_a_delete_on_the_node_a_moved_pod_left_keeps_its_create_on_the_new_node() -> None:
+    """DAH-6540: a moved rent keeps its pod id; the old node's delete retires and blocks only that node's records."""
+    from services.docker_service import inflight_creates
+
+    redis_service = _redis_service()
+    await redis_service.add_inflight_backend_create("pod-1", "miner-hk", "exec-old", WorkloadKind.FILLER, "c-old")
+    client = _client(redis_service)
+    seen: list[dict[str, list[InflightBackendCreate]]] = []
+
+    async def fake_drive_miner_job(job_request) -> None:
+        if isinstance(job_request, ContainerCreateRequest):
+            seen.append(await redis_service.inflight_backend_creates())
+
+    client._drive_miner_job = fake_drive_miner_job
+    with inflight_creates.track("pod-1", ("miner-hk", "exec-old")):  # the old node's create still runs
+        await client._run_miner_job(
+            ContainerDeleteRequest.model_construct(pod_id="pod-1", miner_hotkey="miner-hk", executor_id="exec-old")
+        )
+        await client._run_miner_job(_create_request())  # the move's create, on exec-1
+
+    assert [create.executor_id for create in seen[0]["pod-1"]] == ["exec-1"]
 
 
 @pytest.mark.asyncio
@@ -1330,7 +1354,7 @@ async def test_a_delete_while_the_dispatch_is_being_recorded_cancels_the_create(
     task = await client.miner_drivers.get()
     await asyncio.sleep(0)
 
-    assert inflight_creates.cancel("pod-1")  # what the delete's teardown does first
+    assert inflight_creates.cancel("pod-1", ("miner-hk", "exec-1"))  # what the delete's teardown does first
     assert await asyncio.wait_for(task, 1) is None
     client.miner_driver.assert_not_awaited()
     assert not inflight_creates.is_running("pod-1")

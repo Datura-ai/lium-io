@@ -70,6 +70,12 @@ MINER_HOTKEY = "5MinerHotkeyOfTheExecutorUnderTest"
 # --- fakes -------------------------------------------------------------------------------------
 
 
+@pytest.fixture(autouse=True)
+def allcards_off(monkeypatch):
+    """The one call carries the matmul only while the all-cards check (on by default) is off."""
+    monkeypatch.setattr(settings, "MATMUL_ALLCARDS_CHECK_ENABLED", False)
+
+
 @pytest.fixture
 def keypair():
     return bittensor.Keypair.create_from_uri("//LiumTestValidator")
@@ -116,7 +122,7 @@ class _FakeVerifyXValidator:
     def verify_response(self, response):
         if not response.endswith("-ok"):
             raise RuntimeError("cipher rejected")
-        return {"ok": True}
+        return {"challenge_data": {}, "response_data": {}}
 
 
 @pytest.fixture

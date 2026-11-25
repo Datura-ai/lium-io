@@ -1,3 +1,4 @@
+import time
 import uuid
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
@@ -62,6 +63,10 @@ class JobResult(BaseModel):
     # executor is then scored whole-box; set and below gpu_count on a split node, the incentive
     # engine scores the free GPUs in the unrented pool.
     rented_gpu_count: int | None = None
+    # DAH-5933: the pod ids of the node's own rental in the snapshot this result was scored with, sorted; [] = scored
+    # idle, None = not known (kept before this field, or a verdict the snapshot's rental does not match). A kept result
+    # stands in for a later cycle only for this exact rental state (executor_rollout.rental_state_unchanged).
+    rental_pod_ids: list[str] | None = None
     # DAH-2467: the free remainder of a partially rented split node. It is always rated at the
     # minimum-split tier and rate, never as a bundle of its own size.
     is_split_remainder: bool = False
@@ -103,6 +108,8 @@ class JobResult(BaseModel):
     pod_ssh: list[PodSshObservation] | None = None
     # DAH-5651: ContextState.host_runtime_fault, this cycle's DinD test container on the host never answered
     host_runtime_fault: bool = False
+    # ContextState.rented_pod_faults: {pod_id: [host-side fault codes]} for the rented pods this cycle judged
+    rented_pod_faults: dict[str, list[str]] | None = None
     # True only when this cycle opened the shell with known_hosts pinned to executor_info.ssh_host_key,
     # so the node proved it holds that key. Results for nodes the cycle never reached stay False.
     ssh_host_key_verified: bool = False
@@ -126,6 +133,10 @@ class JobResult(BaseModel):
     # Such a copy under the keeper's own executor UUID: one backend row, so it is not published
     # and the row hears only the copy that kept the score.
     duplicate_shares_kept_row: bool = Field(default=False, exclude=True)
+    # DAH-6596: when what this result says was observed (time.monotonic()): its construction, or for a row from the
+    # miner's answer the answer itself. Such a row observed before an express pass of the same node under the same
+    # cycle id is older news than that pass and is not published.
+    observed_at: float = Field(default_factory=time.monotonic, exclude=True)
     # DAH-4658: the node's last scored result, standing in for a scrape the renter's GPU reset hid the cards
     # from; scored like the cycle it came from, never published
     carried_for_renter_gpu_reset: bool = Field(default=False, exclude=True)

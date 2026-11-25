@@ -23,18 +23,18 @@ _rng = secrets.SystemRandom()
 # the outer JOB_TIME_OUT cancellation, which dies silently without a reason_code (DAH-2365).
 MATRIX_VERIFY_TIMEOUT_SECONDS = 120
 
-# DAH-2671 item 3 — wide aggregate wall-clock (seconds) for the all-claimed-cards work-proof.
-# N honest cards run concurrently in ~single-card time (4-27s); a count lie that serialises onto one
-# real card blows out to ~N*single-card. This threshold is deliberately WIDE so honest slowdowns
-# (disabled P2P/IOMMU/ACS, 10-20% thermal throttle, a card already busy with a filler) do not trip
-# it; the emitted RAW timing lets ops recalibrate before flipping enforcement. The per-card SSH runs
-# each keep the MATRIX_VERIFY_TIMEOUT_SECONDS cap, so this only fails clear serialisation.
+# DAH-2671 item 3: aggregate wall-clock (seconds) per wave of MATMUL_ALLCARDS_MAX_CONCURRENT_CARDS cards for the
+# all-claimed-cards work-proof; a 9-14 card host runs in two waves (the gate below). Rationale: DAH-6576.
 MATMUL_ALLCARDS_WALL_CLOCK_SECONDS = 90
 
 # Cards probed at once. Each card takes an SSH channel on one connection and MAX_GPU_COUNT is 14,
 # while OpenSSH defaults to MaxSessions 10 — 8 keeps the concurrency signal (a count lie still
 # serialises) and stays clear of that ceiling on the widest honest hosts.
 MATMUL_ALLCARDS_MAX_CONCURRENT_CARDS = 8
+
+# A run with a timeout and no wrong answer is retried once as a whole, after the first run's processes are killed;
+# the retry decides, and a card that times out again fails (`timeout_after_retry`). Worst case: two runs of
+# MATRIX_VERIFY_TIMEOUT_SECONDS per wave plus the kill in between. Rationale: DAH-6576.
 
 # VRAM (MB) the work-proof leaves untouched: a quarter of the card, clamped between the two.
 # The reserve must clear what an idle card may legally hold (GPU_HELD_VRAM_MB_LIMIT, 2048 MB —
@@ -198,6 +198,8 @@ class ValidationResult:
     # DAH-6241: card index -> the sealed metrics the all-cards probe read off that card alone
     # (None when the probe did not run); device 0's own are in `metrics`.
     card_metrics: dict[int, dict] | None = None
+    # The all-cards work-proof failed with no card answering at all (see AllCardsProbe.no_card_answered).
+    all_cards_no_answer: bool = False
 
     def __bool__(self) -> bool:
         """Allow using ValidationResult in boolean context for backward compatibility."""
@@ -210,8 +212,8 @@ class AllCardsProbe:
 
     Honesty (validator-side only, never sent to the host): this proves N cards' worth of capacity
     existed in the window, NOT that the cards share one chassis — a relay to a genuine 8-GPU host
-    still passes. Chassis-binding (NCCL) is a follow-on ticket. Each card's answer is sealed (DAH-6241),
-    but only its metrics are read from the seal; `passed` does not depend on it.
+    still passes. Chassis-binding (NCCL) is a follow-on ticket. A card passes only with the right
+    (sealed) answer to the challenge keyed to it alone.
     """
 
     passed: bool
@@ -219,6 +221,21 @@ class AllCardsProbe:
     elapsed_seconds: float
     over_wall_clock: bool
     per_card: list[dict]
+
+    @property
+    def no_card_answered(self) -> bool:
+        """True when NO card answered (every card timed out, lost its channel or gave no answer); only then may
+        CapabilityCheck apply its live-workload waiver. A wrong answer never qualifies. Rationale: DAH-6576."""
+        return bool(self.per_card) and all(
+            not c.get("ok") and c.get("reason") != "wrong_answer" for c in self.per_card
+        )
+
+
+def _not_probed(reason: str) -> AllCardsProbe:
+    # a multi-card claim the probe could not run: no card proven, so not a pass
+    return AllCardsProbe(
+        passed=False, failure_reason=f"not probed: {reason}", elapsed_seconds=0.0, over_wall_clock=False, per_card=[]
+    )
 
 
 class ValidationService:
@@ -297,19 +314,22 @@ class ValidationService:
     ) -> AllCardsProbe | None:
         # concurrent per-card work-proof: one independent challenge per claimed card (own seed + own
         # uuid + own cipher), each pinned with CUDA_VISIBLE_DEVICES=<card UUID>, sized from the registry
-        # SKU (not host self-report), aggregate timed on the validator. Returns None when it does not
-        # apply — a single claimed card (legacy/whole-single-GPU path) or a model with no known
-        # registry VRAM size (cannot size safely) — so the caller's single-card path stays authoritative.
+        # SKU (not host self-report), aggregate timed on the validator. Returns None only for a single
+        # claimed card, whose proof is the caller's single-card run; a multi-card claim it cannot run
+        # (no card details, no registry size, our cipher failed) is a failed probe, never a skip.
         gpu = machine_spec.get("gpu", {}) or {}
         gpu_count = gpu.get("count", 0) or 0
         details = gpu.get("details", []) or []
-        if gpu_count <= 1 or not details:
+        if gpu_count <= 1:
             return None
-
+        # A multi-card claim the probe cannot size or key fails closed: skipping it would leave
+        # cards 1..N-1 unproven (every model in GPU_MODEL_RATES has a registry size).
+        if not details:
+            return _not_probed(f"{gpu_count} cards claimed with no card details")
         gpu_model = details[0].get("name", "") or ""
         sized_vram_mb = matmul_probe_vram_mb(gpu_model, details[0].get("capacity"))
         if not sized_vram_mb:
-            return None
+            return _not_probed(f"no work-proof size for GPU model {gpu_model!r}")
 
         script_path = f"{executor_info.root_dir}/src/decrypt_challenge.py"
 
@@ -319,53 +339,39 @@ class ValidationService:
             (details[index].get("uuid", "") or "") if index < len(details) else ""
             for index in range(gpu_count)
         ]
-        challenges: list[MatmulChallenge] = []
-        for card_uuid in card_uuids:
-            challenge = self._card_challenge(gpu_model, sized_vram_mb, card_uuid, default_extra)
-            # A native error yields an empty cipher, which would go out as a bare `--cipher_text `
-            # and read as a failed work-proof on every card. Our own fault, not the host's: skip
-            # the probe and let the caller's single-card path decide, as the legacy path does.
-            if challenge is None:
-                for prepared in challenges:
-                    prepared.close()
-                logger.warning(
-                    _m(
-                        "All-cards matmul skipped: cipher text generation failed (native error)",
-                        extra=get_extra_info(default_extra),
-                    )
-                )
-                return None
-            challenges.append(challenge)
-
-        # One SSH channel per card on a single connection, so the fan-out has to stay under the
-        # executor's sshd MaxSessions (OpenSSH defaults to 10). A 12-14 card host would otherwise
-        # push the tail channels into the ssh_error branch and read as a failed work-proof.
-        gate = asyncio.Semaphore(MATMUL_ALLCARDS_MAX_CONCURRENT_CARDS)
-
-        async def run_gated(index: int, challenge: MatmulChallenge) -> dict:
-            async with gate:
-                return await self._run_one_card(
-                    ssh_client, executor_info, script_path, index, challenge, card_uuids[index]
-                )
-
-        start = time.perf_counter()
-        try:
-            per_card = await asyncio.gather(
-                *(run_gated(index, challenge) for index, challenge in enumerate(challenges))
+        run = await self._run_all_cards(
+            ssh_client, executor_info, script_path, gpu_model, sized_vram_mb, card_uuids, default_extra
+        )
+        if run is None:
+            return _not_probed("cipher text generation failed (native error)")
+        per_card, elapsed = run
+        waves = -(-gpu_count // MATMUL_ALLCARDS_MAX_CONCURRENT_CARDS)
+        wall_clock_threshold = MATMUL_ALLCARDS_WALL_CLOCK_SECONDS * waves
+        timed_out = any(outcome["reason"] == "timeout" for outcome in per_card)
+        # a slow run where every card answered right is retried the same way (DAH-6576)
+        slow = elapsed > wall_clock_threshold and all(outcome["ok"] for outcome in per_card)
+        if (timed_out or slow) and all(outcome["reason"] != "wrong_answer" for outcome in per_card):
+            # the whole run again, together, so the retry is as concurrent as the first try
+            await self._kill_remote_matmul(ssh_client, script_path, {**default_extra, "retry": "all_cards"})
+            retry = await self._run_all_cards(
+                ssh_client, executor_info, script_path, gpu_model, sized_vram_mb, card_uuids, default_extra
             )
-        finally:
-            for challenge in challenges:
-                challenge.close()
-        elapsed = time.perf_counter() - start
+            if retry is None:
+                return _not_probed("cipher text generation failed (native error)")
+            per_card, elapsed = retry
+            for outcome in per_card:
+                outcome["retried"] = True
+                if outcome["reason"] == "timeout":
+                    outcome["reason"] = "timeout_after_retry"
 
         failed_cards = [outcome for outcome in per_card if not outcome["ok"]]
-        over_wall_clock = elapsed > MATMUL_ALLCARDS_WALL_CLOCK_SECONDS
+        over_wall_clock = elapsed > wall_clock_threshold
         passed = not failed_cards and not over_wall_clock
         if failed_cards:
             failure_reason = f"{len(failed_cards)}/{gpu_count} card(s) failed device work-proof"
         elif over_wall_clock:
             failure_reason = (
-                f"aggregate wall-clock {elapsed:.1f}s over {MATMUL_ALLCARDS_WALL_CLOCK_SECONDS}s "
+                f"aggregate wall-clock {elapsed:.1f}s over {wall_clock_threshold}s "
                 f"(serialisation on fewer real cards than claimed)"
             )
         else:
@@ -377,7 +383,7 @@ class ValidationService:
             "gpu_model": gpu_model,
             "sized_vram_mb": sized_vram_mb,
             "elapsed_seconds": round(elapsed, 3),
-            "wall_clock_threshold_seconds": MATMUL_ALLCARDS_WALL_CLOCK_SECONDS,
+            "wall_clock_threshold_seconds": wall_clock_threshold,
             "over_wall_clock": over_wall_clock,
             "per_card": per_card,
             "passed": passed,
@@ -400,12 +406,70 @@ class ValidationService:
             per_card=per_card,
         )
 
+    async def _run_all_cards(
+        self,
+        ssh_client,
+        executor_info,
+        script_path: str,
+        gpu_model: str,
+        sized_vram_mb: int,
+        card_uuids: list[str],
+        default_extra: dict,
+    ) -> tuple[list[dict], float] | None:
+        """Every claimed card's own challenge, concurrently, timed on the validator: (per-card
+        outcomes, elapsed seconds), or None when our own cipher failed (nothing was sent)."""
+        challenges: list[MatmulChallenge] = []
+        for card_uuid in card_uuids:
+            challenge = self._card_challenge(gpu_model, sized_vram_mb, card_uuid, default_extra)
+            # A native error yields an empty cipher. Nothing is sent; the cards stay unproven, so the
+            # probe fails closed, as the single-card path does on the same error.
+            if challenge is None:
+                for prepared in challenges:
+                    prepared.close()
+                logger.warning(
+                    _m(
+                        "All-cards matmul not run: cipher text generation failed (native error)",
+                        extra=get_extra_info(default_extra),
+                    )
+                )
+                return None
+            challenges.append(challenge)
+
+        # One SSH channel per card on a single connection, so the fan-out has to stay under the
+        # executor's sshd MaxSessions (OpenSSH defaults to 10). A 12-14 card host would otherwise
+        # push the tail channels into the ssh_error branch and read as a failed work-proof.
+        gate = asyncio.Semaphore(MATMUL_ALLCARDS_MAX_CONCURRENT_CARDS)
+
+        async def run_gated(index: int, challenge: MatmulChallenge) -> dict:
+            async with gate:
+                return await self._run_one_card(
+                    ssh_client, executor_info, script_path, index, challenge, card_uuids[index]
+                )
+
+        start = time.perf_counter()
+        try:
+            per_card = await asyncio.gather(
+                *(run_gated(index, challenge) for index, challenge in enumerate(challenges))
+            )
+        except asyncio.CancelledError:
+            # the cycle's deadline or the fast path cancelled us: the remote matmuls keep the cards
+            # busy into the next run, so kill them (shielded: a second cancel must not stop the kill)
+            # and stay cancelled, as the single-card run does
+            await asyncio.shield(
+                self._kill_remote_matmul(ssh_client, script_path, {**default_extra, "cancelled": "all_cards"})
+            )
+            raise
+        finally:
+            for challenge in challenges:
+                challenge.close()
+        return list(per_card), time.perf_counter() - start
+
     @staticmethod
     def _leaves_matmul_running(outcome: dict) -> bool:
         # the per-card failures where the remote matmul may still hold VRAM: a timeout abandons only
         # the local wait, and a channel that dies mid-run (ssh_error) leaves the process untouched
         reason = outcome.get("reason") or ""
-        return reason == "timeout" or reason.startswith("ssh_error")
+        return reason in ("timeout", "timeout_after_retry") or reason.startswith("ssh_error")
 
     def _card_challenge(
         self, gpu_model: str, sized_vram_mb: int, card_uuid: str, default_extra: dict
@@ -469,17 +533,30 @@ class ValidationService:
             return {"card_index": index, "ok": False, "reason": f"exit_status={exit_status}"}
         if not stdout.strip():
             return {"card_index": index, "ok": False, "reason": "empty_output"}
-        outcome = {"card_index": index, "ok": True, "reason": ""}
-        # DAH-6241: the card's sealed answer gives its own cc and SM count. The seal does not gate
-        # the work-proof (ok above); a card whose answer does not unseal gives no metrics.
+        # The card passes only with the right answer to its own challenge (evaluate_matmul_output
+        # also rejects a forged or missing seal from a seal-aware library). A card CUDA cannot see
+        # still exits 0 and prints `UUID:  None`, so exit status alone proves nothing.
         try:
             judged = self.evaluate_matmul_output(
                 challenge, stdout=stdout.strip(), stderr=(getattr(result, "stderr", "") or "").strip()
             )
         except Exception as e:
-            logger.warning("All-cards per-card seal check failed: %s", str(e))
-            judged = None
-        outcome["seal_ok"] = bool(judged and judged.success and judged.sealed)
+            logger.warning("All-cards per-card answer check failed: %s", str(e))
+            return {"card_index": index, "ok": False, "reason": "validator_error"}
+        if not judged.success:
+            no_answer = (judged.error_message or "").startswith(UUID_MISMATCH_ERROR_PREFIX) and (
+                (judged.returned_uuid or "").strip().lower() in ("", "none", "null")
+            )
+            return {
+                "card_index": index,
+                "ok": False,
+                "reason": "no_answer" if no_answer else "wrong_answer",
+                "error": (judged.error_message or "")[:200],
+                "stderr_tail": (judged.stderr or "")[-200:],
+            }
+        outcome = {"card_index": index, "ok": True, "reason": ""}
+        # DAH-6241: the card's sealed answer gives its own cc and SM count
+        outcome["seal_ok"] = bool(judged.sealed)
         if outcome["seal_ok"] and judged.metrics:
             outcome["metrics"] = judged.metrics
         return outcome
@@ -748,10 +825,10 @@ class ValidationService:
         # local_verify.py) calls the same two functions around `POST /verify`.
         # DAH-2671 item 3: all-claimed-cards work-proof. Shadow (MATMUL_ALLCARDS_CHECK_ENABLED
         # without enforcement) logs timing + per-card outcome and NEVER changes the returned result;
-        # enforcement fails a count lie (device-selection error / OOM / serialised aggregate
-        # wall-clock). Single-card / unknown-model hosts skip it (probe returns None), which also
-        # keeps a not-yet-relevant fleet — and the legacy single-card path below — unchanged.
-        # a filler-node sample runs beside the filler, so it never probes every card
+        # enforcement fails any claimed card without its own right answer, and the aggregate
+        # wall-clock. Only a single-card host skips it (probe returns None): the single-card run
+        # below is that card's proof. A filler-node sample runs beside the filler, so it pins one
+        # card per sample instead (checks/capability.py, enforced there).
         all_cards = None
         if settings.MATMUL_ALLCARDS_CHECK_ENABLED and probe_all_cards:
             all_cards = await self.probe_all_claimed_cards(
@@ -765,6 +842,7 @@ class ValidationService:
                 return ValidationResult(
                     success=False,
                     error_message=f"All-cards GPU work-proof failed: {all_cards.failure_reason}",
+                    all_cards_no_answer=all_cards.no_card_answered,
                 )
 
         # Per-call verifier object: its key MUST survive the SSH round-trip so we can

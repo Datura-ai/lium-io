@@ -4,6 +4,8 @@ import re
 import shlex
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
+
+from ssh_channel_double import create_process_answering_through
 from uuid import uuid4
 
 import pytest
@@ -24,6 +26,7 @@ from payload_models.payloads import (
     WorkloadKind,
 )
 import services.docker_service as docker_service_module
+from helpers import no_host_start_lock, shared_pod_start_stop_lock
 from services.docker_service import LEGACY_S3FS_PLUGIN_ALIAS, DockerService, _is_vloopback_driver, _s3fs_plugin_alias
 from services.rental_docker_sdk import (
     ContainerExecResult,
@@ -73,6 +76,12 @@ class RecordingSSHClient:
             exit_status=self.exit_status,
         )
 
+    async def create_process(self, command, *args, **kwargs):
+        # only the bounded host reads open a channel here; other channel users stay unmodelled, as before
+        if not command.startswith(("cat /proc/", "ls -1d /dev/nvidia")):
+            raise AttributeError("create_process")
+        return await create_process_answering_through(self.run)(command)
+
 
 class RecordingRentalDockerClient:
     def __init__(self):
@@ -87,7 +96,7 @@ class RecordingRentalDockerClient:
         self.removed_containers = []
         self.created_volumes = []
         self.removed_volumes = []
-        self.pruned_images = 0
+        self.removed_untagged_images = []
         self.run_container_error = None
 
     async def login(self, *, username: str, password: str, image: str) -> None:
@@ -114,6 +123,9 @@ class RecordingRentalDockerClient:
     async def exec_in_container(self, spec) -> ContainerExecResult:
         self.exec_specs.append(spec)
         return ContainerExecResult(exit_status=0)
+
+    async def container_identity(self, *, container_name: str) -> str | None:
+        return "cid@2026-11-16T14:00:00Z"
 
     async def inspect_container_state(self, *, container_name: str) -> ContainerStateSnapshot:
         return ContainerStateSnapshot(
@@ -170,8 +182,12 @@ class RecordingRentalDockerClient:
     ) -> str | None:
         return None
 
-    async def prune_images(self) -> None:
-        self.pruned_images += 1
+    async def container_image_id(self, *, container: str) -> str:
+        return "sha256:pod-image"
+
+    async def remove_image_if_untagged(self, *, image_id: str) -> bool:
+        self.removed_untagged_images.append(image_id)
+        return True
 
 
 class RecordingRentalDockerFactory:
@@ -201,6 +217,7 @@ def docker_service():
     lock.__aenter__ = AsyncMock(return_value=lock)
     lock.__aexit__ = AsyncMock(return_value=None)
     redis_service.acquire_executor_lock = Mock(return_value=lock)
+    redis_service.pod_start_stop_lock = shared_pod_start_stop_lock({})
     service = DockerService(
         ssh_service=ssh_service,
         redis_service=redis_service,
@@ -209,6 +226,7 @@ def docker_service():
     )
     # the pre-run kernel.pid_max read is mandatory and the SSH doubles here do not model /proc
     service._read_host_pid_max = AsyncMock(return_value=4_194_304)
+    service._hold_pod_start_host_lock = no_host_start_lock
     return service
 
 
@@ -521,7 +539,9 @@ async def test_fresh_create_fails_when_sysbox_cannot_align_the_volume_owner(
     # A range wider than one slice means sysbox picks a different base per
     # container, so the mount owner cannot be aligned. A fresh rental fails
     # before the container exists instead of starting on runc.
-    ssh_client = RecordingSSHClient(stdout="sysbox:231072:1048576")
+    ssh_client = InstalledPluginSSHClient(
+        f"docker.io/{docker_service_module.S3FS_PLUGIN_IMAGE}", stdout="sysbox:231072:1048576"
+    )
     _patch_create_harness(monkeypatch, docker_service, ssh_client)
     plugin_spy = AsyncMock()
     monkeypatch.setattr(docker_service, "remove_s3fs_volume_plugin", plugin_spy)
@@ -679,6 +699,181 @@ async def test_create_s3fs_volume_uses_a_plugin_instance_of_its_own(
         f"/usr/bin/docker volume create -d {LEGACY_S3FS_PLUGIN_ALIAS} ",
     )
     assert not any(command.startswith(forbidden) for command in ssh_client.commands)
+
+
+class InstallFailsSSHClient(RecordingSSHClient):
+    def __init__(self, install_failures: int, install_stderr: str):
+        super().__init__()
+        self.install_failures = install_failures
+        self.install_stderr = install_stderr
+
+    async def run(self, command, *args, **kwargs):
+        self.commands.append(command)
+        if "plugin install" in command and self.install_failures:
+            self.install_failures -= 1
+            return SimpleNamespace(stdout="", stderr=self.install_stderr, exit_status=1)
+        return SimpleNamespace(stdout="", stderr="", exit_status=0)
+
+
+def _s3fs_install_count(ssh_client) -> int:
+    return sum("plugin install" in command for command in ssh_client.commands)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("install_failures", "install_stderr", "expected_installs"),
+    [
+        # a Docker Hub TLS timeout on the plugin pull (node 72d90b60, 15 Nov) is tried again
+        (1, 'failed to do request: Get "https://registry-1.docker.io/v2/": net/http: TLS handshake timeout', 2),
+        # the retries stop after two
+        (5, "net/http: TLS handshake timeout", 3),
+        # an instance already installed for this volume is not pulled again
+        (1, "Error response from daemon: plugin s3fs-celium-volume-safe:latest already exists", 1),
+    ],
+)
+async def test_create_s3fs_volume_retries_a_failed_plugin_install(
+    docker_service,
+    monkeypatch,
+    install_failures,
+    install_stderr,
+    expected_installs,
+):
+    ssh_client = InstallFailsSSHClient(install_failures, install_stderr)
+    monkeypatch.setattr(docker_service, "execute_and_stream_logs", AsyncMock(return_value=(True, "")))
+    monkeypatch.setattr(docker_service_module, "S3FS_PLUGIN_INSTALL_RETRY_WAIT_SECONDS", 0)
+
+    result = await docker_service.create_s3fs_volume(
+        ssh_client=ssh_client,
+        log_extra={},
+        volume_info=_s3fs_volume_info(),
+        log_tag="tag",
+        sysbox_subuid_base=None,
+    )
+
+    assert result == (True, "")
+    assert _s3fs_install_count(ssh_client) == expected_installs
+    # the instance is still configured and enabled after the retried install
+    assert any("plugin enable s3fs-celium-volume-safe" in command for command in ssh_client.commands)
+
+
+class InstalledPluginSSHClient(RecordingSSHClient):
+    # answers `plugin inspect` with the installed instance's reference, `docker ps` with the containers holding the
+    # volume, `plugin rm` with plugin_rm_exit, every other command with `stdout`
+    # `disabled`: the instance was left disabled, so `volume rm` fails (and the volume keeps it in use) until enabled
+    def __init__(self, reference: str, stdout: str = "", plugin_rm_exit: int = 0, holders: str = "", disabled=False):
+        super().__init__(stdout=stdout)
+        self.reference = reference
+        self.plugin_rm_exit = plugin_rm_exit
+        self.holders = holders
+        self.disabled = disabled
+
+    async def run(self, command, *args, **kwargs):
+        self.commands.append(command)
+        if "plugin inspect --format '{{.PluginReference}}'" in command:
+            return SimpleNamespace(stdout=self.reference + "\n", stderr="", exit_status=0)
+        if command.startswith("/usr/bin/docker ps -aq --filter volume="):
+            return SimpleNamespace(stdout=self.holders, stderr="", exit_status=0)
+        if command.startswith("/usr/bin/docker plugin enable "):
+            self.disabled = False
+        if command.startswith("/usr/bin/docker volume rm ") and self.disabled:
+            self.plugin_rm_exit = 1
+            return SimpleNamespace(stdout="", stderr="driver s3fs-celium-volume-safe is disabled", exit_status=1)
+        if command.startswith("/usr/bin/docker plugin rm "):
+            stderr = "plugin s3fs-celium-volume-safe is in use" if self.plugin_rm_exit else ""
+            return SimpleNamespace(stdout="", stderr=stderr, exit_status=self.plugin_rm_exit)
+        return SimpleNamespace(stdout=self.stdout, stderr="", exit_status=0)
+
+
+@pytest.mark.parametrize(
+    ("reference", "current"),
+    [
+        # the mochoa build (s3fs 1.86: retries go out unsigned)
+        ("docker.io/mochoa/s3fs-volume-plugin:latest", False),
+        (f"docker.io/{docker_service_module.S3FS_PLUGIN_IMAGE}", True),
+        # `docker plugin create` records the name without the registry
+        (docker_service_module.S3FS_PLUGIN_IMAGE, True),
+        (f"docker.io/{docker_service_module.S3FS_PLUGIN_IMAGE}-old", False),
+    ],
+)
+def test_only_our_plugin_build_counts_as_current(reference, current):
+    assert docker_service_module._s3fs_plugin_is_current(reference) is current
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("removed", [True, False], ids=["removed", "removal_fails"])
+async def test_an_instance_of_another_build_is_removed_with_its_volume_or_the_rental_fails(
+    docker_service, monkeypatch, removed
+):
+    # review on #2397: `plugin rm` failed while the old volume kept the instance in use, the install accepted
+    # "already exists", and the rental ran on the old build
+    ssh_client = InstalledPluginSSHClient("docker.io/mochoa/s3fs-volume-plugin:latest", plugin_rm_exit=0 if removed else 1)
+    stream_logs = AsyncMock(return_value=(True, ""))
+    monkeypatch.setattr(docker_service, "execute_and_stream_logs", stream_logs)
+
+    is_success, message = await docker_service.create_s3fs_volume(
+        ssh_client=ssh_client,
+        log_extra={},
+        volume_info=_s3fs_volume_info(),
+        log_tag="tag",
+        sysbox_subuid_base=None,
+    )
+
+    # no container references the volume; its handle goes first, then the instance it held in use
+    assert ssh_client.commands[1:6] == [
+        "/usr/bin/docker ps -aq --filter volume=celium-volume-safe",
+        "/usr/bin/docker plugin enable s3fs-celium-volume-safe",
+        "/usr/bin/docker volume rm celium-volume-safe",
+        "/usr/bin/docker plugin disable s3fs-celium-volume-safe -f",
+        "/usr/bin/docker plugin rm s3fs-celium-volume-safe",
+    ]
+    installed = any("plugin install" in command for command in ssh_client.commands)
+    if removed:
+        assert is_success is True and installed
+    else:
+        assert is_success is False and "could not be removed" in message and "in use" in message
+        assert not installed
+        stream_logs.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_an_instance_of_another_build_left_disabled_is_still_replaced(docker_service, monkeypatch):
+    # review on #2397: the old instance was force-disabled with its volume kept; Docker refused `volume rm` on the
+    # disabled driver, so `plugin rm` failed and the rental stopped before the install
+    ssh_client = InstalledPluginSSHClient("docker.io/mochoa/s3fs-volume-plugin:latest", disabled=True)
+    monkeypatch.setattr(docker_service, "execute_and_stream_logs", AsyncMock(return_value=(True, "")))
+
+    is_success, message = await docker_service.create_s3fs_volume(
+        ssh_client=ssh_client,
+        log_extra={},
+        volume_info=_s3fs_volume_info(),
+        log_tag="tag",
+        sysbox_subuid_base=None,
+    )
+
+    assert is_success is True, message
+    assert any("plugin install" in command for command in ssh_client.commands)
+
+
+@pytest.mark.asyncio
+async def test_an_instance_of_another_build_stays_while_a_container_references_its_volume(docker_service, monkeypatch):
+    # review on #2397: an edit/reboot parks the pod's stopped container, which keeps the volume; `plugin rm` then
+    # failed after `disable -f` and the pod came back without its Volume
+    ssh_client = InstalledPluginSSHClient("docker.io/mochoa/s3fs-volume-plugin:latest", holders="0123456789ab\n")
+    monkeypatch.setattr(docker_service, "execute_and_stream_logs", AsyncMock(return_value=(True, "")))
+
+    is_success, _ = await docker_service.create_s3fs_volume(
+        ssh_client=ssh_client,
+        log_extra={},
+        volume_info=_s3fs_volume_info(),
+        log_tag="tag",
+        sysbox_subuid_base=None,
+    )
+
+    assert is_success is True
+    assert "/usr/bin/docker volume rm celium-volume-safe" not in ssh_client.commands
+    assert "/usr/bin/docker plugin rm s3fs-celium-volume-safe" not in ssh_client.commands
+    # the instance is only reconfigured and comes back enabled, as for one of our build
+    assert ssh_client.commands[-1] == "/usr/bin/docker plugin enable s3fs-celium-volume-safe"
 
 
 @pytest.mark.asyncio
@@ -942,6 +1137,7 @@ async def test_create_container_emits_secret_safe_sdk_operation_logs(
     assert sorted(run_extra["environment_keys"]) == [
         "APP_MODE",
         "HOSTILE_ENV",
+        "LIUM_VOLUME_PATH",
         "MULTILINE_ENV",
         "NVIDIA_DRIVER_CAPABILITIES",
     ]
@@ -1139,7 +1335,8 @@ async def test_lifecycle_operations_pass_container_names_as_sdk_data(
         _all_host_commands(retried_commands, ssh_client),
         ["CONTAINER_MARKER"],
     )
-    assert docker_client.started_containers == [HOSTILE_CONTAINER_NAME]
+    # the start runs the id read for that name (as SDK data too), not the name itself
+    assert docker_client.started_containers == ["cid"]
     # two stops: the explicit stop_container call + the graceful stop inside
     # delete_container (DAH-2364)
     assert docker_client.stopped_containers == [HOSTILE_CONTAINER_NAME, HOSTILE_CONTAINER_NAME]
@@ -1150,7 +1347,8 @@ async def test_lifecycle_operations_pass_container_names_as_sdk_data(
             "remove_volumes": True,
         }
     ]
-    assert docker_client.pruned_images == 1
+    # DAH-6314: no host-wide prune (it broke a renter's concurrent pull); only the pod's own image, by ID
+    assert docker_client.removed_untagged_images == ["sha256:pod-image"]
     assert docker_client.removed_volumes == [
         {"volume_name": "volume_lifecycle", "force": False}
     ]
@@ -1330,3 +1528,29 @@ def test_create_request_str_leaves_out_renter_supplied_values():
         assert marker not in logged
     assert payload.custom_options.environment["HOSTILE_ENV"] == HOSTILE_ENV_VALUE
     assert "HOSTILE_ENV" in payload.model_dump_json()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("is_sysbox, sysctls", [(True, {}), (False, {"net.ipv4.conf.all.src_valid_mark": "1"})])
+async def test_create_container_presets_src_valid_mark_only_for_runc_pods(
+    docker_service,
+    executor_info,
+    keypair,
+    monkeypatch,
+    is_sysbox,
+    sysctls,
+):
+    # a sysbox-runc restart that wrote this preset failed the pod when sysbox-fs did not expose the path yet
+    ssh_client = RecordingSSHClient(stdout="sysbox:231072:65536" if is_sysbox else "")
+    _patch_create_harness(monkeypatch, docker_service, ssh_client)
+    payload = _base_create_payload(is_sysbox=is_sysbox)
+
+    await docker_service.create_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=keypair,
+        private_key="encrypted-private-key",
+    )
+
+    run_spec = docker_service.rental_docker_client_factory.client.run_specs[0]
+    assert run_spec.sysctls == sysctls

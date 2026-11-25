@@ -201,6 +201,7 @@ async def test_an_express_pass_after_the_row_was_built_keeps_it_off_the_publish(
     [row] = service._build_unreachable_known_results(payload, RentedExecutorsResponse(executors={}), msg, None)
     service.express_published[UNREACHABLE] = payload.job_batch_id
     service.express_published_miner[UNREACHABLE] = "another miner"
+    service.express_passed_at[UNREACHABLE] = row.observed_at + 1
 
     await service.publish_machine_specs([row], payload.miner_hotkey, payload.miner_coldkey)
     assert service.redis_service.publish.await_count == 1
@@ -209,3 +210,79 @@ async def test_an_express_pass_after_the_row_was_built_keeps_it_off_the_publish(
     service.express_published_miner[UNREACHABLE] = payload.miner_hotkey
     await service.publish_machine_specs([row], payload.miner_hotkey, payload.miner_coldkey)
     service.redis_service.publish.assert_not_awaited()
+
+
+def test_a_node_that_answered_with_a_stale_nonce_is_reported_as_refusing_and_names_the_clock(flag_on):
+    """22 Nov: a node answered every upload with 401 "Stale upload nonce" (its clock more than 10 minutes off) and
+    the provider was told the miner "could not reach" it. The miner's refused_executors names the answer."""
+    msg = AcceptSSHKeyRequest(
+        executors=miner_returned(LISTED),
+        known_executor_ids=[LISTED, UNREACHABLE],
+        refused_executors={UNREACHABLE.upper(): "HTTP 401: Stale upload nonce"},
+    )
+
+    [result] = build(msg, RentedExecutorsResponse(executors={}))
+
+    event = result.validation_event
+    assert result.failure_reason_code == AvailabilityErrorCode.EXECUTOR_UNREACHABLE_BY_MINER
+    assert result.score == 0
+    assert event.event == "Miner reached this node, but the node refused the validator's key"
+    assert "clock" in event.remediation and "timedatectl" in event.remediation
+    assert event.what_we_saw["node_answer"] == "HTTP 401: Stale upload nonce"
+
+
+def test_a_node_the_miner_did_not_hear_from_keeps_the_could_not_reach_event(flag_on):
+    msg = AcceptSSHKeyRequest(
+        executors=miner_returned(LISTED),
+        known_executor_ids=[LISTED, UNREACHABLE],
+        refused_executors={},
+    )
+
+    [result] = build(msg, RentedExecutorsResponse(executors={}))
+
+    assert result.validation_event.event == "Miner could not reach this node to install the validator's key"
+    assert "node_answer" not in result.validation_event.what_we_saw
+
+
+SECOND = "5d1c4a3e-7b20-4a8f-9c11-2f6e0d9b7a41"
+
+
+def test_a_miner_whose_nodes_all_refused_the_key_reports_each_refusal(flag_on):
+    # review at 70e7c4e: no node took the key, but a refusal is an answer, so the miner was up and reached them both
+    msg = AcceptSSHKeyRequest(
+        executors=[],
+        known_executor_ids=[UNREACHABLE, SECOND],
+        refused_executors={UNREACHABLE: "HTTP 401: Stale upload nonce", SECOND: "HTTP 500: boom"},
+    )
+
+    results = build(msg, RentedExecutorsResponse(executors={}))
+
+    by_uuid = {r.executor_info.uuid: r for r in results}
+    assert set(by_uuid) == {UNREACHABLE, SECOND}
+    assert all(r.score == 0 for r in results)
+    assert by_uuid[UNREACHABLE].validation_event.what_we_saw["node_answer"] == "HTTP 401: Stale upload nonce"
+    assert by_uuid[SECOND].validation_event.what_we_saw["node_answer"] == "HTTP 500: boom"
+
+
+@pytest.mark.asyncio
+async def test_rest_answer_where_every_node_refused_writes_a_row_per_node_not_a_miner_failure(
+    rest_service, flag_on  # noqa: F811
+):
+    async def _make_rest_request(method, url, json_data, headers, timeout, log_extra, operation_name):
+        if url.endswith("ssh-pubkey-submit"):
+            msg = AcceptSSHKeyRequest(
+                executors=[],
+                known_executor_ids=[UNREACHABLE, SECOND],
+                refused_executors={UNREACHABLE: "HTTP 401: Stale upload nonce", SECOND: "HTTP 401: Stale upload nonce"},
+            )
+            return 200, msg.model_dump(mode="json")
+        return 200, {"message_type": "SSHKeyRemoved"}
+
+    rest_service._make_rest_request = _make_rest_request
+
+    out = await request(rest_service, RentedExecutorsResponse(executors={}))
+
+    assert {r.executor_info.uuid for r in out["results"]} == {UNREACHABLE, SECOND}
+    assert {r.validation_event.event for r in out["results"]} == {
+        "Miner reached this node, but the node refused the validator's key"
+    }

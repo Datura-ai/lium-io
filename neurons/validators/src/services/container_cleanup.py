@@ -83,7 +83,7 @@ REMOVE_CACHE_SWEEP_CONTAINER = f"/usr/bin/docker rm -f {CACHE_SWEEP_CONTAINER_NA
 FILLER_IMAGE_REPOSITORIES = ("ghcr.io/hanlinai/engy-golden-serve", "daturaai/dolphin", "daturaai/dlph")
 
 
-def _image_repository(image: str) -> str:
+def image_repository(image: str) -> str:
     reference = image.split("@", 1)[0]
     name, _, tag = reference.rpartition(":")
     repository = name if name and "/" not in tag else reference
@@ -93,7 +93,7 @@ def _image_repository(image: str) -> str:
 def idle_filler_images_removal_command(keep_image: str | None = None) -> str:
     """The idle filler images' removal; `keep_image` is the image a create is about to run, whose repository
     is left alone: a renter may rent the Engy image itself, and it has no container until docker run."""
-    keep = _image_repository(keep_image) if keep_image else None
+    keep = image_repository(keep_image) if keep_image else None
     repositories = [repository for repository in FILLER_IMAGE_REPOSITORIES if repository != keep]
     if not repositories:  # `docker image ls` without a filter would list every image
         return "true"
@@ -106,7 +106,7 @@ def idle_filler_images_removal_command(keep_image: str | None = None) -> str:
 
 def idle_filler_images_size_command(keep_image: str | None = None) -> str:
     """Prints the byte size of each image `idle_filler_images_removal_command` would remove, one per line."""
-    keep = _image_repository(keep_image) if keep_image else None
+    keep = image_repository(keep_image) if keep_image else None
     repositories = [repository for repository in FILLER_IMAGE_REPOSITORIES if repository != keep]
     if not repositories:
         return "true"

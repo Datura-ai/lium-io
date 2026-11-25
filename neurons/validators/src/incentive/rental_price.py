@@ -35,11 +35,6 @@ from services.const import (
     SECONDS_PER_BLOCK,
     TEMPO,
 )
-from services.gpu_power_limit import (
-    CAP_REVERT_WINDOW_SECONDS,
-    GpuPowerCapRevert,
-    read_gpu_power_cap_reverts,
-)
 from services.task.models import MixedFormulaInputs
 from services.task_service import JobResult
 
@@ -49,6 +44,13 @@ logger = get_logger(__name__)
 # is below its summed GPU VRAM times this multiplier forfeits the unrented rental
 # incentive but stays active.
 MIN_DISK_TO_VRAM_RATE = 1.5
+
+# DAH-2621 — unrented incentive RAM/VRAM gate. An unrented executor whose system RAM is below this share of its
+# summed GPU VRAM cannot stage a model into its GPUs, so it forfeits the unrented incentive but stays active.
+# Half, not all of it: stock 8x B200/B300 boards carry 0.9x and real offenders sit far below (DAH-2621 fleet data).
+MIN_RAM_TO_VRAM_RATE = 0.5
+# MemTotal reports a few percent less than the installed RAM (24 GB installed reads 23.5 GB)
+RAM_MEMTOTAL_TOLERANCE = 1.05
 
 # DAH-2546 — full 8x capability gate. An unrented 8x machine of these base models must
 # have NCU profiling counters open on the host, real GPU splitting enabled, or a verified TDX
@@ -78,14 +80,6 @@ SPOT_IDLE_SECURE_RATE_SHARE = 0.8
 # The share of the secure rental incentive that a rented spot node earns (ENABLE_SPOT_RENTAL_INCENTIVE).
 SPOT_RENTAL_INCENTIVE_FACTOR = 0.5
 
-# DAH-2786 — GPU power cap revert gate. An unrented executor whose host raises the GPU power
-# limit back while a Lium idle job runs kills that job and still collects the unrented
-# incentive. It forfeits the incentive after this many reverted JOBS inside
-# `CAP_REVERT_WINDOW_SECONDS`. One is not enough, because a driver reload can undo a cap on
-# its own; two is reachable inside a day even with the backend's 12h backoff after each
-# killed job, and a host running a reset timer breaks every job it is given.
-MIN_POWER_CAP_REVERTS_TO_PENALIZE = 2
-
 
 # ── Spec measurements ────────────────────────────────────────────────────────
 
@@ -95,6 +89,15 @@ class InsufficientDisk(BaseModel):
     vram_gb: float
     disk_gb: float
     rate: float  # required disk-to-VRAM margin the machine failed to clear
+
+
+class InsufficientRam(BaseModel):
+    """Measured totals of a machine whose system RAM is below the required share of its GPU VRAM."""
+
+    vram_gb: float
+    ram_gb: float
+    rate: float  # required RAM-to-VRAM share the machine failed to clear
+    required_ram_gb: float  # the RAM reading that clears it
 
 
 class MissingFull8xCapability(BaseModel):
@@ -114,17 +117,6 @@ class PowerCapIncapable(BaseModel):
 
     container_cap_eff: str  # effective capability mask of the executor container, hex
     nvidiactl_owner_uid: int  # owner uid of /dev/nvidiactl inside the container
-
-
-class PowerCapReverted(BaseModel):
-    """How often this executor's host undid a verified GPU power cap, and the last evidence.
-
-    The watt readings are carried so the provider is shown the numbers that were judged."""
-
-    revert_count: int
-    window_hours: int
-    capped_to_watts: int  # what the validator applied and read back
-    found_watts: int  # what the host had put back while the job ran
 
 
 class PortLimitedRemainder(BaseModel):
@@ -397,6 +389,73 @@ class RentalPriceIncentive(DefaultIncentive):
             return None
         return InsufficientDisk(vram_gb=vram_gb, disk_gb=disk_gb, rate=MIN_DISK_TO_VRAM_RATE)
 
+    def _insufficient_ram(self, result: JobResult, log_if_cannot_measure: bool = True) -> InsufficientRam | None:
+        # machine whose RAM is below the required share of its GPU VRAM; None when it clears it or the
+        # scrape is unusable (fail open, as the disk gate: nobody loses incentive over telemetry)
+        spec = result.spec
+        if not spec:
+            return None
+        try:
+            gpu_details = (spec.get("gpu") or {}).get("details") or []
+            vram_gb = sum(float(gpu.get("capacity") or 0) for gpu in gpu_details) / 1024  # capacity is MB
+            ram_gb = float((spec.get("ram") or {}).get("total") or 0) / 1024**2  # MemTotal, kB
+        except (AttributeError, TypeError, ValueError, OverflowError) as exc:
+            if log_if_cannot_measure:
+                self._log_insufficient_ram_unmeasured(result, f"unreadable scrape: {exc!r}")
+            return None
+        if not (vram_gb > 0 and ram_gb > 0):
+            if log_if_cannot_measure:
+                self._log_insufficient_ram_unmeasured(result, "vram or ram missing from the scrape")
+            return None
+        if ram_gb * RAM_MEMTOTAL_TOLERANCE >= vram_gb * MIN_RAM_TO_VRAM_RATE:
+            return None
+        required_ram_gb = round(vram_gb * MIN_RAM_TO_VRAM_RATE / RAM_MEMTOTAL_TOLERANCE, 1)
+        if required_ram_gb * RAM_MEMTOTAL_TOLERANCE < vram_gb * MIN_RAM_TO_VRAM_RATE:
+            # nearest rounding went below the floor: name the next reading the check above accepts
+            required_ram_gb = round(required_ram_gb + 0.1, 1)
+        # rounded only for the report: the check above must use the raw readings
+        return InsufficientRam(
+            vram_gb=round(vram_gb, 1),
+            ram_gb=round(ram_gb, 1),
+            rate=MIN_RAM_TO_VRAM_RATE,
+            required_ram_gb=required_ram_gb,
+        )
+
+    def _log_insufficient_ram_unmeasured(self, result: JobResult, cause: str) -> None:
+        # gate could not run: a shadow report must not read this executor as "RAM is fine"
+        logger.warning(
+            _m(
+                "Cannot measure system RAM against GPU VRAM; unrented incentive kept",
+                extra={
+                    "executor_id": str(result.executor_info.uuid),
+                    "gpu_model": result.gpu_model,
+                    "gpu_count": result.gpu_count,
+                    "cause": cause,
+                    "reason": "insufficient_ram_unmeasured",
+                },
+            )
+        )
+
+    def _log_insufficient_ram(self, result: JobResult, measured: InsufficientRam) -> None:
+        # structured log for every rental-eligible unrented executor short on RAM for its VRAM
+        logger.info(
+            _m(
+                "Unrented executor has less system RAM than its GPU VRAM requires",
+                extra={
+                    "executor_id": str(result.executor_info.uuid),
+                    "gpu_model": result.gpu_model,
+                    "gpu_count": result.gpu_count,
+                    "total_vram_gb": measured.vram_gb,
+                    "total_ram_gb": measured.ram_gb,
+                    "required_ram_gb": measured.required_ram_gb,
+                    "min_ram_to_vram_rate": measured.rate,
+                    "enforced": True,
+                    "reason": ZeroIncentiveReason.INSUFFICIENT_RAM_FOR_VRAM,
+                    "pool": "rental_excluded",
+                },
+            )
+        )
+
     def _log_insufficient_disk_unmeasured(self, result: JobResult, cause: str) -> None:
         # gate could not run: a shadow report must not read this executor as "disk is fine"
         logger.warning(
@@ -553,47 +612,6 @@ class RentalPriceIncentive(DefaultIncentive):
                     "enforced": True,
                     "reason": ZeroIncentiveReason.CANNOT_APPLY_GPU_POWER_CAP,
                     "pool": "rental_excluded",
-                },
-            )
-        )
-
-    async def _power_cap_reverted(self, result: JobResult) -> PowerCapReverted | None:
-        # The validator records one revert per Lium job whose verified cap the host raised while
-        # the job ran (services/gpu_power_limit.py). A Redis outage returns no reverts, so the
-        # gate fails open like every other unknown here.
-        if result.spec is None:
-            # a synthetic or estimated job result: no real executor, so nothing to look up
-            return None
-        reverts: list[GpuPowerCapRevert] = await read_gpu_power_cap_reverts(
-            self.redis_service, str(result.executor_info.uuid)
-        )
-        if len(reverts) < MIN_POWER_CAP_REVERTS_TO_PENALIZE:
-            return None
-        last: GpuPowerCapRevert = reverts[-1]
-        return PowerCapReverted(
-            revert_count=len(reverts),
-            window_hours=CAP_REVERT_WINDOW_SECONDS // 3600,
-            capped_to_watts=last.capped_to_watts,
-            found_watts=last.found_watts,
-        )
-
-    def _log_power_cap_revert_limit(self, result: JobResult, reverted: PowerCapReverted) -> None:
-        enforced: bool = settings.ENABLE_UNRENTED_POWER_CAP_REVERT_LIMIT
-        logger.info(
-            _m(
-                "Unrented executor reverts the GPU power cap of Lium's own idle jobs"
-                + ("" if enforced else " (shadow only - flag off)"),
-                extra={
-                    "executor_id": str(result.executor_info.uuid),
-                    "gpu_model": result.gpu_model,
-                    "gpu_count": result.gpu_count,
-                    "power_cap_revert_count": reverted.revert_count,
-                    "power_cap_revert_window_hours": reverted.window_hours,
-                    "capped_to_watts": reverted.capped_to_watts,
-                    "found_watts": reverted.found_watts,
-                    "enforced": enforced,
-                    "reason": ZeroIncentiveReason.REVERTS_GPU_POWER_CAP,
-                    "pool": "rental_excluded" if enforced else "rental_kept_shadow",
                 },
             )
         )
@@ -839,8 +857,12 @@ class RentalPriceIncentive(DefaultIncentive):
             merged.set_incentive_split(merged.incentive or 0.0, free.incentive or 0.0)
             merged.incentive_logs.extend(free.incentive_logs)
             # DAH-2340 reasons ride a separate list — the unrented portion's zero reasons would
-            # otherwise never reach the backend.
-            merged.zero_incentive_reasons.extend(free.zero_incentive_reasons)
+            # otherwise never reach the backend. A both-pools exclusion is node-wide and each
+            # portion records it, so the node carries each code once.
+            merged_reason_codes: set[str] = {reason.reason for reason in merged.zero_incentive_reasons}
+            merged.zero_incentive_reasons.extend(
+                reason for reason in free.zero_incentive_reasons if reason.reason not in merged_reason_codes
+            )
             # Drop by identity: two portions of one executor can compare equal as pydantic models.
             portions.sibling_results[:] = [
                 result for result in portions.sibling_results if result is not free
@@ -890,7 +912,7 @@ class RentalPriceIncentive(DefaultIncentive):
             result.hourly_rate = self._listed_hourly_rate(result)
 
             # Sysbox penalty is applied later via effective_rate, not baked into hourly_rate
-            result.sysbox_multiplier = 1.0 if result.sysbox_runtime else 1 - settings.PORTION_FOR_SYSBOX_UNRENTED
+            result.sysbox_multiplier = 1.0 if result.sysbox_runtime else 0.0
 
             # Minimum NVIDIA driver penalty: applied later via effective_rate
             result.driver_multiplier = get_min_driver_multiplier(result.nvidia_driver_version)
@@ -1296,7 +1318,7 @@ class RentalPriceIncentive(DefaultIncentive):
         result.count_bucket = bucket
         # own fields, not max_cap & co: those mark a Secure tier member for every reader (portal tier breakdown)
         result.spot_cap = cap_spec.get(bucket, 0)
-        result.sysbox_multiplier = 1.0 if result.sysbox_runtime else 1 - settings.PORTION_FOR_SYSBOX_UNRENTED
+        result.sysbox_multiplier = 1.0 if result.sysbox_runtime else 0.0
         result.driver_multiplier = get_min_driver_multiplier(result.nvidia_driver_version)
         if base_model not in self.config.rental_incentive_gpu_types:
             result.hourly_rate = 0.0
@@ -1560,6 +1582,22 @@ class RentalPriceIncentive(DefaultIncentive):
             )
             job_result.record_incentive_log(reason)
 
+        # DAH-2621 RAM/VRAM gate: an idle machine with too little RAM for its GPU VRAM forfeits the unrented
+        # incentive (node stays active and rentable).
+        insufficient_ram = (
+            self._insufficient_ram(job_result, log_if_cannot_measure=eligible_for_rental_share)
+            if self._should_run_idle_pool_gate(idle_pool_candidate, eligible_for_rental_share, enforced=True)
+            else None
+        )
+        if insufficient_ram is not None:
+            if eligible_for_rental_share:
+                self._log_insufficient_ram(job_result, insufficient_ram)
+            eligible_for_rental_share = False
+            reason: MinerLogLine = MinerLogLine.no_payout_because_insufficient_ram_for_vram(
+                job_result, insufficient_ram
+            )
+            job_result.record_incentive_log(reason)
+
         # DAH-2546 full 8x capability gate
         missing_capability = (
             self._missing_full_8x_capability(job_result, base_model)
@@ -1593,33 +1631,12 @@ class RentalPriceIncentive(DefaultIncentive):
             )
             job_result.record_incentive_log(reason)
 
-        # DAH-2786 power cap revert gate: an idle machine whose host puts the GPU power limit
-        # back kills the Lium job it is being paid to host, so it forfeits the unrented
-        # incentive (node stays active). Shadow-only while the flag is off.
-        power_cap_revert_enforced: bool = settings.ENABLE_UNRENTED_POWER_CAP_REVERT_LIMIT
-        power_cap_reverted: PowerCapReverted | None = (
-            await self._power_cap_reverted(job_result)
-            if self._should_run_idle_pool_gate(
-                idle_pool_candidate, eligible_for_rental_share, power_cap_revert_enforced
-            )
-            else None
-        )
-        if power_cap_reverted is not None:
-            if eligible_for_rental_share:
-                self._log_power_cap_revert_limit(job_result, power_cap_reverted)
-            if power_cap_revert_enforced:
-                eligible_for_rental_share = False
-                reason: MinerLogLine = MinerLogLine.no_payout_because_reverts_gpu_power_cap(
-                    job_result, power_cap_reverted
-                )
-                job_result.record_incentive_log(reason)
-
         # an eligible node has these two factors checked after pricing (_explain_zero_effective_rate)
         if idle_pool_candidate and not eligible_for_rental_share:
             self._record_zero_driver_and_sysbox_reasons(
                 job_result,
                 get_min_driver_multiplier(job_result.nvidia_driver_version),
-                1.0 if job_result.sysbox_runtime else 1 - settings.PORTION_FOR_SYSBOX_UNRENTED,
+                1.0 if job_result.sysbox_runtime else 0.0,
             )
 
         if on_spot_pay_path and eligible_for_rental_share:

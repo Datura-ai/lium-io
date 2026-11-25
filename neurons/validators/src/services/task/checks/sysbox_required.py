@@ -14,6 +14,7 @@ from .rental_owner import rental_of_this_node
 _NVIDIA_HOOK_TEMPLATE_BY_REASON_CODE: dict[str, MessageTemplate] = {
     Msg.NVIDIA_RUNTIME_MISMATCH.reason: Msg.NVIDIA_RUNTIME_MISMATCH,
     Msg.NVIDIA_CONTAINER_HOOK_FAILED.reason: Msg.NVIDIA_CONTAINER_HOOK_FAILED,
+    Msg.NVIDIA_TOOLKIT_CDI_MODE.reason: Msg.NVIDIA_TOOLKIT_CDI_MODE,
 }
 
 
@@ -57,6 +58,11 @@ class SysboxRequiredCheck:
             "is_rented": is_rented,
         }
         remediation = None
+        # the node's own `docker run --runtime=sysbox-runc --gpus all` error (machine_scrape
+        # check_sysbox_gpu_compatibility): the event names why, not only that sysbox is missing
+        scrape_error = (ctx.state.specs or {}).get("sysbox_runtime_scrape_error")
+        if scrape_error:
+            what["sysbox_scrape_error"] = scrape_error
         cause = ctx.state.dind_probe_error
         template = Msg.SYSBOX_MISSING
         nvidia_template = _NVIDIA_HOOK_TEMPLATE_BY_REASON_CODE.get(cause.code) if cause else None
@@ -81,6 +87,8 @@ class SysboxRequiredCheck:
                 # DAH-5844: the container never answered at all, so the notice must not say sysbox is missing
                 template = Msg.DIND_PROBE_UNREACHABLE
                 remediation += f" {template.remediation}"
+        elif scrape_error:
+            remediation = f"The node's sysbox GPU test failed: {scrape_error} {template.remediation}"
         return render_message(
             template,
             ctx=ctx,
