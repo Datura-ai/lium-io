@@ -5,12 +5,13 @@ import random
 import re
 from datetime import UTC, datetime, timedelta
 import shlex
+from types import SimpleNamespace
 from typing import Awaitable, Callable, Optional
 
 import asyncssh
 
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
-from core.docker_utils import ALPINE_HELPER_IMAGE, DockerCommand, df_available_bytes
+from core.docker_utils import ALPINE_HELPER_IMAGE, DockerCommand, df_command, parse_df_available_bytes
 from core.utils import _m
 from services.const import (
     DPHN_CACHE_LISTING_FLOOR_GB,
@@ -244,6 +245,106 @@ def _bound_pod_id_label(container_name: str, label: str) -> str:
 CAPABILITY_CHECK_NAME = re.compile(r"^lium_capability_check_[0-9]+_[0-9a-f]{6}$")
 FULL_CONTAINER_ID = re.compile(r"[0-9a-f]{64}")
 LIST_CREATED_CONTAINERS = "/usr/bin/docker ps -a --no-trunc --filter status=created --format '{{.ID}} {{.Names}}'"
+LIST_VOLUME_NAMES = '/usr/bin/docker volume ls --format "{{.Name}}"'
+LIST_RUNNING_FILLERS = f'/usr/bin/docker ps --filter "name={FILLER_CONTAINER_PREFIX}" --format "{{{{.Names}}}}"'
+# one JSON array per container: a label with a newline cannot forge a second record
+RENTAL_LISTING_FORMAT = f'[{{{{json .Names}}}},{{{{json (.Label "{LIUM_POD_ID_LABEL}")}}}},{{{{json .CreatedAt}}}}]'
+RENTAL_LISTING = "date +%s && " + DockerCommand.ps_filter(
+    *(f"{prefix}*" for prefix in RENTAL_CONTAINER_PREFIXES), output_format=RENTAL_LISTING_FORMAT
+)
+FREE_DISK_UNDER_DOCKER_ROOT = (
+    "root=$(/usr/bin/docker info --format '{{.DockerRootDir}}') && "
+    '{ [ -n "$root" ] || root=/var/lib/docker; } && ' + df_command('"$root"')
+)
+
+# DAH-7109: the cleanup's always-run reads in one SSH call. Joined with `;` so a failing section hides no
+# other; each prints `<TAG>_RC\t<exit status>`. Tags come from docker's own --format (no pipe, which would
+# hide docker's exit status), POSIX sh only: the executor's shell may be dash.
+_SNAPSHOT_SECTIONS = {
+    # tag: (the command it answers, the same listing with each line tagged)
+    "RENTAL": (
+        RENTAL_LISTING,
+        DockerCommand.ps_filter(
+            *(f"{prefix}*" for prefix in RENTAL_CONTAINER_PREFIXES),
+            output_format="RENTAL\\t" + RENTAL_LISTING_FORMAT,
+        ),
+    ),
+    "DANGLING": (
+        DockerCommand.volume_ls_dangling(),
+        "/usr/bin/docker volume ls -f dangling=true --format 'DANGLING\\t{{.Name}}'",
+    ),
+    "CREATED": (
+        LIST_CREATED_CONTAINERS,
+        "/usr/bin/docker ps -a --no-trunc --filter status=created --format 'CREATED\\t{{.ID}} {{.Names}}'",
+    ),
+    "VOL": (LIST_VOLUME_NAMES, "/usr/bin/docker volume ls --format 'VOL\\t{{.Name}}'"),
+    "FILLER": (
+        LIST_RUNNING_FILLERS,
+        f"/usr/bin/docker ps --filter name={FILLER_CONTAINER_PREFIX} --format 'FILLER\\t{{{{.Names}}}}'",
+    ),
+}
+HOST_SNAPSHOT = "printf 'NOW\\t%s\\n' \"$(date +%s)\"; " + "; ".join(
+    f"{listing}; printf '{tag}_RC\\t%s\\n' \"$?\"" for tag, (_, listing) in _SNAPSHOT_SECTIONS.items()
+)
+
+
+def parse_host_snapshot(stdout: str) -> dict[str, SimpleNamespace]:
+    """Each complete section as the result its own command would give, keyed by that command.
+
+    A section without its exit-status line (output cut short) is left out, so that read goes to the host.
+    """
+    lines: dict[str, list[str]] = {tag: [] for tag in _SNAPSHOT_SECTIONS}
+    status: dict[str, int] = {}
+    now = ""
+    for line in stdout.splitlines():
+        tag, sep, value = line.partition("\t")
+        if not sep:
+            continue
+        if tag == "NOW":
+            now = value
+        elif tag in lines:
+            lines[tag].append(value)
+        elif tag.endswith("_RC") and tag[:-3] in lines and value.isdigit():
+            status[tag[:-3]] = int(value)
+    answers = {}
+    for tag, (command, _) in _SNAPSHOT_SECTIONS.items():
+        if tag not in status:
+            continue
+        body = lines[tag] if tag != "RENTAL" else [now, *lines[tag]]
+        answers[command] = SimpleNamespace(exit_status=status[tag], stdout="\n".join(body) + "\n", stderr="")
+    return answers
+
+
+class SnapshotSSH:
+    """The executor SSH connection, with the cleanup's always-run reads answered from one snapshot.
+
+    Any other command may change the host, so it drops the snapshot first: every later read goes to the
+    host, and a read never sees what the cycle's own removals freed as still taken.
+    """
+
+    def __init__(self, ssh_client, answers: dict[str, SimpleNamespace]):
+        self._ssh = ssh_client
+        self._answers = answers
+
+    @classmethod
+    async def take(cls, ssh_client) -> "SnapshotSSH":
+        try:
+            result = await ssh_client.run(HOST_SNAPSHOT)
+            answers = parse_host_snapshot(result.stdout or "")
+        except Exception as e:  # noqa: BLE001 - no snapshot: every read goes to the host as before
+            logger.warning(_m("Cleanup host snapshot failed", extra={"error": str(e)}))
+            answers = {}
+        return cls(ssh_client, answers)
+
+    def __getattr__(self, name):
+        return getattr(self._ssh, name)
+
+    async def run(self, command, *args, **kwargs):
+        answer = None if args or kwargs else self._answers.get(command)
+        if answer is not None:
+            return answer
+        self._answers = {}
+        return await self._ssh.run(command, *args, **kwargs)
 
 
 def _age_minutes(now: Optional[int], created_at) -> Optional[float]:
@@ -682,10 +783,7 @@ class ContainerCleanup:
 
     async def _has_running_filler(self, ssh_client: asyncssh.SSHClientConnection) -> bool:
         # A cache a live filler still mounts is in use.
-        result = await ssh_client.run(
-            f'/usr/bin/docker ps --filter "name={FILLER_CONTAINER_PREFIX}" '
-            '--format "{{.Names}}"'
-        )
+        result = await ssh_client.run(LIST_RUNNING_FILLERS)
         if getattr(result, "exit_status", 0) != 0:
             return True  # cannot prove the node is idle -> do not reclaim
         return bool((result.stdout or "").strip())
@@ -694,12 +792,12 @@ class ContainerCleanup:
         # The root is DISCOVERED, not assumed: a node with docker moved to a dedicated disk would
         # otherwise be judged by its root filesystem, and the reclaim would either never fire while
         # docker's disk is full or fire and delete a healthy cache the node had room for.
-        info = await ssh_client.run("/usr/bin/docker info --format '{{.DockerRootDir}}'")
-        if getattr(info, "exit_status", 0) != 0:
+        # one call: a failed docker info or a failed df both exit non-zero
+        result = await ssh_client.run(FREE_DISK_UNDER_DOCKER_ROOT)
+        if getattr(result, "exit_status", 0) != 0:
             return None
-        docker_root: str = (info.stdout or "").strip() or "/var/lib/docker"
         try:
-            return await df_available_bytes(ssh_client, docker_root) / (1024**3)
+            return parse_df_available_bytes(result.stdout or "") / (1024**3)
         except Exception:
             # A backstop that cannot measure declines rather than guesses; the caller treats None as
             # "leave the cache alone".
@@ -708,7 +806,7 @@ class ContainerCleanup:
     async def _get_cache_volumes(
         self, ssh_client: asyncssh.SSHClientConnection, name_prefixes: tuple[str, ...]
     ) -> list[str]:
-        result = await ssh_client.run('/usr/bin/docker volume ls --format "{{.Name}}"')
+        result = await ssh_client.run(LIST_VOLUME_NAMES)
         if getattr(result, "exit_status", 0) != 0:
             return []
         return sorted(
@@ -893,14 +991,7 @@ class ContainerCleanup:
         when either is unreadable, and such a container is never removed.
         """
         try:
-            patterns = [f"{prefix}*" for prefix in RENTAL_CONTAINER_PREFIXES]
-            # one JSON array per container: a label with a newline cannot forge a second record
-            output_format = (
-                f'[{{{{json .Names}}}},{{{{json (.Label "{LIUM_POD_ID_LABEL}")}}}},{{{{json .CreatedAt}}}}]'
-            )
-            result = await ssh_client.run(
-                "date +%s && " + DockerCommand.ps_filter(*patterns, output_format=output_format)
-            )
+            result = await ssh_client.run(RENTAL_LISTING)
             lines = (result.stdout or "").splitlines()
             now = int(lines[0]) if lines and lines[0].strip().isdigit() else None
             # (name, pod id label or "", age); the name filter is a substring regex that lists "podman" too
