@@ -1173,6 +1173,51 @@ async def test_no_verified_job_reset_is_sent_for_a_node_whose_renter_is_resettin
 
 
 @pytest.mark.asyncio
+async def test_the_forwarded_reset_carries_its_idle_only_mark_as_its_own_field():
+    # DAH-6784: compute_client builds the wire request from the redis payload; drop the key and every idle-only
+    # reset reaches the backend unmarked, ending a rental placed since the check read it
+    import asyncio
+    from unittest.mock import MagicMock
+
+    from clients.compute_client import ComputeClient
+    from services.redis_service import RESET_VERIFIED_JOB_CHANNEL
+
+    def message(executor_uuid: str, **extra):
+        data = {"miner_hotkey": "hk", "executor_uuid": executor_uuid, "reason": 0, "check_id": "c",
+                "reason_code": None, "evidence": None, **extra}
+        return {"channel": RESET_VERIFIED_JOB_CHANNEL.encode(), "data": json.dumps(data)}
+
+    class PubSub:
+        async def listen(self):
+            yield message("marked", unrented_only=True)
+            yield message("older-validator")
+            yield message("garbled", unrented_only="yes")
+            raise asyncio.CancelledError
+
+        async def aclose(self):
+            pass
+
+    redis = PendingRedis()
+    redis.subscribe = AsyncMock(return_value=PubSub())
+    client = ComputeClient.__new__(ComputeClient)
+    client.lock = asyncio.Lock()
+    client.message_queue = []
+    client.logging_extra = {}
+    client.miner_service = MagicMock(redis_service=redis)
+    client.my_hotkey = MagicMock(return_value="validator-hotkey")
+
+    with pytest.raises(asyncio.CancelledError):
+        await client.subscribe_mesages_from_redis()
+
+    assert [(r.executor_uuid, r.unrented_only) for r in client.message_queue] == [
+        ("marked", True),
+        ("older-validator", False),
+        ("garbled", False),
+    ]
+    assert "unrented_only" in client.message_queue[0].model_dump()
+
+
+@pytest.mark.asyncio
 async def test_a_reset_that_never_reached_the_executor_answers_with_a_reset_result():
     from payload_models.payloads import (
         FailedContainerErrorCodes,

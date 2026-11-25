@@ -441,6 +441,17 @@ async def test_a_failed_report_under_the_new_gpu_uuid_does_not_hide_the_recovery
     assert [spec["executor_uuid"] for spec in published] == [node]
 
 
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("passed", [None, [], ["executor.validate.rental_probe"]])
+async def test_the_published_spec_names_the_idle_only_checks_that_passed(mocker, miner_service, passed):
+    """DAH-6784: compute_client reads the key off this payload into ExecutorSpecRequest.idle_checks_passed."""
+    mocker.patch("services.miner_service.settings.DRY_RUN", False)
+    result = _passed_result(str(uuid4()), "GPU-1").model_copy(update={"idle_checks_passed": passed})
+    await miner_service.publish_machine_specs([result], "hk", "ck")
+    [spec] = [call.args[1] for call in miner_service.redis_service.publish.await_args_list]
+    assert spec["idle_checks_passed"] == passed
+
 # DAH-5510: the backend stops a moved pod's old container on the node it left
 
 
