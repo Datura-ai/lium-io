@@ -1,5 +1,7 @@
 """DAH-7077: one lock per volume between a storage dispatch and the delete's wipe."""
 
+from uuid import uuid4
+
 import pytest
 
 from services.storage_operations import (
@@ -63,3 +65,27 @@ async def test_a_repeated_dispatch_of_the_same_operation_keeps_its_hold():
     await take_storage_volume_lock(redis, "volume_a", "operation:op-2")
     await release_storage_volume_lock(redis, "volume_a", WIPE_LOCK_HOLDER)
     assert list(redis.values.values()) == ["operation:op-2"]
+
+
+@pytest.mark.asyncio
+async def test_concurrent_retries_of_one_operation_never_drop_the_survivors_hold():
+    import asyncio
+    redis = VolumeLockRedis()
+    op = uuid4()
+    first_in = asyncio.Event()
+
+    async def failing_retry():
+        with pytest.raises(RuntimeError):
+            async with storage_dispatch_holds_volume(redis, "vol", op):
+                first_in.set()
+                await asyncio.sleep(0)
+                raise RuntimeError("ssh failed")
+
+    async def surviving_retry():
+        await first_in.wait()
+        async with storage_dispatch_holds_volume(redis, "vol", op):
+            for _ in range(5):
+                await asyncio.sleep(0)  # let the failing retry finish and release
+            assert not await take_storage_volume_lock(redis, "vol", WIPE_LOCK_HOLDER)
+
+    await asyncio.gather(failing_retry(), surviving_retry())

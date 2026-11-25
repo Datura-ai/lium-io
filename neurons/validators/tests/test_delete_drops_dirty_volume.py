@@ -611,12 +611,11 @@ async def test_a_failed_lock_release_never_fails_the_delete(docker_service, monk
         monkeypatch,
         _host_answers(wipe=_make_ssh_command_result(exit_status=7, stdout="volume has a storage operation")),
     )
-    lock_redis = docker_service.redis_service.set_if_absent.__self__
 
     async def broken_delete(*args, **kwargs):
         raise ConnectionError("redis down")
 
-    monkeypatch.setattr(lock_redis, "delete", broken_delete, raising=False)
+    monkeypatch.setattr(docker_service.redis_service, "delete", broken_delete)
     payload = _delete_payload()
 
     result = await _delete(docker_service, payload)

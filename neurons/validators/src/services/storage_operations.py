@@ -5,6 +5,7 @@ import json
 import logging
 import shlex
 import time
+import weakref
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -106,12 +107,20 @@ async def storage_dispatch_holds_volume(
         yield
         return
     holder = f"operation:{operation_id}"
-    if not await take_storage_volume_lock(redis, volume, holder):
-        raise StorageVolumeBeingWiped(f"the pod is being deleted; volume {volume} is being wiped")
-    try:
-        yield
-    finally:
-        await release_storage_volume_lock(redis, volume, holder)
+    # retries of one operation share the holder: serialized, so one retry's release never drops the
+    # hold another retry still needs before its marker exists (review, Pixel)
+    serial = _operation_dispatch_locks.setdefault(holder, asyncio.Lock())
+    async with serial:
+        if not await take_storage_volume_lock(redis, volume, holder):
+            raise StorageVolumeBeingWiped(f"the pod is being deleted; volume {volume} is being wiped")
+        try:
+            yield
+        finally:
+            await release_storage_volume_lock(redis, volume, holder)
+
+
+# shortcut: per validator process; retries of one operation reach the same process (one validator per hotkey)
+_operation_dispatch_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
 
 
 def _key(executor_id: str) -> str:
