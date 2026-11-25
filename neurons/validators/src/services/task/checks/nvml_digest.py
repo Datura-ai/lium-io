@@ -12,10 +12,7 @@ from ..pipeline import CheckResult, Context
 
 logger = logging.getLogger(__name__)
 
-# The validator's own read of the library the scrape hashes, picked the same way (machine_scrape.get_libnvidia_ml_path:
-# the first `find /usr` hit with x86_64 or lib64 in its path, else the first hit). It proves itself complete: every
-# step must exit 0 and the file's inode, size and mtime must be the same before and after hashing, so a failed read or
-# a file replaced mid-read never prints the DIGEST line.
+# the library the scrape hashes, picked the same way (machine_scrape.get_libnvidia_ml_path)
 LIBNVIDIA_ML_DIGEST_CMD = (
     "p=$(find /usr -name 'libnvidia-ml.so.1' 2>/dev/null | grep -E 'x86_64|lib64' | head -n 1); "
     "[ -n \"$p\" ] || p=$(find /usr -name 'libnvidia-ml.so.1' 2>/dev/null | head -n 1); "
@@ -81,21 +78,21 @@ class NvmlDigestCheck:
             updates = {"clear_verified_job_info": True} if is_confirmed_spoof else {}
             return CheckResult(passed=False, event=event, updates=updates)
 
-        # Known driver: the validator's own read decides (DAH-7050). The scrape's digest cannot tell a failed or
-        # partial read from a complete read of a wrong file, so one bad scrape read reset honest nodes at once. The
-        # own read proves itself complete: complete and wrong resets, complete and right passes, anything else is
-        # unknown (the cycle fails, the verification stays).
+        if lib_digest == expected_digest:
+            event = render_message(
+                Msg.DIGEST_OK, ctx=ctx, check_id=self.check_id, what={"driver": driver_version, "libnvidia_ml": lib_digest}
+            )
+            return CheckResult(passed=True, event=event)
+
+        # DAH-7050: a mismatch resets only once confirmed
         actual_digest = await self._read_digest(ctx)
         what = {
             "driver": driver_version,
             "expected_md5": expected_digest,
-            "actual_md5": actual_digest,
-            "scrape_md5": lib_digest,
+            "actual_md5": lib_digest,
+            "read_md5": actual_digest,
         }
-        if actual_digest == expected_digest:
-            event = render_message(Msg.DIGEST_OK, ctx=ctx, check_id=self.check_id, what=what)
-            return CheckResult(passed=True, event=event)
-        if actual_digest is None:
+        if actual_digest is None or actual_digest == expected_digest:
             event = render_message(Msg.DIGEST_UNREAD, ctx=ctx, check_id=self.check_id, what=what)
             return CheckResult(passed=False, event=event)
         event = render_message(Msg.DIGEST_MISMATCH, ctx=ctx, check_id=self.check_id, what=what)

@@ -41,38 +41,40 @@ def _ctx(context_factory, driver, ssh, scrape="", digest_map=None, arch=None, se
 
 
 @pytest.mark.asyncio
-async def test_a_complete_read_of_the_right_library_passes(context_factory):
-    ctx = _ctx(context_factory, KNOWN, _read(GOOD), digest_map={KNOWN: GOOD})
+async def test_a_matching_scrape_digest_passes_without_a_read(context_factory):
+    ctx = _ctx(context_factory, KNOWN, _read(GOOD), scrape=GOOD, digest_map={KNOWN: GOOD})
 
     result = await NvmlDigestCheck().run(ctx)
 
     assert result.passed is True
     assert result.event.reason_code == Msg.DIGEST_OK.reason
     assert "clear_verified_job_info" not in result.updates
+    ctx.ssh.run.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_a_complete_read_of_a_wrong_library_resets_at_once(context_factory):
-    ctx = _ctx(context_factory, KNOWN, _read(OTHER), digest_map={KNOWN: GOOD})
+async def test_a_mismatch_a_complete_read_confirms_resets_at_once(context_factory):
+    ctx = _ctx(context_factory, KNOWN, _read(OTHER), scrape=OTHER, digest_map={KNOWN: GOOD})
 
     result = await NvmlDigestCheck().run(ctx)
 
     assert result.passed is False
     assert result.event.reason_code == Msg.DIGEST_MISMATCH.reason
     assert result.updates["clear_verified_job_info"] is True
-    assert result.event.what_we_saw["actual_md5"] == OTHER
+    assert result.event.what_we_saw["read_md5"] == OTHER
     assert ctx.ssh.run.await_count == 1
 
 
 @pytest.mark.asyncio
-async def test_a_wrong_scrape_digest_no_longer_decides(context_factory):
-    # DAH-7050, 23 Nov: one scrape reported a digest that matched no file on an intact host; the read decides
+async def test_a_mismatch_the_read_does_not_confirm_fails_without_a_reset(context_factory):
+    # DAH-7050, 23 Nov: one scrape reported a digest that matched no file on an intact host
     ctx = _ctx(context_factory, KNOWN, _read(GOOD), scrape=OTHER, digest_map={KNOWN: GOOD})
 
     result = await NvmlDigestCheck().run(ctx)
 
-    assert result.passed is True
-    assert result.event.what_we_saw["scrape_md5"] == OTHER
+    assert result.passed is False
+    assert result.event.reason_code == Msg.DIGEST_UNREAD.reason
+    assert "clear_verified_job_info" not in result.updates
 
 
 @pytest.mark.asyncio
@@ -100,7 +102,7 @@ async def test_a_failed_or_partial_read_is_unknown_never_a_fault(context_factory
     assert result.passed is False
     assert result.event.reason_code == Msg.DIGEST_UNREAD.reason
     assert "clear_verified_job_info" not in result.updates
-    assert result.event.what_we_saw["actual_md5"] is None
+    assert result.event.what_we_saw["read_md5"] is None
 
 
 @pytest.mark.asyncio
@@ -115,7 +117,7 @@ async def test_a_failed_or_partial_read_is_unknown_never_a_fault(context_factory
     ],
 )
 async def test_the_built_in_map_allows_these_drivers(context_factory, driver, digest):
-    result = await NvmlDigestCheck().run(_ctx(context_factory, driver, _read(digest)))
+    result = await NvmlDigestCheck().run(_ctx(context_factory, driver, _read(digest), scrape=digest))
 
     assert result.passed is True
     assert result.event.reason_code == Msg.DIGEST_OK.reason
@@ -185,7 +187,14 @@ async def test_nvml_digest_check_uses_the_host_arch_list(
     arch, read_digest, expected_pass, expected_reason, context_factory
 ):
     # the shared-config map is x86_64 only and must not apply to an aarch64 host
-    ctx = _ctx(context_factory, "580.95.05", _read(read_digest), digest_map={"580.95.05": X86_580_95_05}, arch=arch)
+    ctx = _ctx(
+        context_factory,
+        "580.95.05",
+        _read(read_digest),
+        scrape=read_digest,
+        digest_map={"580.95.05": X86_580_95_05},
+        arch=arch,
+    )
 
     result = await NvmlDigestCheck().run(ctx)
 

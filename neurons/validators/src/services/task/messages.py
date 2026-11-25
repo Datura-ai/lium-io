@@ -738,7 +738,7 @@ class NvmlDigestMessages:
         remediation="Reinstall the NVIDIA driver matching this version and ensure libnvidia-ml is not tampered.",
     )
     DIGEST_UNREAD = MessageTemplate(
-        event="NVML library could not be read completely",
+        event="NVML library digest mismatch not confirmed",
         reason="NVML_DIGEST_UNREAD",
         severity="warning",
         category="env",
