@@ -3504,8 +3504,9 @@ def _wipe_volume_cmd(local_volume: str, *container_names: str) -> str:
     # widen the rm to the host root or to the other volumes (review, 27.10). A volume another
     # container still mounts (a running backup's lium-storage-* helper) is left alone: exit 6.
     # Only `container_names` may mount it (docker names never hold a space). A backup or restore
-    # whose spec names the volume is starting or running even before its helper mounts it: the
-    # spec is written before the helper exists and removed when the run ends, so exit 7 (DAH-7077).
+    # on the volume holds it from launch to the wrapper's end, before and after its helper mounts it:
+    # its `<op>.volume` marker names it (the spec loses the name once the runner reads it), and a
+    # legacy tar job names it on its command line, so exit 7 (DAH-7077).
     volume = shlex.quote(local_volume)
     specs = shlex.quote(str(REMOTE_OPERATION_DIRECTORY))
     allowed = shlex.quote(f" {' '.join(container_names)} ")
@@ -3515,7 +3516,9 @@ def _wipe_volume_cmd(local_volume: str, *container_names: str) -> str:
         'd=${dm%% *}; m=${dm#* }; '
         f"users=$({docker} ps -a --filter volume=\"$v\" --format '{{{{.Names}}}}') || exit 2; "
         f'ok={allowed}; for u in $users; do case "$ok" in *" $u "*) ;; *) echo "volume in use by $u"; exit 6;; esac; done; '
-        f'grep -qsF "\\"volume_name\\":\\"$v\\"" {specs}/*.json && {{ echo "volume has a storage operation"; exit 7; }}; '
+        f'{{ grep -qsxF -- "$v" {specs}/*.volume || grep -qsF "\\"volume_name\\":\\"$v\\"" {specs}/*.json || '
+        'pgrep -f -- "[-]-source-volume $v --" >/dev/null || pgrep -f -- "[-]-target-volume $v --" >/dev/null; } && '
+        '{ echo "volume has a storage operation"; exit 7; }; '
         'case "$d" in '
         'local) case "$m" in */volumes/"$v"/_data) p=$m;; *) echo "unexpected mountpoint $m"; exit 5;; esac;; '
         f'vloopback|vloopback:*) [ "$m" = "/mnt/$v" ] || {{ echo "unexpected mountpoint $m"; exit 5; }}; '
@@ -14737,7 +14740,10 @@ class DockerService:
         finally:
             if not wiped:
                 # the volume keeps its files: a backup may start on it again
-                await release_storage_volume_lock(self.redis_service, payload.local_volume, WIPE_LOCK_HOLDER)
+                try:
+                    await release_storage_volume_lock(self.redis_service, payload.local_volume, WIPE_LOCK_HOLDER)
+                except Exception as exc:  # noqa: BLE001 -- never fatal; the lock's TTL ends it
+                    log.warning("Releasing the volume's storage lock failed", error=f"{type(exc).__name__}: {exc}", **fields)
 
     async def _run_volume_wipe(
         self,

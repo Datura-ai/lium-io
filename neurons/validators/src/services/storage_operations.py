@@ -101,7 +101,7 @@ async def release_storage_volume_lock(redis: RedisService, volume: str, holder: 
 async def storage_dispatch_holds_volume(
     redis: RedisService, volume: str | None, operation_id: UUID | str
 ) -> AsyncIterator[None]:
-    """Holds the volume against the delete's wipe from the dispatch until the spec is written (the block's end)."""
+    """Holds the volume against the delete's wipe from the dispatch until its marker is on the executor (the block's end)."""
     if not volume:
         yield
         return
@@ -221,6 +221,9 @@ class StorageOperationFiles:
     pid: PurePosixPath
     status: PurePosixPath
     cancel: PurePosixPath
+    # the volume the operation works on, for the delete's wipe (DAH-7077): the runner strips the
+    # spec once it has read it, so the spec cannot say which volume a running operation holds
+    volume: PurePosixPath
 
     @classmethod
     def for_operation(cls, operation_id: UUID) -> StorageOperationFiles:
@@ -231,6 +234,7 @@ class StorageOperationFiles:
             pid=REMOTE_OPERATION_DIRECTORY / f"{stem}.pid",
             status=REMOTE_OPERATION_DIRECTORY / f"{stem}.status",
             cancel=REMOTE_OPERATION_DIRECTORY / f"{stem}.cancel",
+            volume=REMOTE_OPERATION_DIRECTORY / f"{stem}.volume",
         )
 
 
@@ -343,7 +347,13 @@ async def start_storage_operation(
             await _remove_operation_artifacts(ssh_client, files)
         await _remove_stale_helper_container(ssh_client, operation_id)
 
+        workspace = spec.get("workspace")
+        volume = workspace.get("volume_name") if isinstance(workspace, Mapping) else None
         async with ssh_client.start_sftp_client() as sftp:
+            if volume:
+                # written before the runner exists, removed by the wrapper only after it exits
+                async with sftp.open(str(files.volume), "w") as remote_volume:
+                    await remote_volume.write(f"{volume}\n")
             async with sftp.open(str(files.spec), "w") as remote_spec:
                 await remote_spec.write(
                     json.dumps(dict(spec), separators=(",", ":"), sort_keys=True)
@@ -379,7 +389,7 @@ async def start_storage_operation(
             'wait "$child"; result=$?; '
             f"printf '%s\\n' \"$result\" > {shlex.quote(str(files.status))}; "
             f"rm -f {shlex.quote(str(files.spec))} {shlex.quote(str(files.pid))} "
-            f"{shlex.quote(str(files.cancel))}{terminal_cleanup}"
+            f"{shlex.quote(str(files.cancel))} {shlex.quote(str(files.volume))}{terminal_cleanup}"
         )
         launch_command = (
             f"nohup /bin/sh -c {shlex.quote(wrapper)} "
@@ -569,7 +579,7 @@ async def _remove_operation_artifacts(
         "rm -f "
         + " ".join(
             shlex.quote(str(path))
-            for path in (files.status, files.log, files.pid, files.spec, files.cancel)
+            for path in (files.status, files.log, files.pid, files.spec, files.cancel, files.volume)
         ),
         check=False,
     )

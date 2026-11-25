@@ -11,6 +11,7 @@ import json
 import os
 import shlex
 import subprocess
+import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock
 from uuid import uuid4
@@ -158,6 +159,7 @@ def _run_wipe(
     users: str = "pod_dirty",
     fail: str = "",
     operation_volumes: tuple[str, ...] = (),
+    volume_markers: tuple[str, ...] = (),
 ) -> subprocess.CompletedProcess:
     """Runs the wipe command under sh against a docker stub whose answers come from the arguments;
     `users` is what `docker ps` lists on the volume, `fail` names the stub call that exits nonzero
@@ -168,6 +170,10 @@ def _run_wipe(
     for i, name in enumerate(operation_volumes):
         spec = {"action": "backup", "workspace": {"volume_name": name}}
         (operations / f"op{i}.json").write_text(json.dumps(spec, separators=(",", ":"), sort_keys=True))
+    for i, name in enumerate(volume_markers):
+        # a running operation: the runner has stripped its spec to the reporter, the marker stays
+        (operations / f"run{i}.json").write_text(json.dumps({"reporter": {"resource": "backup"}}))
+        (operations / f"run{i}.volume").write_text(f"{name}\n")
     docker = tmp_path / "docker"
     docker.write_text(
         "#!/bin/sh\n"
@@ -246,6 +252,47 @@ def test_wipe_leaves_a_volume_whose_backup_is_starting(tmp_path, driver, mountpo
     assert completed.returncode == 7
     assert completed.stdout.strip() == "volume has a storage operation"
     assert files[wiped_dir].exists()
+
+
+def test_wipe_leaves_a_volume_whose_running_operation_stripped_its_spec(tmp_path):
+    # Pixel's review: the runner rewrites the spec without the workspace once it has read it
+    files = _host_files(tmp_path, _LOCAL_MOUNT)
+
+    completed = _run_wipe(tmp_path, "volume_dirty", "local", _LOCAL_MOUNT, volume_markers=("volume_dirty",))
+
+    assert completed.returncode == 7
+    assert files[_LOCAL_MOUNT].exists()
+
+
+@pytest.mark.parametrize("flag", ["--source-volume", "--target-volume"])
+def test_wipe_leaves_a_volume_a_legacy_tar_job_runs_on(tmp_path, flag):
+    files = _host_files(tmp_path, _LOCAL_MOUNT)
+    job = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)", flag, "volume_dirty", "--backup-path", "/x"]
+    )
+    try:
+        completed = _run_wipe(tmp_path, "volume_dirty", "local", _LOCAL_MOUNT)
+    finally:
+        job.kill()
+        job.wait()
+
+    assert completed.returncode == 7
+    assert files[_LOCAL_MOUNT].exists()
+
+
+def test_wipe_runs_when_only_another_volume_has_a_marker_or_legacy_job(tmp_path):
+    files = _host_files(tmp_path, _LOCAL_MOUNT)
+    job = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)", "--source-volume", "volume_dirty_2", "--backup-path", "/x"]
+    )
+    try:
+        completed = _run_wipe(tmp_path, "volume_dirty", "local", _LOCAL_MOUNT, volume_markers=("volume_dirty_2",))
+    finally:
+        job.kill()
+        job.wait()
+
+    assert completed.returncode == 0, completed.stderr
+    assert not files[_LOCAL_MOUNT].exists()
 
 
 def test_wipe_runs_when_only_another_volume_has_a_storage_operation(tmp_path):
@@ -554,3 +601,25 @@ async def test_a_wipe_that_ran_keeps_the_volume_from_any_later_backup(
     else:
         async with storage_dispatch_holds_volume(lock_redis, payload.local_volume, uuid4()):
             pass
+
+
+@pytest.mark.asyncio
+async def test_a_failed_lock_release_never_fails_the_delete(docker_service, monkeypatch):
+    # Pixel's review: Redis failing on the release of a skipped wipe must leave the normal stop path
+    order = _wire_delete(
+        docker_service,
+        monkeypatch,
+        _host_answers(wipe=_make_ssh_command_result(exit_status=7, stdout="volume has a storage operation")),
+    )
+    lock_redis = docker_service.redis_service.set_if_absent.__self__
+
+    async def broken_delete(*args, **kwargs):
+        raise ConnectionError("redis down")
+
+    monkeypatch.setattr(lock_redis, "delete", broken_delete, raising=False)
+    payload = _delete_payload()
+
+    result = await _delete(docker_service, payload)
+
+    assert isinstance(result, ContainerDeleted)
+    assert ("remove", payload.container_name) in order
