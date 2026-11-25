@@ -1927,11 +1927,12 @@ def _pod_volume_labels(payload) -> dict[str, str]:
 
 def _node_left_delete_command(payload: ContainerDeleteOnNodeLeftRequest) -> str:
     """Exits 97 on another boot, or when the pod's container or its parked edit container (``<name>__prev``) there
-    was created for another registration, another pod or another placement than `create_command_id` (a replacement
-    made on this host through a re-pointed registration or another miner's registration of the same executor, or the
-    pod placed back on this boot after the move); 0 once the left registration's container,
-    its parked edit container and its kept edit containers are gone. Unlabelled containers (made before the labels)
-    are kept.
+    was created for another registration or another pod (a replacement made on this host through a re-pointed
+    registration or another miner's registration of the same executor), or the pod's container for another placement
+    than `create_command_id` (the pod placed back on this boot after the move); 0 once the left registration's
+    container, its parked edit container and its kept edit containers are gone. Only the live container is matched on
+    the placement: an edit or reboot mints a new create id, so the parked and kept edit containers carry an older one.
+    Unlabelled containers (made before the labels) are kept.
 
     The pod's named volume is never removed here: one pod keeps one volume name on every registration, so on a
     daemon two registrations share it may be the replacement's, mounted or about to be, and nothing on the host
@@ -1945,24 +1946,25 @@ def _node_left_delete_command(payload: ContainerDeleteOnNodeLeftRequest) -> str:
     if payload.container_name != DockerService.get_container_name(payload):
         # the name selects the kept containers too: only the pod's own may be named
         raise ValueError("the delete names another pod's container")
-    owner_pod_and_placement = shlex.quote(f"{_executor_label(payload)} {payload.pod_id} {payload.create_command_id}")
-    found = "{{.Id}} " + " ".join(
-        f'{{{{index .Config.Labels "{label}"}}}}'
-        for label in (LIUM_EXECUTOR_ID_LABEL, LIUM_POD_ID_LABEL, LIUM_CREATE_COMMAND_LABEL)
-    )
+    owner_and_pod = f"{_executor_label(payload)} {payload.pod_id}"
+    labels = (LIUM_EXECUTOR_ID_LABEL, LIUM_POD_ID_LABEL)
     lines = [
         # an unreadable boot id is not this node's: the read must succeed and give a value before it is compared
         f'boot=$(cat /proc/sys/kernel/random/boot_id) && [ -n "$boot" ] '
         f'&& [ "$boot" = {shlex.quote(payload.expected_boot_id)} ] || exit {_NOT_THE_NODE_LEFT_EXIT}',
         "ids=",
     ]
-    for container_name in (payload.container_name, f"{payload.container_name}{EDIT_PARKED_SUFFIX}"):
+    for container_name, checked, expected in (
+        (payload.container_name, labels + (LIUM_CREATE_COMMAND_LABEL,), f"{owner_and_pod} {payload.create_command_id}"),
+        (f"{payload.container_name}{EDIT_PARKED_SUFFIX}", labels, owner_and_pod),
+    ):
         name = shlex.quote(container_name)
+        found = "{{.Id}} " + " ".join(f'{{{{index .Config.Labels "{label}"}}}}' for label in checked)
         lines += [
             # a failed inspect is absence only when a listing that succeeded shows no container under the name
             f"found=$(/usr/bin/docker inspect --type container -f {shlex.quote(found)} {name} 2>/dev/null) "
             f"|| {{ found=; named=$(/usr/bin/docker ps -aq --no-trunc --filter name=^{name}$) && [ -z \"$named\" ] || exit 1; }}",
-            f'[ -z "$found" ] || [ "${{found#* }}" = {owner_pod_and_placement} ] || exit {_NOT_THE_NODE_LEFT_EXIT}',
+            f'[ -z "$found" ] || [ "${{found#* }}" = {shlex.quote(expected)} ] || exit {_NOT_THE_NODE_LEFT_EXIT}',
             # removed by the ID that was checked: a container created under the same name after the check is not it
             'ids="$ids ${found%% *}"',
         ]
@@ -1970,8 +1972,7 @@ def _node_left_delete_command(payload: ContainerDeleteOnNodeLeftRequest) -> str:
         f"kept=$(/usr/bin/docker ps -aq --no-trunc --filter name=^{shlex.quote(_kept_container_prefix(payload.container_name))} "
         f"--filter label={shlex.quote(f'{LIUM_EXECUTOR_ID_LABEL}={_executor_label(payload)}')} "
         # label filters all apply: a kept name's prefix and the registration alone do not make it this pod's
-        f"--filter label={shlex.quote(f'{LIUM_POD_ID_LABEL}={payload.pod_id}')} "
-        f"--filter label={shlex.quote(f'{LIUM_CREATE_COMMAND_LABEL}={payload.create_command_id}')}) || exit 1",
+        f"--filter label={shlex.quote(f'{LIUM_POD_ID_LABEL}={payload.pod_id}')}) || exit 1",
         'set -- $ids $kept',
         '[ $# -eq 0 ] || /usr/bin/docker rm -fv "$@" >/dev/null 2>&1',
         # done only when a listing that succeeded shows none of the selected containers

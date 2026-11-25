@@ -86,6 +86,8 @@ LEFT_LABEL = f"{LEFT_MINER}:{LEFT}"
 # the create command id of the placement on the node left; the pod placed back on that boot later has another
 LEFT_PLACEMENT = "placement-left"
 LATER_PLACEMENT = "placement-later"
+# an edit of the pod on the node left: its earlier containers carry the create id from before the edit
+EDITED_PLACEMENT = "placement-before-the-edit"
 
 
 def _daemon_stub(
@@ -101,11 +103,12 @@ def _daemon_stub(
     kept_pod: str | None = None,
     placement: str = LEFT_PLACEMENT,
     kept_placement: str = LEFT_PLACEMENT,
+    prev_placement: str = LEFT_PLACEMENT,
 ) -> Path:
     """A docker stub. Each file under containers/ is a container named as the file, holding "<id> <registration
     label> <pod label> <placement label>": the pod's container (`cid`, labelled `container_owner`, `container_pod`,
     default `pod_id`, and `placement`) and its parked edit container `<name>__prev` (`pid`, labelled `prev_owner` and
-    `placement`). The kept container `kept1` (left registration, pod `kept_pod`, default `pod_id`, `kept_placement`) exists while its file does, listed when every label filter
+    `prev_placement`); inspect prints the placement only when the format asks for it. The kept container `kept1` (left registration, pod `kept_pod`, default `pod_id`, `kept_placement`) exists while its file does, listed when every label filter
     matches. A removal deletes each unless sticky. `inspect_fails` makes inspect fail as a daemon
     error would, with the containers still there. Each file under volumes/ is a volume whose lines are its labels
     (`inuse` marks one a container still uses), inspected as "<pod id> <registration>" and removed by name."""
@@ -119,12 +122,12 @@ def _daemon_stub(
         f"io.lium.create_command_id={kept_placement}"
     )
     name = f"pod_{pod_id}"
-    for container_name, cid, owner, pod in [
-        (name, "cid", container_owner, pod_id if container_pod is None else container_pod),
-        (f"{name}__prev", "pid", prev_owner, pod_id),
+    for container_name, cid, owner, pod, made_by in [
+        (name, "cid", container_owner, pod_id if container_pod is None else container_pod, placement),
+        (f"{name}__prev", "pid", prev_owner, pod_id, prev_placement),
     ]:
         if owner is not None:
-            (containers / container_name).write_text(f"{cid} {owner} {pod} {placement}")
+            (containers / container_name).write_text(f"{cid} {owner} {pod} {made_by}")
     cs, k, vols = (shlex.quote(str(path)) for path in (containers, kept, volumes))
     sticky_ids = " ".join(cid for cid, on in [("cid", sticky), ("pid", sticky_prev)] if on) or "-"
     rm_kept = "true" if sticky_kept else f"rm -f {k}"
@@ -139,7 +142,8 @@ def _daemon_stub(
         f'*name=*) n=${{last#name=^}}; n=${{n%\\$}}; [ -e {cs}/"$n" ] && cut -d" " -f1 {cs}/"$n";; '
         f'*) for f in {cs}/*; do [ -e "$f" ] && cut -d" " -f1 "$f"; done; [ -e {k} ] && echo kept1;; esac; exit 0;;\n'
         + ("  inspect) exit 1;;\n" if inspect_fails else "")
-        + f'  inspect) [ -e {cs}/"$last" ] || exit 1; cat {cs}/"$last";;\n'
+        + f'  inspect) [ -e {cs}/"$last" ] || exit 1; case "$*" in *create_command_id*) cat {cs}/"$last";; '
+        f'*) cut -d" " -f1-3 {cs}/"$last";; esac;;\n'
         f'  rm) for a in "$@"; do case "$a" in kept1) {rm_kept};; -*) ;; '
         f'*) case " {sticky_ids} " in *" $a "*) ;; *) for f in {cs}/*; do '
         f'[ -e "$f" ] && [ "$(cut -d" " -f1 "$f")" = "$a" ] && rm -f "$f"; done;; esac;; esac; done;;\n'
@@ -286,13 +290,23 @@ def test_the_pods_container_from_another_placement_on_the_same_boot_is_never_tou
     assert "rm" not in calls.replace("inspect", "")
 
 
-def test_a_kept_container_of_a_later_placement_is_never_touched(tmp_path):
-    status, calls = _run(tmp_path, _payload(HOST_BOOT), kept_placement=LATER_PLACEMENT)
+@pytest.mark.parametrize("edit_placement", [EDITED_PLACEMENT, ""], ids=["edited", "made-before-the-label"])
+def test_the_parked_and_kept_edit_containers_of_an_edited_pod_go_with_it(tmp_path, edit_placement):
+    # r460 #2: an edit or reboot mints a new create id, so the renter's earlier containers (parked <name>__prev, kept
+    # kept_unmounted_<pod>_*) carry an older one than the live container the move named; they are the left
+    # registration's and the pod's, and go with it (the renter's old writable layer is not left on the node)
+    status, calls = _run(
+        tmp_path,
+        _payload(HOST_BOOT),
+        prev_owner=LEFT_LABEL,
+        prev_placement=edit_placement,
+        kept_placement=edit_placement,
+    )
 
     assert status == 0
-    assert f"label=io.lium.create_command_id={LEFT_PLACEMENT}" in calls
-    assert "kept1" not in "".join(line for line in calls.splitlines(True) if line.startswith("rm"))
-    assert (tmp_path / "kept").exists()
+    assert "rm -fv cid pid kept1" in calls
+    assert "label=io.lium.create_command_id" not in calls
+    assert not any((tmp_path / "containers").iterdir()) and not (tmp_path / "kept").exists()
 
 
 @pytest.mark.parametrize("container_owner", [LEFT_LABEL, None])
