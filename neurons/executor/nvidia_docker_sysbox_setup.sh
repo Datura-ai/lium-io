@@ -1066,7 +1066,7 @@ resolve_disk_dir() {
     [ -z "$meta" ] || [ ! -d "${meta%/*}" ] || META_DIR=${meta%/*}
     # Docker's own containerd keeps its root in data-root (<data-root>/containerd/daemon): the data-root fix covers it
     case "$DISK_DIR/" in "$data_root"/* | "${SYSBOX_SETUP_HOST_ROOT:-}$data_root"/*) return 0 ;; esac
-    SNAPSHOTTER_FIX="Docker's containerd image store keeps containers in $DISK_DIR, not under data-root: Pause New Rentals and wait for rentals to end, set \"features\": {\"containerd-snapshotter\": false} in /etc/docker/daemon.json, then sudo systemctl restart docker; switching stores hides the old images and containers (switching back restores them), so recreate the executor and watchtower with docker compose up -d --force-recreate. Or move containerd's root (or the snapshotter's \"root_path\") to the big disk and restart containerd."
+    SNAPSHOTTER_FIX="Docker's containerd image store keeps containers in $DISK_DIR, not under data-root: Pause New Rentals and wait for rentals to end, set \"features\": {\"containerd-snapshotter\": false} in /etc/docker/daemon.json, then sudo systemctl restart docker; switching stores hides the old images and containers (switching back restores them), so recreate the executor and watchtower with docker compose up -d --force-recreate, then Resume New Rentals in the portal. Or move containerd's root (or the snapshotter's \"root_path\") to the big disk and restart containerd."
 }
 
 tighter_df_kb() {
@@ -1095,10 +1095,20 @@ tighter_df_kb() {
     echo "$best $where"
 }
 
+store_fix_if_tighter() {
+    # SNAPSHOTTER_FIX only when the store is strictly tighter than data-root (df column $1, the reading $2 kB): on a
+    # data-root-limited node, switching the store off would move containers onto the disk that just failed
+    local data_kb
+    [ -n "${SNAPSHOTTER_FIX:-}" ] || return 0
+    data_kb=$(df -Pk "$DATA_ROOT" 2>/dev/null | awk -v c="$1" 'NR == 2 {print $c}')
+    [[ "$data_kb" =~ ^[0-9]+$ ]] && [ "$2" -ge "$data_kb" ] && return 0
+    printf '%s' "$SNAPSHOTTER_FIX"
+}
+
 check_total_disk_for_vram() {
     # The validators compare the TOTAL size of the filesystem the executor sees as / (its
     # rootfs lives under DISK_DIR) with total GPU VRAM; free space is not the rule.
-    local vram_mib vram_gb data_root total_kb total_gb needed_gb
+    local vram_mib vram_gb data_root total_kb total_gb needed_gb store_fix
     command -v nvidia-smi &>/dev/null || { pf_skip "Disk >= ${MIN_DISK_TO_VRAM_RATE}x VRAM — no NVIDIA driver, VRAM unknown."; return 0; }
     vram_mib=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | awk '{s += $1} END {print s + 0}')
     [ "${vram_mib:-0}" -gt 0 ] 2>/dev/null || { pf_skip "Disk >= ${MIN_DISK_TO_VRAM_RATE}x VRAM — nvidia-smi reports no GPU memory."; return 0; }
@@ -1118,9 +1128,10 @@ check_total_disk_for_vram() {
         pf_pass "Disk ${total_gb} GB on $data_root >= ${needed_gb} GB (${MIN_DISK_TO_VRAM_RATE}x of ${vram_gb} GB VRAM) — idle pay eligible."
         return 0
     fi
+    store_fix=$(store_fix_if_tighter 2 "$total_kb")
     pf_fix "Disk ${total_gb} GB on $data_root is below ${needed_gb} GB (${MIN_DISK_TO_VRAM_RATE}x of ${vram_gb} GB VRAM) — the node is listed but earns nothing while idle." \
         "Add disk, or move Docker's data-root to a filesystem of at least ${needed_gb} GB (\"data-root\" in /etc/docker/daemon.json, then sudo systemctl restart docker)." \
-        ${SNAPSHOTTER_FIX:+"$SNAPSHOTTER_FIX"}
+        ${store_fix:+"$store_fix"}
 }
 
 check_data_root_loop_dio() {
@@ -1146,7 +1157,7 @@ check_data_root_loop_dio() {
 check_free_disk_for_node() {
     # VerifyX allocates MIN_FREE_STORAGE_GB on the node's filesystem; before the first `lium mine` the node's images
     # still have to come out of the same free space
-    local data_root free_kb free_gb needed_gb
+    local data_root free_kb free_gb needed_gb store_fix
     resolve_disk_dir || { pf_skip "Free disk for the node — $CTRD_UNKNOWN"; return 0; }
     read -r free_kb data_root <<<"$(tighter_df_kb 4)"
     [[ "$free_kb" =~ ^[0-9]+$ ]] || { pf_skip "Free disk for the node — cannot read the free space of $DISK_DIR."; return 0; }
@@ -1158,9 +1169,10 @@ check_free_disk_for_node() {
         pf_pass "Free disk ${free_gb} GB on $data_root >= ${needed_gb} GB for the node's images and the validators' ${MIN_FREE_STORAGE_GB} GB storage test."
         return 0
     fi
+    store_fix=$(store_fix_if_tighter 4 "$free_kb")
     pf_fix "Free disk ${free_gb} GB on $data_root is below ${needed_gb} GB — the validators' storage test needs ${MIN_FREE_STORAGE_GB} GB free after the node's images (~${NODE_IMAGES_GB} GB) are pulled, so \`lium mine\` would fail at validation." \
         "Use a disk of at least $((MIN_FREE_STORAGE_GB + NODE_IMAGES_GB + 10)) GB, or free space / move Docker's data-root (\"data-root\" in /etc/docker/daemon.json, then sudo systemctl restart docker)." \
-        ${SNAPSHOTTER_FIX:+"$SNAPSHOTTER_FIX"}
+        ${store_fix:+"$store_fix"}
 }
 
 resolve_preflight_ports() {

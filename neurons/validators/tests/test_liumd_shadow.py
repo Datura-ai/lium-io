@@ -543,6 +543,32 @@ async def test_live_and_python_timeout_fields_are_not_a_specs_difference(
 
 
 @pytest.mark.asyncio
+async def test_the_containerd_store_disk_fields_only_liumd_reads_are_not_a_specs_difference(
+    keypair, monkeypatch, verifyx_service
+):
+    # DAH-5238 (jam6099 review on lium-io#1892): liumd reads data-root apart from a containerd store; the Python scrape
+    # has no such fields, so each one would read as a difference on every node
+    liumd_specs = {
+        **LIUMD_SCRAPE,
+        "hard_disk": {
+            **LIUMD_SCRAPE["hard_disk"],
+            "data_root_used": 1,
+            "data_root_docker_used": 2,
+            "data_root_free": 3,
+            "engy_cache_released_gb": 4,
+            "hard_disk_content_scrape_error": "ctr: not found",
+        },
+    }
+    state = build_state(specs=SPECS, scrape_specs=PYTHON_SCRAPE)
+    ctx = _ctx(keypair, monkeypatch, verifyx_service, state=state)
+
+    record = await _shadow(ctx, FakeLiumd(specs=liumd_specs))
+
+    assert record["specs_diff"] == []
+    assert record["specs_agree"] is True
+
+
+@pytest.mark.asyncio
 async def test_a_missing_python_needrestart_guard_does_not_beat_the_node_view(
     keypair, monkeypatch, verifyx_service
 ):

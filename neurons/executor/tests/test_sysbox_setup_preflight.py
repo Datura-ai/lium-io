@@ -412,6 +412,9 @@ def test_disk_checks_measure_the_tighter_of_the_store_and_data_root(tmp_path, ch
     assert rc == expected_rc, out
     if limiting:
         assert f"{limiting} is below" in out, out
+    # jam6099 review on lium-io#1892: switching the store off moves containers onto data-root, so that fix is only
+    # offered when the store, not data-root, is the tighter disk
+    assert ("containerd-snapshotter" in out) == (limiting == f"/{SNAPSHOTS}"), out
 
 
 @pytest.mark.parametrize("store_avail_kb, data_root_avail_kb, limiting", [
