@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import logging
+import re
 
 from core.utils import _m, get_extra_info
 from services.const import LIB_NVIDIA_ML_DIGESTS, LIB_NVIDIA_ML_DIGESTS_AARCH64
@@ -9,6 +11,16 @@ from ..messages import NvmlDigestMessages as Msg, render_message
 from ..pipeline import CheckResult, Context
 
 logger = logging.getLogger(__name__)
+
+# The second read hashes the library the scrape hashed, picked the same way (machine_scrape.get_libnvidia_ml_path:
+# the first `find /usr` hit with x86_64 or lib64 in its path, else the first hit), as "<md5>:<sha256>".
+LIBNVIDIA_ML_DIGEST_CMD = (
+    "p=$(find /usr -name 'libnvidia-ml.so.1' 2>/dev/null | grep -E 'x86_64|lib64' | head -n 1); "
+    "[ -n \"$p\" ] || p=$(find /usr -name 'libnvidia-ml.so.1' 2>/dev/null | head -n 1); "
+    "[ -n \"$p\" ] && echo \"$(md5sum < \"$p\" | cut -d' ' -f1):$(sha256sum < \"$p\" | cut -d' ' -f1)\""
+)
+SECOND_READ_TIMEOUT_SECONDS = 15
+_DIGEST_RE = re.compile(r"[0-9a-f]{32}:[0-9a-f]{64}")
 
 
 class NvmlDigestCheck:
@@ -65,18 +77,25 @@ class NvmlDigestCheck:
                 # DIGEST_MISMATCH.
                 updates = {"clear_verified_job_info": True} if is_confirmed_spoof else {}
             else:
-                # Driver is known but digest doesn't match - possible tampering
+                # Driver is known but digest doesn't match - possible tampering. One read is not proof: a read that
+                # failed or came back partial (an all-zero digest, one that never repeats) looks the same, and the
+                # reset drops a rented node at once (DAH-7050). Only a second read of its own that is also wrong
+                # confirms it; one that matches or cannot be read leaves the node's verification as it is.
+                second_digest = await self._read_digest_again(ctx)
+                what = {
+                    "driver": driver_version,
+                    "expected_md5": expected_digest,
+                    "actual_md5": lib_digest,
+                    "second_read_md5": second_digest,
+                }
+                confirmed = second_digest is not None and second_digest != expected_digest
                 event = render_message(
-                    Msg.DIGEST_MISMATCH,
+                    Msg.DIGEST_MISMATCH if confirmed else Msg.DIGEST_UNCONFIRMED,
                     ctx=ctx,
                     check_id=self.check_id,
-                    what={
-                        "driver": driver_version,
-                        "expected_md5": expected_digest,
-                        "actual_md5": lib_digest,
-                    },
+                    what=what,
                 )
-                updates = {"clear_verified_job_info": True}
+                updates = {"clear_verified_job_info": True} if confirmed else {}
             return CheckResult(
                 passed=False,
                 event=event,
@@ -93,6 +112,18 @@ class NvmlDigestCheck:
             },
         )
         return CheckResult(passed=True, event=event)
+
+    async def _read_digest_again(self, ctx: Context) -> str | None:
+        """The library's digest read by the validator itself; None when it cannot be read (unknown, never a fault)."""
+        if ctx.ssh is None:
+            return None
+        try:
+            res = await asyncio.wait_for(ctx.ssh.run(LIBNVIDIA_ML_DIGEST_CMD), timeout=SECOND_READ_TIMEOUT_SECONDS)
+        except Exception as exc:
+            logger.info(_m("NVML digest second read failed: %s", extra=get_extra_info(ctx.default_extra)), repr(exc))
+            return None
+        digest = (res.stdout or "").strip()
+        return digest if res.exit_status == 0 and _DIGEST_RE.fullmatch(digest) else None
 
     def _log_missing_driver_and_fail(self, ctx: Context, lib_digest: str) -> CheckResult:
         """Log NVML_DRIVER_MISSING and return a failing result."""

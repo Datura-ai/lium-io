@@ -1,4 +1,7 @@
+import hashlib
 import logging
+import subprocess
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -21,14 +24,14 @@ from tests.helpers import build_context_config, build_services, build_state
             Msg.DIGEST_OK.reason,
             False,
         ),
-        # Mismatched digest - should fail
+        # Mismatched digest with no second read (no SSH): fails, but one read is no proof, so no reset (DAH-7050)
         (
             "535.183.01",
             "wrong_digest_here",
             {"535.183.01": "58fc46eefa8ebb265293556951a75a39:67185f510159acdc8f38b768b059bfb0f3ec5869baaffd1dc1c949e52012b18f"},
             False,
-            Msg.DIGEST_MISMATCH.reason,
-            True,
+            Msg.DIGEST_UNCONFIRMED.reason,
+            False,
         ),
         # Driver version not in map - should fail with DRIVER_UNKNOWN
         (
@@ -48,14 +51,14 @@ from tests.helpers import build_context_config, build_services, build_state
             Msg.DRIVER_UNKNOWN.reason,
             False,  # DAH-2742: unknown driver is not tampering
         ),
-        # Empty digest - should fail if driver version is known
+        # Empty digest - should fail if driver version is known (reset only once a second read confirms it)
         (
             "535.183.01",
             "",
             {"535.183.01": "58fc46eefa8ebb265293556951a75a39:67185f510159acdc8f38b768b059bfb0f3ec5869baaffd1dc1c949e52012b18f"},
             False,
-            Msg.DIGEST_MISMATCH.reason,
-            True,
+            Msg.DIGEST_UNCONFIRMED.reason,
+            False,
         ),
     ],
 )
@@ -230,7 +233,8 @@ async def test_nvml_digest_check_uses_the_host_arch_list(
     }
     # the shared-config map is x86_64 only and must not apply to an aarch64 host
     config = build_context_config(nvml_digest_map={"580.95.05": X86_580_95_05})
-    ctx = context_factory(config=config, state=build_state(specs=specs))
+    # the second read of the same file returns the same digest
+    ctx = context_factory(config=config, state=build_state(specs=specs), ssh=_ssh(lib_digest + "\n"))
 
     result = await NvmlDigestCheck().run(ctx)
 
@@ -252,3 +256,82 @@ async def test_unknown_aarch64_driver_is_not_reported_to_the_x86_resolver(contex
 
     assert result.event.reason_code == Msg.DRIVER_UNKNOWN.reason
     services.backend.report_unknown_driver.assert_not_awaited()
+
+
+KNOWN = "535.183.01"
+GOOD = "58fc46eefa8ebb265293556951a75a39:67185f510159acdc8f38b768b059bfb0f3ec5869baaffd1dc1c949e52012b18f"
+OTHER = "e3795cab4c63f3974e2c5c3f98539680:0d5d550ebfae598379af36c4a49c1e3f63f44d0ab1efa69d6a205d7909ee0856"
+ZEROS = "00000000000000000000000000000000:" + "0" * 64
+
+
+def _ssh(stdout="", exit_status=0, raises=None):
+    ssh = AsyncMock()
+    ssh.run = AsyncMock(side_effect=raises) if raises else AsyncMock(
+        return_value=MagicMock(exit_status=exit_status, stdout=stdout, stderr="")
+    )
+    return ssh
+
+
+def _mismatch_ctx(context_factory, ssh, reported=ZEROS):
+    config = build_context_config(nvml_digest_map={KNOWN: GOOD})
+    state = build_state(specs={"gpu": {"driver": KNOWN}, "md5_checksums": {"libnvidia_ml": reported}})
+    return context_factory(config=config, state=state, ssh=ssh)
+
+
+@pytest.mark.asyncio
+async def test_a_mismatch_the_second_read_confirms_resets_the_node(context_factory):
+    ctx = _mismatch_ctx(context_factory, _ssh(OTHER + "\n"), reported=OTHER)
+
+    result = await NvmlDigestCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.DIGEST_MISMATCH.reason
+    assert result.updates["clear_verified_job_info"] is True
+    assert result.event.what_we_saw["second_read_md5"] == OTHER
+
+
+@pytest.mark.asyncio
+async def test_one_bad_read_the_second_read_contradicts_keeps_the_verification(context_factory):
+    # DAH-7050: node 1778f7ba, 23 Nov: one wrong digest, intact file, the next cycle passed
+    ctx = _mismatch_ctx(context_factory, _ssh(GOOD + "\n"))
+
+    result = await NvmlDigestCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.DIGEST_UNCONFIRMED.reason
+    assert "clear_verified_job_info" not in result.updates
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "ssh",
+    [
+        _ssh(raises=TimeoutError()),
+        _ssh(raises=OSError("connection lost")),
+        _ssh(stdout="", exit_status=1),  # no library found
+        _ssh(stdout="d41d8cd98f00b204e9800998ecf8427e\n"),  # not "<md5>:<sha256>"
+    ],
+    ids=["timeout", "ssh error", "no library", "partial output"],
+)
+async def test_an_unreadable_second_read_is_unknown_never_a_fault(context_factory, ssh):
+    result = await NvmlDigestCheck().run(_mismatch_ctx(context_factory, ssh))
+
+    assert result.event.reason_code == Msg.DIGEST_UNCONFIRMED.reason
+    assert "clear_verified_job_info" not in result.updates
+    assert result.event.what_we_saw["second_read_md5"] is None
+
+
+def test_the_second_read_hashes_the_library_the_scrape_picks(tmp_path):
+    usr = tmp_path / "usr"
+    (usr / "local" / "cuda" / "compat").mkdir(parents=True)
+    (usr / "local" / "cuda" / "compat" / "libnvidia-ml.so.1").write_bytes(b"not this one")
+    lib_dir = usr / "lib" / "x86_64-linux-gnu"
+    lib_dir.mkdir(parents=True)
+    (lib_dir / "libnvidia-ml.so.595.84").write_bytes(b"the real library")
+    (lib_dir / "libnvidia-ml.so.1").symlink_to("libnvidia-ml.so.595.84")
+    cmd = nvml_digest.LIBNVIDIA_ML_DIGEST_CMD.replace("find /usr ", f"find {usr} ")
+
+    out = subprocess.run(["sh", "-c", cmd], capture_output=True, text=True, check=True).stdout.strip()
+
+    data = b"the real library"
+    assert out == f"{hashlib.md5(data).hexdigest()}:{hashlib.sha256(data).hexdigest()}"
