@@ -34,8 +34,9 @@ OOM = SimpleNamespace(exit_status=0, stdout="UUID:  None", stderr="Failed to all
 NO_DEVICE = SimpleNamespace(exit_status=0, stdout="UUID:  None", stderr="no CUDA-capable device is detected")
 
 
-def _node(answers: dict[int, object]):
-    """Each pinned card in `answers` gives that answer (an exception is raised); every other run answers right."""
+def _node(answers: dict[int, object], *, closed: bool = False):
+    """Each pinned card in `answers` gives that answer (an exception is raised); every other run answers right.
+    `closed`: the SSH connection reads as closed after the run (it dropped under it)."""
     pinned: list[int] = []
 
     async def run(cmd, *args, **kwargs):
@@ -51,7 +52,7 @@ def _node(answers: dict[int, object]):
                 return answer
         return SimpleNamespace(exit_status=0, stdout=ANSWER, stderr="")
 
-    return SimpleNamespace(run=run), pinned
+    return SimpleNamespace(run=run, is_closed=lambda: closed), pinned
 
 
 def _filler_on(cards) -> RentedExecutorsResponse:
@@ -271,14 +272,35 @@ async def test_a_deferral_never_extends_the_last_pass(context_factory, svc):  # 
 
 
 @pytest.mark.asyncio
-async def test_a_lost_connection_to_the_whole_node_defers(context_factory, svc):  # noqa: F811
-    ssh, _ = _node({i: ConnectionResetError("connection lost") for i in range(8)})
+@pytest.mark.parametrize(
+    "lost_cards, closed",
+    [(range(8), False), (range(4, 8), True)],
+    ids=["every_card", "dropped_after_cards_0_3_answered"],
+)
+async def test_a_lost_connection_to_the_whole_node_defers(context_factory, svc, lost_cards, closed):  # noqa: F811
+    # arhangel66 review 6054371012: the connection closed after some cards answered is a lost connection too
+    ssh, _ = _node({i: ConnectionResetError("connection lost") for i in lost_cards}, closed=closed)
+    redis = _proven(FakeRedis())
+    redis.ttl[PASS_KEY] = 3600
 
-    result, state = await _cycle(context_factory, svc, ssh, redis=_proven(FakeRedis()))
+    result, state = await _cycle(context_factory, svc, ssh, redis=redis)
 
     assert result.passed is True
     assert result.event.reason_code == Msg.ALLCARDS_DEFERRED.reason
     assert state.allcards_not_proven is False
+    # the pass from before stays, with its expiry
+    assert redis.store[PASS_KEY] == "2026-11-23T11:00:00" and redis.ttl[PASS_KEY] == 3600
+
+
+@pytest.mark.asyncio
+async def test_cards_whose_channels_fail_on_a_live_connection_fail(context_factory, svc):  # noqa: F811
+    # the connection stayed open: the failed channels say something about those cards
+    ssh, _ = _node({i: ConnectionResetError("channel closed") for i in range(4, 8)}, closed=False)
+
+    result, _ = await _cycle(context_factory, svc, ssh, redis=_proven(FakeRedis()))
+
+    assert result.passed is False
+    assert result.event.what_we_saw["allcards"]["outcome"] == "failed"
 
 
 @pytest.mark.asyncio

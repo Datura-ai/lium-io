@@ -40,7 +40,7 @@ class FakeValidation:
         return self.all_cards
 
 
-def _all_cards(*reasons, over_wall_clock=False):
+def _all_cards(*reasons, over_wall_clock=False, connection_closed=False):
     per_card = [{"card_index": i, "ok": not r, "reason": r} for i, r in enumerate(reasons)]
     passed = not any(reasons) and not over_wall_clock
     return AllCardsProbe(
@@ -49,6 +49,7 @@ def _all_cards(*reasons, over_wall_clock=False):
         elapsed_seconds=1.0,
         over_wall_clock=over_wall_clock,
         per_card=per_card,
+        connection_closed=connection_closed,
     )
 
 
@@ -215,6 +216,8 @@ async def test_no_all_cards_matmul_is_inconclusive_on_a_multi_card_node(
     [
         # the connection to the whole node was lost: every card's run raised an SSH error
         _all_cards("ssh_error: connection lost", "ssh_error: connection lost"),
+        # the connection closed after card 0 answered (arhangel66 review 6054371012)
+        _all_cards("", "ssh_error: connection lost", connection_closed=True),
         _all_cards("", "", over_wall_clock=True),
         # review (17 Nov): a multi-card claim the probe could not run (no card details or size, our own cipher
         # failed) ran no card, so it says nothing about them: inconclusive as before

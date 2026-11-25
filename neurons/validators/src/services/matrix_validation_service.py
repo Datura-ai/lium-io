@@ -222,6 +222,8 @@ class AllCardsProbe:
     elapsed_seconds: float
     over_wall_clock: bool
     per_card: list[dict]
+    # the SSH connection to the node was closed when the run ended (not just one card's channel)
+    connection_closed: bool = False
 
     @property
     def wrong_answer(self) -> bool:
@@ -235,9 +237,13 @@ class AllCardsProbe:
 
     @property
     def connection_lost(self) -> bool:
-        """The SSH connection to the whole node was lost: every card's run raised an SSH error. A run that ended
-        without an exit status is not this: the channel answered, so it says something about the card."""
-        return bool(self.per_card) and all((c.get("reason") or "").startswith("ssh_error") for c in self.per_card)
+        """The SSH connection to the whole node was lost: every card that failed raised an SSH error, and either every
+        card did or the connection itself was closed (it dropped after some cards answered). One card's channel failing
+        on a live connection, or a run that ended without an exit status, is not this: it says something about the card."""
+        failed = [c for c in self.per_card if not c.get("ok")]
+        if not failed or not all((c.get("reason") or "").startswith("ssh_error") for c in failed):
+            return False
+        return len(failed) == len(self.per_card) or self.connection_closed
 
 
 def _not_probed(reason: str) -> AllCardsProbe:
@@ -401,6 +407,8 @@ class ValidationService:
         log = logger.info if passed else logger.warning
         log(_m("All-cards GPU work-proof", extra=get_extra_info(log_extra)))
 
+        is_closed = getattr(ssh_client, "is_closed", None)
+        connection_closed = bool(callable(is_closed) and is_closed())
         if any(self._leaves_matmul_running(outcome) for outcome in per_card):
             # asyncssh's timeout only abandons the local wait; a timed-out remote matmul keeps
             # running and holding VRAM. The fatal single-card capability matmul runs next in this
@@ -413,6 +421,7 @@ class ValidationService:
             elapsed_seconds=elapsed,
             over_wall_clock=over_wall_clock,
             per_card=per_card,
+            connection_closed=connection_closed,
         )
 
     async def _run_all_cards(
