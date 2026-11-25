@@ -6,7 +6,7 @@ The validator↔backend wire, once. Pydantic v2 models for:
 - `lium_protocol.backend_to_validator` — every message the backend sends down that socket (`BackendMessageType`, 19 types: container lifecycle, ssh keys, backups, Jupyter, the estimate request, the staging-only forced cycle, the one-node recheck), plus the three typeless replies it sends there (`SOCKET_REPLIES`: `Response`, `RentedMachineResponse`, `RevenuePerGpuTypeResponse` — no `message_type`, told apart by the request the validator is waiting for).
 - `lium_protocol.http` — the bodies of the backend HTTP API the validator reads between cycles (`HTTP_MODELS`, 10 bodies).
 
-No application code: nothing here imports the validator or the backend. `PROTOCOL_VERSION` (`2.23.0`) is semver over the wire.
+No application code: nothing here imports the validator or the backend. `PROTOCOL_VERSION` (`2.17.0`) is semver over the wire.
 
 ## Using it
 
@@ -88,7 +88,6 @@ To undo a wire change that is not released yet, `git revert` alone is not enough
 - `2.15.0` — `SshPubKeyRemoved.command_id` (optional, default empty): the `RemoveSshPublicKeysRequest`'s `command_id`, echoed, as `SshPubKeyAdded` does since 1.14.0; a removal's `FailedContainerRequest` echoes it too. The backend confirms a removal only on the answer to that send, so a delayed answer to an earlier send cannot confirm a later one. Empty from an older validator.
 - `2.17.0` — `ExecutorSpecRequest.rented_pod_faults` (optional): the rented pods this cycle's pod checks judged, by pod id, each with the host-side fault codes found on it (`RENTED_POD_PROC_FUSE_DISCONNECTED`: sysbox-fs died or restarted under the pod and its `/proc` answers "Transport endpoint is not connected"); `[]` = judged and clean, a pod not listed was not judged. None from an older validator and for a cycle that judged no pod.
 - `2.16.0` — `GpuResetErrorCode.GpusLostOnHost`: a renter's GPU reset found the GPUs gone from the host driver (the host GPU listing failed, timed out or came back empty); the provider has to reboot the host. The validator sends it once the backend accepts it; a validator released before that sends `ResetNotSupported` with the same detail for this case.
-- `2.23.0` — `ResetVerifiedJobRequest.unrented_only` (optional, default false): the check that cleared the verified job meant it for an idle node only; the backend then applies the reset only while no customer pod runs on the node, and otherwise closes the node to new rentals until a full check passes. A field of its own, not inside the reset's evidence, so no evidence size can drop it. `ExecutorSpecRequest.idle_checks_passed` (optional): the check_ids of those idle-only checks that this cycle ran in full on the node and passed (a skipped run is not listed); the backend lifts that hold only when the check that failed is listed.
 - `1.0.0` — first release.
 
 ## Tests
