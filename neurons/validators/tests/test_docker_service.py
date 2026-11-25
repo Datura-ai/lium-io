@@ -2,6 +2,7 @@ import asyncio
 import re
 import contextlib
 import contextvars
+import dataclasses
 import json
 from datetime import datetime
 import logging
@@ -27,6 +28,7 @@ from services.attestation_service import AttestationError
 from services.image_flatten import FLATTEN_NO_DISK_RENTER_SENTENCE, ImageFlattenNoDisk
 import services.image_flatten as image_flatten_module
 from services.cvm_quote_broker import DSTACK_GUEST_SOCKET_PATH, QUOTE_BROKER_SOCKET_PATH
+from services.prerun_host_probe import PrerunHostProbe
 from services.docker_service import (
     CONTAINER_STOP_GRACE_SECONDS,
     FILLER_CONTAINER_STOP_GRACE_SECONDS,
@@ -7440,6 +7442,126 @@ async def test_wait_for_port_check_filter_includes_health_check(docker_service):
     # the port verifier's host-network container holds the range's host ports
     assert "name=^port_test_" in ps_cmd
 
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("filler", [True, False])
+async def test_wait_for_port_check_filler_leaves_backend_health_check_running(docker_service, filler):
+    """DAH-6756: a filler create force-removed the backend's running health_check_* probe, which
+    then failed ('sshd binary not found', SSH auth) and failed the node. A filler removes no probe;
+    a customer rental still does (DAH-2272)."""
+    commands: list[str] = []
+
+    class FakeSSHClient:
+        async def run(self, cmd):
+            commands.append(cmd)
+            return MagicMock(stdout="health_check_abc\n", stderr="", exit_status=0)
+
+    removed, message = await docker_service.wait_for_port_check_containers(
+        executor_info=MagicMock(),
+        miner_hotkey="5TestMiner",
+        keypair=MagicMock(),
+        private_key="encrypted-private-key",
+        ssh_client=FakeSSHClient(),
+        probed_container_names=("health_check_abc",),
+        is_filler_create=filler,
+    )
+
+    removes = [c for c in commands if "docker rm" in c]
+    if filler:
+        assert (removed, message) == (False, "Filler create leaves probe containers running")
+        assert commands == []
+    else:
+        assert removed is True
+        assert len(removes) == 1 and "name=^health_check_" in removes[0]
+
+
+
+@pytest.mark.asyncio
+async def test_filler_create_container_removes_no_probe_and_has_no_live_re_removal(docker_service, monkeypatch):
+    """DAH-6756 (review): through `create_container`, a filler issues no probe `docker rm`, and the
+    bind-refusal retry gets no live re-removal to run."""
+    commands: list[str] = []
+
+    async def run(cmd, *args, **kwargs):
+        commands.append(cmd)
+        return _make_ssh_command_result(stdout="health_check_abc\n")
+
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(side_effect=run)
+    monkeypatch.setattr(
+        "services.docker_service.asyncssh.connect",
+        Mock(return_value=DummySSHConnectionManager(ssh_client)),
+    )
+    monkeypatch.setattr("services.docker_service.asyncssh.import_private_key", Mock())
+    monkeypatch.setattr(
+        "services.docker_service.build_gpu_docker_config_for_executor",
+        AsyncMock(return_value=build_gpu_docker_config(["GPU-test"])),
+    )
+    docker_service.ssh_service.decrypt_payload = Mock(return_value="private-key")
+    docker_service.redis_service.add_pending_pod = AsyncMock()
+    docker_service.redis_service.remove_pending_pod = AsyncMock()
+    docker_service.redis_service.add_rented_pod = AsyncMock()
+    monkeypatch.setattr(docker_service, "_prepare_known_hosts_policy", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        docker_service, "generate_portMappings", AsyncMock(return_value=([(20000, 20020, 20020)], None))
+    )
+    # nothing removed, so the probe's port-check listing reaches the pre-run step
+    for name in ("clean_existing_containers", "clean_stale_vloopback_volumes"):
+        monkeypatch.setattr(docker_service, name, AsyncMock(return_value=[]))
+    monkeypatch.setattr(docker_service, "create_local_volume", AsyncMock())
+    monkeypatch.setattr(docker_service, "check_container_running", AsyncMock(return_value=True))
+    for name in ("execute_and_stream_logs", "stream_log", "finish_stream_logs", "handle_stream_logs"):
+        monkeypatch.setattr(docker_service, name, AsyncMock())
+    # every other section None: its consumer runs its own command
+    probe = PrerunHostProbe(
+        **{f.name: None for f in dataclasses.fields(PrerunHostProbe) if f.name != "container_ids"}
+    )
+    probe = dataclasses.replace(probe, port_check_container_names=("health_check_abc",))
+    monkeypatch.setattr(docker_service, "probe_prerun_host", AsyncMock(return_value=probe))
+    retry_kwargs: dict = {}
+
+    async def create_with_retry(**kwargs):
+        retry_kwargs.update(kwargs)
+        return "container-id"
+
+    monkeypatch.setattr(docker_service, "_run_rental_docker_create_with_port_retry", create_with_retry)
+
+    payload = ContainerCreateRequest(
+        miner_hotkey="miner",
+        executor_id=str(uuid4()),
+        pod_id=str(uuid4()),
+        workload_kind=WorkloadKind.FILLER,
+        docker_image="daturaai/dlph:test",
+        user_public_keys=["ssh-ed25519 test-key"],
+        gpu_uuids=["GPU-test"],
+        cpu_count=1,
+        memory_gb=1,
+        volume_limit_gb=2,
+        storage_limit_gb=1,
+        available_ports=[PayloadPortMapping(internal_port=20020, external_port=20020)],
+        pod_mapping=[],
+        active_container_names=[],
+        active_volume_names=[],
+    )
+    executor_info = ExecutorSSHInfo(
+        uuid=payload.executor_id,
+        address="127.0.0.1",
+        port=8080,
+        ssh_username="root",
+        ssh_port=2200,
+        python_path="/usr/bin/python",
+        root_dir="/root/app",
+        ssh_host_key=FAKE_SSH_HOST_KEY,
+    )
+
+    await docker_service.create_container(
+        payload=payload, executor_info=executor_info, keypair=Mock(ss58_address="v"), private_key="encrypted"
+    )
+
+    docker_service.probe_prerun_host.assert_awaited()
+    assert "remove_port_checks_listed_live" in retry_kwargs
+    assert retry_kwargs["remove_port_checks_listed_live"] is None
+    assert not [c for c in commands if "docker rm" in c and "health_check" in c]
 
 @pytest.mark.asyncio
 async def test_wait_for_port_check_does_not_block_other_miner(docker_service):
