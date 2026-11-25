@@ -6945,7 +6945,7 @@ async def test_failed_create_removes_the_pods_volume_only_when_no_other_create_i
     async with _another_create_live("test", live_creates == 2):
         with registry.track("test", ("miner", "exec")):
             await docker_service.cleanup_failed_container_creation(
-                ssh_client=Mock(), default_extra={}, container_name="pod_test", volume_name="volume_test",
+                ssh_client=AsyncMock(), default_extra={}, container_name="pod_test", volume_name="volume_test",
                 remove_volume=True, container_id="cid", pod_id="test",
             )
     assert any("volume rm volume_test" in str(call) for call in ssh_commands.call_args_list) is removed

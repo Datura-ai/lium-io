@@ -1816,15 +1816,16 @@ class MinerService:
                     raise error
                 if payload.volume_encrypted and payload.container_name:
                     await _remount_dropped_gocryptfs(ssh_client, payload, docker_service)
+                spec = self._restic_backup_operation_spec(payload)
                 await note_started_storage_helper(
-                    self.redis_service, executor_info.uuid, operation_id
+                    self.redis_service, executor_info.uuid, operation_id, spec
                 )
                 try:
                     await start_storage_operation(
                         ssh_client,
                         executor_info.python_path,
                         operation_id,
-                        self._restic_backup_operation_spec(payload),
+                        spec,
                         retain_terminal_artifacts=False,
                     )
                 except Exception:
@@ -1881,15 +1882,16 @@ class MinerService:
 
             if payload.backup_engine == "restic":
                 operation_id = UUID(payload.restore_log_id)
+                spec = self._restic_restore_operation_spec(payload)
                 await note_started_storage_helper(
-                    self.redis_service, executor_info.uuid, operation_id
+                    self.redis_service, executor_info.uuid, operation_id, spec
                 )
                 try:
                     await start_storage_operation(
                         ssh_client,
                         executor_info.python_path,
                         operation_id,
-                        self._restic_restore_operation_spec(payload),
+                        spec,
                         retain_terminal_artifacts=False,
                     )
                 except Exception:
@@ -1948,7 +1950,7 @@ class MinerService:
             client_keys=[pkey],
             known_hosts=await _storage_known_hosts(docker_service, executor_info, payload),
         ) as ssh_client:
-            await cancel_storage_operation(ssh_client, UUID(payload.operation_id))
+            await cancel_storage_operation(ssh_client, self.redis_service, UUID(payload.operation_id))
             await forget_storage_helper(
                 self.redis_service, executor_info.uuid, payload.operation_id
             )
