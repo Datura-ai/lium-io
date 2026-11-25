@@ -1940,29 +1940,34 @@ def _node_left_delete_command(payload: ContainerDeleteOnNodeLeftRequest) -> str:
     /proc's own lowercase 8-4-4-4-12 form: any other spelling compares unequal. A live container's absence
     proves nothing: the pod may be placed back here with its container not made yet.
 
+    An empty `expected_boot_id` (the backend knows no boot of the node left) runs no boot check and removes only the
+    live container labelled with `create_command_id`, never a parked or kept edit container: a placement of the pod
+    back on the node always has a fresh create id, and its live container makes the delete exit 97 (coordinator r476).
+
     The pod's named volume is never removed here: one pod keeps one volume name on every registration, so on a
     daemon two registrations share it may be the replacement's, mounted or about to be, and nothing on the host
     tells the two apart until the mount exists. It stays until the pod ends, as before this delete."""
     if not payload.executor_id or not payload.miner_hotkey:
         raise ValueError("the delete names no registration")
-    if not _BOOT_ID.fullmatch(payload.expected_boot_id):
+    scoped = not payload.expected_boot_id
+    if not scoped and not _BOOT_ID.fullmatch(payload.expected_boot_id):
         raise ValueError("the delete names no boot id")
     if not payload.create_command_id:
         raise ValueError("the delete names no placement")
     placed_on = payload.pod_placed_on_boot_id
-    if not _BOOT_ID.fullmatch(placed_on) or placed_on == payload.expected_boot_id:
+    if not scoped and (not _BOOT_ID.fullmatch(placed_on) or placed_on == payload.expected_boot_id):
         raise ValueError("the delete does not prove the pod left this boot")
     if payload.container_name != DockerService.get_container_name(payload):
         # the name selects the kept containers too: only the pod's own may be named
         raise ValueError("the delete names another pod's container")
     owner_and_pod = f"{_executor_label(payload)} {payload.pod_id}"
     labels = (LIUM_EXECUTOR_ID_LABEL, LIUM_POD_ID_LABEL)
-    lines = [
+    lines = [] if scoped else [
         # an unreadable boot id is not this node's: the read must succeed and give a value before it is compared
         f'boot=$(cat /proc/sys/kernel/random/boot_id) && [ -n "$boot" ] '
         f'&& [ "$boot" = {shlex.quote(payload.expected_boot_id)} ] || exit {_NOT_THE_NODE_LEFT_EXIT}',
-        "ids=",
     ]
+    lines.append("ids=")
     placement = f"{owner_and_pod} {payload.create_command_id}"
     found = "{{.Id}} " + " ".join(
         f'{{{{index .Config.Labels "{label}"}}}}' for label in labels + (LIUM_CREATE_COMMAND_LABEL,)
@@ -1971,7 +1976,7 @@ def _node_left_delete_command(payload: ContainerDeleteOnNodeLeftRequest) -> str:
     # create id (or none) is kept, anything else under the parked name exits 97
     for container_name, other_placement in (
         (payload.container_name, f"exit {_NOT_THE_NODE_LEFT_EXIT}"),
-        (f"{payload.container_name}{EDIT_PARKED_SUFFIX}", "found="),
+        *(() if scoped else ((f"{payload.container_name}{EDIT_PARKED_SUFFIX}", "found="),)),
     ):
         name = shlex.quote(container_name)
         lines += [
@@ -1984,6 +1989,7 @@ def _node_left_delete_command(payload: ContainerDeleteOnNodeLeftRequest) -> str:
             'ids="$ids ${found%% *}"',
         ]
     lines += [
+        "kept=" if scoped else
         f"kept=$(/usr/bin/docker ps -aq --no-trunc --filter name=^{shlex.quote(_kept_container_prefix(payload.container_name))} "
         f"--filter label={shlex.quote(f'{LIUM_EXECUTOR_ID_LABEL}={_executor_label(payload)}')} "
         # label filters all apply: a kept name's prefix and the registration alone do not make it this pod's

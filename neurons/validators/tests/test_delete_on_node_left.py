@@ -369,12 +369,57 @@ def test_a_parked_edit_container_of_another_registration_keeps_everything(tmp_pa
     assert "rm" not in calls.replace("inspect", "")
 
 
-@pytest.mark.parametrize(
-    "missing", ["executor_id", "miner_hotkey", "expected_boot_id", "create_command_id", "pod_placed_on_boot_id"]
-)
+@pytest.mark.parametrize("missing", ["executor_id", "miner_hotkey", "create_command_id", "pod_placed_on_boot_id"])
 def test_a_delete_naming_no_registration_or_boot_id_is_refused(missing):
     with pytest.raises(ValueError):
         _node_left_delete_command(_payload(HOST_BOOT).model_copy(update={missing: ""}))
+
+
+# coordinator r476: the backend knows no boot of the node the pod left (expected_boot_id empty). The delete still goes,
+# with no boot check, and removes only the live container labelled with the left placement's create id: a placement
+# of the pod back on that node always has a fresh create id, and its live container makes the delete exit 97
+@pytest.mark.parametrize("placed_on", [PLACED_ELSEWHERE_BOOT, ""], ids=["placed-elsewhere", "placed-on-unknown"])
+def test_a_delete_off_a_node_with_no_boot_id_removes_only_the_left_placements_live_container(tmp_path, placed_on):
+    payload = _payload("", placed_on=placed_on)
+    status, calls = _run(tmp_path, payload, prev_owner=LEFT_LABEL)
+
+    assert status == 0
+    assert [line for line in calls.splitlines() if line.startswith("rm")] == ["rm -fv cid"]
+    # parked and kept edit containers stay, even under the left create id
+    assert (tmp_path / "containers" / f"pod_{payload.pod_id}__prev").exists() and (tmp_path / "kept").exists()
+
+
+@pytest.mark.parametrize("live", [LATER_PLACEMENT, ""], ids=["new-create", "made-before-the-label"])
+def test_a_delete_off_a_node_with_no_boot_id_never_touches_a_kept_edit_or_a_new_create_container(tmp_path, live):
+    status, calls = _run(
+        tmp_path,
+        _payload("", placed_on=""),
+        placement=live,
+        prev_owner=LEFT_LABEL,
+        prev_placement=EDITED_PLACEMENT,
+        kept_placement=EDITED_PLACEMENT,
+    )
+
+    assert status == 97
+    assert "rm" not in calls.replace("inspect", "")
+    assert len(list((tmp_path / "containers").iterdir())) == 2 and (tmp_path / "kept").exists()
+
+
+def test_a_delete_off_a_node_with_no_boot_id_and_no_live_container_removes_nothing(tmp_path):
+    payload = _payload("", placed_on="")
+    status, calls = _run(tmp_path, payload, container_owner=None, prev_owner=LEFT_LABEL)
+
+    assert status == 0
+    assert "rm" not in calls.replace("inspect", "")
+    assert (tmp_path / "containers" / f"pod_{payload.pod_id}__prev").exists() and (tmp_path / "kept").exists()
+
+
+@pytest.mark.parametrize("owner", [f"miner-b:{LEFT}", ""])
+def test_a_delete_off_a_node_with_no_boot_id_never_touches_another_registrations_container(tmp_path, owner):
+    status, calls = _run(tmp_path, _payload("", placed_on=""), container_owner=owner)
+
+    assert status == 97
+    assert "rm" not in calls.replace("inspect", "")
 
 
 # coordinator r475: only /proc's own spelling (lowercase 8-4-4-4-12) is a boot id; any other compares unequal to the

@@ -535,7 +535,8 @@ NODE_LEFT_DELETE_ANSWER_SECONDS = 1800
 
 class ContainerDeleteOnNodeLeftRequest(ContainerDeleteRequest):
     """lium_protocol 2.18.0: the delete for the node a moved pod left. Its registration may point at another host
-    by now, so the delete runs only on a host whose boot id is expected_boot_id (DockerService.delete_container)."""
+    by now, so the delete runs only on a host whose boot id is expected_boot_id (DockerService.delete_container).
+    Empty expected_boot_id: no boot check, only the live container labelled create_command_id is removed."""
 
     message_type: ContainerRequestType = ContainerRequestType.ContainerDeleteOnNodeLeftRequest
     expected_boot_id: str
