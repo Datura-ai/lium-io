@@ -24,7 +24,12 @@ def test_returns_configured_hotkey_and_echoes_nonce():
     response = _client().get("/miner-identity", params={"nonce": NONCE})
 
     assert response.status_code == 200
-    assert response.json() == {"miner_hotkey": settings.MINER_HOTKEY_SS58_ADDRESS, "nonce": NONCE}  # no claim set
+    declared = {"port_range": settings.RENTING_PORT_RANGE, "port_mappings": settings.RENTING_PORT_MAPPINGS}
+    assert response.json() == {  # no claim set
+        "miner_hotkey": settings.MINER_HOTKEY_SS58_ADDRESS,
+        "nonce": NONCE,
+        "declared_ports": declared,
+    }
 
 
 def test_follows_the_configured_hotkey(monkeypatch):
@@ -46,7 +51,19 @@ def test_carries_the_account_claim_when_configured(monkeypatch):
         "miner_hotkey": settings.MINER_HOTKEY_SS58_ADDRESS,
         "nonce": NONCE,
         "account_claim": "c1" * 16,
+        "declared_ports": {"port_range": settings.RENTING_PORT_RANGE, "port_mappings": settings.RENTING_PORT_MAPPINGS},
     }
+
+
+def test_reports_the_declared_renting_ports(monkeypatch):
+    # an Edit Address onto this machine is checked against what it declares; null both ways is the default
+    monkeypatch.setattr(settings, "RENTING_PORT_RANGE", "20000-20009")
+    monkeypatch.setattr(settings, "RENTING_PORT_MAPPINGS", None)
+    body = _client().get("/miner-identity", params={"nonce": NONCE}).json()
+    assert body["declared_ports"] == {"port_range": "20000-20009", "port_mappings": None}
+    monkeypatch.setattr(settings, "RENTING_PORT_RANGE", None)
+    body = _client().get("/miner-identity", params={"nonce": NONCE}).json()
+    assert body["declared_ports"] == {"port_range": None, "port_mappings": None}
 
 
 def test_nonce_is_required():
