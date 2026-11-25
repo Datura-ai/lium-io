@@ -48,6 +48,13 @@ def test_internal_addresses_are_not_public(address):
     assert not is_public_address(address)
 
 
+def test_a_dev_stack_admits_private_node_addresses_only(monkeypatch):
+    monkeypatch.setattr(node_address, "ALLOW_PRIVATE", True)
+    assert is_public_address("10.20.30.40") and is_public_address("192.168.7.7")  # secret-scan: allow
+    assert not is_public_address("127.0.0.1") and not is_public_address("169.254.169.254")
+    assert not is_public_address("::1") and not is_public_address("0.0.0.0")
+
+
 def test_public_addresses_are_public():
     assert is_public_address("1.2.3.4") and is_public_address("2001:4860:4860::8888")
     # lium-io#2369 review 5981962325: an IPv6-only host's DNS64 answer for a public A record stays reachable

@@ -25,6 +25,7 @@ from core.config import settings
 
 
 NAT64_PREFIX = ipaddress.ip_network("64:ff9b::/96")  # RFC 6052 well-known prefix: the IPv4 address in the last 32 bits
+ALLOW_PRIVATE = settings.NODE_ALLOW_PRIVATE_ADDRESS
 
 
 class NonPublicNodeAddress(aiohttp.ClientConnectionError):
@@ -38,6 +39,9 @@ def is_public_address(address: str) -> bool:
     # a DNS64 answer (what an IPv6-only host gets for a public A record) is judged as the IPv4 address it carries
     if ip.version == 6 and ip in NAT64_PREFIX:
         ip = ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF)
+    # a dev stack (a /temp-dev copy) whose own nodes sit on its private network, by design; never set in production
+    if ALLOW_PRIVATE and ip.is_private and not (ip.is_loopback or ip.is_link_local or ip.is_unspecified):
+        return True
     # Python counts global-scope multicast, IPv6 site-local (fec0::/10) and other reserved ranges as global
     return (
         ip.is_global and not ip.is_multicast and not ip.is_reserved and not getattr(ip, "is_site_local", False)
