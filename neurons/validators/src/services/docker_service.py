@@ -87,6 +87,11 @@ from services.const import (
     EDIT_PARKED_SUFFIX,
     PARKED_SUFFIXES,
     RECOVERY_STOPPED_SUFFIX,
+    CACHE_KINDS,
+    CacheCharge,
+    cache_kind,
+    cache_prefixes,
+    cache_size_gb,
     is_cache_volume_name,
     unparked_name,
     KEPT_UNMOUNTED_PREFIX,
@@ -96,10 +101,7 @@ from services.const import (
     FILLER_CACHE_VOLUME_PREFIXES,
     DPHN_CACHE_FREE_MARGIN_GB,
     DPHN_CACHE_LISTING_FLOOR_GB,
-    DPHN_CACHE_SIZE_GB,
     ENGY_CACHE_VOLUME_PREFIX,
-    JOB_CACHE_VOLUME_NAME,
-    JOB_CACHE_VOLUME_PREFIX,
     FILLER_CACHE_MAX_FREE_DISK_SHARE,
     FILLER_RUN_VOLUME_GB_BESIDE_ENGY_CACHE,
     ENGY_CACHE_COMPLETE_SHARE,
@@ -544,21 +546,7 @@ def _parse_listening_ports(output: str) -> set[int]:
     return ports
 
 
-_DPHN_CACHE_EMPTY_KB = 1024
-_ENGY_CACHE_SIZE_IN_NAME = re.compile(rf"^{ENGY_CACHE_VOLUME_PREFIX}hf_(\d+)gb_")
-
-
-def _cache_download_gb(volume_name: str) -> float:
-    # DAH-5014: an Engy checkpoint's size is in its name (engy_cache_hf_<N>gb_...); one without it is
-    # never afforded, rather than assumed to be DPHN's 40 GB. A provider job's cache (job_cache_<N>gb_...)
-    # is charged its whole limit: the job can fill it.
-    if volume_name.startswith(JOB_CACHE_VOLUME_PREFIX):
-        match = JOB_CACHE_VOLUME_NAME.match(volume_name)
-    elif volume_name.startswith(ENGY_CACHE_VOLUME_PREFIX):
-        match = _ENGY_CACHE_SIZE_IN_NAME.match(volume_name)
-    else:
-        return DPHN_CACHE_SIZE_GB
-    return int(match.group(1)) if match else math.inf
+_EMPTY_CACHE_KB = 1024  # du of an empty directory is a few KB
 
 
 def _filler_run_volume_gb(volume_limit_gb: int | None, cache_volumes: list[CacheVolume] | None) -> int | None:
@@ -6734,10 +6722,9 @@ class DockerService:
             # not full); the tight-disk sweep evicts it later if the pod's writes need the room. The Engy cache is
             # listed as free disk, so it still gives way until the floor fits too.
             volume_needs_free_gb = rental_needs_free_gb - DPHN_CACHE_LISTING_FLOOR_GB + DPHN_CACHE_FREE_MARGIN_GB
-            # a provider job's cache is listed as free disk too (DAH-6406), so it gives way like the Engy cache
-            listed_as_free_prefixes = (ENGY_CACHE_VOLUME_PREFIX, JOB_CACHE_VOLUME_PREFIX)
+            listed_as_free_prefixes = cache_prefixes("listed_as_free")
             volumes_listed_as_free: set[str] = {
-                name for name in cache_volumes if name.startswith(listed_as_free_prefixes)
+                name for name in cache_volumes if is_cache_volume_name(name, listed_as_free_prefixes)
             }
             if not volumes_listed_as_free and free_gb >= volume_needs_free_gb:
                 logger.info(
@@ -6979,7 +6966,7 @@ class DockerService:
         floor_gb: int = DPHN_CACHE_LISTING_FLOOR_GB + DPHN_CACHE_FREE_MARGIN_GB
         # One family per launch: DPHN's whole set is DPHN_CACHE_SIZE_GB, an Engy launch asks for one volume.
         download_gb: float = max(
-            missing_gb.get(volume.name) or _cache_download_gb(volume.name)
+            missing_gb.get(volume.name) or cache_size_gb(volume.name)
             for volume in payload.cache_volumes
             if volume.name not in {kept.name for kept in present}
         )
@@ -7047,28 +7034,17 @@ class DockerService:
     async def _cache_missing_gb(
         self, ssh_client: asyncssh.SSHClientConnection, volume_name: str, default_extra: dict
     ) -> float:
-        """GB an existing Engy cache still lacks of the checkpoint size in its name; 0 when complete or unknown.
-
-        A Dolphin volume's own size is not known (DPHN_CACHE_SIZE_GB is the whole set), so it is not ready only
-        when empty, as the reclaim's wipe leaves it (DAH-5664): then the set's whole download is charged.
-
-        A provider job's cache (DAH-6406) is charged what it can still grow by; one over the size in its name is
-        REMOVED here, so the run starts it empty, and charged its whole size (_remove_oversized_job_cache_and_get_gb_to_charge).
+        """GB an existing cache still costs a launch, by its kind's CacheCharge (CACHE_KINDS); 0 when unknown.
 
         Measured in a helper container that mounts the volume by name (the SSH session lands inside the executor
         container, where the volume's host path does not exist). A checkpoint is a few hundred large files, so
-        `du` is quick. An unmeasurable Engy cache reads as complete: mounting what exists costs nothing, as before; an
-        unmeasurable job cache is charged its whole size.
+        `du` is quick. Unmeasurable, a kind is charged its whole size or nothing (unmeasured_charged_whole).
         """
-        expected_gb: float = _cache_download_gb(volume_name)
-        if math.isinf(expected_gb):
+        kind = cache_kind(volume_name)
+        size_gb: float = cache_size_gb(volume_name)
+        if kind is None or math.isinf(size_gb):
             return 0
-        is_dphn_cache: bool = volume_name.startswith(DPHN_CACHE_VOLUME_PREFIX)
-        # an unmeasured Dolphin volume can be one the reclaim wiped, so its download is charged; a job cache can
-        # grow to its whole size, so unmeasured it is charged that too
-        unmeasured_missing_gb: float = (
-            expected_gb if is_dphn_cache or volume_name.startswith(JOB_CACHE_VOLUME_PREFIX) else 0
-        )
+        unmeasured_missing_gb: float = size_gb if kind.unmeasured_charged_whole else 0
         try:
             result = await ssh_client.run(
                 f"{REMOVE_CACHE_SWEEP_CONTAINER}; timeout 60 /usr/bin/docker run --rm --name {CACHE_SWEEP_CONTAINER_NAME} "
@@ -7083,54 +7059,32 @@ class DockerService:
         if not used_kb.isdigit():
             return unmeasured_missing_gb
         held_gb: float = int(used_kb) * 1024 / 10**9
-        if volume_name.startswith(JOB_CACHE_VOLUME_PREFIX):
-            return await self._remove_oversized_job_cache_and_get_gb_to_charge(ssh_client, volume_name, held_gb, expected_gb, default_extra)
-        if is_dphn_cache:
-            # du of an empty directory is a few KB
-            return expected_gb if int(used_kb) < _DPHN_CACHE_EMPTY_KB else 0
-        if held_gb >= expected_gb * ENGY_CACHE_COMPLETE_SHARE:
-            return 0
-        logger.info(
-            _m(
-                "Engy cache is a partial download; the run resumes it",
-                extra=get_extra_info({**default_extra, "volume": volume_name, "held_gb": round(held_gb, 1)}),
-            )
-        )
-        return expected_gb - held_gb
-
-    async def _remove_oversized_job_cache_and_get_gb_to_charge(
-        self,
-        ssh_client: asyncssh.SSHClientConnection,
-        volume_name: str,
-        held_gb: float,
-        limit_gb: float,
-        default_extra: dict,
-    ) -> float:
-        """A provider job's cache within its limit is charged what it can still grow by, like a partial Engy cache:
-        the job fills it to the limit. One over it is removed so the run starts it empty, and the whole limit is
-        charged like a new cache; if docker cannot remove it, it is kept as is."""
-        if held_gb <= limit_gb:
-            return limit_gb - held_gb
-        try:
-            result = await ssh_client.run(DockerCommand.volume_remove_strict(volume_name))
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            return 0
-        if result.exit_status != 0:
-            return 0
-        logger.info(
-            _m(
-                "Job cache was over its size; removed so the run starts it empty",
-                extra=get_extra_info({
-                    **default_extra,
-                    "volume": volume_name,
-                    "held_gb": round(held_gb, 1),
-                    "limit_gb": limit_gb,
-                }),
-            )
-        )
-        return limit_gb
+        extra = {**default_extra, "volume": volume_name, "held_gb": round(held_gb, 1), "size_gb": size_gb}
+        match kind.charge:
+            case CacheCharge.WHOLE_WHEN_EMPTY:
+                return size_gb if int(used_kb) < _EMPTY_CACHE_KB else 0
+            case CacheCharge.REST_OF_DOWNLOAD:
+                if held_gb >= size_gb * ENGY_CACHE_COMPLETE_SHARE:
+                    return 0
+                logger.info(_m("Cache is a partial download; the run resumes it", extra=get_extra_info(extra)))
+                return size_gb - held_gb
+            case CacheCharge.REST_OF_SIZE:
+                if held_gb <= size_gb:
+                    return size_gb - held_gb
+                # over its size: removed so the run starts it empty, and charged whole like a new one; kept as is
+                # (nothing charged) when docker cannot remove it
+                try:
+                    removed = await ssh_client.run(DockerCommand.volume_remove_strict(volume_name))
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    return 0
+                if removed.exit_status != 0:
+                    return 0
+                logger.info(
+                    _m("Cache was over its size; removed so the run starts it empty", extra=get_extra_info(extra))
+                )
+                return size_gb
 
     @staticmethod
     def _cache_volume_families(volume_names: list[str]) -> tuple[str, ...]:
@@ -7222,17 +7176,11 @@ class DockerService:
             return []
 
         keep_names: set[str] = {cache_volume.name for cache_volume in payload.cache_volumes}
-        cache_prefixes_to_sweep: tuple[str, ...] = self._cache_volume_families(sorted(keep_names))
-        if (
-            ENGY_CACHE_VOLUME_PREFIX in cache_prefixes_to_sweep
-            and DPHN_CACHE_VOLUME_PREFIX not in cache_prefixes_to_sweep
-        ):
-            # A node moved to Engy no longer runs Dolphin, so its old Dolphin cache is leftover disk.
-            # Only this way round: the Dolphin cache is tens of GB, an Engy checkpoint terabytes.
-            cache_prefixes_to_sweep += (DPHN_CACHE_VOLUME_PREFIX,)
-        if JOB_CACHE_VOLUME_PREFIX not in cache_prefixes_to_sweep:
-            # Lium's own filler runs only where no provider job does, so a provider job's cache there is leftover
-            cache_prefixes_to_sweep += (JOB_CACHE_VOLUME_PREFIX,)
+        launched: set[str] = set(self._cache_volume_families(sorted(keep_names)))
+        # each kind says which launches sweep it (CACHE_KINDS swept_by_launches_of)
+        cache_prefixes_to_sweep: tuple[str, ...] = tuple(
+            kind.prefix for kind in CACHE_KINDS if launched & kind.swept_by_launches_of
+        )
         stale_volumes: list[str] = await self._find_cache_volumes_to_sweep(
             ssh_client,
             keep_names,

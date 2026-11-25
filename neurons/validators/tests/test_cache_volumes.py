@@ -5,7 +5,16 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from payload_models.payloads import CacheVolume, ContainerCreateRequest, WorkloadKind
-from services.const import DPHN_CACHE_FREE_MARGIN_GB, DPHN_CACHE_LISTING_FLOOR_GB
+import math
+
+from services.const import (
+    DPHN_CACHE_FREE_MARGIN_GB,
+    DPHN_CACHE_LISTING_FLOOR_GB,
+    CacheCharge,
+    cache_kind,
+    cache_prefixes,
+    cache_size_gb,
+)
 from services.container_cleanup import (
     FILLER_IMAGE_REPOSITORIES,
     FILLER_WORKLOADS,
@@ -968,6 +977,29 @@ def test_the_idle_filler_image_removal_takes_every_filler_image_but_pearl_miner(
 
 
 # ---------------------------------------------------------------- provider job cache (/cache, size in the name)
+
+
+@pytest.mark.parametrize(
+    ("name", "size_gb", "charge"),
+    [
+        ("dphn_cache_m1_r2", 40, CacheCharge.WHOLE_WHEN_EMPTY),
+        ("engy_cache_hf_1600gb_kimi", 1600, CacheCharge.REST_OF_DOWNLOAD),
+        ("engy_cache_kimi", math.inf, CacheCharge.REST_OF_DOWNLOAD),  # no size in the name: never afforded
+        ("job_cache_200gb_0123456789ab", 200, CacheCharge.REST_OF_SIZE),
+    ],
+)
+def test_each_cache_kind_reads_its_size_and_charge_from_one_table(name, size_gb, charge):
+    assert (cache_size_gb(name), cache_kind(name).charge) == (size_gb, charge)
+
+
+def test_the_per_kind_rules_come_from_the_table():
+    assert cache_prefixes("listed_as_free") == ("engy_cache_", "job_cache_")
+    assert cache_prefixes("reclaimed_beside_filler_when_unmounted") == ("job_cache_",)
+    assert cache_prefixes("download_temporaries_swept") == ("dphn_cache_", "engy_cache_")
+    # a provider's own volume that only starts with the prefix is no cache of ours
+    assert cache_kind("job_cache_mine") is None
+
+
 
 _JOB_CACHE = "job_cache_200gb_0123456789ab"
 

@@ -15,16 +15,14 @@ from core.docker_utils import ALPINE_HELPER_IMAGE, DockerCommand, df_available_b
 from core.utils import _m
 from services.const import (
     DPHN_CACHE_LISTING_FLOOR_GB,
-    DPHN_CACHE_VOLUME_PREFIX,
-    ENGY_CACHE_VOLUME_PREFIX,
     CACHE_SWEEP_CONTAINER_NAME,
     PARKED_SUFFIXES,
+    cache_prefixes,
     is_cache_volume_name,
     unparked_name,
     FILLER_CACHE_VOLUME_PREFIXES,
     FILLER_CONTAINER_GRACE_MINUTES,
     FILLER_CONTAINER_PREFIX,
-    JOB_CACHE_VOLUME_PREFIX,
     LEGACY_LIUM_CONTAINER_NAME,
     LIUM_HEALTH_CHECK_CONTAINER_NAME,
     LIUM_POD_ID_LABEL,
@@ -178,7 +176,7 @@ async def evict_cache_volumes_oldest_first(
     await run_removal(idle_filler_images_removal_command(keep_image))
     if await has_room():
         return
-    # DAH-5260: a rental passes the prefixes of the caches its listing offered as free disk (Engy, provider job)
+    # DAH-5260: a rental passes the prefixes of the caches its listing offered as free disk (CacheKind.listed_as_free)
     ordered: list[str] = sorted(
         volume_names,
         key=lambda name: (
@@ -510,18 +508,16 @@ class ContainerCleanup:
             )
             return 0
 
-    async def _job_caches_no_container_mounts(
+    async def _caches_reclaimable_beside_a_filler(
         self,
         ssh_client: asyncssh.SSHClientConnection,
         cache_volumes: list[str],
     ) -> list[str]:
-        """The provider job caches among ``cache_volumes`` that no container mounts.
-
-        A live filler's caches are in use, but a job cache no container mounts (left beside a rental:
-        the job's run is gone) still holds disk and goes like any other (DAH-6406).
-        """
+        """The caches among ``cache_volumes`` whose kind is reclaimed beside a live filler once no container
+        mounts them (CacheKind.reclaimed_beside_filler_when_unmounted): their run is gone, but they still hold disk."""
         unmounted: set[str] = set(await self._get_dangling_volumes(ssh_client) or [])
-        return [name for name in cache_volumes if name.startswith(JOB_CACHE_VOLUME_PREFIX) and name in unmounted]
+        kinds = cache_prefixes("reclaimed_beside_filler_when_unmounted")
+        return [name for name in cache_volumes if is_cache_volume_name(name, kinds) and name in unmounted]
 
     async def reclaim_dphn_cache_when_disk_is_tight(
         self,
@@ -538,8 +534,8 @@ class ContainerCleanup:
         nothing, so the cache is the first thing to sacrifice.
 
         Gated on NO live filler container: a cache a sibling still mounts is in use (docker refuses to
-        remove it anyway), and a node still filling bundles is not the node this is meant to rescue. A
-        provider job cache no container mounts is the exception (DAH-6406): it goes even beside a filler.
+        remove it anyway), and a node still filling bundles is not the node this is meant to rescue. A kind
+        reclaimed beside a filler once unmounted is the exception (DAH-6406, CACHE_KINDS).
         A live customer pod does not hold it back (DAH-6187): the rent keeps the cache when the
         pod's volume fits beside it, but the pod's container writes take real disk, so once they
         push the node under the floor the cache gives way to the renter.
@@ -559,7 +555,7 @@ class ContainerCleanup:
             # RUNNING only: _get_all_rental_containers uses `docker ps -a`, so one long-exited
             # filler_* would make "no live filler" false forever and the reclaim would never fire.
             if await self._has_running_filler(ssh_client):
-                cache_volumes = await self._job_caches_no_container_mounts(ssh_client, cache_volumes)
+                cache_volumes = await self._caches_reclaimable_beside_a_filler(ssh_client, cache_volumes)
                 if not cache_volumes:
                     return 0
 
@@ -777,9 +773,8 @@ class ContainerCleanup:
         """
         extra = {"executor_uuid": executor_uuid}
         try:
-            # a provider's own job cache keeps its files: a long run may write one for hours
             cache_volumes: list[str] = await self._get_cache_volumes(
-                ssh_client, (DPHN_CACHE_VOLUME_PREFIX, ENGY_CACHE_VOLUME_PREFIX)
+                ssh_client, cache_prefixes("download_temporaries_swept")
             )
             if not cache_volumes:
                 return 0
