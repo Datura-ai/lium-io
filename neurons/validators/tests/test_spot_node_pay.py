@@ -200,7 +200,7 @@ def spot_rental_on(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def flags_default_off(monkeypatch):
+def spot_rental_incentive_off(monkeypatch):
     monkeypatch.setattr(settings, "ENABLE_SPOT_RENTAL_INCENTIVE", False)
 
 
