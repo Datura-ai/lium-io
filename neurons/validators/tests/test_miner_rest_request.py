@@ -78,6 +78,15 @@ async def test_a_non_public_axon_is_refused_with_nothing_sent(monkeypatch, host)
         await _request(f"http://{host}:8080/executors")
 
 
+@pytest.mark.asyncio
+async def test_a_refused_literal_axon_logs_no_error(monkeypatch):
+    logged = []
+    monkeypatch.setattr("services.miner_service.logger.error", lambda *a, **k: logged.append(a))
+    with pytest.raises(NodeHostError):
+        await _request("http://0.0.0.0:8080/executors")
+    assert logged == []
+
+
 def _debug_local_miner(monkeypatch, host, port):
     monkeypatch.setattr(settings.debug, "USE_LOCAL_MINER", True)
     monkeypatch.setattr(settings.debug, "MINER_ADDRESS", host)

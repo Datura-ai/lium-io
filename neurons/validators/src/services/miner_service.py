@@ -81,6 +81,7 @@ from services.docker_service import (
 )
 from services.executor_image_policy import ExpectedImageSnapshot
 from services.node_host import (
+    NodeHostError,
     NonPublicAddressError,
     for_payload_miner,
     is_ip_literal,
@@ -2132,7 +2133,8 @@ class MinerService:
                 ),
             )
             raise
-        except aiohttp.ClientError as e:
+        # a refused literal address is the same outcome as the connector's refusal of a name (a ClientError)
+        except (aiohttp.ClientError, NodeHostError) as e:
             logger.debug(
                 _m(
                     f"REST API {operation_name} client error",
