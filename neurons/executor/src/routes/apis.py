@@ -508,6 +508,8 @@ async def get_miner_identity(
                 "port_mappings": settings.RENTING_PORT_MAPPINGS,
                 # the SSH port this executor reports to validators (miner_service), which they exclude from rental ports
                 "ssh_port": settings.SSH_PUBLIC_PORT or settings.SSH_PORT,
+                # the port sshd listens on here; a mapping from it forwards to sshd, so no pod can be reached on it
+                "ssh_internal_port": settings.SSH_PORT,
             }
             if declared_ports
             else None
