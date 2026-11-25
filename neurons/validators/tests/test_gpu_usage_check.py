@@ -1992,6 +1992,7 @@ async def test_a_fillers_own_workload_passes(
         ("daturaai/pearl-miner", ""),  # the scrape could not read it, or liumd does not report it
         ("daturaai/pearl-miner", None),
         (None, "/opt/other/gpu-app"),  # no record and no running image reported
+        ("daturaai/other-filler", "/opt/other/gpu-app"),  # an image outside FILLER_WORKLOADS
     ],
 )
 @pytest.mark.asyncio
