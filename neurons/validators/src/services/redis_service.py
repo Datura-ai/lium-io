@@ -243,6 +243,9 @@ def _executor_create_lock_key(executor_id: str) -> str:
 
 # the connector's id of the create execution being run (InflightBackendCreate.create_id), set around the create
 renter_create_id: ContextVar[str] = ContextVar("renter_create_id", default="")
+# DAH-6992: the create being run is the backend's re-send of one a connector restart cut off (it never replied), so a
+# container under the pod's name is that cut-off attempt's, started or not, and nobody was handed it
+resumed_create: ContextVar[bool] = ContextVar("resumed_create", default=False)
 
 
 def _renter_create_lock_token(pod_id: str, create_id: str = "") -> str:

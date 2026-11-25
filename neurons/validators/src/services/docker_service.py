@@ -202,6 +202,7 @@ from services.redis_service import (
     STOPPED_BY_RECOVERY_STOPPED,
     STREAMING_LOG_CHANNEL,
     RedisService,
+    resumed_create,
     sshd_bootstrap_failed_key,
     sshd_bootstrap_failed_stamp,
 )
@@ -4051,7 +4052,9 @@ class DockerService:
                 # registered: a live attempt (registered until its own failure cleanup ends) may still own
                 # that container, so then the conflict fails as before. Any other name conflict fails too.
                 # A container the earlier attempt already started (or one whose state cannot be read) is
-                # the renter's pod and is never removed: the conflict then fails as before.
+                # the renter's pod and is never removed: the conflict then fails as before. DAH-6992: except
+                # when this create is the re-send of one a connector restart cut off: that attempt never
+                # replied, so its container (started or not) was never handed to anyone and is replaced.
                 if (
                     not own_leftover_removed
                     and pod_id is not None
@@ -4062,7 +4065,8 @@ class DockerService:
                         or isinstance(exc, ContainerNameTakenOnRetry)
                     )
                 ):
-                    if not (
+                    resumed = resumed_create.get()
+                    if not resumed and not (
                         await self._leftover_container_never_started(docker_client, container_name)
                         # another create may have registered (and started the pod) during the status read
                         and inflight_creates.is_only_create(pod_id)
@@ -4070,13 +4074,14 @@ class DockerService:
                         raise _SameNameContainerKept(str(exc)) from exc
                     own_leftover_removed = True
                     attempt += 1
-                    # not forced: dockerd itself refuses the removal if the pod was started meanwhile
+                    # not forced on a fresh create: dockerd itself refuses the removal if the pod was started
+                    # meanwhile; a resumed create's leftover may be running, so that one is forced
                     if not await self._remove_failed_rental_container_for_retry(
                         docker_client=docker_client,
                         container_name=container_name,
                         default_extra=default_extra,
                         warning_event="OWN_LEFTOVER_CONTAINER_RM_FAILED",
-                        force=False,
+                        force=resumed,
                     ):
                         raise _SameNameContainerKept(str(exc)) from exc
                     continue

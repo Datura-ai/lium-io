@@ -6719,22 +6719,29 @@ async def _another_create_live(pod_id: str, live: bool):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "conflict_name, live_creates, status, expected_events",
+    "conflict_name, live_creates, status, expected_events, resumed",
     [
         # 26 Oct 2026: a re-sent create met its earlier attempt's container under the pod's own name
-        ("pod_test", 1, "created", ["run", "rm pod_test", "run"]),
-        ("pod_test", 1, "exited", ["run", "rm pod_test", "run"]),
+        ("pod_test", 1, "created", ["run", "rm pod_test force=False", "run"], False),
+        ("pod_test", 1, "exited", ["run", "rm pod_test force=False", "run"], False),
         # the earlier attempt already started the pod: a running (or unreadable) container is never removed
-        ("pod_test", 1, "running", ["run"]),
-        ("pod_test", 1, "restarting", ["run"]),
-        ("pod_test", 1, RuntimeError("inspect failed"), ["run"]),
+        ("pod_test", 1, "running", ["run"], False),
+        ("pod_test", 1, "restarting", ["run"], False),
+        ("pod_test", 1, RuntimeError("inspect failed"), ["run"], False),
         # the earlier attempt is still live (its start may fail later and clean up by name): touch nothing
-        ("pod_test", 2, "created", ["run"]),
-        ("pod_other", 1, "created", ["run"]),
+        ("pod_test", 2, "created", ["run"], False),
+        ("pod_other", 1, "created", ["run"], False),
+        # DAH-6992: the re-send of a create a connector restart cut off: that attempt never replied, so its
+        # container, started or not, is replaced (forced: it may be running)
+        ("pod_test", 1, "running", ["run", "rm pod_test force=True", "run"], True),
+        ("pod_test", 1, RuntimeError("inspect failed"), ["run", "rm pod_test force=True", "run"], True),
+        # even resumed: a live second attempt, or another name, is never touched
+        ("pod_test", 2, "running", ["run"], True),
+        ("pod_other", 1, "running", ["run"], True),
     ],
 )
 async def test_rental_create_removes_only_its_own_leftover_container_on_a_name_conflict(
-    docker_service, monkeypatch, conflict_name, live_creates, status, expected_events,
+    docker_service, monkeypatch, conflict_name, live_creates, status, expected_events, resumed,
 ):
     events: list[str] = []
 
@@ -6754,10 +6761,11 @@ async def test_rental_create_removes_only_its_own_leftover_container_on_a_name_c
             return status
 
         async def remove_container(self, *, container_name, force, remove_volumes):
-            events.append(f"rm {container_name}")
+            events.append(f"rm {container_name} force={force}")
 
     monkeypatch.setattr(docker_service, "stream_log", AsyncMock())
     registry = docker_service_module.inflight_creates
+    resumed_token = docker_service_module.resumed_create.set(resumed)
     async with _another_create_live("test", live_creates == 2):
         # production registers one create twice: the job runner, then the miner handler
         with registry.track("test", ("miner", "exec")), registry.track("test", ("miner", "exec")):
@@ -6769,11 +6777,12 @@ async def test_rental_create_removes_only_its_own_leftover_container_on_a_name_c
                 default_extra={},
                 pod_id="test",
             )
-            if "rm pod_test" in expected_events:
+            if "run" in expected_events[1:]:
                 assert await run == "cid"
             else:
                 with pytest.raises(Exception, match="already in use"):
                     await run
+    docker_service_module.resumed_create.reset(resumed_token)
     assert events == expected_events
     assert not registry.is_running("test")
 
