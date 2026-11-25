@@ -556,8 +556,9 @@ async def test_the_containerd_store_disk_fields_only_liumd_reads_are_not_a_specs
             "data_root_docker_used": 2,
             "data_root_free": 3,
             "engy_cache_released_gb": 4,
-            "hard_disk_content_scrape_error": "ctr: not found",
         },
+        # top level, where liumd emits it (jam6099 review on lium-io#1892)
+        "hard_disk_content_scrape_error": "ctr: not found",
     }
     state = build_state(specs=SPECS, scrape_specs=PYTHON_SCRAPE)
     ctx = _ctx(keypair, monkeypatch, verifyx_service, state=state)

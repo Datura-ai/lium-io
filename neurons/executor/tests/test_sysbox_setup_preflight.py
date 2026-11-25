@@ -450,6 +450,9 @@ def test_free_disk_counts_whichever_filesystem_is_full(tmp_path, check, full, ex
     assert rc == expected_rc, out
     if limiting:
         assert f"{limiting} is below" in out, out
+    # jam6099 review on lium-io#1892: the store-switch line is about the snapshot store, so a full content store
+    # or data-root does not get it
+    assert ("containerd-snapshotter" in out) == (full == "snapshots"), out
 
 
 _CONTENT_ROOT = "var/lib/containerd/io.containerd.content.v1.content"
@@ -473,6 +476,7 @@ def test_a_disk_mounted_inside_the_content_store_counts_for_free_room(tmp_path, 
     assert rc == expected_rc, out
     if expected_rc:
         assert f"/{_CONTENT_ROOT}/{child} is below" in out, out
+    assert "containerd-snapshotter" not in out, out
 
 
 @pytest.mark.parametrize(
@@ -554,6 +558,7 @@ def test_a_full_filesystem_under_containerds_metadata_fails_the_free_check_only(
     assert rc == expected_rc, out
     if expected_rc:
         assert f"FIX  Free disk 0.0 GB on {tmp_path}/root/{_METADATA_ROOT} is below" in out, out
+    assert "containerd-snapshotter" not in out, out
 
 
 def test_the_containerd_query_has_a_deadline(tmp_path):

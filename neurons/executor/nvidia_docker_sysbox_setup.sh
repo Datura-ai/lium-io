@@ -1096,10 +1096,12 @@ tighter_df_kb() {
 }
 
 store_fix_if_tighter() {
-    # SNAPSHOTTER_FIX only when the store is strictly tighter than data-root (df column $1, the reading $2 kB): on a
-    # data-root-limited node, switching the store off would move containers onto the disk that just failed
+    # SNAPSHOTTER_FIX only when the snapshot store is the limiting directory $3 (tighter_df_kb) and strictly tighter
+    # than data-root (df column $1, the reading $2 kB): on a data-root-limited node, switching the store off would move
+    # containers onto the disk that just failed, and a full content store or meta.db is not where containers live
     local data_kb
     [ -n "${SNAPSHOTTER_FIX:-}" ] || return 0
+    case "$3" in "$DISK_DIR" | "$DISK_DIR/snapshots") ;; *) return 0 ;; esac
     data_kb=$(df -Pk "$DATA_ROOT" 2>/dev/null | awk -v c="$1" 'NR == 2 {print $c}')
     [[ "$data_kb" =~ ^[0-9]+$ ]] && [ "$2" -ge "$data_kb" ] && return 0
     printf '%s' "$SNAPSHOTTER_FIX"
@@ -1128,7 +1130,7 @@ check_total_disk_for_vram() {
         pf_pass "Disk ${total_gb} GB on $data_root >= ${needed_gb} GB (${MIN_DISK_TO_VRAM_RATE}x of ${vram_gb} GB VRAM) — idle pay eligible."
         return 0
     fi
-    store_fix=$(store_fix_if_tighter 2 "$total_kb")
+    store_fix=$(store_fix_if_tighter 2 "$total_kb" "$data_root")
     pf_fix "Disk ${total_gb} GB on $data_root is below ${needed_gb} GB (${MIN_DISK_TO_VRAM_RATE}x of ${vram_gb} GB VRAM) — the node is listed but earns nothing while idle." \
         "Add disk, or move Docker's data-root to a filesystem of at least ${needed_gb} GB (\"data-root\" in /etc/docker/daemon.json, then sudo systemctl restart docker)." \
         ${store_fix:+"$store_fix"}
@@ -1169,7 +1171,7 @@ check_free_disk_for_node() {
         pf_pass "Free disk ${free_gb} GB on $data_root >= ${needed_gb} GB for the node's images and the validators' ${MIN_FREE_STORAGE_GB} GB storage test."
         return 0
     fi
-    store_fix=$(store_fix_if_tighter 4 "$free_kb")
+    store_fix=$(store_fix_if_tighter 4 "$free_kb" "$data_root")
     pf_fix "Free disk ${free_gb} GB on $data_root is below ${needed_gb} GB — the validators' storage test needs ${MIN_FREE_STORAGE_GB} GB free after the node's images (~${NODE_IMAGES_GB} GB) are pulled, so \`lium mine\` would fail at validation." \
         "Use a disk of at least $((MIN_FREE_STORAGE_GB + NODE_IMAGES_GB + 10)) GB, or free space / move Docker's data-root (\"data-root\" in /etc/docker/daemon.json, then sudo systemctl restart docker)." \
         ${store_fix:+"$store_fix"}

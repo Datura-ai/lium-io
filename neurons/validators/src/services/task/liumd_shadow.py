@@ -605,7 +605,8 @@ NOT_COMPARABLE_SPEC_PATHS = frozenset(
         "hard_disk.data_root_used",
         "hard_disk.data_root_docker_used",
         "hard_disk.data_root_free",
-        "hard_disk.hard_disk_content_scrape_error",
+        # liumd emits it at the top level, next to hard_disk_docker_scrape_error
+        "hard_disk_content_scrape_error",
         "hard_disk.images",
         "hard_disk.containers",
         "hard_disk.volumes",
