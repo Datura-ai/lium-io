@@ -529,6 +529,10 @@ class Settings(BaseSettings):
     # read 32-88 Mbps on healthy nodes (DAH-2959), so 50 would flag them; the defect is two orders of magnitude lower.
     CONTAINER_DOWNLOAD_SPEED_CHECK_ENABLED: bool = Field(env="CONTAINER_DOWNLOAD_SPEED_CHECK_ENABLED", default=True)
     CONTAINER_DOWNLOAD_SPEED_MIN_MBPS: float = Field(env="CONTAINER_DOWNLOAD_SPEED_MIN_MBPS", default=10.0, gt=0)
+    # the same container's upload of 16 MiB to Cloudflare's speed-test sink (what a pod sends: checkpoints, results)
+    CONTAINER_UPLOAD_SPEED_MIN_MBPS: float = Field(env="CONTAINER_UPLOAD_SPEED_MIN_MBPS", default=10.0, gt=0)
+    # DAH-6887 rollout switch, off by default
+    CONTAINER_SPEED_FLEET_RULE_ENFORCED: bool = Field(env="CONTAINER_SPEED_FLEET_RULE_ENFORCED", default=False)
     CONTAINER_DOWNLOAD_SPEED_INTERVAL_HOURS: float = Field(
         env="CONTAINER_DOWNLOAD_SPEED_INTERVAL_HOURS", default=6.0, gt=0
     )

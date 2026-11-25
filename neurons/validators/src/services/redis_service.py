@@ -216,6 +216,8 @@ RECHECK_POP_ATTEMPTS = 5
 # an in-memory stamp restarted with every rollout and logged discovery waits of up to 25 min (5 Nov).
 EXPRESS_LANE_FIRST_SEEN_PREFIX = "express_lane:first_seen"
 EXPRESS_LANE_FIRST_SEEN_TTL_SECONDS = 2 * 3600
+# every node's in-container reading of each endpoint, scored by time: the fleet control for that endpoint
+ENDPOINT_SPEED_FLEET_PREFIX = "endpoint_speed_fleet"
 
 # Distributed lock settings
 EXECUTOR_LOCK_TIMEOUT = 30  # TTL for lock auto-release (seconds)
@@ -727,6 +729,19 @@ class RedisService:
             for executor_id, value in zip(executor_ids, values, strict=True)
             if value is not None
         }
+
+    async def record_endpoint_speed(self, endpoint: str, member: str, now: float, window_seconds: float) -> None:
+        """One node's reading of an endpoint into that endpoint's fleet window; older readings drop out."""
+        key = f"{ENDPOINT_SPEED_FLEET_PREFIX}:{endpoint}"
+        async with self.redis.pipeline(transaction=False) as pipe:
+            pipe.zadd(key, {member: now})
+            pipe.zremrangebyscore(key, "-inf", now - window_seconds)
+            pipe.expire(key, int(window_seconds * 2))
+            await pipe.execute()
+
+    async def endpoint_speeds_since(self, endpoint: str, since: float) -> list[str]:
+        members = await self.redis.zrangebyscore(f"{ENDPOINT_SPEED_FLEET_PREFIX}:{endpoint}", since, "+inf")
+        return [m.decode() if isinstance(m, bytes) else m for m in members]
 
     async def is_forced_validation_cycle_requested(self) -> bool:
         return await self.get(FORCED_VALIDATION_CYCLE_KEY) is not None
