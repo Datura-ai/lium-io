@@ -236,6 +236,7 @@ class HardwareIdentityCheck:
             if previous and previous.get("dmi")
             else None,
             "kernel_gpu_uuids": kernel,
+            "kernel_view_source": source,
             "host_kernel_gpu_uuids": host_kernel,
             "reported_gpu_uuids": reported,
             "dmi_overlays": overlays,

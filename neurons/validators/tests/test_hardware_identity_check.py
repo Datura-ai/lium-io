@@ -103,6 +103,7 @@ async def test_clean_host_passes_and_logs_fingerprint(context_factory):
     assert result.passed is True
     assert result.event.reason_code == Msg.OK.reason
     assert result.event.what_we_saw["gpu_fingerprint"]
+    assert result.event.what_we_saw["kernel_view_source"] == "container"
 
 
 @pytest.mark.asyncio
@@ -354,3 +355,4 @@ async def test_a_short_host_list_stands_and_the_host_is_not_read_again(context_f
     result = await _run(ctx)
     assert result.passed is False
     assert result.event.what_we_saw["findings"] == ["gpu_sources_disagree"]
+    assert result.event.what_we_saw["kernel_view_source"] == "host_pid1_root"
