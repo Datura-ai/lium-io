@@ -258,6 +258,8 @@ async def _fleet_reads_slow(ctx: Context, endpoint: str, now: float) -> bool:
         try:
             hotkey, uuid, at, bad = json.loads(m)
             at, bad = float(at), int(bad)
+            if not (isinstance(hotkey, str) and isinstance(uuid, str)):
+                raise TypeError("node ids must be strings")  # a list or dict would not even key the dict below
         except (TypeError, ValueError):
             continue  # an entry in another format says nothing; the window holds the rest
         if hotkey != ctx.miner_hotkey and at >= latest.get((hotkey, uuid), (float("-inf"), 0))[0]:

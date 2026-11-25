@@ -427,7 +427,15 @@ async def test_an_upload_error_is_judged_by_the_fleet_and_recorded_in_its_window
 async def test_a_window_entry_in_another_format_is_skipped_not_fatal():
     with flags():
         fleet = FleetRedis(pypi=(0, 30), hf=(0, 30), cf_up=(0, 30))
-        for junk in ("5Old|node|1790000000.000|1", "not json", json.dumps({"a": 1}), json.dumps([1, 2])):
+        for junk in (
+            "5Old|node|1790000000.000|1",
+            "not json",
+            json.dumps({"a": 1}),
+            json.dumps([1, 2]),
+            # well-formed JSON with a list or a dict where a node id is expected
+            json.dumps(["5Other", ["node"], Clock.now - 30, 1]),
+            json.dumps([{"hk": 1}, "node", Clock.now - 30, 1]),
+        ):
             fleet.fleet["pypi"].append((Clock.now - 30, junk))
         ctx, _, _ = make_ctx(PYPI_ONLY_SLOW, redis=fleet)
         res = await ContainerDownloadSpeedCheck().run(ctx)
