@@ -24,7 +24,7 @@ import logging
 import os
 import time
 from collections import Counter
-from collections.abc import Awaitable, Callable, Iterator
+from collections.abc import Callable, Iterator
 from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -128,8 +128,10 @@ class CycleInputs:
     # DAH-6013: executor id -> end (UTC) of the provider maintenance window the backend still holds it for. The
     # lane rechecks each node once its window has ended instead of leaving it to the next cycle.
     maintenance_ends: dict[str, datetime] = field(default_factory=dict)
-    # The cycle's job block: the rollout window is read for it (lio#2389 review)
+    # The cycle's job block and the rollout window the cycle read for it (lio#2389 review): the lane reads this
+    # window, never the registry, so an express result neither counts a cycle again nor waits on Docker Hub
     job_block: int | None = None
+    rollout_window: RolloutWindow | None = None
 
 
 @dataclass
@@ -188,7 +190,6 @@ class ExpressLane:
         subtensor_client,
         cycle_inputs: Callable[[], CycleInputs | None],
         portal_api=ValidatorPortalAPI,
-        rollout_window: Callable[[int], Awaitable[RolloutWindow]] | None = None,
     ):
         self.miner_service = miner_service
         self.redis_service = redis_service
@@ -199,8 +200,6 @@ class ExpressLane:
         # before it.
         self.cycle_inputs = cycle_inputs
         self.portal_api = portal_api
-        # The validator's rollout read, the one the cycle end makes (a push in mid-cycle opens the window)
-        self.rollout_window = rollout_window
         self._pending: dict[str, _Pending] = {}
         # The wave leaves what this lane has queued to it (MinerService._claim_for_cycle), through
         # a view of this dict, never rebound, so the wave always reads the current queue.
@@ -704,7 +703,8 @@ class ExpressLane:
             rented = result.failure_reason_code == RentalVerificationMessages.RENTED_SINCE_THE_SNAPSHOT.reason
             self._defer(pending, RENTED_DURING_THE_CHECK if rented else NO_TASK_TIME_FOR_THE_RENTAL_PROBE)
             return
-        if await self._rollout_explains(result):
+        passed = result.score > 0 or result.job_score > 0
+        if not passed and self._rollout_explains(result):
             # lio#2389 review: a failure the executor-image rollout explains gets no verdict in the cycle; published
             # here it would be a zero that takes a node updating right after the push off the rent list
             self._left_to_cycle.add(executor_id)
@@ -718,7 +718,6 @@ class ExpressLane:
                 )
             )
             return
-        passed = result.score > 0 or result.job_score > 0
         should_run_first_pass_again = (
             not passed
             and settings.EXPRESS_LANE_FAILED_FIRST_PASS_RETRY_ENABLED
@@ -829,17 +828,13 @@ class ExpressLane:
             )
         )
 
-    async def _rollout_explains(self, result: JobResult) -> bool:
-        """Whether the rollout grace withholds this result, as `withhold_rollout_verdicts` does at the cycle end."""
+    def _rollout_explains(self, result: JobResult) -> bool:
+        """Whether the rollout grace withholds this result, as `withhold_rollout_verdicts` does at the cycle end,
+        read from the window the cycle holds."""
         inputs = self.cycle_inputs()
-        if self.rollout_window is None or inputs is None or inputs.job_block is None:
+        if inputs is None or inputs.rollout_window is None or inputs.job_block is None:
             return False
-        try:
-            window = await self.rollout_window(inputs.job_block)
-        except Exception as exc:  # the cycle end decides then
-            logger.warning(_m("[express] Rollout window unreadable", extra=get_extra_info({"error": str(exc)})))
-            return False
-        return rollout_grace_reason(result, window, inputs.job_block) is not None
+        return rollout_grace_reason(result, inputs.rollout_window, inputs.job_block) is not None
 
     def _defer(self, pending: _Pending, reason: str) -> None:
         """Try again after retry_seconds_for(reason), or after max_attempts_for(reason) asks leave

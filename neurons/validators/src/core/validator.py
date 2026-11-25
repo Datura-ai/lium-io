@@ -234,7 +234,6 @@ class Validator:
             backend_client=self.backend_client,
             subtensor_client=self.subtensor_client,
             cycle_inputs=self.express_lane_cycle_inputs,
-            rollout_window=self.rollout_window_now,
         )
         # DAH-5215: re-probes rented pods' SSH between cycles; observe only.
         self.rented_pod_watch = RentedPodWatch(backend_client=self.backend_client)
@@ -533,6 +532,7 @@ class Validator:
                     job_batch_id=job_batch_id,
                     fleet_known_since=self.first_cycle_started_at,
                     job_block=job_block,
+                    rollout_window=rollout_window,
                     maintenance_ends={
                         executor_id: window.expiring_at
                         for executor_id, window in (
@@ -1592,11 +1592,6 @@ class Validator:
                 cycles_seen=0,
                 grace_cycles=0,
             )
-
-    async def rollout_window_now(self, job_block: int) -> RolloutWindow:
-        """The rollout window as the registry shows it now, for the express lane (lio#2389 review): the read the
-        cycle end makes. Within one job block it counts no extra cycle."""
-        return await self.observe_executor_rollout(await self.fetch_executor_digest_or_none(), job_block)
 
     async def carry_scores_over_renter_gpu_resets(
         self,

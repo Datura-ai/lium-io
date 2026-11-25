@@ -1326,7 +1326,7 @@ async def test_a_first_pass_the_rollout_explains_is_left_to_the_cycle_not_publis
         cycles_seen=1 if covers else 0,
         grace_cycles=2,
     )
-    harness.lane.rollout_window = AsyncMock(return_value=window)
+    harness.inputs.rollout_window = window
 
     def outdated(payload, executor_id):
         result = _job_result(executor_id, score=0.0)
@@ -1336,9 +1336,34 @@ async def test_a_first_pass_the_rollout_explains_is_left_to_the_cycle_not_publis
     harness.job_for = outdated
     assert await harness.tick_and_settle() == 1
 
-    harness.lane.rollout_window.assert_awaited_once_with(100)
     if covers:
         harness.miner_service.publish_machine_specs.assert_not_awaited()
         assert new_node in harness.lane._left_to_cycle and new_node not in harness.lane._pending
     else:
         harness.miner_service.publish_machine_specs.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_a_passed_result_is_published_without_reading_the_rollout_window(monkeypatch, wallet):
+    """lio#2389 review 4694852173: only a failure can be withheld, so a pass never looks at the rollout window."""
+    import core.express_lane as express_lane
+    from services.executor_rollout import RolloutWindow
+
+    grace = Mock(return_value=None)
+    monkeypatch.setattr(express_lane, "rollout_grace_reason", grace)
+    node = str(uuid4())
+    harness = _Harness(monkeypatch, {"miner-a": [_portal_executor(node)]}, [_Neuron("miner-a")])
+    harness.inputs.job_block = 100
+    harness.inputs.rollout_window = RolloutWindow(
+        digest="sha256:" + "b" * 64,
+        previous_digest="sha256:" + "a" * 64,
+        started_at=datetime.now(UTC),
+        opened_job_block=100,
+        cycles_seen=1,
+        grace_cycles=2,
+    )
+
+    assert await harness.tick_and_settle() == 1
+
+    grace.assert_not_called()
+    harness.miner_service.publish_machine_specs.assert_awaited_once()
