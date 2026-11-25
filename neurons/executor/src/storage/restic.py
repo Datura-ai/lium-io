@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import io
 import json
 import os
 import queue
@@ -7,12 +9,13 @@ import re
 import signal
 import subprocess
 import sys
+import tarfile
 import threading
 import time
 from datetime import datetime, timedelta, timezone
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import IO
 
 from storage.models import (
@@ -71,6 +74,30 @@ _WRITE_HELPER_SPEC = (
     "os.write(fd, sys.stdin.buffer.read())\n"
     "os.close(fd)\n"
     "os.rename(path + '.part', path)\n"
+)
+# The helper's image has no copy of a runner the validator staged in a temporary directory: the launching runner
+# sends its own files through `docker exec` stdin into the helper's /tmp tmpfs, and the helper's entrypoint waits for
+# them. So the helper always runs the code that launched it, wherever that code lives.
+HELPER_RUNNER_DIR = "/tmp/lium-storage-runner"
+HELPER_RUNNER_WAIT_SECONDS = 60
+_AWAIT_HELPER_RUNNER = (
+    "import os, signal, sys, time\n"
+    # PID 1 ignores a SIGTERM it has no handler for: a cancel that lands during the wait must still end the helper
+    "signal.signal(signal.SIGTERM, lambda *_: sys.exit(130))\n"
+    f"deadline = time.monotonic() + {HELPER_RUNNER_WAIT_SECONDS}\n"
+    "while not os.path.exists(sys.argv[1]):\n"
+    "    if time.monotonic() > deadline:\n"
+    "        sys.exit('the storage helper never got its runner')\n"
+    "    time.sleep(0.1)\n"
+    "os.execv(sys.executable, [sys.executable, '-E', '-s', '-B', *sys.argv[1:]])\n"
+)
+# unpacked beside the target then renamed, so the entrypoint never starts half a runner
+_UNPACK_HELPER_RUNNER = (
+    "import base64, io, os, sys, tarfile\n"
+    "target = sys.argv[1]\n"
+    "with tarfile.open(fileobj=io.BytesIO(base64.b64decode(sys.stdin.read()))) as archive:\n"
+    "    archive.extractall(target + '.part', filter='data')\n"
+    "os.rename(target + '.part', target)\n"
 )
 CGROUP_MEMORY_EVENTS = "/sys/fs/cgroup/memory.events"
 STALE_HELPER_AGE = timedelta(minutes=10)
@@ -227,6 +254,16 @@ class JsonEventWriter:
         self._output.flush()
         if self._reporter:
             self._reporter.send(payload)
+
+
+def _runner_archive(runner: Path) -> str:
+    """The runner script and the storage package beside it, as the base64 tar the helper unpacks."""
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w") as archive:
+        archive.add(runner, runner.name)
+        for module in sorted((runner.parent / "storage").glob("*.py")):
+            archive.add(module, f"storage/{module.name}")
+    return base64.b64encode(buffer.getvalue()).decode()
 
 
 class ResticStorageRunner:
@@ -860,6 +897,8 @@ class ResticStorageRunner:
             arguments = ["--workspace", str(workspace.path)]
         else:
             raise ResticOperationError("the storage helper needs a docker volume or encrypted workspace")
+        # read before the helper exists: a runner file that cannot be read leaves no container behind
+        runner_files = _runner_archive(Path(runner))
         self._remove_stopped_helpers()
         command = [
             *self._docker_helper_base(),
@@ -872,11 +911,20 @@ class ResticStorageRunner:
             "--entrypoint",
             python,
             workspace.image,
-            runner,
+            "-I",
+            "-c",
+            _AWAIT_HELPER_RUNNER,
+            f"{HELPER_RUNNER_DIR}/{Path(runner).name}",
             "--in-helper",
             *arguments,
         ]
         started = subprocess.run(command, capture_output=True, text=True)
+        if started.returncode == 0:
+            started = subprocess.run(
+                [self._docker_binary, "exec", "-i", self._helper_container_name(), python, "-I", "-c",
+                 _UNPACK_HELPER_RUNNER, HELPER_RUNNER_DIR],
+                input=runner_files, capture_output=True, text=True,
+            )
         if started.returncode == 0:
             started = subprocess.run(
                 [self._docker_binary, "exec", "-i", self._helper_container_name(), python, "-I", "-c",
