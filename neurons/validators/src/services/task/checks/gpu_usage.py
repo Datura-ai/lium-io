@@ -269,7 +269,7 @@ class GpuUsageCheck:
         process_names = {process.get("container_name") for process in gpu_processes}
         if rented_data is not None:
             # DAH-7071: a filler started after this cycle's snapshot is ours at ANY load, so the backend is asked
-            # before the load is judged, not only on the idle path below (it zeroed a node running our own filler)
+            # before the load is judged, not only on the idle path below
             filler_containers |= await _lium_named_containers_the_backend_still_owns(
                 ctx, {name for name in process_names - filler_containers if name and name.startswith(FILLER_CONTAINER_PREFIX)}
             )

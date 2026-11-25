@@ -1429,8 +1429,8 @@ async def test_a_lium_named_container_is_judged_by_the_backend(
 )
 @pytest.mark.asyncio
 async def test_a_late_filler_at_full_load_is_judged_by_the_backend_once(context_factory, filler_run, expected_pass):
-    # DAH-7071: a live filler started after the snapshot, under full load, zeroed an idle node (filler_d0dc2cbc)
-    # because only the idle path asked the backend. Both paths now take the same one answer.
+    # DAH-7071: a live filler started after the snapshot is settled by the backend on every path,
+    # with one question per container.
     state = _idle_state(
         [{"gpu_utilization": 100, "memory_utilization": 95, "memory_used_mb": 70000}],
         [{"pid": 111, "info": "0::/../docker-a.scope", "container_name": LATE_FILLER}],
