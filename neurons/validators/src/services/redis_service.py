@@ -35,6 +35,8 @@ PENDING_PODS_PREFIX = "pending_pods_prefix"
 # VerifyX cold retry sees a create whose pending-pod marker came and went between two of its reads
 CREATE_STARTED_AT_PREFIX = "create_started_at"
 CREATE_STARTED_AT_TTL_SECONDS = 900
+# set on the pending-pod entry of a renter's create (not a filler's, a probe's or a GPU operation's)
+PENDING_RENTER_CREATE = "renter"
 GPU_RESET_PENDING_KIND = "gpu_reset"
 # DAH-4663: a renter's own GPU clock lock in progress (a second lock, reset or create is declined meanwhile)
 GPU_CLOCKS_PENDING_KIND = "gpu_clocks"
@@ -1169,10 +1171,16 @@ class RedisService:
         gpu_uuids: list[str] | None = None,
         command_id: str = "",
         synthetic_probe: bool = False,
+        is_filler_create: bool = False,
     ):
         now = int(time.time())
+        # a renter's pod being created: the validation cycle on the node stops its GPU and network tests for it
+        # (RentedMidCycleCheck); the validator's own probe, a filler and a GPU reset or clock operation are not one
+        is_renter_create = kind is None and not synthetic_probe and not is_filler_create
 
         item: dict = {"time": now, "pod_id": pod_id}
+        if is_renter_create:
+            item[PENDING_RENTER_CREATE] = True
         if kind:
             # DAH-4658: "gpu_reset" marks a renter's own GPU reset, which the rented GPU checks skip
             item["kind"] = kind
@@ -1184,9 +1192,9 @@ class RedisService:
         def stamp() -> RedisWrites:
             # read at each try: a retry after a newer create's EXEC must not write an older time over its stamp
             writes = RedisWrites()
-            if kind is None and not synthetic_probe:
-                # only a rental create stamps: the validator's own rental probe and a GPU reset or clock operation
-                # keep their marker but leave no stamp, since neither is a rental being created
+            if is_renter_create:
+                # only a renter's create stamps: the validator's own rental probe, a filler and a GPU reset or clock
+                # operation keep their marker but leave no stamp, since none is a rental being created
                 writes.set(
                     create_started_at_key(miner_hotkey, executor_id), str(time.time()), ex=CREATE_STARTED_AT_TTL_SECONDS
                 )

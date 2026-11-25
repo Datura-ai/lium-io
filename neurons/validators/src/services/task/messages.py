@@ -1621,6 +1621,14 @@ class TenantEnforcementMessages:
         category="policy",
         impact="Proceed",
     )
+    # the run gives no verdict and its kept result is dropped: the cycle saw the rental state change
+    RENTED_SINCE_CYCLE_START = MessageTemplate(
+        event="Executor rented since the cycle started",
+        reason="RENTED_SINCE_CYCLE_START",
+        severity="info",
+        category="policy",
+        impact="Validation halted — no verdict this cycle",
+    )
 
 
 class GpuUsageMessages:
@@ -3447,7 +3455,13 @@ class SshdAuthLogMessages:
 NO_TASK_TIME_REASONS = (RentalVerificationMessages.NO_TASK_TIME.reason, VerifyXMessages.NO_TASK_TIME.reason)
 # results the cycle's snapshot cannot score, held for the cycle-end rented read: a budget stop (above), or a node the
 # backend found rented after the snapshot listed it idle (its GPU count and pool come from that read, never the snapshot)
-CYCLE_END_READ_REASONS = (*NO_TASK_TIME_REASONS, RentalVerificationMessages.RENTED_SINCE_THE_SNAPSHOT.reason)
+# a rental that started after the cycle-start snapshot: one the backend found during the check, or a renter's create
+# the run stopped for (DAH-5750). The cycle saw the rental state change, so its kept result never stands in for it
+RENTED_AFTER_START_REASONS = (
+    RentalVerificationMessages.RENTED_SINCE_THE_SNAPSHOT.reason,
+    TenantEnforcementMessages.RENTED_SINCE_CYCLE_START.reason,
+)
+CYCLE_END_READ_REASONS = (*NO_TASK_TIME_REASONS, *RENTED_AFTER_START_REASONS)
 # DAH-5933 review at ea74f37: a budget stop after a check that already zeroed the cycle's score. Its own code, since
 # the last event before the stop can be one a rollout withholds (a warn-only EXECUTOR_IMAGE_OUTDATED): no rule withholds
 # or carries this one, so the zero is published as it is
