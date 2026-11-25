@@ -4,8 +4,9 @@ import time
 from unittest.mock import AsyncMock
 from uuid import uuid4
 
+import fakeredis
+import lupa  # noqa: F401  fakeredis runs the Lua through it; a missing lupa must fail, not skip
 import pytest
-
 from services.storage_operations import (
     StorageVolumeBeingWiped,
     new_wipe_token,
@@ -89,8 +90,6 @@ async def test_a_failed_attempt_of_one_operation_never_drops_another_attempts_ho
 
 @pytest.mark.asyncio
 async def test_the_redis_script_keeps_each_attempts_hold_and_lets_a_wipe_in_only_alone():
-    fakeredis = pytest.importorskip("fakeredis")
-    pytest.importorskip("lupa")  # fakeredis runs the Lua through lupa
     from services.redis_service import RedisService
 
     service = RedisService.__new__(RedisService)
@@ -134,8 +133,6 @@ async def test_a_release_error_after_the_dispatch_never_fails_the_started_operat
 
 @pytest.mark.asyncio
 async def test_the_redis_script_drops_lapsed_tokens_and_keeps_renewed_ones():
-    fakeredis = pytest.importorskip("fakeredis")
-    pytest.importorskip("lupa")
     from services.redis_service import RedisService
 
     service = RedisService.__new__(RedisService)
