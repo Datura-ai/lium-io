@@ -304,7 +304,7 @@ async def storage_operation_open(ctx: Context, operation_id: str) -> bool | None
     if answer is None or not answer.active:
         return None if answer is None else False
     if ctx.runner is not None and await report_exited_detached_helper(
-        lambda command: _stdout(ctx, command), operation_id
+        lambda command: _stdout(ctx, command), ctx.services.redis, operation_id
     ):
         return False
     # the progress token lives on the node, so open alone is not proof the helper still works

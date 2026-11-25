@@ -35,6 +35,7 @@ REMOTE_SECRETS_DIRECTORY = PurePosixPath("/root/app/storage-secrets")
 # cap: never a container that only wears the prefix, and never one after its operation ended.
 STORAGE_HELPER_PREFIX = "lium-storage-"
 STARTED_STORAGE_HELPERS_PREFIX = "started_storage_helpers:"
+STORAGE_REPORTER_PREFIX = "storage_reporter:"
 # a docker container name cannot hold ":", so no container's name or id ever matches this key
 STORAGE_HELPER_KEY_MARK = "helper:"
 # the backend fails a backup still open after 4 h (BACKUP_AUTH_TOKEN_EXPIRY_HOURS): no helper
@@ -90,15 +91,29 @@ async def _raw_records(redis: RedisService, executor_id: str) -> list[str]:
     return [m.decode() if isinstance(m, bytes) else str(m) for m in members or ()]
 
 
+def _reporter_key(operation_id: UUID | str) -> str:
+    return f"{STORAGE_REPORTER_PREFIX}{operation_id}"
+
+
 async def note_started_storage_helper(
-    redis: RedisService, executor_id: str, operation_id: UUID | str
+    redis: RedisService,
+    executor_id: str,
+    operation_id: UUID | str,
+    spec: Mapping[str, object] | None = None,
 ) -> None:
-    """Records the operation starting its helper on this executor."""
+    """Records the operation starting its helper on this executor, and the reporter this validator built
+    for it: a later report on the operation (killed helper, cancel) never takes its target from the node."""
 
     async def note() -> None:
         record = StorageHelperRecord(str(operation_id), int(time.time()))
         await redis.sadd(_key(executor_id), record.format())
         await redis.expire(_key(executor_id), STARTED_STORAGE_HELPERS_TTL_SECONDS)
+        if spec and isinstance(spec.get("reporter"), Mapping):
+            await redis.set(
+                _reporter_key(operation_id),
+                json.dumps({"action": spec.get("action"), "reporter": spec["reporter"]}),
+                ex=STARTED_STORAGE_HELPERS_TTL_SECONDS,
+            )
 
     await _redis_call(f"record {operation_id} on {executor_id}", note)
 
@@ -114,6 +129,7 @@ async def forget_storage_helper(
             record = StorageHelperRecord.parse(raw)
             if record and record.operation_id == str(operation_id):
                 await redis.srem(_key(executor_id), raw)
+        await redis.delete(_reporter_key(operation_id))
 
     await _redis_call(f"forget {operation_id} on {executor_id}", forget)
 
@@ -419,23 +435,23 @@ async def _operation_state(
 
 
 async def report_exited_detached_helper(
-    run: Callable[[str], Awaitable[str | None]], operation_id: str
+    run: Callable[[str], Awaitable[str | None]], redis: RedisService, operation_id: str
 ) -> bool:
-    """The runner reports before it exits, so an exited helper whose job the backend still has open lost
-    its report (killed whole, crash): the periodic pass reports it when it sees it. True when it did."""
+    """The runner reports before it exits, so a helper that exited non-zero while the backend still has its
+    job open lost its report (killed whole, crash): the periodic pass reports it, through the reporter this
+    validator stored at launch, never one read from the node. True when it did."""
     files = StorageOperationFiles.for_operation(UUID(operation_id))
     state = ((await run(_operation_state_command(files))) or "").strip()
-    if not state.startswith("STATUS:"):
-        return False
-    spec = _parse_spec(await run(f"cat {shlex.quote(str(files.spec))}"))
     exit_code = state.removeprefix("STATUS:").strip()
-    reporter = spec.get("reporter") if spec else None
-    backup = isinstance(reporter, Mapping) and reporter.get("resource") == "backup"
+    if not state.startswith("STATUS:") or exit_code == "0":
+        # exit 0: the runner reported success, which may just not have landed yet
+        return False
+    spec = await _held_reporter_spec(redis, operation_id)
     if spec is None or not await _report_operation_status(
         UUID(operation_id),
         spec,
         status="FAILED",
-        stage="BACKUP" if backup else "RESTORING",
+        stage="BACKUP" if spec.get("action") == "backup" else "RESTORING",
         message=(
             "Storage helper was killed (often out of memory)"
             if exit_code == str(KILLED_EXIT)
@@ -474,11 +490,12 @@ def _operation_state_command(files: StorageOperationFiles) -> str:
 
 async def cancel_storage_operation(
     ssh_client: asyncssh.SSHClientConnection,
+    redis: RedisService,
     operation_id: UUID,
 ) -> None:
     files = StorageOperationFiles.for_operation(operation_id)
-    # once the runner has read it, the spec holds only the reporter (DAH-6463)
-    spec = await _read_operation_spec(ssh_client, files.spec)
+    # the node's files are the provider's to write: the report goes where this validator's own record says
+    spec = await _held_reporter_spec(redis, operation_id)
     helper = shlex.quote(files.helper)
     legacy_runner = shlex.quote(
         f"[-]-spec {files.spec}"
@@ -510,21 +527,15 @@ async def cancel_storage_operation(
     await _remove_operation_artifacts(ssh_client, files)
 
 
-async def _read_operation_spec(
-    ssh_client: asyncssh.SSHClientConnection,
-    spec_path: PurePosixPath,
-) -> Mapping[str, object] | None:
-    result = await ssh_client.run(
-        f"cat {shlex.quote(str(spec_path))}",
-        check=False,
-    )
-    return _parse_spec(result.stdout) if result.exit_status == 0 else None
-
-
-def _parse_spec(raw: str | None) -> Mapping[str, object] | None:
+async def _held_reporter_spec(redis: RedisService, operation_id: UUID | str) -> Mapping[str, object] | None:
+    """The reporter this validator stored when it launched the operation; None when it holds none."""
     try:
+        raw = await asyncio.wait_for(
+            redis.get(_reporter_key(operation_id)), timeout=_STARTED_STORAGE_HELPERS_REDIS_TIMEOUT_SEC
+        )
         value = json.loads(raw or "")
-    except json.JSONDecodeError:
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Storage operation %s: no held reporter: %s", operation_id, exc)
         return None
     return value if isinstance(value, Mapping) else None
 
@@ -639,6 +650,19 @@ async def report_killed_helper(operation_id: UUID, spec: Mapping[str, object]) -
         # the stage the helper was in: the executor reports backups under BACKUP and restores under RESTORING
         stage="BACKUP" if spec.get("action") == "backup" else "RESTORING",
         message="Storage helper was killed (often out of memory)",
+        attempts=3,
+    )
+
+
+async def report_storage_operation_failed(
+    operation_id: UUID, spec: Mapping[str, object], message: str
+) -> None:
+    await _report_operation_status(
+        operation_id,
+        spec,
+        status="FAILED",
+        stage="BACKUP" if spec.get("action") == "backup" else "RESTORING",
+        message=message,
         attempts=3,
     )
 

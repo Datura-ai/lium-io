@@ -1149,8 +1149,7 @@ async def test_the_periodic_pass_reports_an_exited_helper_whose_job_is_still_ope
     def run(command, **kwargs):
         if "docker inspect" in command and str(OPERATION) in command:
             return MagicMock(success=True, stdout="STATUS:1\n")
-        if command.startswith("cat ") and str(OPERATION) in command:
-            return MagicMock(success=True, stdout='{"reporter": {"resource": "backup"}}')
+        assert not command.startswith("cat ")  # the node's spec is never read
         return node(command, **kwargs)
 
     store: set[str] = set()
@@ -1158,8 +1157,11 @@ async def test_the_periodic_pass_reports_an_exited_helper_whose_job_is_still_ope
         context_factory(state=_rented_state(SN13_SPECS), runner=runner), OPERATION, records=store
     )
     ctx.runner.run = AsyncMock(side_effect=run)
+    held = '{"action": "backup", "reporter": {"auth_token": "t", "resource": "backup"}}'
+    ctx.services.redis.get = AsyncMock(side_effect=lambda key: held if key == f"storage_reporter:{OPERATION}" else None)
 
     assert await _provider_cores(ctx) == 8.9
     assert report.await_args.kwargs["status"] == "FAILED"
     assert "exited with code 1" in report.await_args.kwargs["message"]
+    assert report.await_args.args[1]["reporter"]["auth_token"] == "t"
     assert store == set()

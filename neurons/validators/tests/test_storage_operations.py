@@ -1,11 +1,10 @@
-import inspect
 import json
 import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
-from uuid import UUID, uuid4
+from uuid import UUID
 
 import pytest
 
@@ -67,7 +66,7 @@ async def test_cancel_signals_the_helper_by_name_never_a_stored_pid(
     (tmp_path / f"{OPERATION_ID}.pid").write_text(str(unrelated.pid))
     runner = _legacy_runner(tmp_path) if legacy else None
     try:
-        await storage_operations.cancel_storage_operation(_local_ssh(fake_docker), OPERATION_ID)
+        await storage_operations.cancel_storage_operation(_local_ssh(fake_docker), _HeldRedis(), OPERATION_ID)
         assert unrelated.poll() is None  # the stored PID is never signalled
         if runner:
             assert runner.wait(timeout=5) is not None
@@ -240,26 +239,76 @@ async def test_a_repeated_dispatch_never_starts_a_second_runner(
     assert any("nohup" in c for c in commands) is False  # never launched a second wrapper
 
 
+class _HeldRedis:
+    """Just the validator-side Redis calls the reporter record uses."""
+
+    def __init__(self) -> None:
+        self.values: dict[str, str] = {}
+
+    async def set(self, key: str, value: str, ex: int | None = None) -> None:
+        self.values[key] = value
+
+    async def get(self, key: str) -> str | None:
+        return self.values.get(key)
+
+    async def sadd(self, *_: object) -> None:
+        pass
+
+    async def expire(self, *_: object) -> None:
+        pass
+
+
+REPORTER = {"api_url": "https://api.example", "auth_token": "t", "resource": "restore"}
+
+
+async def _held(action: str = "restore") -> _HeldRedis:
+    redis = _HeldRedis()
+    await storage_operations.note_started_storage_helper(
+        redis, "executor", OPERATION_ID, {"action": action, "reporter": REPORTER}
+    )
+    return redis
+
+
+def _planted_node_spec() -> None:
+    # the provider writes what it likes on its node: a spec aimed at its own URL must never be followed
+    spec = storage_operations.StorageOperationFiles.for_operation(OPERATION_ID).spec
+    spec.write_text(json.dumps({"reporter": {**REPORTER, "api_url": "http://169.254.169.254/"}}))
+
+
 @pytest.mark.asyncio
-async def test_a_cancel_reports_with_the_reporter_the_runner_left_in_its_spec(
+async def test_a_cancel_reports_through_the_reporter_this_validator_launched_with(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     monkeypatch.setattr(storage_operations, "REMOTE_OPERATION_DIRECTORY", tmp_path)
     report = AsyncMock(return_value=True)
     monkeypatch.setattr(storage_operations, "_report_cancelled", report)
-    reporter = {"api_url": "https://api.example", "auth_token": "t", "resource": "restore"}
-    # what the runner leaves once it has read the spec; no copy of the token is kept anywhere else
-    spec = storage_operations.StorageOperationFiles.for_operation(OPERATION_ID).spec
-    spec.write_text(json.dumps({"reporter": reporter}))
+    _planted_node_spec()
 
     async def run_locally(command: str, check: bool = False) -> SimpleNamespace:
         result = subprocess.run(["sh", "-c", command.replace("/usr/bin/docker", "true")], capture_output=True, text=True)
         return SimpleNamespace(exit_status=result.returncode, stdout=result.stdout, stderr=result.stderr)
 
-    await storage_operations.cancel_storage_operation(SimpleNamespace(run=run_locally), OPERATION_ID)
+    await storage_operations.cancel_storage_operation(SimpleNamespace(run=run_locally), await _held(), OPERATION_ID)
 
-    report.assert_awaited_once_with(OPERATION_ID, {"reporter": reporter})
-    assert "redis" not in inspect.signature(storage_operations.start_storage_operation).parameters
+    report.assert_awaited_once_with(OPERATION_ID, {"action": "restore", "reporter": REPORTER})
+
+
+@pytest.mark.asyncio
+async def test_a_cancel_with_no_held_reporter_sends_nothing_even_with_a_node_spec(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(storage_operations, "REMOTE_OPERATION_DIRECTORY", tmp_path)
+    report = AsyncMock(return_value=True)
+    monkeypatch.setattr(storage_operations, "_report_operation_status", report)
+    _planted_node_spec()
+
+    async def run_locally(command: str, check: bool = False) -> SimpleNamespace:
+        result = subprocess.run(["sh", "-c", command.replace("/usr/bin/docker", "true")], capture_output=True, text=True)
+        return SimpleNamespace(exit_status=result.returncode, stdout=result.stdout, stderr=result.stderr)
+
+    await storage_operations.cancel_storage_operation(SimpleNamespace(run=run_locally), _HeldRedis(), OPERATION_ID)
+
+    report.assert_not_awaited()
 
 
 @pytest.mark.parametrize("exit_code", [0, 3])
@@ -323,11 +372,12 @@ def test_detached_wrapper_keeps_the_log_only_when_the_runner_fails(
 
 
 
+
 def _node(state: str, commands: list[str]):
     async def run(command: str) -> str:
         commands.append(command)
         if command.startswith("cat "):
-            return '{"reporter": {"api_url": "https://x", "auth_token": "t", "resource": "backup"}}'
+            return '{"reporter": {"api_url": "http://169.254.169.254/", "auth_token": "x", "resource": "backup"}}'
         return state if "docker inspect" in command else ""
 
     return run
@@ -338,24 +388,40 @@ def _node(state: str, commands: list[str]):
     ("state", "message"),
     [("STATUS:137\n", "killed"), ("STATUS:1\n", "exited with code 1"), ("STATUS:139\n", "code 139")],
 )
-async def test_an_exited_helper_with_its_job_open_is_reported_failed_and_removed(monkeypatch, state, message):
+async def test_an_exited_helper_with_its_job_open_is_reported_through_the_held_reporter(monkeypatch, state, message):
     report = AsyncMock(return_value=True)
     monkeypatch.setattr(storage_operations, "_report_operation_status", report)
     commands: list[str] = []
 
-    assert await storage_operations.report_exited_detached_helper(_node(state, commands), str(uuid4()))
+    assert await storage_operations.report_exited_detached_helper(
+        _node(state, commands), await _held("backup"), str(OPERATION_ID)
+    )
+    assert report.await_args.args[1] == {"action": "backup", "reporter": REPORTER}
     assert report.await_args.kwargs["status"] == "FAILED"
     assert report.await_args.kwargs["stage"] == "BACKUP"
     assert message in report.await_args.kwargs["message"]
+    assert not any(c.startswith("cat ") for c in commands)  # the node's spec is never read
     assert "docker rm -f" in commands[-1]
 
 
 @pytest.mark.asyncio
-async def test_a_running_helper_is_left_alone(monkeypatch):
+@pytest.mark.parametrize("state", ["RUNNING\n", "STATUS:0\n"])
+async def test_a_running_or_succeeded_helper_is_not_reported(monkeypatch, state):
     report = AsyncMock(return_value=True)
     monkeypatch.setattr(storage_operations, "_report_operation_status", report)
-    commands: list[str] = []
 
-    assert not await storage_operations.report_exited_detached_helper(_node("RUNNING\n", commands), str(uuid4()))
+    assert not await storage_operations.report_exited_detached_helper(
+        _node(state, []), await _held(), str(OPERATION_ID)
+    )
     report.assert_not_awaited()
-    assert len(commands) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_planted_node_spec_with_no_held_reporter_sends_nothing(monkeypatch):
+    report = AsyncMock(return_value=True)
+    monkeypatch.setattr(storage_operations, "_report_operation_status", report)
+
+    assert not await storage_operations.report_exited_detached_helper(
+        _node("STATUS:137\n", []), _HeldRedis(), str(OPERATION_ID)
+    )
+    report.assert_not_awaited()
