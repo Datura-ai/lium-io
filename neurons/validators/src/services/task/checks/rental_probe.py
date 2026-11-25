@@ -72,6 +72,10 @@ _CREATE_STEPS_BEFORE_THE_HOST = frozenset(
         "ssh_connect",
     }
 )
+# Failures that are the validator's although the create had reached the host: its Redis holding the GPU
+# power restore records (DAH-5861). No verdict about the node, but the settle still removes what the
+# create left there, as the cap and the container may already be on the host.
+_VALIDATOR_SIDE_CREATE_STEPS = _CREATE_STEPS_BEFORE_THE_HOST | {"gpu_power_restore_state"}
 
 # What the provider is told for each failed step, in plain words. The mapped port is filled in.
 _REMEDIATION_BY_STEP: dict[str, str] = {
@@ -1077,7 +1081,7 @@ async def _step_container_start(
         outcome.create_step = create_step
         if create_step is None:
             outcome.inconclusive_reason = "create returned a result without a failure step"
-        elif create_step in _CREATE_STEPS_BEFORE_THE_HOST:
+        elif create_step in _VALIDATOR_SIDE_CREATE_STEPS:
             outcome.inconclusive_reason = f"create failed on the validator's side at {create_step}"
         else:
             outcome.failed_step = STEP_CONTAINER_START

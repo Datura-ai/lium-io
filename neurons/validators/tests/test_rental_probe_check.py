@@ -1003,6 +1003,22 @@ async def test_a_create_that_cannot_open_its_ssh_session_is_inconclusive():
 
 
 @pytest.mark.asyncio
+async def test_a_create_that_fails_on_the_validators_power_restore_state_is_inconclusive_and_still_cleans_up():
+    # Regression: a failure of our own Redis holding the GPU power restore records zeroed the node (DAH-5861)
+    ctx, docker, redis = make_probe_context(
+        docker=FakeDocker(create_result=create_failed("gpu_power_restore_state"))
+    )
+    with probe_settings(), renter_path():
+        result = await RentalProbeCheck().run(ctx)
+    assert result.passed is True
+    assert result.event.reason_code == Msg.INCONCLUSIVE.reason
+    assert not redis.stamped()
+    # the create had reached the host, so the settle still removes the pod by name
+    shell_commands = [call.args[0] for call in ctx.ssh.run.call_args_list]
+    assert any("docker rm" in cmd for cmd in shell_commands)
+
+
+@pytest.mark.asyncio
 async def test_a_node_without_an_ssh_host_key_fails_the_probe():
     ctx, docker, redis = make_probe_context(
         docker=FakeDocker(create_result=create_failed("docker_sdk_ssh_host_key"))

@@ -104,7 +104,7 @@ async def _restore_records_of_this_executor(ctx: Context, gpu_uuids: list[str]) 
     return [record for record in read_result.records if record.executor_id == ctx.executor.uuid]
 
 
-async def _host_limit_records_under_miner_job(
+async def _pre_cap_host_limit_records_under_miner_job(
     ctx: Context, default_job_owner: str | None
 ) -> list[GpuPowerRestoreRecord]:
     """Under the provider's own capped Default Job (DAH-5861), the host's own limits recorded
@@ -184,7 +184,7 @@ class GpuPowerLimitCheck:
                 updates=_with_host_limits(ctx, readout.records, readout.recapped_watts_by_uuid),
             )
 
-        host_limit_records = await _host_limit_records_under_miner_job(ctx, default_job_owner)
+        host_limit_records = await _pre_cap_host_limit_records_under_miner_job(ctx, default_job_owner)
         host_watts_by_uuid = {record.gpu_uuid: record.watts for record in host_limit_records}
         measurements: list[GpuPowerMeasurement] = []
         incomplete: list[GpuPowerMeasurement] = []
@@ -233,13 +233,19 @@ class GpuPowerLimitCheck:
                 f"({shown(m.power_limit / m.power_default_limit * 100, 0, failed_below=True)}%)"
                 for m in rejected
             )
+            under_own_job = (
+                " Under your own Default Job this is your host's limit recorded before the job's cap: stop the job,"
+                " then raise it."
+                if host_limit_rejected
+                else ""
+            )
             event = render_message(
                 Msg.LIMIT_BELOW_DEFAULT,
                 ctx=ctx,
                 check_id=self.check_id,
                 remediation=(
                     f"{measured}. {Msg.LIMIT_BELOW_DEFAULT.remediation} Restore it with "
-                    "`sudo nvidia-smi -i <GPU> -pl <default W>`."
+                    f"`sudo nvidia-smi -i <GPU> -pl <default W>`.{under_own_job}"
                 ),
                 what={
                     "threshold": MIN_POWER_LIMIT_RATIO,

@@ -581,6 +581,23 @@ async def test_under_the_providers_own_cap_the_floor_and_tier_judge_the_recorded
 
 
 @pytest.mark.asyncio
+async def test_a_low_recorded_host_limit_under_the_providers_own_job_says_to_stop_the_job_first(
+    context_factory, read_records_mock
+) -> None:
+    read_records_mock.return_value = _read_result(_restore_record().model_copy(update={"watts": 105}))
+    ctx = context_factory(state=_state(current_limit=280, default_limit=350, default_job_owner="miner"))
+
+    result = await GpuPowerLimitCheck().run(ctx)
+
+    # the shown limit is the recorded one, not the live cap the provider sees in nvidia-smi
+    assert result.event.remediation.startswith("GPU 0: 105 W limit, default 350 W (30%).")
+    assert result.event.remediation.endswith(
+        "Under your own Default Job this is your host's limit recorded before the job's cap: stop the job,"
+        " then raise it."
+    )
+
+
+@pytest.mark.asyncio
 async def test_a_low_power_limit_names_each_gpu_measured_and_required(context_factory, read_records_mock) -> None:
     ctx = context_factory(state=_state(current_limit=105, default_limit=350))
 
