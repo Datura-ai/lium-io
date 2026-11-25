@@ -98,6 +98,43 @@ def _dump_measurements(measurements: list[GpuPowerMeasurement]) -> list[dict[str
 FILLER_INSPECT_TIMEOUT_SECONDS = 30
 
 
+def _limit_below_default_event(
+    ctx: Context,
+    check_id: str,
+    rejected: list[GpuPowerMeasurement],
+    measurements: list[GpuPowerMeasurement],
+    incomplete: list[GpuPowerMeasurement],
+    host_limit_rejected: bool,
+):
+    measured = "; ".join(
+        f"GPU {m.index}: {shown(m.power_limit, 0, failed_below=True)} W limit, "
+        f"default {m.power_default_limit:.0f} W "
+        f"({shown(m.power_limit / m.power_default_limit * 100, 0, failed_below=True)}%)"
+        for m in rejected
+    )
+    own_job_remediation = (
+        " Under your own Default Job this is your host's limit recorded before the job's cap: stop the job,"
+        " then raise it."
+        if host_limit_rejected
+        else ""
+    )
+    return render_message(
+        Msg.LIMIT_BELOW_DEFAULT,
+        ctx=ctx,
+        check_id=check_id,
+        remediation=(
+            f"{measured}. {Msg.LIMIT_BELOW_DEFAULT.remediation} Restore it with "
+            f"`sudo nvidia-smi -i <GPU> -pl <default W>`.{own_job_remediation}"
+        ),
+        what={
+            "threshold": MIN_POWER_LIMIT_RATIO,
+            "rejected_gpus": _dump_measurements(rejected),
+            "measurements": _dump_measurements(measurements),
+            "incomplete_gpus": _dump_measurements(incomplete),
+        },
+    )
+
+
 async def _restore_records_of_this_executor(ctx: Context, gpu_uuids: list[str]) -> list[GpuPowerRestoreRecord]:
     """This executor's restore records for these GPUs (the host's own limits under our cap)."""
     read_result = await read_gpu_power_restore_records(ctx.services.redis, gpu_uuids, log_extra=ctx.default_extra)
@@ -227,36 +264,11 @@ class GpuPowerLimitCheck:
             )
             if stale_cap_event is not None:
                 return CheckResult(passed=True, event=stale_cap_event)
-            measured = "; ".join(
-                f"GPU {m.index}: {shown(m.power_limit, 0, failed_below=True)} W limit, "
-                f"default {m.power_default_limit:.0f} W "
-                f"({shown(m.power_limit / m.power_default_limit * 100, 0, failed_below=True)}%)"
-                for m in rejected
-            )
-            under_own_job = (
-                " Under your own Default Job this is your host's limit recorded before the job's cap: stop the job,"
-                " then raise it."
-                if host_limit_rejected
-                else ""
-            )
-            event = render_message(
-                Msg.LIMIT_BELOW_DEFAULT,
-                ctx=ctx,
-                check_id=self.check_id,
-                remediation=(
-                    f"{measured}. {Msg.LIMIT_BELOW_DEFAULT.remediation} Restore it with "
-                    f"`sudo nvidia-smi -i <GPU> -pl <default W>`.{under_own_job}"
-                ),
-                what={
-                    "threshold": MIN_POWER_LIMIT_RATIO,
-                    "rejected_gpus": _dump_measurements(rejected),
-                    "measurements": _dump_measurements(measurements),
-                    "incomplete_gpus": _dump_measurements(incomplete),
-                },
-            )
             return CheckResult(
                 passed=False,
-                event=event,
+                event=_limit_below_default_event(
+                    ctx, self.check_id, rejected, measurements, incomplete, host_limit_rejected
+                ),
                 updates={
                     "score": 0.0,
                     "job_score": 0.0,
