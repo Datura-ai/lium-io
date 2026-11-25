@@ -73,10 +73,10 @@ class NodeAccountCheck:
         if executor.expected_node_hotkeys:
             binding_proven = False
             if ctx.runner is not None:
-                refused = await self._other_account(ctx, what)
-                if isinstance(refused, CheckResult):
-                    return refused
-                binding_proven = refused
+                binding_outcome = await self._other_account(ctx, what)
+                if isinstance(binding_outcome, CheckResult):
+                    return binding_outcome
+                binding_proven = binding_outcome
         # DAH-6784: the parts this pass proved; a part whose input is missing (no recorded host key, no hotkeys listed,
         # host files unread) is not proven, so a hold that part left stays. Both proven: the whole check too.
         proven = (HOST_KEY_PART,) * bool(expected) + (BINDING_PART,) * (binding_proven is True)

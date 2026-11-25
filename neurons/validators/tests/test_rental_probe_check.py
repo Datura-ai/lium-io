@@ -657,7 +657,13 @@ async def test_a_probe_that_clears_a_standing_failure_in_a_cycle_without_verifyx
         result = await RentalProbeCheck().run(ctx)
     assert result.passed is False and result.event.reason_code == Msg.CYCLE_WITHOUT_VERIFYX.reason
     assert "clear_verified_job_info" not in result.updates
-    assert redis.standing_failure() is None and redis.stamped()
+    # the dropped pass is not stamped, so the next cycle (VerifyX runs) probes in full instead of waiting an interval
+    assert redis.standing_failure() is None and not redis.stamped()
+    ctx, docker, _ = make_probe_context(redis=redis)
+    with probe_settings(), renter_path():
+        result = await RentalProbeCheck().run(ctx)
+    assert result.passed is True and result.event.reason_code == Msg.PROBE_OK.reason
+    assert result.updates.get("idle_check_passed") is True and redis.stamped()
 
 
 @pytest.mark.asyncio
@@ -670,7 +676,7 @@ async def test_a_probe_that_clears_a_standing_failure_in_a_cycle_without_the_all
     with probe_settings(), renter_path():
         result = await RentalProbeCheck().run(ctx)
     assert result.passed is False and result.event.reason_code == Msg.CYCLE_WITHOUT_ALLCARDS.reason
-    assert redis.standing_failure() is None and redis.stamped()
+    assert redis.standing_failure() is None and not redis.stamped()   # the dropped pass is not stamped
 
 
 @pytest.mark.asyncio
