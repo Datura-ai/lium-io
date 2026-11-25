@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -338,3 +339,18 @@ async def test_a_dmi_change_stays_a_finding_when_the_session_drops_while_the_new
     assert not reconnect.called
     assert Msg.SPOOFED.reason in [e.reason_code for e in events]
     assert after.hardware_identity_passed is False
+
+
+@pytest.mark.asyncio
+async def test_a_short_host_list_stands_and_the_host_is_not_read_again(context_factory, monkeypatch):
+    # DAH-7076 review: the cycle's list is already the host's; a later fuller read must not override it
+    ctx = _container_with_one_of_two_cards(context_factory, monkeypatch, host_uuids=["GPU-a", "GPU-b"])
+    ctx = ctx.model_copy(update={"state": replace(ctx.state, kernel_gpu_view_source="host_pid1_root")})
+
+    async def no_second_read(ssh, *, host_view=False):
+        raise AssertionError("the host list is read once per cycle")
+
+    monkeypatch.setattr(hardware_identity, "read_kernel_gpu_view", no_second_read)
+    result = await _run(ctx)
+    assert result.passed is False
+    assert result.event.what_we_saw["findings"] == ["gpu_sources_disagree"]

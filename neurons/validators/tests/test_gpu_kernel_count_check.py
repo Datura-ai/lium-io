@@ -860,3 +860,17 @@ async def test_an_unattachable_card_marks_its_own_score_flag(context_factory, ch
     result = await GpuKernelCountCheck().run(ctx)
 
     assert result.updates == {"gpu_kernel_count_passed": False, "gpu_kernel_unattachable": True}
+
+
+@pytest.mark.asyncio
+async def test_a_short_host_list_stands_and_the_host_is_not_read_again(context_factory, check_enabled):
+    # DAH-7076 review: one host inventory per cycle; a later read listing every card must not override it
+    ctx = _ctx(context_factory, reported=REAL[:2], kernel=REAL[:1], host=_host_stdout(REAL[:2]))
+    ctx = ctx.model_copy(update={"state": replace(ctx.state, kernel_gpu_view_source="host_pid1_root")})
+
+    result = await GpuKernelCountCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.what_we_saw["kernel_verdict"] == "count_lower"
+    assert result.event.what_we_saw["kernel_view_source"] == "host_pid1_root"
+    ctx.ssh.run.assert_not_awaited()

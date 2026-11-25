@@ -238,7 +238,8 @@ class GpuKernelCountCheck:
             kernel_uuids=kernel_uuids,
         ).as_fields()
         kernel_check_fields["kernel_view_source"] = source
-        if kernel_check_fields["kernel_verdict"] == "count_lower":
+        # a short list from the host stands: one host inventory per cycle, a later read never overrides it
+        if kernel_check_fields["kernel_verdict"] == "count_lower" and source != KERNEL_VIEW_SOURCE_HOST:
             kernel_check_fields["container_kernel_gpu_count"] = kernel_check_fields[
                 "kernel_gpu_count"
             ]
