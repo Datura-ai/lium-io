@@ -93,6 +93,7 @@ from .checks import (
     DockerCpuCheck,
     NeedrestartGuardCheck,
     SysboxLayerResetCheck,
+    HostPidMaxCheck,
     PidHostRequiredCheck,
     SysboxRequiredCheck,
     TdxHostCheck,
@@ -423,6 +424,10 @@ class PipelineFactory:
                 # instance so cadence state persists across `build_checks()`
                 # calls.
                 _CUSTOM_BUILD_ORPHAN_SWEEP_SINGLETON,
+                # DAH-7041: the create refuses every rental on a host with an unusable kernel.pid_max; not listed then.
+                # Fatal, so it runs after the stale container cleanup and every non-fatal check above: a halt here
+                # must not leave an ended rental's container running on the host or skip one of them
+                HostPidMaxCheck(),
                 PortConnectivityCheck(),
                 PortCountCheck(),
                 # Before the rented short-circuit; it leaves a rented node alone itself (no pull beside a
@@ -585,6 +590,8 @@ class PipelineFactory:
                 _STALE_CONTAINER_CLEANUP_SINGLETON,
                 ProviderSideLoadCheck(),
                 _CUSTOM_BUILD_ORPHAN_SWEEP_SINGLETON,
+                # DAH-7041: same place as in build_checks(), after the stale container cleanup
+                HostPidMaxCheck(),
                 ExecutorImageCheck(),
                 InspectorRentedCheck(),
                 RentedPodResourcesCheck(),
@@ -672,6 +679,8 @@ class PipelineFactory:
                 SplitDiskCheck(),
                 # DAH-3484: before the rented halt, same as build_checks().
                 TdxHostCheck(),
+                # DAH-7041: one read-only cat; the dry run has no stale container cleanup to run first
+                HostPidMaxCheck(),
                 GpuCountCheck(),
                 GpuModelValidCheck(),
                 GpuVramPrecheck(),
