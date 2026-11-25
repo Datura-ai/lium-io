@@ -242,8 +242,8 @@ from services.rental_docker_sdk import (
 from services.ssh_connect_timing import connect_with_phase_timing
 from services.storage_operations import (
     REMOTE_OPERATION_DIRECTORY,
-    WIPE_LOCK_HOLDER,
     forget_storage_helper,
+    wipe_token,
     release_storage_volume_lock,
     take_storage_volume_lock,
     note_started_storage_helper,
@@ -14724,10 +14724,12 @@ class DockerService:
         # its files are unlinked first (_wipe_volume_cmd). Never fatal: a failure leaves the delete
         # as it always was.
         fields = dict(container_name=payload.container_name, local_volume=payload.local_volume, stage=stage)
-        # DAH-7077: a backup or restore dispatched on the volume holds it until its spec is on the executor;
-        # the command's spec check covers it from there. Taken here, a dispatch arriving now is refused.
+        # DAH-7077: a backup or restore dispatched on the volume holds it until its marker is on the executor;
+        # the command's marker check covers it from there. The wipe's own token, taken only when no dispatch
+        # holds the volume, refuses every dispatch from now on.
+        token = wipe_token(payload.container_name)
         try:
-            locked = await take_storage_volume_lock(self.redis_service, payload.local_volume, WIPE_LOCK_HOLDER)
+            locked = await take_storage_volume_lock(self.redis_service, payload.local_volume, token, exclusive=True)
         except Exception as exc:  # noqa: BLE001
             log.warning("Skipped the volume wipe: its storage lock could not be read", error=f"{type(exc).__name__}: {exc}", **fields)
             return
@@ -14741,7 +14743,7 @@ class DockerService:
             if not wiped:
                 # the volume keeps its files: a backup may start on it again
                 try:
-                    await release_storage_volume_lock(self.redis_service, payload.local_volume, WIPE_LOCK_HOLDER)
+                    await release_storage_volume_lock(self.redis_service, payload.local_volume, token)
                 except Exception as exc:  # noqa: BLE001 -- never fatal; the lock's TTL ends it
                     log.warning("Releasing the volume's storage lock failed", error=f"{type(exc).__name__}: {exc}", **fields)
 

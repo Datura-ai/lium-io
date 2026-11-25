@@ -5,8 +5,8 @@ from uuid import uuid4
 import pytest
 
 from services.storage_operations import (
-    WIPE_LOCK_HOLDER,
     StorageVolumeBeingWiped,
+    wipe_token,
     release_storage_volume_lock,
     storage_dispatch_holds_volume,
     take_storage_volume_lock,
@@ -14,22 +14,24 @@ from services.storage_operations import (
 
 
 class VolumeLockRedis:
-    """The three RedisService calls the volume lock makes, in memory."""
+    """RedisService's two volume-hold calls, in memory, with the Lua script's rules."""
 
     def __init__(self):
-        self.values: dict[str, str] = {}
+        self.holders: dict[str, set[str]] = {}
 
-    async def set_if_absent(self, key, value, ex):
-        if key in self.values:
+    async def add_volume_hold(self, key, token, exclusive, ex):
+        holders = self.holders.setdefault(key, set())
+        if any(h != token and (exclusive or h.startswith("wipe:")) for h in holders):
             return False
-        self.values[key] = value
+        holders.add(token)
         return True
 
-    async def get(self, key):
-        return self.values.get(key)
+    async def remove_volume_hold(self, key, token):
+        self.holders.get(key, set()).discard(token)
 
-    async def delete(self, key):
-        self.values.pop(key, None)
+
+async def _wipe(redis, volume):
+    return await take_storage_volume_lock(redis, volume, wipe_token("pod_" + volume), exclusive=True)
 
 
 @pytest.mark.asyncio
@@ -37,16 +39,17 @@ async def test_a_dispatch_holds_the_volume_against_the_wipe_until_its_block_ends
     redis = VolumeLockRedis()
 
     async with storage_dispatch_holds_volume(redis, "volume_a", "op-1"):
-        assert not await take_storage_volume_lock(redis, "volume_a", WIPE_LOCK_HOLDER)
-        assert await take_storage_volume_lock(redis, "volume_b", WIPE_LOCK_HOLDER)
+        assert not await _wipe(redis, "volume_a")
+        assert not await _wipe(redis, "volume_a")  # a refused wipe left no token behind
+        assert await _wipe(redis, "volume_b")
 
-    assert await take_storage_volume_lock(redis, "volume_a", WIPE_LOCK_HOLDER)
+    assert await _wipe(redis, "volume_a")
 
 
 @pytest.mark.asyncio
 async def test_a_dispatch_is_refused_while_the_wipe_holds_the_volume():
     redis = VolumeLockRedis()
-    await take_storage_volume_lock(redis, "volume_a", WIPE_LOCK_HOLDER)
+    await _wipe(redis, "volume_a")
 
     with pytest.raises(StorageVolumeBeingWiped):
         async with storage_dispatch_holds_volume(redis, "volume_a", "op-1"):
@@ -54,38 +57,49 @@ async def test_a_dispatch_is_refused_while_the_wipe_holds_the_volume():
 
 
 @pytest.mark.asyncio
-async def test_a_repeated_dispatch_of_the_same_operation_keeps_its_hold():
+async def test_a_release_drops_only_its_own_token():
     redis = VolumeLockRedis()
-    await take_storage_volume_lock(redis, "volume_a", "operation:op-1")
+    wipe = wipe_token("pod_a")
+    assert await take_storage_volume_lock(redis, "volume_a", wipe, exclusive=True)
 
-    async with storage_dispatch_holds_volume(redis, "volume_a", "op-1"):
-        pass
+    await release_storage_volume_lock(redis, "volume_a", wipe_token("pod_other"))
 
-    # the release is by holder: another holder's lock is never dropped
-    await take_storage_volume_lock(redis, "volume_a", "operation:op-2")
-    await release_storage_volume_lock(redis, "volume_a", WIPE_LOCK_HOLDER)
-    assert list(redis.values.values()) == ["operation:op-2"]
+    assert redis.holders["storage_volume_holders:volume_a"] == {wipe}
 
 
 @pytest.mark.asyncio
-async def test_concurrent_retries_of_one_operation_never_drop_the_survivors_hold():
-    import asyncio
+async def test_a_failed_attempt_of_one_operation_never_drops_another_attempts_hold():
+    # Pixel's review: two attempts of one operation, one fails and releases, the other still holds
     redis = VolumeLockRedis()
     op = uuid4()
-    first_in = asyncio.Event()
 
-    async def failing_retry():
+    async with storage_dispatch_holds_volume(redis, "vol", op):
         with pytest.raises(RuntimeError):
             async with storage_dispatch_holds_volume(redis, "vol", op):
-                first_in.set()
-                await asyncio.sleep(0)
                 raise RuntimeError("ssh failed")
+        assert not await _wipe(redis, "vol")
 
-    async def surviving_retry():
-        await first_in.wait()
-        async with storage_dispatch_holds_volume(redis, "vol", op):
-            for _ in range(5):
-                await asyncio.sleep(0)  # let the failing retry finish and release
-            assert not await take_storage_volume_lock(redis, "vol", WIPE_LOCK_HOLDER)
+    assert await _wipe(redis, "vol")
 
-    await asyncio.gather(failing_retry(), surviving_retry())
+
+@pytest.mark.asyncio
+async def test_the_redis_script_keeps_each_attempts_hold_and_lets_a_wipe_in_only_alone():
+    fakeredis = pytest.importorskip("fakeredis")
+    pytest.importorskip("lupa")  # fakeredis runs the Lua through lupa
+    from services.redis_service import RedisService
+
+    service = RedisService.__new__(RedisService)
+    service.redis = fakeredis.FakeAsyncRedis()
+    op = uuid4()
+
+    async with storage_dispatch_holds_volume(service, "vol", op):
+        with pytest.raises(RuntimeError):
+            async with storage_dispatch_holds_volume(service, "vol", op):
+                raise RuntimeError("ssh failed")
+        assert not await _wipe(service, "vol")
+
+    assert await _wipe(service, "vol")
+    assert 0 < await service.redis.ttl("storage_volume_holders:vol") <= 3600
+    with pytest.raises(StorageVolumeBeingWiped):
+        async with storage_dispatch_holds_volume(service, "vol", uuid4()):
+            pass

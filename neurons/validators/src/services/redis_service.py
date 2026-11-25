@@ -237,6 +237,18 @@ EXECUTOR_CREATE_LOCK_TIMEOUT = 360  # TTL (seconds)
 EXECUTOR_CREATE_LOCK_BLOCKING_TIMEOUT = 360  # a renter's create waits at most this long
 
 
+# DAH-7077: one Redis set of holder tokens per volume; a wipe's token starts with "wipe:" and holds it alone
+_ADD_VOLUME_HOLD = """
+local holders = redis.call('SMEMBERS', KEYS[1])
+for _, holder in ipairs(holders) do
+  if holder ~= ARGV[1] and (ARGV[2] == '1' or string.sub(holder, 1, 5) == 'wipe:') then return 0 end
+end
+redis.call('SADD', KEYS[1], ARGV[1])
+redis.call('EXPIRE', KEYS[1], ARGV[3])
+return 1
+"""
+
+
 def _executor_create_lock_key(executor_id: str) -> str:
     return f"lock:executor-create:{executor_id}"
 
@@ -891,9 +903,14 @@ class RedisService:
         """Set a key-value pair in Redis; `ex` is the key's lifetime in seconds (none = no expiry)."""
         await self.redis.set(key, value, ex=ex)
 
-    async def set_if_absent(self, key: str, value: str, ex: int) -> bool:
-        """SET NX with a lifetime: True when this call created the key."""
-        return bool(await self.redis.set(key, value, ex=ex, nx=True))
+    async def add_volume_hold(self, key: str, token: str, exclusive: bool, ex: int) -> bool:
+        """Adds `token` to the volume's holder set in one atomic step and returns True, unless another token
+        that is a wipe holds it, or `exclusive` is asked and any other token holds it."""
+        return bool(await self.redis.eval(_ADD_VOLUME_HOLD, 1, key, token, "1" if exclusive else "0", ex))
+
+    async def remove_volume_hold(self, key: str, token: str) -> None:
+        """Drops only this token: the other holders keep the volume."""
+        await self.redis.srem(key, token)
 
     async def get(self, key: str):
         """Get a value by key from Redis."""

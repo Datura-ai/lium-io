@@ -5,7 +5,6 @@ import json
 import logging
 import shlex
 import time
-import weakref
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -42,9 +41,8 @@ _STARTED_STORAGE_HELPERS_REDIS_TIMEOUT_SEC = 2
 # DAH-7077: one lock per volume between a storage dispatch and the delete's wipe. A dispatch holds it until its
 # spec is on the executor (the wipe's own spec check covers the run from there); a wipe that ran keeps it, as
 # the volume is going away. The TTL only clears a holder that died.
-STORAGE_VOLUME_LOCK_PREFIX = "storage_volume_lock:"
+STORAGE_VOLUME_LOCK_PREFIX = "storage_volume_holders:"
 STORAGE_VOLUME_LOCK_TTL_SECONDS = 3600
-WIPE_LOCK_HOLDER = "wipe"
 
 
 def storage_helper_name(operation_id: UUID | str) -> str:
@@ -82,20 +80,20 @@ def _volume_lock_key(volume: str) -> str:
     return f"{STORAGE_VOLUME_LOCK_PREFIX}{volume}"
 
 
-async def take_storage_volume_lock(redis: RedisService, volume: str, holder: str) -> bool:
-    """True when `holder` now holds the volume (also when it already did: a repeated dispatch)."""
-    key = _volume_lock_key(volume)
-    if await redis.set_if_absent(key, holder, STORAGE_VOLUME_LOCK_TTL_SECONDS):
-        return True
-    current = await redis.get(key)
-    return (current.decode() if isinstance(current, bytes) else current) == holder
+def wipe_token(container_name: str) -> str:
+    """One token per pod's delete: its second wipe (before the kill) runs under the hold its first one kept."""
+    return f"wipe:{container_name}"
 
 
-async def release_storage_volume_lock(redis: RedisService, volume: str, holder: str) -> None:
-    key = _volume_lock_key(volume)
-    current = await redis.get(key)
-    if (current.decode() if isinstance(current, bytes) else current) == holder:
-        await redis.delete(key)
+async def take_storage_volume_lock(redis: RedisService, volume: str, token: str, *, exclusive: bool) -> bool:
+    """True when `token` now holds the volume. Every acquire brings its own token, so one attempt's release can
+    never drop another's hold; a wipe (`exclusive`) holds it only when nothing else does, and refuses every
+    dispatch while it does."""
+    return await redis.add_volume_hold(_volume_lock_key(volume), token, exclusive, STORAGE_VOLUME_LOCK_TTL_SECONDS)
+
+
+async def release_storage_volume_lock(redis: RedisService, volume: str, token: str) -> None:
+    await redis.remove_volume_hold(_volume_lock_key(volume), token)
 
 
 @asynccontextmanager
@@ -106,21 +104,14 @@ async def storage_dispatch_holds_volume(
     if not volume:
         yield
         return
-    holder = f"operation:{operation_id}"
-    # retries of one operation share the holder: serialized, so one retry's release never drops the
-    # hold another retry still needs before its marker exists (review, Pixel)
-    serial = _operation_dispatch_locks.setdefault(holder, asyncio.Lock())
-    async with serial:
-        if not await take_storage_volume_lock(redis, volume, holder):
-            raise StorageVolumeBeingWiped(f"the pod is being deleted; volume {volume} is being wiped")
-        try:
-            yield
-        finally:
-            await release_storage_volume_lock(redis, volume, holder)
-
-
-# shortcut: per validator process; retries of one operation reach the same process (one validator per hotkey)
-_operation_dispatch_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
+    # each attempt its own token: a failed retry releases only itself (review, Pixel)
+    token = f"operation:{operation_id}:{uuid4().hex}"
+    if not await take_storage_volume_lock(redis, volume, token, exclusive=False):
+        raise StorageVolumeBeingWiped(f"the pod is being deleted; volume {volume} is being wiped")
+    try:
+        yield
+    finally:
+        await release_storage_volume_lock(redis, volume, token)
 
 
 def _key(executor_id: str) -> str:

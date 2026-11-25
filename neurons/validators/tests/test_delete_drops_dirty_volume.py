@@ -106,7 +106,7 @@ def _wire_delete(docker_service, monkeypatch, ssh_answers) -> list:
     docker_service.ssh_service.decrypt_payload = Mock(return_value="private-key")
     docker_service.redis_service.remove_rented_machine = AsyncMock()
     lock_redis = VolumeLockRedis()
-    for call in ("set_if_absent", "get", "delete"):
+    for call in ("add_volume_hold", "remove_volume_hold"):
         setattr(docker_service.redis_service, call, getattr(lock_redis, call))
     monkeypatch.setattr(settings, "POD_VOLUME_WIPE_BEFORE_STOP_ENABLED", True)
     return order
@@ -565,7 +565,7 @@ async def test_delete_answers_in_progress_until_the_kept_edit_containers_are_rem
 @pytest.mark.asyncio
 async def test_delete_skips_the_wipe_while_a_backup_dispatch_holds_the_volume(docker_service, monkeypatch):
     order = _wire_delete(docker_service, monkeypatch, _host_answers())
-    lock_redis = docker_service.redis_service.set_if_absent.__self__
+    lock_redis = docker_service.redis_service.add_volume_hold.__self__
     payload = _delete_payload()
 
     async with storage_dispatch_holds_volume(lock_redis, payload.local_volume, uuid4()):
@@ -589,7 +589,7 @@ async def test_a_wipe_that_ran_keeps_the_volume_from_any_later_backup(
     docker_service, monkeypatch, ssh_answers, dispatch_refused
 ):
     _wire_delete(docker_service, monkeypatch, ssh_answers)
-    lock_redis = docker_service.redis_service.set_if_absent.__self__
+    lock_redis = docker_service.redis_service.add_volume_hold.__self__
     payload = _delete_payload()
 
     await _delete(docker_service, payload)
@@ -615,7 +615,7 @@ async def test_a_failed_lock_release_never_fails_the_delete(docker_service, monk
     async def broken_delete(*args, **kwargs):
         raise ConnectionError("redis down")
 
-    monkeypatch.setattr(docker_service.redis_service, "delete", broken_delete)
+    monkeypatch.setattr(docker_service.redis_service, "remove_volume_hold", broken_delete)
     payload = _delete_payload()
 
     result = await _delete(docker_service, payload)
