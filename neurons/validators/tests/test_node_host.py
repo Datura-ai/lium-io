@@ -221,8 +221,10 @@ async def test_http_request_to_a_name_with_a_private_address_is_never_sent(monke
 
     # Act / Assert
     async with aiohttp.ClientSession(connector=public_host_connector()) as session:
-        with pytest.raises(aiohttp.ClientConnectorError):
+        with pytest.raises(aiohttp.ClientConnectorError) as refused:
             await session.get("http://gpu-node1.example.net:8080/")
+    # a caller that retries failed connects tells this lasting refusal apart from a passing DNS failure
+    assert isinstance(refused.value.os_error, node_host.NonPublicAddressError)
 
 
 async def _local_server(hits: list, redirect_to: str | None = None) -> tuple[web.AppRunner, int]:

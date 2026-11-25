@@ -4,6 +4,8 @@ import asyncio
 import uuid
 from dataclasses import replace
 
+from services import executor_payload
+
 from ..messages import UploadFilesMessages as Msg, render_message
 from ..pipeline import CheckResult, Context
 
@@ -18,11 +20,12 @@ class UploadFailed(Exception):
 async def upload_validation_files_to_fresh_remote_dir(ctx: Context, *, attempts: int = MAX_RETRIES) -> str:
     # copy the local validation assets into a fresh random directory on the executor, and name it
     local_dir = ctx.state.upload_local_dir
-    executor_root = ctx.config.executor_root
-    if not local_dir or not executor_root:
-        raise UploadFailed(f"missing upload config: local_dir={local_dir}, executor_root={executor_root}")
+    if not local_dir:
+        raise UploadFailed(f"missing upload config: local_dir={local_dir}")
 
-    remote_dir = f"{executor_root.rstrip('/')}/{uuid.uuid4().hex}"
+    # a validator-chosen place, never one the executor reported; the executor's disk reserve backs it and sweeps
+    # old <32 hex> upload directories there (setup_disk_reserve.sh)
+    remote_dir = f"{executor_payload.SERVICE_DIR_PARENT}/{uuid.uuid4().hex}"
     last_exc: Exception | None = None
 
     for attempt in range(1, attempts + 1):
@@ -61,21 +64,17 @@ class UploadFilesCheck:
                 Msg.UPLOAD_SKIPPED,
                 ctx=ctx,
                 check_id=self.check_id,
-                what={"python_path": ctx.executor.python_path},
+                what={"python_path": executor_payload.EXECUTOR_PYTHON},
             )
             return CheckResult(passed=True, event=event)
 
         local_dir = ctx.state.upload_local_dir
-        executor_root = ctx.config.executor_root
-        if not local_dir or not executor_root:
+        if not local_dir:
             event = render_message(
                 Msg.CONFIG_MISSING,
                 ctx=ctx,
                 check_id=self.check_id,
-                what={
-                    "local_dir": local_dir,
-                    "executor_root": executor_root,
-                },
+                what={"local_dir": local_dir},
             )
             return CheckResult(passed=False, event=event)
 

@@ -39,6 +39,12 @@ READ_NODE_ACCOUNT_COMMAND = (
 )
 READ_TIMEOUT_SECONDS = 15
 
+# DAH-6784: the two parts of this check, each its own id in a reset's evidence and in a pass's idle_checks_passed. The
+# backend lifts a hold once a pass lists the id the reset named, so a hold one part left lifts only on proof of that part.
+CHECK_ID = "executor.validate.node_account"
+HOST_KEY_PART = f"{CHECK_ID}.host_key"
+BINDING_PART = f"{CHECK_ID}.account_binding"
+
 _logged_without_expected: set[str] = set()
 
 
@@ -51,7 +57,7 @@ def presented_host_key(ctx: Context) -> str:
 
 
 class NodeAccountCheck:
-    check_id = "executor.validate.node_account"
+    check_id = CHECK_ID
     replays_after_session_drop = True
     fatal = True
 
@@ -62,11 +68,19 @@ class NodeAccountCheck:
         expected = registered_host_keys(executor)
         # compared first: it needs no read, so a stalled account read cannot hide this direct evidence
         if expected and presented_host_key(ctx) not in expected:
-            return _refused(ctx, self.check_id, Msg.MISMATCH, what)
-        if executor.expected_node_hotkeys and ctx.runner is not None:
-            refused = await self._other_account(ctx, what)
-            if refused is not None:
-                return refused
+            return _refused(ctx, self.check_id, Msg.MISMATCH, what, HOST_KEY_PART)
+        binding_proven: bool | None = None  # None: the node names no account to bind it to
+        if executor.expected_node_hotkeys:
+            binding_proven = False
+            if ctx.runner is not None:
+                binding_outcome = await self._other_account(ctx, what)
+                if isinstance(binding_outcome, CheckResult):
+                    return binding_outcome
+                binding_proven = binding_outcome
+        # DAH-6784: the parts this pass proved; a part whose input is missing (no recorded host key, no hotkeys listed,
+        # host files unread) is not proven, so a hold that part left stays. Both proven: the whole check too.
+        proven = (HOST_KEY_PART,) * bool(expected) + (BINDING_PART,) * (binding_proven is True)
+        full = {"idle_check_passed": proven + (CHECK_ID,) * (len(proven) == 2)} if proven else {}
         if not expected:
             if not is_ip_literal(executor.address) and executor.uuid not in _logged_without_expected:
                 _logged_without_expected.add(executor.uuid)
@@ -76,12 +90,17 @@ class NodeAccountCheck:
                         extra=get_extra_info({**what, "miner_hotkey": ctx.miner_hotkey}),
                     )
                 )
-            return CheckResult(passed=True, event=render_message(Msg.SKIPPED, ctx=ctx, check_id=self.check_id, what=what))
+            return CheckResult(
+                passed=True, event=render_message(Msg.SKIPPED, ctx=ctx, check_id=self.check_id, what=what), updates=full
+            )
 
-        return CheckResult(passed=True, event=render_message(Msg.MATCH, ctx=ctx, check_id=self.check_id, what=what))
+        return CheckResult(
+            passed=True, event=render_message(Msg.MATCH, ctx=ctx, check_id=self.check_id, what=what), updates=full
+        )
 
-    async def _other_account(self, ctx: Context, what: dict) -> CheckResult | None:
-        """MISMATCH when the machine reached is set up for another account than the one listing it, else None."""
+    async def _other_account(self, ctx: Context, what: dict) -> CheckResult | bool:
+        """MISMATCH when the machine reached is set up for another account than the one listing it; else whether the
+        binding was read and proven (False: an older executor without host files, or an unread claim)."""
         executor = ctx.executor
         result = await ctx.runner.run(READ_NODE_ACCOUNT_COMMAND, timeout=READ_TIMEOUT_SECONDS, retryable=True)
         found = dict(line.split("=", 1) for line in (result.stdout or "").splitlines() if "=" in line)
@@ -92,11 +111,11 @@ class NodeAccountCheck:
             # failed, timed out or closed without an exit status: a relay could stall it on purpose, so ownership is
             # not proven and the node is hidden until a cycle reads it
             what["read_error"] = result.error_type or f"exit {result.exit_code}"
-            return _refused(ctx, self.check_id, Msg.BINDING_UNVERIFIED, what)
+            return _refused(ctx, self.check_id, Msg.BINDING_UNVERIFIED, what, BINDING_PART)
         if not hotkey:
             # the read worked and found no host files: an older executor, no evidence either way
             logger.info(_m("NODE_ACCOUNT_BINDING_UNVERIFIED", extra=get_extra_info({**what, "unread": "hotkey"})))
-            return None
+            return False
         if hotkey not in executor.expected_node_hotkeys and hotkey not in portal_owner_hotkeys(ctx.miner_hotkey):
             # DAH-6740: the listing owner's other accounts, as this validator read them from the portal itself; the
             # list a miner relays is never widened
@@ -106,13 +125,17 @@ class NodeAccountCheck:
             # account's own hotkey needs none
             what["binding_mismatch"] = "claim"
         else:
-            if expected_claim and hotkey == ctx.miner_hotkey and not claim:
-                logger.info(_m("NODE_ACCOUNT_BINDING_UNVERIFIED", extra=get_extra_info({**what, "unread": "claim"})))
-            return None
-        return _refused(ctx, self.check_id, Msg.BINDING_MISMATCH, what)
+            # a pool-key node is bound to this account only by a claim that matches the one expected: without either
+            # side of that comparison nothing is proven (no refusal either)
+            if hotkey == ctx.miner_hotkey and not (expected_claim and claim):
+                unread = "claim" if expected_claim else "expected_claim"
+                logger.info(_m("NODE_ACCOUNT_BINDING_UNVERIFIED", extra=get_extra_info({**what, "unread": unread})))
+                return False
+            return True
+        return _refused(ctx, self.check_id, Msg.BINDING_MISMATCH, what, BINDING_PART)
 
 
-def _refused(ctx: Context, check_id: str, template, what: dict) -> CheckResult:
+def _refused(ctx: Context, check_id: str, template, what: dict, part: str) -> CheckResult:
     """Like GPU_MODEL_MISMATCH: an availability entry, so the backend hides the node and refuses new rentals on its
     free GPUs too (the node stays active), and score 0. With a live rental the renter's pod runs on and is billed as
     usual: the verified job is kept and the run is not fatal, because clearing it resets the node inactive in the
@@ -124,6 +147,14 @@ def _refused(ctx: Context, check_id: str, template, what: dict) -> CheckResult:
     return CheckResult(
         passed=False,
         event=event,
-        updates={"node_account_passed": False, "clear_verified_job_info": True},
+        updates={
+            "node_account_passed": False,
+            "clear_verified_job_info": True,
+            # the part that failed, so only a pass that proves that part lifts the hold this reset may leave
+            "clear_verified_job_evidence": {"check_id": part},
+            # has_live_rental reads a snapshot: a rental placed since must not be ended, so the backend applies this
+            # reset only while no customer pod runs on the node, under its row lock
+            "clear_verified_job_unrented_only": True,
+        },
         fatal=True,
     )
