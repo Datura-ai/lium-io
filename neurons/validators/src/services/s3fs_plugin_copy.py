@@ -11,17 +11,18 @@ made by validation or, on a node that has none yet, by the first Volume rental; 
 import shlex
 
 # The pinned build, fetched by digest over the registry API: the manifest, the plugin config and every layer are
-# checked against their sha256 as they arrive, so nothing but this build can become the copy. v2.0.9 is the build
-# `latest` has carried since Dec 2021. Nothing here reads dockerd's own plugin store, whose layout is internal to
-# dockerd (lium-io#2345 review).
-S3FS_PLUGIN_REPOSITORY = "mochoa/s3fs-volume-plugin"
-S3FS_PLUGIN_TAG = "mochoa/s3fs-volume-plugin:v2.0.9"
-S3FS_PLUGIN_MANIFEST = "sha256:c3a12ea5bc1f86eb86e8b4890cfbda19a0c45be4678bf9008421b85c8d11daf9"
+# checked against their sha256 as they arrive, so nothing but this build can become the copy. It is our build of the
+# plugin (s3fs_volume_plugin/, published by .github/workflows/s3fs_volume_plugin.yml): the mochoa one carries s3fs 1.86,
+# whose retried requests go out unsigned. A republish of that tag needs these three digests updated with it. Nothing
+# here reads dockerd's own plugin store, whose layout is internal to dockerd (lium-io#2345 review).
+S3FS_PLUGIN_REPOSITORY = "daturaai/compute-subnet-validator"
+S3FS_PLUGIN_TAG = "daturaai/compute-subnet-validator:s3fs-volume-plugin"
+S3FS_PLUGIN_MANIFEST = "sha256:6c66443497c0e8c4258462b5ef1eae47b6b1da63d41c5ea969260c8dc5617867"
 # the uncompressed digest of its one layer (the config's rootfs.diff_ids), which `docker plugin inspect` also shows:
-# how a build installed through dockerd is checked to be the pinned one
-S3FS_PLUGIN_DIFF_ID = "sha256:adb3d068dfc915b2495c679c13681166bd0a333d3766a7393fd45294dd75bd48"
+# how an instance on the node is checked to be the pinned build
+S3FS_PLUGIN_DIFF_ID = "sha256:85fb3ced1a33e10ce889e49c26f25fc4df4ad3000fd8c55b9f192779ac305750"
 REGISTRY_URL = "https://registry-1.docker.io"
-# a 57 MB download, a 150 MB unpack and a create; the rent path waits for it on a node without the copy
+# a 54 MB download, its unpack and a create; the rent path waits for it on a node without the copy
 S3FS_PLUGIN_COMMAND_TIMEOUT_SECONDS = 300
 
 # Executed by the executor's Python against the host's dockerd. The executor has host PID access, so the
@@ -94,7 +95,8 @@ def download(endpoint, staging):
     for layer in found["layers"]:
         with open(staging + "/layer", "wb") as out:
             pinned(fetch(endpoint, blob + layer["digest"], tokens), layer["digest"], out)
-        unpacked = subprocess.run(["tar", "-xzf", staging + "/layer", "-C", staging + "/rootfs", "--numeric-owner"],
+        # tar detects the compression: the pinned layer is stored as a plain tar though the manifest labels it gzip
+        unpacked = subprocess.run(["tar", "-xf", staging + "/layer", "-C", staging + "/rootfs", "--numeric-owner"],
                                   capture_output=True, text=True)
         if unpacked.returncode:
             raise RuntimeError("unpacking the plugin files failed: " + tail(unpacked.stderr))

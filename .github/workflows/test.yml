@@ -267,6 +267,7 @@ jobs:
     timeout-minutes: 60
     permissions:
       contents: read
+      packages: write   # the GHCR layer cache (registry, E2E_CACHE_REF)
     strategy:
       fail-fast: false
       # protocol rides with cycle: it is 27 s, a runner of its own would only add a stack build
@@ -289,12 +290,18 @@ jobs:
           driver-opts: image=moby/buildkit:v0.33.1@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea
       - uses: crazy-max/ghaction-github-runtime@3cb05d89e1f492524af3d41a1c98c83bc3025124 # v3.1.0
         if: contains(fromJSON(needs.route.outputs.shards), matrix.shard)
+      - name: registry for the layer cache
+        if: contains(fromJSON(needs.route.outputs.shards), matrix.shard)
+        env:
+          TOKEN: ${{ github.token }}
+        run: echo "$TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
       - name: build, up, ${{ matrix.suites }}, logs, down — each step under a hard timeout (gate.sh)
         id: gate
         if: contains(fromJSON(needs.route.outputs.shards), matrix.shard)
         timeout-minutes: 55
         env:
-          E2E_CACHE: gha
+          E2E_CACHE: registry
+          E2E_CACHE_REF: ghcr.io/datura-ai/lium-io-e2e-cache
           SUITES: ${{ matrix.suites }}
         run: ./gate.sh
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

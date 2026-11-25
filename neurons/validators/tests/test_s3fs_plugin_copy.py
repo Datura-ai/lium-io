@@ -79,9 +79,9 @@ def _digest(data: bytes) -> str:
     return "sha256:" + hashlib.sha256(data).hexdigest()
 
 
-def _layer() -> bytes:
+def _layer(compressed: bool = True) -> bytes:
     raw = io.BytesIO()
-    with tarfile.open(fileobj=raw, mode="w:gz") as tar:
+    with tarfile.open(fileobj=raw, mode="w:gz" if compressed else "w") as tar:
         tini = tarfile.TarInfo("usr/bin/tini")
         tini.size, tini.mode = 4, 0o755
         tar.addfile(tini, io.BytesIO(b"tini"))
@@ -91,8 +91,8 @@ def _layer() -> bytes:
 class _Registry:
     """Docker Hub's token endpoint and registry API for one pinned plugin build, on localhost."""
 
-    def __init__(self):
-        layer = _layer()
+    def __init__(self, compressed: bool = True):
+        layer = _layer(compressed)
         self.manifest = json.dumps(
             {
                 "schemaVersion": 2,
@@ -148,8 +148,8 @@ class _Registry:
 
 
 @pytest.fixture
-def registry():
-    served = _Registry()
+def registry(request):
+    served = _Registry(getattr(request, "param", True))
     yield served
     served.server.shutdown()
 
@@ -199,6 +199,15 @@ def test_a_node_without_the_copy_downloads_once_and_every_volume_after_is_made_l
     assert not [path for path in node.base.iterdir() if path.name.startswith("instance-") or path.name.endswith(".tmp")]
     # nothing is installed through dockerd and nothing of dockerd's own plugin store is read
     assert not any(call[:2] == ["plugin", "install"] for call in state["calls"])
+
+
+@pytest.mark.parametrize("registry", [False], indirect=True)
+def test_a_layer_stored_as_a_plain_tar_is_unpacked_too(node, registry):
+    # the pinned build's layer is a plain tar though its manifest labels it gzip; dockerd accepts either, so must we
+    result, state = node("s3fs-celium-volume-one")
+
+    assert result.returncode == 0, result.stderr
+    assert state["plugins"]["s3fs-celium-volume-one"]["tini"] == "tini"
 
 
 def test_validation_stages_the_copy_and_the_rental_then_needs_no_registry(node, registry):

@@ -166,7 +166,7 @@ from services.image_flatten import (
     flatten_sized_mark_command,
     wait_for_node_flatten,
 )
-from services.s3fs_plugin_copy import s3fs_plugin_command
+from services.s3fs_plugin_copy import S3FS_PLUGIN_DIFF_ID, s3fs_plugin_command
 from services.loopback_plugin_setup import (
     LOOPBACK_PLUGIN_BUILDS,
     current_loopback_plugin_alias,
@@ -364,10 +364,9 @@ FILLER_STILL_RUNNING_EVENT = "FILLER_STILL_RUNNING"
 # image-managed Jupyter path is only safe while the mapped docker port is this one.
 IMAGE_JUPYTER_DOCKER_PORT = 8888
 
-DOCKER_VOLUME_PLUGINS = {
-    "s3fs": "mochoa/s3fs-volume-plugin"
-}
-
+# the s3fs volume plugin is our build (s3fs_volume_plugin/, .github/workflows/s3fs_volume_plugin.yml), pinned by digest in
+# services/s3fs_plugin_copy.py: the published mochoa/s3fs-volume-plugin carries s3fs 1.86, whose retried requests go out
+# unsigned, so S3 refuses a renter's read after a network blip and it fails with an I/O error
 
 
 LEGACY_S3FS_PLUGIN_ALIAS = "s3fs"
@@ -392,6 +391,17 @@ def _published_ports(
             for udp_port in cluster_udp_ports
         ),
     )
+
+
+def _s3fs_plugin_is_current(diff_ids: str) -> bool:
+    """Whether an instance's layers (`docker plugin inspect` .Config.Rootfs.DiffIds, as JSON) are the pinned build's.
+
+    By content, not name: an instance made from the node's copy (`docker plugin create`) carries its own alias as its
+    reference, an installed one the tag it was pulled by."""
+    try:
+        return json.loads(diff_ids) == [S3FS_PLUGIN_DIFF_ID]
+    except ValueError:
+        return False
 
 
 def _s3fs_plugin_alias(volume_name: str) -> str:
@@ -8177,6 +8187,11 @@ class DockerService:
         if sysbox_subuid_base is not None:
             mount_options = f"allow_other,umask=0000,uid={sysbox_subuid_base},gid={sysbox_subuid_base}"
 
+        stale = await self._remove_s3fs_plugin_of_another_build(ssh_client, plugin_alias, volume_info.name)
+        if stale is not None:
+            logger.warning(_m(f"s3fs_volume failed. {stale}", extra=get_extra_info({**log_extra})))
+            return False, stale
+
         setup_results: list[asyncssh.SSHCompletedProcess] = (
             await self._install_s3fs_plugin_instance(
                 ssh_client=ssh_client,
@@ -8242,6 +8257,41 @@ class DockerService:
             f"/usr/bin/docker plugin enable {plugin_alias}",
         ]
         return [install_result] + [await ssh_client.run(command) for command in commands]
+
+    async def _remove_s3fs_plugin_of_another_build(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        plugin_alias: str,
+        volume_name: str,
+    ) -> str | None:
+        """Remove this volume's plugin instance when it is of another build (the old s3fs 1.86 one), which the install
+        would only reconfigure ("already exists") and leave serving the rental. None when nothing of another build is
+        left; else why it stays, and the rental fails rather than run on it."""
+        installed = await ssh_client.run(
+            f"/usr/bin/docker plugin inspect --format '{{{{json .Config.Rootfs.DiffIds}}}}' {plugin_alias}"
+        )
+        layers = (installed.stdout or "").strip() if installed.exit_status == 0 else ""
+        if not layers or _s3fs_plugin_is_current(layers):
+            return None
+        # a container that references the volume, running or stopped (an edit/reboot parks the pod's one), keeps the
+        # instance in use: disabling it would leave that pod without its Volume, so the old build serves it until no
+        # container references the volume. An unreadable list counts as held
+        holders = await ssh_client.run(f"/usr/bin/docker ps -aq --filter volume={shlex.quote(volume_name)}")
+        if holders.exit_status != 0 or (holders.stdout or "").strip():
+            return None
+        # its volume handle keeps the instance in use, so `plugin rm` fails until the handle is gone; the data is in the
+        # bucket. Docker cannot remove a volume whose driver is disabled, so the instance is enabled first (a no-op
+        # error when it already is)
+        await ssh_client.run(f"/usr/bin/docker plugin enable {plugin_alias}")
+        await ssh_client.run(f"/usr/bin/docker volume rm {volume_name}")
+        await ssh_client.run(f"/usr/bin/docker plugin disable {plugin_alias} -f")
+        removed = await ssh_client.run(f"/usr/bin/docker plugin rm {plugin_alias}")
+        if removed.exit_status == 0:
+            return None
+        return (
+            f"the s3fs plugin instance {plugin_alias} of an older build (layers {layers}) could not be removed: "
+            f"{(removed.stderr or '').strip() or f'exit {removed.exit_status}'}"
+        )
 
     async def _drop_legacy_shared_s3fs_volume(
         self,

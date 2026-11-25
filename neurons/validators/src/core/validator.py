@@ -491,6 +491,8 @@ class Validator:
                         rollout_earlier_digests=tuple(filter(None, map(normalize_sha256_digest, earlier))),
                     )
 
+                wave_started_at = time.monotonic()
+                wave_cpu_started_at = time.process_time()
                 logger.info(
                     _m(
                         "[sync] Send jobs to miners",
@@ -927,6 +929,10 @@ class Validator:
                                     "failed_executors": incentive.failed_executors,
                                     "withheld_executors": len(withheld_results),
                                     "completed_cycles_since_start": self.completed_cycles_since_start,
+                                    "wave_duration_seconds": round(time.monotonic() - wave_started_at, 1),
+                                    "miners": len(miners),
+                                    "timed_out_miners": len(pending),
+                                    "wave_cpu_seconds": round(time.process_time() - wave_cpu_started_at, 1),
                                 }
                             ),
                         ),
