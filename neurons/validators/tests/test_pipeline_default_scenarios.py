@@ -116,11 +116,22 @@ class DummySFTPClient:
         pass
 
 
+NVML_535_104_05 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+
 class SimpleSSHResult:
     """Simple SSH result that is JSON serializable."""
 
-    def __init__(self, stdout: str = ""):
+    def __init__(self, stdout: str = "", exit_status: int = 0):
         self.stdout = stdout
+        self.exit_status = exit_status
+
+
+def _nvml_read(command: str):
+    """The node's answer to NvmlDigestCheck's own complete read of the library, else None."""
+    if "libnvidia-ml.so.1" in command:
+        return SimpleSSHResult(stdout=f"DIGEST {NVML_535_104_05} 1854672\n")
+    return None
 
 
 class DummySSHClient:
@@ -143,7 +154,7 @@ class DummySSHClient:
         # Docker container checks for rented machines
         if "docker ps" in command:
             return SimpleSSHResult(stdout="")  # Not rented
-        return SimpleSSHResult(stdout="")
+        return _nvml_read(command) or SimpleSSHResult(stdout="")
 
 
 class DummySSHService:
@@ -164,7 +175,7 @@ class DummySSHService:
             "gpu_processes": [],
             "sysbox_runtime": True,
             "md5_checksums": {
-                "libnvidia_ml": "expected_digest_for_535.104.05",
+                "libnvidia_ml": NVML_535_104_05,
             },
         })
 
@@ -350,7 +361,7 @@ async def test_successful_unrented_pipeline_flow(context_factory):
         obfuscation_keys={},
         max_gpu_count=8,
         gpu_model_rates={"NVIDIA RTX 4090": 1.0},
-        nvml_digest_map={"535.104.05": "expected_digest_for_535.104.05"},
+        nvml_digest_map={"535.104.05": NVML_535_104_05},
         port_private_key="private_key",
         port_public_key="public_key",
         job_batch_id="batch-123",
@@ -483,7 +494,7 @@ async def test_successful_rented_pipeline_flow(context_factory):
                 return SimpleSSHResult(stdout="container-id-123")  # Container is running
             elif "authorized_keys" in command:
                 return SimpleSSHResult(stdout="ssh-rsa AAA...")  # SSH keys present
-            return SimpleSSHResult(stdout="")
+            return _nvml_read(command) or SimpleSSHResult(stdout="")
 
     ssh_client = RentedSSHClient()
 
@@ -531,7 +542,7 @@ async def test_successful_rented_pipeline_flow(context_factory):
         obfuscation_keys={},
         max_gpu_count=8,
         gpu_model_rates={"NVIDIA RTX 4090": 1.0},
-        nvml_digest_map={"535.104.05": "expected_digest_for_535.104.05"},
+        nvml_digest_map={"535.104.05": NVML_535_104_05},
     )
 
     # Setup state with GPU processes in the correct container and rented_data
