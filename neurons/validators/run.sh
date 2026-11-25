@@ -42,7 +42,8 @@ if [ "$MODE" = "validator" ]; then
     # exec: bash as PID 1 would swallow the rollout's SIGTERM; pdm forwards it to the validator (DAH-6011)
     exec pdm run src/validator.py
 elif [ "$MODE" = "connector" ]; then
-    pdm run src/connector.py
+    # exec: as for the validator, the shell as PID 1 would swallow the rollout's SIGTERM
+    exec pdm run src/connector.py
 else
     echo "Error: Invalid mode '$MODE'. Use 'validator' or 'connector'."
     exit 1

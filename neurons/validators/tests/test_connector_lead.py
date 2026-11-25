@@ -1,4 +1,7 @@
 import asyncio
+import os
+import signal
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
@@ -83,3 +86,45 @@ def test_an_unready_connector_has_no_ready_file(tmp_path, monkeypatch) -> None:
     compute_client.mark_connector_unready()
     assert not ready.exists()
     compute_client.mark_connector_unready()  # already gone: no error
+
+
+@pytest.mark.asyncio
+async def test_sigterm_releases_the_lead_and_exits_0(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(compute_client, "CONNECTOR_READY_FILE", str(tmp_path / "ready"))
+
+    # shortcut: fakeredis runs no Lua without lupa; release with a plain compare-and-delete here
+    async def do_release(self, expected_token):
+        if await self.redis.get(self.name) == expected_token:
+            await self.redis.delete(self.name)
+
+    monkeypatch.setattr(aioredis.lock.Lock, "do_release", do_release)
+    exited = asyncio.Event()
+    codes = []
+
+    def fake_exit(code):
+        codes.append(code)
+        exited.set()
+
+    monkeypatch.setattr(compute_client.os, "_exit", fake_exit)
+    server = FakeServer()
+    client = _client(server)
+    await client.take_connector_lead()
+    loop = asyncio.get_running_loop()
+    client.exit_on_sigterm(loop)
+    try:
+        os.kill(os.getpid(), signal.SIGTERM)
+        await asyncio.wait_for(exited.wait(), 3)
+    finally:
+        loop.remove_signal_handler(signal.SIGTERM)
+
+    assert codes == [0]
+    assert not await FakeRedis(server=server).exists(compute_client.CONNECTOR_LEAD_LOCK_KEY)  # the new pod leads now
+    assert client._lead_task.cancelled() or client._lead_task.done()
+    assert not (tmp_path / "ready").exists()
+
+
+def test_run_sh_execs_the_connector() -> None:
+    """Without exec the shell is PID 1 and swallows the rollout's SIGTERM, so the kubelet SIGKILLs the pod."""
+    run_sh = (Path(__file__).parents[1] / "run.sh").read_text()
+    assert "exec pdm run src/connector.py" in run_sh
+    assert "exec pdm run src/validator.py" in run_sh

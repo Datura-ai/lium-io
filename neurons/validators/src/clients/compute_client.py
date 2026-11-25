@@ -3,6 +3,7 @@ import functools
 import json
 import logging
 import os
+import signal
 import time
 from contextlib import suppress
 from contextvars import ContextVar
@@ -1412,7 +1413,29 @@ class ComputeClient:
                 logger.warning(_m("Could not take the connector lead", extra={**extra, "error": str(exc)}))
                 await asyncio.sleep(1)
         logger.info(_m("Leading the backend connection", extra=extra))
+        self._lead_lock = lock
         self._lead_task = asyncio.create_task(self._keep_connector_lead(lock))
+
+    def exit_on_sigterm(self, loop: asyncio.AbstractEventLoop) -> None:
+        """A rollout's SIGTERM hands the lead to the new pod at once and exits 0, instead of taking new work for the
+        whole grace and being SIGKILLed holding the lock. Deliberately no drain: an in-flight create is cut as the
+        SIGKILL cut it, and the new leader's restart sweep has the backend resend it (DAH-5437)."""
+        loop.add_signal_handler(signal.SIGTERM, lambda: loop.create_task(self._release_lead_and_exit()))
+
+    async def _release_lead_and_exit(self) -> None:
+        extra = get_extra_info(self.logging_extra)
+        logger.info(_m("SIGTERM: releasing the connector lead and exiting", extra=extra))
+        mark_connector_unready()
+        if (lead_task := getattr(self, "_lead_task", None)) is not None:
+            lead_task.cancel()
+        if (lock := getattr(self, "_lead_lock", None)) is not None:
+            try:
+                await asyncio.wait_for(lock.release(), 2)
+            except Exception as exc:
+                logger.warning(
+                    _m("Could not release the connector lead; it expires", extra={**extra, "error": str(exc)})
+                )
+        os._exit(0)
 
     async def _keep_connector_lead(self, lock: aioredis.lock.Lock) -> None:
         extra = get_extra_info(self.logging_extra)
