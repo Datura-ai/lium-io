@@ -1,6 +1,7 @@
 """DAH-4547 - HardwareIdentityCheck: DMI overlay, an NVML GPU the kernel does not list, DMI drift."""
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -8,12 +9,18 @@ import pytest
 from neurons.validators.src.services.nvidia_devices import KernelGpuView
 from neurons.validators.src.services.task.checks import hardware_identity
 from neurons.validators.src.services.task.checks.hardware_identity import (
+    BOOT_ID_PATH,
     DMI_ID_PATH,
+    HW_ID_BOOT_FS_SEPARATOR,
+    HW_ID_BOOT_SEPARATOR,
+    HW_ID_BOOT_VALUE_SEPARATOR,
     HW_ID_FS_SEPARATOR,
+    HW_ID_KEY_PREFIX,
     HW_ID_VALUES_SEPARATOR,
     HardwareIdentityCheck,
     dmi_overlay_findings,
     gpu_sources_disagree,
+    trusted_boot_id,
 )
 from neurons.validators.src.services.task.messages import HardwareIdentityMessages as Msg, render_message
 from neurons.validators.src.services.task.pipeline import CheckResult, Pipeline
@@ -23,6 +30,11 @@ from tests.helpers import build_services, build_state, default_executor
 
 SYSFS_ROW = f"{DMI_ID_PATH}/product_uuid sysfs\n{DMI_ID_PATH}/product_uuid|regular file\n"
 SYS_MOUNT = "25 20 0:22 / /sys ro,nosuid - sysfs sysfs ro\n"
+PROC_MOUNT = "30 20 0:5 / /proc rw,nosuid - proc proc rw\n"
+# Docker's read-only bind of the same procfs subtree
+PROC_SYS_RO = "31 30 0:5 /sys /proc/sys ro,nosuid - proc proc rw\n"
+PROC_FILE = "proc\nregular empty file\n"
+B1, B2, B3 = (f"{n}1234567-89ab-cdef-0123-456789abcdef" for n in "123")
 
 
 def test_clean_sysfs_has_no_overlay():
@@ -71,8 +83,13 @@ def _ctx(
     )
 
 
-def _stdout(mounts=SYS_MOUNT, rows=SYSFS_ROW, values="uuid-1|serial-1|"):
-    return f"{mounts}{HW_ID_FS_SEPARATOR}\n{rows}{HW_ID_VALUES_SEPARATOR}\n{values}"
+def _boot(boot, boot_mounts=PROC_MOUNT, boot_file=PROC_FILE):
+    return f"\n{boot_mounts}{HW_ID_BOOT_FS_SEPARATOR}\n{boot_file}{HW_ID_BOOT_VALUE_SEPARATOR}\n{boot}\n"
+
+
+def _stdout(mounts=SYS_MOUNT, rows=SYSFS_ROW, values="uuid-1|serial-1|", boot=None, **boot_layout):
+    out = f"{mounts}{HW_ID_FS_SEPARATOR}\n{rows}{HW_ID_VALUES_SEPARATOR}\n{values}"
+    return out if boot is None else f"{out}\n{HW_ID_BOOT_SEPARATOR}{_boot(boot, **boot_layout)}"
 
 
 async def _run(ctx):
@@ -138,6 +155,103 @@ async def test_dmi_change_under_same_gpus_is_flagged(context_factory):
     result = await _run(_ctx(context_factory, stdout=_stdout(values="uuid-2|serial-1|"), redis=redis))
     assert result.passed is False
     assert result.event.what_we_saw["findings"] == ["dmi_changed_under_same_gpus"]
+
+
+async def _seen(context_factory, redis, dmi, boot, **boot_layout):
+    """One check of the node with this DMI identity and boot id; True when it passed."""
+    ctx = _ctx(context_factory, stdout=_stdout(values=dmi, boot=boot, **boot_layout), redis=redis)
+    return (await _run(ctx)).passed
+
+
+@pytest.fixture
+def redis():
+    return build_services().redis
+
+
+A, B = "uuid-1|serial-1|", "uuid-2|serial-1|"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("boot_after", "passes"), [(B1, False), (B2, True)])
+async def test_a_dmi_change_with_a_fresh_trusted_boot_id_is_a_restart(context_factory, redis, boot_after, passes):
+    assert await _seen(context_factory, redis, A, B1)
+    assert await _seen(context_factory, redis, B, boot_after) is passes
+
+
+@pytest.mark.asyncio
+async def test_a_return_to_an_earlier_identity_and_boot_id_is_flagged(context_factory, redis):
+    assert await _seen(context_factory, redis, A, B1)
+    assert await _seen(context_factory, redis, B, B2)
+    assert await _seen(context_factory, redis, A, B1) is False
+
+
+@pytest.mark.asyncio
+async def test_every_fresh_boot_id_is_a_restart(context_factory, redis):
+    for n in range(10):
+        assert await _seen(context_factory, redis, (A, B)[n % 2], f"{n:08x}-89ab-cdef-0123-456789abcdef")
+
+
+@pytest.mark.asyncio
+async def test_a_boot_id_seen_without_a_dmi_change_is_remembered(context_factory, redis):
+    assert await _seen(context_factory, redis, A, B1)
+    assert await _seen(context_factory, redis, A, B2)
+    assert await _seen(context_factory, redis, B, B1) is False
+
+
+@pytest.mark.asyncio
+async def test_an_existing_records_boot_id_seeds_the_history(context_factory, redis):
+    key = f"{HW_ID_KEY_PREFIX}:{default_executor().uuid}"
+    await redis.set(key, json.dumps({"gpus": ["GPU-a"], "dmi": A, "boot": B1}))
+    assert await _seen(context_factory, redis, B, B1) is False
+    assert json.loads(await redis.get(key))["boots"] == [B1]
+
+
+@pytest.mark.asyncio
+async def test_a_record_without_boot_history_keeps_flagging_a_dmi_change(context_factory, redis):
+    key = f"{HW_ID_KEY_PREFIX}:{default_executor().uuid}"
+    await redis.set(key, json.dumps({"gpus": ["GPU-a"], "dmi": A}))
+    assert await _seen(context_factory, redis, B, B2) is False
+    assert json.loads(await redis.get(key))["boots"] == [B2]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("boot", ["", "not-a-boot-id", B2.upper()])
+async def test_a_missing_or_invalid_boot_id_excuses_nothing(context_factory, redis, boot):
+    assert await _seen(context_factory, redis, A, B1)
+    assert await _seen(context_factory, redis, B, boot) is False
+
+
+@pytest.mark.parametrize(
+    ("boot_mounts", "boot_file"),
+    [
+        # a file bound over the boot id
+        (PROC_MOUNT + f"40 30 259:2 /tmp/boot {BOOT_ID_PATH} ro - ext4 /dev/nvme0n1p2 rw\n", "ext4\nregular file\n"),
+        # a procfs file that changes on every read, bound over the boot id
+        (PROC_MOUNT + f"40 30 0:5 /sys/kernel/random/uuid {BOOT_ID_PATH} ro - proc proc rw\n", PROC_FILE),
+        # a parent replaced by another filesystem
+        (PROC_MOUNT + "40 30 0:60 / /proc/sys/kernel tmpfs rw - tmpfs tmpfs rw\n", "tmpfs\nregular file\n"),
+        # a parent replaced by another procfs subtree
+        (PROC_MOUNT + "40 30 0:5 /sys/vm /proc/sys/kernel ro - proc proc rw\n", PROC_FILE),
+        # no mount listing
+        ("", PROC_FILE),
+    ],
+)
+def test_a_boot_id_not_served_by_procfs_is_not_trusted(boot_mounts, boot_file):
+    assert trusted_boot_id(_boot(B1, boot_mounts, boot_file)) == ""
+
+
+@pytest.mark.parametrize("boot_mounts", [PROC_MOUNT, PROC_MOUNT + PROC_SYS_RO])
+def test_a_normal_procfs_layout_is_trusted(boot_mounts):
+    assert trusted_boot_id(_boot(B1, boot_mounts)) == B1
+
+
+@pytest.mark.asyncio
+async def test_an_overlaid_boot_id_excuses_nothing_and_is_not_remembered(context_factory, redis):
+    overlay = PROC_MOUNT + "40 30 0:60 / /proc/sys/kernel tmpfs rw - tmpfs tmpfs rw\n"
+    assert await _seen(context_factory, redis, A, B1)
+    assert await _seen(context_factory, redis, A, B2, boot_mounts=overlay)  # unchanged DMI: no new failure
+    assert await _seen(context_factory, redis, B, B2, boot_mounts=overlay) is False
+    assert await _seen(context_factory, redis, B, B2)  # B2 was never remembered, so the trusted read is fresh
 
 
 @pytest.mark.asyncio

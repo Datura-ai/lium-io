@@ -10,6 +10,7 @@ import pytest
 from neurons.validators.src.services.task.checks.machine_spec_scrape import (
     MachineSpecScrapeCheck,
     _normalize_gpu_details,
+    scrape_gpu_details,
 )
 from neurons.validators.src.services.task.messages import MachineSpecMessages as Msg
 from neurons.validators.src.services.task.messages import (
@@ -714,6 +715,18 @@ async def test_a_provider_reported_split_disk_is_dropped(context_factory):
     assert "split_disk" not in result.updates["state"].specs
 
 
+@pytest.mark.asyncio
+async def test_a_provider_reported_in_pod_download_figure_is_dropped(context_factory):
+    # DAH-6239: the in-pod download figure is the validator's own reading; a scrape-sent one must not reach the
+    # listing on a cycle the download check skips
+    result = await _scrape_ok_event_for(
+        context_factory, {"container_download_mbps": 9999.0, "container_download_measured_at": 1.0}
+    )
+
+    specs = result.updates["state"].specs
+    assert "container_download_mbps" not in specs and "container_download_measured_at" not in specs
+
+
 # Which side failed, from what the scrape run returned. Host side needs an exit status from the
 # host; without one the code is undetermined (lium-platform#714 bills a running pod only through a
 # failure no host fault can produce, and none of these qualifies).
@@ -935,3 +948,49 @@ async def test_a_provider_reported_host_power_limit_is_dropped(context_factory):
 
     details = result.updates["state"].specs["gpu"]["details"]
     assert details and all("power_host_limit" not in d for d in details)
+
+
+@pytest.mark.asyncio
+async def test_a_successful_scrape_starts_the_liumd_facts_read(context_factory, monkeypatch):
+    # The shadow's docker and ports read must start here, right after the scrape, so both see the same containers.
+    import neurons.validators.src.services.task.liumd_shadow as shadow
+
+    started = object()
+    seen = []
+    monkeypatch.setattr(shadow, "start_facts_after_scrape", lambda ctx: seen.append(ctx) or started)
+
+    result = await _scrape_ok_event_for(context_factory, {})
+
+    assert result.passed is True
+    assert result.updates["state"].liumd_shadow_facts_task is started and len(seen) == 1
+    assert result.updates["state"].liumd_shadow_facts_attempted is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "stdout,expected",
+    [
+        # DAH-6469: the cards' rows, normalised as the check stores them
+        (FERNET_TOKEN, [{"name": "NVIDIA A10 Tensor Core GPU", "uuid": "GPU-abc123"}]),
+        # a reading only counts from a payload this validator can decrypt
+        ("GPU-abc123 99 % 1980 MHz", []),
+    ],
+)
+async def test_scrape_gpu_details_reads_the_encrypted_scrape_and_leaves_the_state_alone(
+    context_factory, stdout, expected
+):
+    runner = DummySSHCommandRunner(result=make_command_result(success=True, stdout=stdout))
+    ctx = context_factory(
+        services=build_services(ssh=DummySSHService(decrypted_data=RAW_SPECS, valid_payload=FERNET_TOKEN)),
+        config=build_context_config(machine_scrape_source="print('scrape')"),
+        state=build_state(gpu_details=[{"uuid": "GPU-before"}]),
+        runner=runner,
+        encrypt_key="test-encrypt-key",
+    )
+
+    rows = await scrape_gpu_details(ctx, 120)
+
+    assert rows == expected
+    assert runner.called_with.command == "/usr/bin/python -I -"
+    assert runner.called_with.timeout == 120
+    assert ctx.state.gpu_details == [{"uuid": "GPU-before"}]

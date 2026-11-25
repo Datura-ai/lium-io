@@ -38,6 +38,7 @@ from .checks import (
     ContainerDownloadSpeedCheck,
     CpuTruthCheck,
     CustomBuildOrphanSweepCheck,
+    RentalEgressGuardCheck,
     DiskHealthCheck,
     DiskSpaceCheck,
     SplitDiskCheck,
@@ -57,6 +58,8 @@ from .checks import (
     GpuThermalThrottleCheck,
     GpuUsageCheck,
     GpuVramPrecheck,
+    SpecFloorCheck,
+    GpuModelVerdictCheck,
     HardwareIdentityCheck,
     IdleDiskWriteCheck,
     InspectorRentedCheck,
@@ -73,6 +76,7 @@ from .checks import (
     ProviderSideLoadCheck,
     RegistryPullCheck,
     RentalProbeCheck,
+    RentedSinceStartCheck,
     RentalVerificationCheck,
     RentedGpuDropCheck,
     RentedPodNetworkCheck,
@@ -87,9 +91,12 @@ from .checks import (
     StartGPUMonitorCheck,
     SshdBootstrapCheck,
     DockerCpuCheck,
+    NeedrestartGuardCheck,
+    SysboxLayerResetCheck,
     PidHostRequiredCheck,
     SysboxRequiredCheck,
     TdxHostCheck,
+    HalfStartedStopRetryCheck,
     TenantEnforcementCheck,
     UploadFilesCheck,
     VerifyXCheck,
@@ -102,7 +109,6 @@ from .pipeline import (
     ContextServices,
     ContextState,
     LoggerSink,
-    ParallelStage,
     Pipeline,
     PodRecoverer,
     StatusChangeTracker,
@@ -119,6 +125,11 @@ JOB_LENGTH = 300
 # call would lose the "last swept at" timestamps. The check itself is stateless
 # wrt input data and only reads ctx, so a shared instance is safe.
 _CUSTOM_BUILD_ORPHAN_SWEEP_SINGLETON = CustomBuildOrphanSweepCheck()
+# Same reason: per-executor cadence state, shared by the two positions. Never before a scored step:
+# a rented node is guarded inside TenantEnforcementCheck's rented halt, an idle node after ScoreCheck.
+_RENTAL_EGRESS_GUARD_LAST_RUN: dict[tuple, float] = {}
+_RENTAL_EGRESS_GUARD_RENTED = RentalEgressGuardCheck(rented_only=True, last_run=_RENTAL_EGRESS_GUARD_LAST_RUN)
+_RENTAL_EGRESS_GUARD_IDLE = RentalEgressGuardCheck(last_run=_RENTAL_EGRESS_GUARD_LAST_RUN)
 
 # DAH-2805: same reason — the download-temporary sweep inside this check carries its own per-executor
 # cadence, and a fresh instance every cycle would sweep every cycle.
@@ -181,6 +192,7 @@ class PipelineFactory:
         first_pass: bool = False,
         encrypted_private_key: str | None = None,
         task_started_at: float | None = None,
+        deadline_monotonic: float | None = None,
     ) -> Context:
         """Build the base validation context with all configuration.
 
@@ -194,6 +206,7 @@ class PipelineFactory:
             encrypted_private_key: the same key as the backend sent it, for the rental probe's
                 create_container / delete_container calls (DAH-3436); None disables the probe
             task_started_at: time.monotonic() at the executor task's start, which its timeout counts from
+            deadline_monotonic: an express recheck's own earlier deadline (time.monotonic()), or None
             encrypted_files: Encrypted validation files
             tdx_attestation_passed: Whether TDX attestation passed
             gpu_attestation_passed: NVIDIA CC GPU attestation outcome (None = not performed)
@@ -231,6 +244,7 @@ class PipelineFactory:
         return Context(
             pipeline_id=pipeline_id,
             started_at_monotonic=task_started_at or time.monotonic(),
+            deadline_monotonic=deadline_monotonic,
             executor=executor_info,
             miner_hotkey=miner_info.miner_hotkey,
             miner_coldkey=miner_info.miner_coldkey,
@@ -310,11 +324,18 @@ class PipelineFactory:
             [
                 # DAH-4629: first, before any fatal check, so every node reports its ssh logins, rented ones too
                 SshdAuthLogCheck(),
+                # F-31: before any check that can halt the cycle, so a pending stop is retried on every node, every cycle
+                HalfStartedStopRetryCheck(),
                 # DAH-5729: before any work on the node, the node must be the registering account's
                 NodeAccountCheck(),
                 StartGPUMonitorCheck(),
                 UploadFilesCheck(),
                 MachineSpecScrapeCheck(),
+                # DAH-6566: right after the scrape, before any fatal check: writes the needrestart guard on hosts set up
+                # before 16 Nov, idle and rented alike, so apt never restarts sysbox-fs under running pods
+                NeedrestartGuardCheck(),
+                # DAH-6804: same place: installs the boot-time layer reset on idle Sysbox hosts without it
+                SysboxLayerResetCheck(),
                 # Non-fatal, right after the scrape. A rented node that lost a GPU fails the fatal
                 # GPU checks below (DETAILS_MISMATCH, GPU_MISSING), which halt the cycle before
                 # TenantEnforcementCheck; this reports it to the backend on that same cycle.
@@ -341,6 +362,8 @@ class PipelineFactory:
                 # here — before the rented short-circuit (TenantEnforcementCheck)
                 # — to gate rented and idle executors alike.
                 GpuVramPrecheck(),
+                # pure-data hard floors on the scraped specs, before the rented short-circuit like the VRAM gate
+                SpecFloorCheck(),
                 # DAH-2928: pure-data, non-fatal report on specs.disk_health from the scrape. A
                 # docker root that refuses writes cannot start a container; placed before the rented
                 # short-circuit so a rented host that has just lost its disk is reported too. The
@@ -360,9 +383,11 @@ class PipelineFactory:
                 # DAH-3457: the UUID set is the node's identity and model:count is derived from it, so the
                 # fingerprint check runs first; a missing card is then GPU_MISSING, not SPEC_CHANGED.
                 GpuFingerprintCheck(),
+                # right after the fingerprint: a re-anchor onto other cards of another model is undone here, before a
+                # later check can fail the cycle and the re-anchor is saved without this decision (DAH-7001)
+                SpecChangeCheck(),
                 # DAH-4551: the reported UUIDs checked against each card's NVIDIA-signed identity (shadow by default).
                 GpuAttestationIdentityCheck(),
-                SpecChangeCheck(),
                 BannedProviderCheck(),
                 # DAH-4547: after BannedProviderCheck, which leaves the kernel GPU list in ctx.state.
                 HardwareIdentityCheck(),
@@ -419,10 +444,16 @@ class PipelineFactory:
                 RentedPodOwnershipCheck(),
                 # RentedThroughputCheck starts a container beside the renter's pod, so never in the dry run.
                 RentedThroughputCheck(),
-                TenantEnforcementCheck(),
+                # DAH-6241: a rented node never reaches the matmul; its stored GPU model verdict judges it
+                GpuModelVerdictCheck(),
+                TenantEnforcementCheck(egress_guard=_RENTAL_EGRESS_GUARD_RENTED),
                 # DAH-4663: idle nodes only; resets a leftover clock lock or unlists the node
                 GpuClockLockCheck(),
                 GpuUsageCheck(),
+                # DAH-5933: before VerifyX, which can take its whole 600 s on a slow download; after it, the
+                # backend's probe was left 1 s and its client timeout read as an API error (ad2382f9, 21 Nov).
+                # Needs only the verified ports, GPU details and rented data, all settled above.
+                RentalVerificationCheck(),
                 # liumd phase 1 (DAH-2834): one signed `POST /verify` runs the VerifyX and matmul
                 # challenges on the executor side by side; the two checks below consume a judged,
                 # passing answer and run over SSH otherwise. Off by default, never fatal.
@@ -448,7 +479,6 @@ class PipelineFactory:
                 # after specs/gpu_model/driver are populated and the GPU is validated, on the
                 # idle valid-executor population. No scoring impact; fails open on any error.
                 CachedTemplateVerificationCheck(),
-                RentalVerificationCheck(),
                 # DAH-3436: rent the idle node from the validator once per interval, the way a renter
                 # would (default image, probe key, verified ports), and prove sshd, the login and
                 # `nvidia-smi -L`. Last before scoring: it needs the verified ports, the GPU list and
@@ -459,6 +489,7 @@ class PipelineFactory:
                 # DAH-5462: VerifyX's second sample of a cold never-measured node, in whatever time the checks above left
                 VerifyXColdRetryCheck(),
                 ScoreCheck(),
+                _RENTAL_EGRESS_GUARD_IDLE,
                 FinalizeCheck(),
             ],
         )
@@ -487,34 +518,38 @@ class PipelineFactory:
         """The first-pass pipeline with the validation fast path on: every check of build_checks,
         each deciding exactly as there, in an order that waits less.
 
-        - VerifyX runs alone first: it measures the node's network, and nothing else of ours may
-          be pulling an image or copying a challenge while it does.
-        - Then one `ParallelStage` with two lanes that share no data: the GPU lane (matmul,
-          fault probe, cached template — the challenge lives on the card) and the host lane
-          (port connectivity, port count, registry pull, sysbox, rental check — containers, ports and the
-          backend's probe). The executor's own one-call verification already runs its facts
-          steps (docker, ports, inspector) beside its GPU group, and runs VerifyX before the
-          matmul unless asked otherwise (`LocalVerifyService`, `parallel_gpu`) — the same split
-          and the same order kept here. `StaleContainerCleanupCheck` still precedes the port
-          checks, and `TenantEnforcementCheck` still halts a rented node before either lane
-          starts.
+        - The host prerequisites (port connectivity, port count, registry pull, sysbox, pid, docker CPU) and the
+          rental check run first, after `TenantEnforcementCheck` halted a rented node, so neither the executor's
+          `POST /verify` nor VerifyX can spend the rental check's time (DAH-5933 review).
+        - `LocalVerifyCheck` runs alone next: its VerifyX challenge measures the node's network, so nothing else
+          of ours may be pulling an image or copying a challenge while it does, and the matmul consumes its answer.
+        - The GPU checks (matmul, fault probe, cached template) follow. `RentedSinceStartCheck` right after the matmul,
+          and again right after the pinned-memory probe, halts a node whose customer pod either of them found started
+          during the run, before any later GPU workload. Every check that re-reads the rentals mid-run is followed by
+          the halt before the next GPU load.
+        - VerifyX runs alone after them, its up to 600 s after the rental check instead of before it.
         - The rental probe, score and finalize follow as today.
-        The list differs from build_checks only in where these checks sit; a node that would fail
-        there fails here too. A node that would fail two checks can report the other one first:
-        the port checks now run after VerifyX, and a lane that stops first wins. One read is not
-        shared: when the matmul fails and CapabilityCheck finds a Lium workload started during the
-        run, RentalVerificationCheck in the host lane still sees the cycle-start rented_data.
+        The checks run one after another, as in build_checks; a node that would fail there fails here too. A node
+        that would fail two checks can report the other one first: the port checks run after the rented halt and
+        VerifyX after the matmul.
         """
         return cast(
             list[Check],
             [
                 # DAH-4629: first, before any fatal check, so every node reports its ssh logins, rented ones too
                 SshdAuthLogCheck(),
+                # F-31: before any check that can halt the cycle, so a pending stop is retried on every node, every cycle
+                HalfStartedStopRetryCheck(),
                 # DAH-5729: before any work on the node, the node must be the registering account's
                 NodeAccountCheck(),
                 StartGPUMonitorCheck(),
                 UploadFilesCheck(),
                 MachineSpecScrapeCheck(),
+                # DAH-6566: right after the scrape, before any fatal check: writes the needrestart guard on hosts set up
+                # before 16 Nov, idle and rented alike, so apt never restarts sysbox-fs under running pods
+                NeedrestartGuardCheck(),
+                # DAH-6804: same place: installs the boot-time layer reset on idle Sysbox hosts without it
+                SysboxLayerResetCheck(),
                 RentedGpuDropCheck(),
                 GpuLossHoldCheck(),
                 GpuThermalThrottleCheck(),
@@ -526,15 +561,18 @@ class PipelineFactory:
                 GpuCountCheck(),
                 GpuModelValidCheck(),
                 GpuVramPrecheck(),
+                SpecFloorCheck(),
                 DiskHealthCheck(),
                 GpuMemoryHealthCheck(),
                 CpuTruthCheck(),
                 GpuPowerLimitCheck(),
                 NvmlDigestCheck(),
                 GpuFingerprintCheck(),
+                # right after the fingerprint: a re-anchor onto other cards of another model is undone here, before a
+                # later check can fail the cycle and the re-anchor is saved without this decision (DAH-7001)
+                SpecChangeCheck(),
                 # DAH-4551: the reported UUIDs checked against each card's NVIDIA-signed identity (shadow by default).
                 GpuAttestationIdentityCheck(),
-                SpecChangeCheck(),
                 BannedProviderCheck(),
                 # DAH-4547: after BannedProviderCheck, which leaves the kernel GPU list in ctx.state.
                 HardwareIdentityCheck(),
@@ -554,41 +592,47 @@ class PipelineFactory:
                 RentedPodOwnershipCheck(),
                 # RentedThroughputCheck starts a container beside the renter's pod, so never in the dry run.
                 RentedThroughputCheck(),
-                TenantEnforcementCheck(),
+                # DAH-6241: a rented node never reaches the matmul; its stored GPU model verdict judges it
+                GpuModelVerdictCheck(),
+                TenantEnforcementCheck(egress_guard=_RENTAL_EGRESS_GUARD_RENTED),
                 # DAH-4663: idle nodes only; resets a leftover clock lock or unlists the node
                 GpuClockLockCheck(),
                 GpuUsageCheck(),
+                # DAH-5933 review: the host prerequisites and the rental check first, so neither the executor's
+                # `POST /verify` nor VerifyX can spend the rental check's time
+                PortConnectivityCheck(),
+                PortCountCheck(),
+                # a customer pod PortCountCheck's rental re-read found is handled before the executor's POST /verify
+                RentedSinceStartCheck(TenantEnforcementCheck(egress_guard=_RENTAL_EGRESS_GUARD_RENTED)),
+                RegistryPullCheck(),
+                ContainerDownloadSpeedCheck(),
+                SysboxRequiredCheck(),
+                PidHostRequiredCheck(),
+                DockerCpuCheck(),
+                RentalVerificationCheck(),
+                # alone, so no traffic of ours shares the network it measures; ahead of the matmul that consumes it
                 LocalVerifyCheck(),
+                CapabilityCheck(),
+                # a customer pod CapabilityCheck found started during the run is handled right here, before the next
+                # GPU workload (fault, pinned-memory and NVLink probes, VerifyX) runs beside it (stand check at c795850)
+                RentedSinceStartCheck(TenantEnforcementCheck(egress_guard=_RENTAL_EGRESS_GUARD_RENTED)),
+                GpuFaultProbeCheck(),
+                PinnedMemoryProbeCheck(),
+                # the pinned-memory probe's hung copy re-reads the rentals too, and puts a customer pod it finds in the
+                # snapshot: halted here, before the NVLink probe or VerifyX loads the GPUs beside it
+                RentedSinceStartCheck(TenantEnforcementCheck(egress_guard=_RENTAL_EGRESS_GUARD_RENTED)),
+                PostRentalGpuRecheckCheck(),
+                NvlinkFaultCheck(),
+                CachedTemplateVerificationCheck(),
                 VerifyXCheck(),
                 DiskSpaceCheck(),
-                ParallelStage(
-                    [
-                        [
-                            PortConnectivityCheck(),
-                            PortCountCheck(),
-                            RegistryPullCheck(),
-                            ContainerDownloadSpeedCheck(),
-                            SysboxRequiredCheck(),
-                            PidHostRequiredCheck(),
-                            DockerCpuCheck(),
-                            RentalVerificationCheck(),
-                        ],
-                        [
-                            CapabilityCheck(),
-                            GpuFaultProbeCheck(),
-                            PinnedMemoryProbeCheck(),
-                            PostRentalGpuRecheckCheck(),
-                            NvlinkFaultCheck(),
-                            CachedTemplateVerificationCheck(),
-                        ],
-                    ]
-                ),
                 RentalProbeCheck(),
                 # DAH-5320: the idle node's disk write with fsync, shadow only; last so it never takes the checks' time.
                 IdleDiskWriteCheck(),
                 # DAH-5462: VerifyX's second sample of a cold never-measured node, in whatever time the checks above left
                 VerifyXColdRetryCheck(),
                 ScoreCheck(),
+                _RENTAL_EGRESS_GUARD_IDLE,
                 FinalizeCheck(),
             ],
         )
@@ -612,6 +656,10 @@ class PipelineFactory:
                 # StartGPUMonitorCheck(),  # SKIP: Starts processes on executor
                 UploadFilesCheck(),
                 MachineSpecScrapeCheck(),
+                # DAH-6566: same place as in build_checks(); under DRY_RUN it reports and writes nothing
+                NeedrestartGuardCheck(write=False),
+                # DAH-6804: same place as in build_checks(); under DRY_RUN it reports and installs nothing
+                SysboxLayerResetCheck(write=False),
                 # RentedGpuDropCheck: same place as in build_checks(); under DRY_RUN it logs and posts nothing.
                 RentedGpuDropCheck(),
                 # DAH-4457: same place as in build_checks(); under DRY_RUN it reads the hold and writes none.
@@ -627,6 +675,7 @@ class PipelineFactory:
                 GpuCountCheck(),
                 GpuModelValidCheck(),
                 GpuVramPrecheck(),
+                SpecFloorCheck(),
                 # DAH-2928: pure-data report on specs.disk_health, same place as in build_checks.
                 DiskHealthCheck(),
                 # one NVML read, no CUDA: safe in dry run, and a broken card is not rented out
@@ -646,9 +695,11 @@ class PipelineFactory:
                 # DAH-3457: the UUID set is the node's identity and model:count is derived from it, so the
                 # fingerprint check runs first; a missing card is then GPU_MISSING, not SPEC_CHANGED.
                 GpuFingerprintCheck(),
+                # right after the fingerprint: a re-anchor onto other cards of another model is undone here, before a
+                # later check can fail the cycle and the re-anchor is saved without this decision (DAH-7001)
+                SpecChangeCheck(),
                 # DAH-4551: the reported UUIDs checked against each card's NVIDIA-signed identity (shadow by default).
                 GpuAttestationIdentityCheck(),
-                SpecChangeCheck(),
                 BannedProviderCheck(),
                 # DAH-4547: after BannedProviderCheck, which leaves the kernel GPU list in ctx.state.
                 HardwareIdentityCheck(),
@@ -671,6 +722,8 @@ class PipelineFactory:
                 ExecutorImageCheck(),
                 # recover_stale_pods=False: dry run still reports a pod as down, but must not rmdir
                 # a stale mountpoint on the host or start a customer's container (DAH-2306).
+                # DAH-6241: a rented node never reaches the matmul; its stored GPU model verdict judges it
+                GpuModelVerdictCheck(),
                 TenantEnforcementCheck(recover_stale_pods=False),
                 # dry_run=True: reports a ghost GPU but runs no pkill + nvidia-smi reset on the
                 # executor and leaves the shared wedge timers the production pipeline relies on.

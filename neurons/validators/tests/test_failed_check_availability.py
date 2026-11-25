@@ -13,7 +13,9 @@ from services.task.availability import (
     ReachTarget,
     availability_errors,
     build_availability_event,
+    build_ssh_unreachable_event,
     failed_check_event,
+    run_availability_errors,
     silence_availability_errors_on_our_own_outage,
 )
 from services.task.models import JobResult, build_msg
@@ -281,3 +283,25 @@ async def test_create_task_says_nothing_against_the_node_for_our_own_errors(erro
     result = await _create_task(_service(build_context_error=error))
 
     assert result.availability_errors == []
+
+
+def test_a_run_stopped_on_an_unread_pod_with_no_errors_sends_none_so_stored_restrictions_stay() -> None:
+    events = [_event("gpu.scrape.machine_spec", "OK", "info"), _event("gpu.validate.loss_hold", "GPU_LOST_POD_UNREAD", "warning")]
+
+    assert run_availability_errors(False, events) is None
+
+
+def test_a_run_stopped_on_an_unread_pod_keeps_the_errors_it_collected() -> None:
+    unreachable = build_ssh_unreachable_event(executor_uuid="node-9", host="192.0.2.10", port=2200, error="refused")
+    events = [unreachable, _event("gpu.validate.loss_hold", "GPU_LOST_POD_UNREAD", "warning")]
+
+    errors = run_availability_errors(False, events)
+
+    assert [e["reason_code"] for e in errors] == [unreachable.reason_code]
+
+
+def test_any_other_run_still_sends_an_empty_list() -> None:
+    events = [_event("gpu.scrape.machine_spec", "OK", "info"), _event("gpu.validate.model", "SOME_REASON")]
+
+    assert run_availability_errors(False, events) == []
+    assert run_availability_errors(True, events[:1]) == []

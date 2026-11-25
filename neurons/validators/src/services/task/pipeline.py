@@ -26,8 +26,8 @@ from services.inspector_validation_service import InspectorValidationService
 from services.container_cleanup import ContainerCleanup
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from protocol.vc_protocol.validator_requests import PodContainerState
-from .availability import REASONS_THAT_HIDE_AT_ONCE
-from .messages import RentalVerificationMessages, TenantEnforcementMessages, render_message
+from .availability import REASONS_THAT_HIDE_AT_ONCE, AvailabilityErrorCode
+from .messages import NodeAccountMessages, RentalVerificationMessages, TenantEnforcementMessages, render_message
 from .models import ValidationEvent
 from .runner import SSHCommandResult, SSHCommandRunner
 
@@ -108,6 +108,10 @@ class PodRecoverer(Protocol):
 
     async def unmounted_stop_outcome(self, pod_id: str) -> str | None: ...
 
+    async def retry_pending_half_started_stops(
+        self, *, executor_info: ExecutorSSHInfo, private_key: str | None, default_extra: dict[str, Any]
+    ) -> None: ...
+
     async def forget_recovery_stop(self, pod_id: str) -> None: ...
 
     async def recovery_stop_pending(self, pod_id: str) -> bool: ...
@@ -174,6 +178,9 @@ class ContextState:
     upload_remote_dir: Optional[str] = None
     remote_dir: Optional[str] = None
     specs: dict[str, Any] = field(default_factory=dict)
+    # The normalized scrape document before later checks write into it; None when this cycle used
+    # the liumd document instead of the Python scrape.
+    scrape_specs: dict[str, Any] | None = None
     gpu_model: Optional[str] = None
     gpu_count: Optional[int] = None
     gpu_details: list[dict] = field(default_factory=list)
@@ -208,6 +215,11 @@ class ContextState:
     # DAH-5244: this cycle's verified ports and sysbox were republished from the last completed check's memory,
     # not measured; a consumer that keeps "last good ports" must not store them as fresh.
     port_check_deferred: bool = False
+    # VerifyXCheck skipped its run for a standing rental-probe failure; RentalProbeCheck then never passes the cycle
+    verifyx_skipped_for_standing_probe_failure: bool = False
+    # CapabilityCheck skipped the enforced all-cards work proof for a standing rental-probe failure; RentalProbeCheck
+    # then never passes the cycle either
+    allcards_skipped_for_standing_probe_failure: bool = False
     # DAH-5981: the error of this cycle's port probe when the SSH connection dropped mid-probe; None otherwise.
     # PortCountCheck then reports the lost connection, not a port shortfall it never measured.
     port_probe_connection_lost: str | None = None
@@ -223,6 +235,9 @@ class ContextState:
     # DAH-5651: this cycle's DinD test container was started on the host and never answered, so the host's
     # container runtime is failing; reaches the backend as ExecutorSpecRequest.host_runtime_fault
     host_runtime_fault: bool = False
+    # the rented pods this cycle's pod checks judged, by pod id, each with its host-side fault codes ([] = clean);
+    # None = no check judged a pod. Reaches the backend as ExecutorSpecRequest.rented_pod_faults
+    rented_pod_faults: dict[str, list[str]] | None = None
     # this cycle's outside reading was "blocked" (already recorded): a re-probe in the same cycle never adds a miss
     external_probe_blocked: bool = False
     # DAH-3338: per rented pod, the container state this cycle saw (TenantEnforcementCheck) and
@@ -247,6 +262,12 @@ class ContextState:
     # not attempted or fell back entirely; the capability and VerifyX checks consume a judged
     # step when present and run over SSH otherwise.
     local_verify: LocalVerifyOutcome | None = None
+    # The liumd shadow's docker and ports read, started right after machine_scrape so both see the
+    # same containers; awaited by the shadow at the end of the run. None = no shadow for this node.
+    liumd_shadow_facts_task: Any = None
+    # True once machine_scrape has tried to start that read, so a later shadow never falls back
+    # to a different Docker moment.
+    liumd_shadow_facts_attempted: bool = False
     # DAH-5462: VerifyX's cold first sample, re-measured by VerifyXColdRetryCheck just before scoring
     verifyx_cold_retry: Any = None
 
@@ -269,6 +290,8 @@ class Context(BaseModel):
     # time.monotonic() at the executor task's start; a best-effort step budgets against
     # the executor task's timeout from here.
     started_at_monotonic: float = Field(default_factory=time.monotonic)
+    # an express recheck's own deadline (time.monotonic()), when it cancels the task before its timeout does
+    deadline_monotonic: float | None = None
     executor: ExecutorSSHInfo
     miner_hotkey: str
     miner_coldkey: str | None = None
@@ -300,10 +323,14 @@ class Context(BaseModel):
     # Set by GpuFingerprintCheck when the node lists a full set of other GPUs (full_set_changed): ResultHandler
     # makes this cycle's set the anchor.
     gpu_reanchor: bool = False
+    # Set by SpecChangeCheck: the reset records this cycle's model:count, so the next cycle audits the node as it is now
+    gpu_respec: bool = False
     collateral_deposited: bool = False
     contract_version: str | None = None
     is_rental_succeed: bool = False
     rented: bool = False
+    # the rental snapshot whose listed pods the rented halt judged all closed: a later halt judges only a fresher read
+    rentals_judged_closed: RentedExecutorsResponse | None = None
     renting_in_progress: bool = False
     ssh_pub_keys: list[str] | None = None
     port_count: int = 0
@@ -318,12 +345,11 @@ class Context(BaseModel):
     # False only once CpuTruthCheck sees a mismatch under enforcement; the score gate lives in
     # calculate_scores because the check is non-fatal and ScoreCheck runs after it.
     cpu_truth_passed: bool = True
+    # False only once SpecFloorCheck fails a node under a live rental (fatal otherwise); gated in calculate_scores.
+    spec_floor_passed: bool = True
     # False only once ProviderSideLoadCheck sees provider-side CPU/disk above the floors under
     # enforcement; the score gate lives in calculate_scores for the same reason as above.
     provider_side_load_passed: bool = True
-    # False only once InspectorRentedCheck counts a blind streak at the limit under enforcement;
-    # the score gate lives in calculate_scores for the same reason as above.
-    inspector_blind_streak_passed: bool = True
     # False only once RentedPodResourcesCheck sees a pinned cpuset or a cut CPU quota under
     # enforcement; the score gate lives in calculate_scores for the same reason as above.
     rented_pod_resources_passed: bool = True
@@ -346,15 +372,18 @@ class Context(BaseModel):
     # False once HardwareIdentityCheck has a finding; non-fatal on a live rental, so the score
     # gate lives in calculate_scores.
     hardware_identity_passed: bool = True
-    # False only once InspectorRentedCheck reads the sensor's verdict of a host write into a
-    # rented pod under enforcement.
-    inspector_host_write_passed: bool = True
     # False only once BannedProviderCheck finds the kernel GPU view overlaid; the check is
     # non-fatal on a live rental, so the score gate lives in calculate_scores.
     kernel_gpu_view_passed: bool = True
     # False once GpuKernelCountCheck finds a kernel list shorter than the reported count; the
     # check is non-fatal on a live rental, so the score gate lives in calculate_scores.
     gpu_kernel_count_passed: bool = True
+    # False once a card is below its reported GPU model (DAH-6241); non-fatal on a live rental, so the score
+    # gate lives in calculate_scores.
+    gpu_model_passed: bool = True
+    # False once NodeAccountCheck finds the node on another account's machine (DAH-6539); non-fatal on a live
+    # rental, so the score gate lives in calculate_scores.
+    node_account_passed: bool = True
     # G1 — NVIDIA CC GPU attestation outcome: True/False when verified, None when
     # not performed (non-CVM node, no evidence supplied, or NRAS undeterminable).
     gpu_attestation_passed: bool | None = None
@@ -625,11 +654,19 @@ def _not_terminal(ran: _RanCheck) -> _RanCheck:
     return replace(ran, result=ran.result.model_copy(update={"fatal": False, "halt": False}))
 
 
+_NOT_THE_ACCOUNTS_MACHINE = frozenset(
+    {NodeAccountMessages.MISMATCH.reason, NodeAccountMessages.BINDING_UNVERIFIED.reason}
+)
+
+
 def _a_finding(ran: _RanCheck) -> bool:
     # a fault the check finished reading stays the run's verdict: hiding the node and publishing it key on the last event;
     # its extra events count too (the GPU recheck's failure carries GPU_LOST there)
+    # NODE_ACCOUNT_UNVERIFIED is a read that did not finish, not a fault read off the node: a dropped session is
+    # reconnected and the read run again (DAH-6539, Sergej lio#2288 at 72215ea)
     return any(
-        event.is_availability_error or event.reason_code in REASONS_THAT_HIDE_AT_ONCE
+        (event.is_availability_error or event.reason_code in REASONS_THAT_HIDE_AT_ONCE)
+        and event.reason_code != AvailabilityErrorCode.NODE_ACCOUNT_UNVERIFIED
         for event in [ran.result.event, *ran.result.extra_events]
     )
 
@@ -666,7 +703,10 @@ class Pipeline:
         reconnect: Callable[[], Awaitable[asyncssh.SSHClientConnection]] | None = None,
     ):
         """`reconnect` opens a fresh session to the same node; without it a dropped session ends the run as before."""
-        self.checks = checks
+        # DAH-6442: a check with `on_completion` runs once the run has ended, however it ended (passed, a fatal
+        # failure or a halt), so a fatal check before it can never leave its host-side cleanup undone
+        self.checks = [chk for chk in checks if not getattr(chk, "on_completion", False)]
+        self.on_completion = [chk for chk in checks if getattr(chk, "on_completion", False)]
         self.sink = sink
         self.reconnect = reconnect
         # one reconnect per run: a session that drops again stands as the transport failure it is
@@ -812,6 +852,22 @@ class Pipeline:
         return current_ctx.model_copy(update=updates)
 
     async def run(self, ctx: Context) -> Tuple[bool, list[ValidationEvent], Context]:
+        passed, events, end_ctx = await self._run_checks(ctx)
+        # another account's machine answered, or the machine could not be confirmed as the account's (a read that
+        # still failed after the reconnect, which a relay can cause): no completion step touches it (DAH-6539)
+        if any(event.reason_code in _NOT_THE_ACCOUNTS_MACHINE for event in events):
+            return passed, events, end_ctx
+        for chk in self.on_completion:
+            try:
+                res = await chk.run(end_ctx)
+            except Exception as exc:  # noqa: BLE001 — a completion step never changes the run's verdict
+                logger.warning(_m("Completion check failed", extra={**end_ctx.default_extra, "error": repr(exc)[:300]}))
+                continue
+            # reported, but not one of the run's events: the verdict and its publication read the last of those
+            await self.sink.emit(res.event)
+        return passed, events, end_ctx
+
+    async def _run_checks(self, ctx: Context) -> Tuple[bool, list[ValidationEvent], Context]:
         events: list[ValidationEvent] = []
         current_ctx = ctx
         pipeline_start_time = time.perf_counter()
@@ -820,7 +876,26 @@ class Pipeline:
 
         for index, step in enumerate(self.checks):
             parallel = isinstance(step, ParallelStage)
-            ran_checks, current_ctx = await self._run_step_surviving_a_dropped_session(step, current_ctx)
+            step_started = time.perf_counter()
+            try:
+                ran_checks, current_ctx = await self._run_step_surviving_a_dropped_session(step, current_ctx)
+            except asyncio.CancelledError:
+                # any cancellation inside a step (the per-node or whole-miner limit, shutdown) names the step it
+                # cut; a cancellation outside the steps (connect, context build, result handling) writes nothing
+                step_check_ids = [chk.check_id for chk in step.checks] if parallel else [step.check_id]
+                logger.warning(
+                    _m(
+                        "Validation cancelled mid-step",
+                        extra={
+                            **current_ctx.default_extra,
+                            "cancelled_check_ids": step_check_ids,
+                            "cancelled_step_elapsed_ms": int((time.perf_counter() - step_started) * 1000),
+                            "elapsed_time_ms": int((time.perf_counter() - pipeline_start_time) * 1000),
+                            "steps": dict(steps),
+                        },
+                    )
+                )
+                raise
             for ran in ran_checks:
                 ran.result.event.context["execution_time_ms"] = int((ran.finished - ran.started) * 1000)
                 ran.result.event.context["elapsed_time_ms"] = int((ran.finished - pipeline_start_time) * 1000)

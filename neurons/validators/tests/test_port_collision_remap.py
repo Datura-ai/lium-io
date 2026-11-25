@@ -167,8 +167,9 @@ async def test_pod_holding_the_whole_range_drops_a_held_extra_port_and_runs(monk
     client = _RunRecorder(
         RentalDockerOperationError("failed to bind host port 0.0.0.0:40418/tcp: address already in use"), None
     )
+    service = _whole_range_service()
 
-    await _whole_range_service()._run_rental_docker_create_with_port_retry(
+    await service._run_rental_docker_create_with_port_retry(
         docker_client=client,
         ssh_client=RecordingSSHClient(stdout="LISTEN 0 128  0.0.0.0:40418     0.0.0.0:*\n"),
         run_spec=ContainerRunSpec(
@@ -185,11 +186,46 @@ async def test_pod_holding_the_whole_range_drops_a_held_extra_port_and_runs(monk
     assert len(client.specs) == 2
     assert port_maps == [(22, 40400, 40400), (8888, 40401, 40401), (40419, 40419, 40419)]
     assert {b.host_port for b in client.specs[-1].ports} == {40400, 40401, 40419}
+    service.stream_log.assert_any_await(
+        "TCP port 40418 is not published: no spare host-port pair was available.", "warning", "container_creation"
+    )
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("docker_port", [22, 8888])
-async def test_ssh_or_jupyter_port_is_never_dropped_when_no_pair_is_left(monkeypatch, docker_port):
+async def test_ssh_or_jupyter_port_takes_a_free_extra_ports_pair_when_none_is_left(monkeypatch, docker_port):
+    monkeypatch.setattr("services.docker_service.asyncio.sleep", AsyncMock())
+    port_maps = [(docker_port, 40400, 40400), (40418, 40418, 40418), (40419, 40419, 40419)]
+    client = _RunRecorder(_bind_refused(40400), None)
+    service = _whole_range_service()
+
+    await service._run_rental_docker_create_with_port_retry(
+        docker_client=client,
+        ssh_client=RecordingSSHClient(stdout="LISTEN 0 128  0.0.0.0:40400     0.0.0.0:*\n"),
+        run_spec=ContainerRunSpec(
+            image="lium/pod:1",
+            name="pod_test",
+            ports=tuple(PortBinding(container_port=d, host_port=h) for d, h, _ in port_maps),
+        ),
+        container_name="pod_test",
+        default_extra={},
+        port_maps=port_maps,
+        spare_port_pairs=[],
+    )
+
+    assert port_maps == [(docker_port, 40419, 40419), (40418, 40418, 40418)]
+    assert [(b.container_port, b.host_port) for b in client.specs[-1].ports] == [
+        (docker_port, 40419),
+        (40418, 40418),
+    ]
+    service.stream_log.assert_any_await(
+        "TCP port 40419 is not published: no spare host-port pair was available.", "warning", "container_creation"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("docker_port", [22, 8888])
+async def test_ssh_or_jupyter_port_fails_when_every_extra_port_is_listening_too(monkeypatch, docker_port):
     monkeypatch.setattr("services.docker_service.asyncio.sleep", AsyncMock())
     port_maps = [(docker_port, 40400, 40400), (40419, 40419, 40419)]
     client = _RunRecorder(_bind_refused(40400), None)
@@ -197,7 +233,9 @@ async def test_ssh_or_jupyter_port_is_never_dropped_when_no_pair_is_left(monkeyp
     with pytest.raises(RentalPortCollisionError):
         await _whole_range_service()._run_rental_docker_create_with_port_retry(
             docker_client=client,
-            ssh_client=RecordingSSHClient(stdout="LISTEN 0 128  0.0.0.0:40400     0.0.0.0:*\n"),
+            ssh_client=RecordingSSHClient(
+                stdout="LISTEN 0 128  0.0.0.0:40400     0.0.0.0:*\nLISTEN 0 128  0.0.0.0:40419     0.0.0.0:*\n"
+            ),
             run_spec=ContainerRunSpec(
                 image="lium/pod:1",
                 name="pod_test",
@@ -208,8 +246,6 @@ async def test_ssh_or_jupyter_port_is_never_dropped_when_no_pair_is_left(monkeyp
             port_maps=port_maps,
             spare_port_pairs=[],
         )
-
-    assert port_maps == [(docker_port, 40400, 40400), (40419, 40419, 40419)]
 
 
 @pytest.mark.asyncio

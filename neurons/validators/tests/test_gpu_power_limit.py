@@ -142,6 +142,16 @@ async def test_strict_pod_restore_without_record_holds_the_floor(current_watts, 
 
 
 @pytest.mark.asyncio
+async def test_strict_pod_restore_with_an_unreadable_host_is_the_hosts_failure():
+    # prod 11 Nov 2026 pod f43cdd12: the host's nvidia-smi query failed while confirming a record-less GPU
+    redis = FakeRedis({_pod_index_key(POD_ID): '["GPU-a"]'})
+    ssh = AsyncMock(run=AsyncMock(side_effect=TimeoutError()))
+    with pytest.raises(RuntimeError) as caught:
+        await restore_filler_pod_gpu_power_limits(ssh, redis, POD_ID, require_complete=True)
+    assert type(caught.value) is RuntimeError  # not GpuPowerRestoreStateError (platform state)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("require_complete", [True, False])
 async def test_pod_index_delete_failure_after_successful_restore(require_complete):
     # Arrange: only the final index deletion fails; the GPU record can be cleared.

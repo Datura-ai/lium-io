@@ -693,16 +693,17 @@ def _score_ctx(tdx_quote, attestation_passed, gpu_attestation_passed=None):
         tdx_attestation_passed=attestation_passed,
         gpu_attestation_passed=gpu_attestation_passed,
         cpu_truth_passed=True,
+        spec_floor_passed=True,
         provider_side_load_passed=True,
-        inspector_blind_streak_passed=True,
         rented_pod_resources_passed=True,
         rented_throughput_passed=True,
         gpu_attestation_identity_passed=True,
         cc_vbios_passed=True,
-        inspector_host_write_passed=True,
         kernel_gpu_view_passed=True,
         gpu_kernel_count_passed=True,
+        gpu_model_passed=True,
         hardware_identity_passed=True,
+        node_account_passed=True,
     )
 
 

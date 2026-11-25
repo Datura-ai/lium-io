@@ -5,7 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from helpers import build_services, build_state
+from helpers import FakeRedis, build_services, build_state
 from neurons.validators.src.services import matrix_validation_service as mvs
 from neurons.validators.src.services.matrix_validation_service import ValidationResult
 from neurons.validators.src.services.task.checks import capability
@@ -33,9 +33,10 @@ class SamplingValidationService:
             raise RuntimeError("ssh went away")
         if self.result is not None:
             return self.result
-        return ValidationResult(
-            success=self.success, error_message="" if self.success else "no card"
-        )
+        if self.success:
+            return ValidationResult(success=True)
+        # a failure that reads as a busy card: the filler holds the VRAM
+        return _no_answer("Failed to allocate d_A: out of memory")
 
 
 _real_cycle_index = capability._filler_cycle_index
@@ -55,6 +56,7 @@ def _offset(uuid: str) -> int:
 
 async def _filler_cycles(context_factory, service, cycles: int, specs=None, clock=None) -> list:
     results = []
+    redis = FakeRedis()  # one Redis across the cycles, as in the validator
     for i in range(cycles):
         if clock is not None:
             clock["now"] = i - _offset("executor-123")
@@ -66,7 +68,7 @@ async def _filler_cycles(context_factory, service, cycles: int, specs=None, cloc
                 filler_containers_by_executor={"executor-123": "filler_active"},
             ),
         )
-        ctx = context_factory(services=build_services(validation=service), state=state)
+        ctx = context_factory(services=build_services(validation=service, redis=redis), state=state)
         results.append(await CapabilityCheck().run(ctx))
     return results
 
@@ -225,13 +227,67 @@ def _no_answer(stderr: str) -> ValidationResult:
 )
 async def test_a_failed_sample_names_why(context_factory, monkeypatch, result, kind):
     monkeypatch.setattr(capability.settings, "FILLER_MATMUL_SAMPLE_EVERY_N_CYCLES", 1)
+    monkeypatch.setattr(capability.settings, "MATMUL_ALLCARDS_CHECK_ENABLED", True)
+    monkeypatch.setattr(capability.settings, "MATMUL_ALLCARDS_ENFORCEMENT_ENABLED", True)
 
     (check,) = await _filler_cycles(
         context_factory, SamplingValidationService(result=result), 1, specs=_cards(2)
     )
 
-    assert check.passed is True
+    # a busy card (or our own fault) stays a record; a wrong answer fails the node under enforcement
+    assert check.passed is (kind != "wrong_answer")
     assert check.event.what_we_saw["matmul_sample"]["error_kind"] == kind
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enforced", [True, False])
+async def test_a_sampled_card_cuda_cannot_see_fails_the_filler_node_under_enforcement(
+    context_factory, monkeypatch, enforced
+):
+    monkeypatch.setattr(capability.settings, "FILLER_MATMUL_SAMPLE_EVERY_N_CYCLES", 1)
+    monkeypatch.setattr(capability.settings, "MATMUL_ALLCARDS_ENFORCEMENT_ENABLED", enforced)
+    monkeypatch.setattr(capability.settings, "MATMUL_ALLCARDS_CHECK_ENABLED", True)
+
+    (check,) = await _filler_cycles(
+        context_factory,
+        SamplingValidationService(result=_no_answer("no CUDA-capable device is detected")),
+        1,
+        specs=_cards(8),
+    )
+
+    assert check.event.what_we_saw["matmul_sample"]["error_kind"] == "no_answer"
+    assert check.passed is (not enforced)
+    if enforced:
+        assert check.event.reason_code == Msg.GPU_WORK_PROOF_FAILED.reason
+        assert check.event.what_we_saw["transport"] == "filler"
+
+
+class ScriptedSamplingService(SamplingValidationService):
+    def __init__(self, results: list):
+        super().__init__()
+        self.results = results
+
+    async def validate_gpu_model_and_process_job(self, **kwargs):
+        self.result = self.results[len(self.gpu_uuids)]
+        return await super().validate_gpu_model_and_process_job(**kwargs)
+
+
+@pytest.mark.asyncio
+async def test_a_failed_card_is_stored_and_resampled_every_cycle_until_it_passes(context_factory, monkeypatch):
+    """lio#2305 review: the failed card lives in the GPU model verdict, so the node fails on the cycles between
+    samples too, and that card is sampled every cycle until a right answer from it clears it."""
+    monkeypatch.setattr(capability.settings, "FILLER_MATMUL_SAMPLE_EVERY_N_CYCLES", 96)
+    monkeypatch.setattr(capability.settings, "MATMUL_ALLCARDS_ENFORCEMENT_ENABLED", True)
+    monkeypatch.setattr(capability.settings, "MATMUL_ALLCARDS_CHECK_ENABLED", True)
+    blind = _no_answer("no CUDA-capable device is detected")
+    service = ScriptedSamplingService([blind, blind, ValidationResult(success=True)])
+
+    results = await _filler_cycles(context_factory, service, 4, specs=_cards(8))
+
+    # cycle 1 samples the unjudged node (card 0) and fails it; cycles 2-3 resample card 0, the 3rd answers right
+    assert service.gpu_uuids == ["GPU-0", "GPU-0", "GPU-0"]
+    assert [r.passed for r in results] == [False, False, True, True]
+    assert results[1].event.reason_code == Msg.GPU_WORK_PROOF_FAILED.reason
 
 
 @pytest.mark.asyncio
@@ -278,3 +334,68 @@ async def test_an_ssh_or_cipher_failure_is_flagged_as_ours(monkeypatch, cipher):
 
     assert result.success is False
     assert result.validator_error is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("flag", ["MATMUL_ALLCARDS_CHECK_ENABLED", "MATMUL_ALLCARDS_ENFORCEMENT_ENABLED"])
+async def test_a_stored_work_proof_failure_stops_failing_the_node_when_either_flag_is_off(
+    context_factory, monkeypatch, flag
+):
+    """lio#2305 review: with the check or its enforcement off, a stored work_proof_failed fails nothing, and a filler
+    sample's no_answer is a record only."""
+    monkeypatch.setattr(capability.settings, "FILLER_MATMUL_SAMPLE_EVERY_N_CYCLES", 96)
+    monkeypatch.setattr(capability.settings, "MATMUL_ALLCARDS_CHECK_ENABLED", True)
+    monkeypatch.setattr(capability.settings, "MATMUL_ALLCARDS_ENFORCEMENT_ENABLED", True)
+    blind = _no_answer("no CUDA-capable device is detected")
+    service = ScriptedSamplingService([blind, blind, blind])
+    redis = FakeRedis()
+
+    async def cycle():
+        state = build_state(
+            specs=_cards(8),
+            rented_data=RentedExecutorsResponse(
+                executors={}, banned_guids=[], filler_containers_by_executor={"executor-123": "filler_active"}
+            ),
+        )
+        ctx = context_factory(services=build_services(validation=service, redis=redis), state=state)
+        return await CapabilityCheck().run(ctx)
+
+    assert (await cycle()).event.reason_code == Msg.GPU_WORK_PROOF_FAILED.reason
+    monkeypatch.setattr(capability.settings, flag, False)
+
+    assert (await cycle()).passed is True
+
+
+class _AllCardsService(SamplingValidationService):
+    async def validate_gpu_model_and_process_job(self, **kwargs):
+        # the scored call passes probe_all_cards only to turn it off
+        self.probe_all_cards.append(kwargs.get("probe_all_cards", True))
+        return ValidationResult(success=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("standing", "enforced"), [(True, True), (False, True), (True, False)])
+async def test_a_standing_rental_probe_failure_defers_the_all_cards_run_and_marks_the_cycle(
+    context_factory, monkeypatch, standing, enforced
+):
+    """lio-deployment#129 review: on a node with a standing rental-probe failure the enforced all-cards run would leave
+    the probe, the only check that clears it, too little cycle time. That cycle proves card 0 only and flags the state,
+    so RentalProbeCheck does not pass it (rental probe tests)."""
+    monkeypatch.setattr(capability.settings, "MATMUL_ALLCARDS_CHECK_ENABLED", True)
+    monkeypatch.setattr(capability.settings, "MATMUL_ALLCARDS_ENFORCEMENT_ENABLED", enforced)
+    # the GPU model check is not under test: a pass with no speed numbers reads as measured
+    monkeypatch.setattr(capability, "unmeasured_cards", lambda *_a, **_kw: set())
+    redis = FakeRedis()
+    if standing:
+        await redis.set("rental_probe_failed:executor-123", "gpu_count")
+    service = _AllCardsService()
+    ctx = context_factory(
+        services=build_services(validation=service, redis=redis), state=build_state(specs=_cards(8))
+    )
+
+    result = await CapabilityCheck().run(ctx)
+
+    # in shadow the run is skipped too (it still takes the time) but decides nothing, so the cycle is not marked
+    assert result.passed is True
+    assert service.probe_all_cards == [not standing]
+    assert result.updates.get("state", ctx.state).allcards_skipped_for_standing_probe_failure is (standing and enforced)

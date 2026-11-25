@@ -21,6 +21,7 @@ from services.gpu_precheck import UnsupportedGpuModelError, precheck_gpu_spec
 from services.gpu_reference_table import GPU_REFERENCE_TABLE
 from services.gpu_spec_table import (
     GPU_VRAM_SIZES_MB,
+    MODDED_VRAM_MODELS,
     VRAM_FLOOR_RATIO,
     matmul_probe_vram_mb,
     reference_gpu_model,
@@ -34,13 +35,15 @@ from tests.test_rental_price_incentive_flow import _make_pcc_job
 UNKNOWN = "NVIDIA RTX Future 9000"
 # lium-platform keeps a byte-identical apps/lium/backend/apps/server/src/core/gpu_reference_table.py
 # and pins the same hash
-GPU_REFERENCE_TABLE_SHA256 = "dc5b7fd493229374bbfcc10a313c9fb1d5c4a393cdd90e0e8d3933ac2344e462"
+GPU_REFERENCE_TABLE_SHA256 = "ff8ef3b70f35b8966e6f9b338f531c23d76aa1ca7bfb751eed985ddb136b46e4"
 PRICES = {model: price for model, (price, _) in GPU_REFERENCE_TABLE.items()}
-CANDIDATES = list(GPU_REFERENCE_TABLE)
+CANDIDATES = [m for m in GPU_REFERENCE_TABLE if m not in gpu_reference_table.NEVER_A_REFERENCE]
+# memory-mod sizes of a factory model: accepted by the precheck, never an unknown card's reference
+MOD_ONLY_SIZES_MB = {"NVIDIA CMP 170HX": {81920}}
 
 
 def _in_band(model: str, vram_mb: int) -> bool:
-    return any(0.90 * vram_mb <= size <= 1.10 * vram_mb for size in GPU_VRAM_SIZES_MB[model])
+    return any(0.90 * vram_mb <= size * 1024 <= 1.10 * vram_mb for size in GPU_REFERENCE_TABLE[model][1])
 
 
 def test_the_reference_table_is_the_one_lium_platform_pins():
@@ -51,7 +54,8 @@ def test_the_reference_table_is_the_one_lium_platform_pins():
 def test_every_candidate_is_a_scored_model_with_the_registry_sizes():
     for model, (_, sizes_gb) in GPU_REFERENCE_TABLE.items():
         assert model in GPU_MODEL_RATES
-        assert sorted(size * 1024 for size in sizes_gb) == sorted(GPU_VRAM_SIZES_MB[model])
+        reference_sizes_mb = set(GPU_VRAM_SIZES_MB[model]) - MOD_ONLY_SIZES_MB.get(model, set())
+        assert sorted(size * 1024 for size in sizes_gb) == sorted(reference_sizes_mb)
     assert set(GPU_MODEL_RATES) <= set(GPU_REFERENCE_TABLE)
 
 
@@ -86,6 +90,25 @@ PARITY_CASES = [
 
 @pytest.mark.parametrize(("vram_mb", "reference"), PARITY_CASES)
 def test_the_reference_matches_the_backends(vram_mb, reference):
+    assert reference_gpu_model(UNKNOWN, vram_mb) == reference
+
+
+def test_the_modded_models_are_exactly_the_ones_never_a_reference():
+    assert gpu_reference_table.NEVER_A_REFERENCE == set(MODDED_VRAM_MODELS)
+
+
+# DAH-6595: an unknown card with a modded card's memory keeps the reference it had before the modded models
+@pytest.mark.parametrize(
+    ("vram_mb", "reference"),
+    [
+        (20480, "NVIDIA RTX A4500"),
+        (22528, "NVIDIA Tesla P40"),
+        (32768, "NVIDIA GeForce RTX 5090 D"),
+        (49140, "NVIDIA Quadro RTX 8000"),
+        (81920, "NVIDIA A800 80GB PCIe"),
+    ],
+)
+def test_an_unknown_card_of_a_modded_size_is_never_paid_as_a_modded_model(vram_mb, reference):
     assert reference_gpu_model(UNKNOWN, vram_mb) == reference
 
 
@@ -231,3 +254,10 @@ def test_an_unknown_card_has_no_hard_price_limit(context_factory):
     )
 
     assert calculate_scores(context_factory(executor=executor, state=state), rented=True)[0] == 1.0
+
+
+def test_a_bare_nvidia_h100_is_scored_as_the_h100_pcie_not_by_vram():
+    # 80 GB HBM2e H100 (10de:2336) the driver names bare "NVIDIA H100" fell to the 80 GB VRAM reference (15 Nov)
+    from services.gpu_spec_table import reference_gpu_model
+
+    assert reference_gpu_model("NVIDIA H100", 81559) == "NVIDIA H100 PCIe"

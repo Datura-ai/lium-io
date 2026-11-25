@@ -30,9 +30,13 @@ import time
 
 MB = 1024 * 1024
 JSON_MARKER = "PINNED_MEMORY_PROBE_JSON:"
-# A 64 MB copy takes a few milliseconds on PCIe; a card that has not finished it in this budget, setup
-# included, is hung. The check's SSH cap sits above it.
-WORKER_BUDGET_SECONDS = 30.0
+# A 64 MB copy takes a few milliseconds on PCIe; a card that has not finished it within this many seconds
+# of its own copy start is hung. Setup has its own budget: in an 8-GPU TDX guest cuInit and cuCtxCreate run one
+# GPU at a time (~16 s and ~7.5 s for all 8, DAH-6451), so a shared budget failed healthy cards as hung copies.
+# Teardown (~8 s there) runs after the verdict is sent and is never waited for. The check's SSH cap sits above
+# COUNT_BUDGET_SECONDS + SETUP_BUDGET_SECONDS + COPY_BUDGET_SECONDS.
+COPY_BUDGET_SECONDS = 10.0
+SETUP_BUDGET_SECONDS = 60.0
 COUNT_BUDGET_SECONDS = 20.0
 NVIDIA_SMI_TIMEOUT_SECONDS = 10
 MAX_MISMATCH_OFFSETS = 4
@@ -112,8 +116,9 @@ class Cuda:
             raise ProbeError(message)
 
 
-def probe_device(index: int, size_mb: int, on_phase=None) -> dict:
-    """Round-trip a random pattern through pinned host memory and the device; raise CopyFault if it does not survive."""
+def probe_device(index: int, size_mb: int, on_phase=None, on_verdict=None) -> dict:
+    """Round-trip a random pattern through pinned host memory and the device; raise CopyFault if it does not survive.
+    `on_verdict` gets the report before teardown, which can take seconds per GPU and is not part of the check."""
     size = size_mb * MB
     cuda = Cuda()
     # setup: a refusal is an error, not a fault, unless a driver-start call
@@ -175,6 +180,8 @@ def probe_device(index: int, size_mb: int, on_phase=None) -> dict:
             f"pinned H2D/D2H round trip: {what}; {mismatched} of {size // MB} MB chunks differ, "
             f"first at byte offsets {offsets}"
         )
+    if on_verdict:
+        on_verdict(report)
     cuda.call("cuMemFree_v2", d_buf.value)
     cuda.call("cuMemFreeHost", h_src)
     cuda.call("cuMemFreeHost", h_dst)
@@ -208,20 +215,29 @@ def _quiet_child() -> None:
 def _worker(index: int, size_mb: int, conn) -> None:
     _quiet_child()
 
+    verdict_sent = False
+
     def on_phase(phase: str) -> None:
-        # the parent classifies a worker that never answers by the phase it reached: setup -> error, copy -> fault
-        conn.send({"phase": phase})
+        # the parent classifies a worker that never answers by the phase it reached: setup -> error, copy -> fault.
+        # The copy deadline runs from `at`: CLOCK_MONOTONIC is system-wide, so the parent compares it with its own.
+        conn.send({"phase": phase, "at": time.monotonic()})
+
+    def on_verdict(report: dict) -> None:
+        nonlocal verdict_sent
+        conn.send({**report, "status": "ok"})
+        verdict_sent = True
 
     try:
-        report = probe_device(index, size_mb, on_phase)
-        report["status"] = "ok"
+        report = {**probe_device(index, size_mb, on_phase, on_verdict), "status": "ok"}
     except CopyFault as exc:
         report = {"index": index, "status": "fault", "error": str(exc)}
     except ProbeError as exc:
         report = {"index": index, "status": "error", "error": str(exc)}
     except Exception as exc:  # noqa: BLE001 - the parent must always get a verdict
         report = {"index": index, "status": "error", "error": f"{type(exc).__name__}: {exc}"}
-    conn.send(report)
+    # a teardown failure after the verdict changes nothing: the copy already passed
+    if not verdict_sent:
+        conn.send(report)
     conn.close()
 
 
@@ -271,15 +287,18 @@ def _device_count(mp) -> int:
     return reply["count"]
 
 
-def drain_workers(workers: list, deadline: float) -> list[dict]:
-    """Collect one verdict per worker by the shared deadline. A worker that dies or hangs in the copy is a
-    fault; one that never got past setup is an error."""
+def drain_workers(workers: list, setup_deadline: float) -> list[dict]:
+    """Collect one verdict per worker: setup has until the shared `setup_deadline`, then each copy has
+    COPY_BUDGET_SECONDS from its own start (time.monotonic), or from `setup_deadline` if it started later, so all
+    copies end by setup_deadline + COPY_BUDGET_SECONDS. A worker that dies or hangs in the copy is a fault;
+    one that never got past setup is an error."""
     reports = []
     for index, process, conn in workers:
         phase = "setup"
+        deadline = setup_deadline
         report = None
         while report is None:
-            remaining = deadline - time.perf_counter()
+            remaining = deadline - time.monotonic()
             try:
                 # past the deadline a verdict already in the pipe still counts: poll(0) reads it
                 if not conn.poll(max(remaining, 0)):
@@ -289,6 +308,8 @@ def drain_workers(workers: list, deadline: float) -> list[dict]:
                 break
             if "phase" in message:
                 phase = message["phase"]
+                if phase == "copy":
+                    deadline = min(message["at"], setup_deadline) + COPY_BUDGET_SECONDS
             else:
                 report = message
         if report is None:
@@ -360,7 +381,7 @@ def main(argv: list[str]) -> int:
         process.start()
         child_conn.close()
         workers.append((index, process, parent_conn))
-    result["devices"] = drain_workers(workers, time.perf_counter() + WORKER_BUDGET_SECONDS)
+    result["devices"] = drain_workers(workers, time.monotonic() + SETUP_BUDGET_SECONDS)
 
     for report in result["devices"]:
         if report["status"] == "fault":

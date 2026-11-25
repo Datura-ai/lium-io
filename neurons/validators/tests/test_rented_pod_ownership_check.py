@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 from neurons.validators.src.services.task.checks.rented_pod_ownership import (
+    PATHS,
     RentedPodOwnershipCheck,
     judge,
     read_command,
@@ -159,7 +160,7 @@ def test_read_command_reports_a_missing_pid_without_failing(tmp_path):
     out = subprocess.run(
         ["sh", "-c", read_command([999], proc=str(tmp_path))], capture_output=True, text=True
     )
-    assert out.stdout == "999|||||||\n"
+    assert out.stdout == "999|" + "|" * len(PATHS) + "\n"
 
 
 @pytest.mark.parametrize(
@@ -206,3 +207,283 @@ async def test_the_read_includes_sudo_files_and_an_image_without_sudo_is_ok(
         "/etc/sudoers.d/README": me,
     }
     assert pods["pod_2"]["host_owners"] == {"/": me, "/root": me}
+
+
+def test_a_shifted_package_dir_warns_although_slash_root_and_sudo_are_inside():
+    # a partial shift left /usr/share owned by nobody while /, /root and sudo were fine: dpkg fails
+    pod = judge(
+        "4242|0 100000 65536|100000|100000|100000|100000|100000|100000|100000|100000|0|100000"
+    )
+    assert pod["outside_namespace"] == ["/usr/share"]
+
+
+def _ssh_with_uptime(proc: str, uptime_and_ages: str):
+    inner = _ssh(proc)
+
+    async def run(cmd, check=False):
+        if cmd.startswith("cut -d' ' -f1 /proc/uptime"):
+            return SimpleNamespace(exit_status=0, stdout=uptime_and_ages, stderr="")
+        return await inner.run(cmd, check=check)
+
+    return SimpleNamespace(run=run)
+
+
+@pytest.mark.parametrize(
+    ("uptime_and_ages", "template", "after_boot"),
+    [
+        # host up a day, pod container started 30 s ago: a `docker restart`, not a host reboot
+        ("86400.12\n 4242    30\n", Msg.SHIFTED_AFTER_CONTAINER_RESTART, 86370),
+        # host up 700 s, container started 50 s after boot: brought back by the reboot
+        ("700.50\n4242 650\n", Msg.SHIFTED, 50),
+        # uptime not read: the cause is unknown, the host message stays
+        ("\n4242 30\n", Msg.SHIFTED, None),
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_shift_after_a_container_only_restart_does_not_blame_the_host(
+    context_factory, tmp_path, uptime_and_ages, template, after_boot
+):
+    me = os.getuid()
+    _proc(tmp_path, 4242, f"         0     {me + 200000}      65536\n")
+    _proc(tmp_path, 4343, f"         0     {me}      65536\n")
+    result = await RentedPodOwnershipCheck().run(
+        _ctx(context_factory, _ssh_with_uptime(str(tmp_path), uptime_and_ages))
+    )
+    assert result.event.reason_code == Msg.SHIFTED.reason
+    assert result.event.remediation == template.remediation
+    pods = {p["container"]: p for p in result.event.what_we_saw["pods"]}
+    assert pods["pod_1"].get("started_after_boot_s") == after_boot
+    assert "started_after_boot_s" not in pods["pod_2"]  # only the shifted pod is read
+
+
+@pytest.mark.parametrize(
+    ("created", "template", "before_boot"),
+    [
+        # created 36 min before the host booted at 20:20:03Z, started by the validator's stale-mount
+        # recovery 1358 s after boot: it was on the host when it stopped, so the host message stays
+        ("2026-11-17T19:44:26.034526789Z", Msg.SHIFTED, True),
+        # created 30 s after boot and restarted later on the running host: a container-only restart
+        ("2026-11-17T20:20:33.5Z", Msg.SHIFTED_AFTER_CONTAINER_RESTART, False),
+        # a creation time that is not one: the age alone decides, as before
+        ("yesterday", Msg.SHIFTED_AFTER_CONTAINER_RESTART, None),
+        # within seconds of the boot either side: rounding and clock slew, and no container is created that soon
+        # after a boot, so it was there at the stop however late the recovery started it
+        ("2026-11-17T20:20:03.3Z", Msg.SHIFTED, True),
+        ("2026-11-17T20:19:59.9Z", Msg.SHIFTED, True),
+        ("2026-11-17T20:20:09Z", Msg.SHIFTED_AFTER_CONTAINER_RESTART, False),
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_pod_created_before_the_boot_is_blamed_on_the_host_however_late_it_started(
+    context_factory, tmp_path, created, template, before_boot
+):
+    me = os.getuid()
+    _proc(tmp_path, 4242, f"         0     {me + 200000}      65536\n")
+    _proc(tmp_path, 4343, f"         0     {me}      65536\n")
+    boot = 1794946803  # 2026-11-17T20:20:03Z
+    out = f"1400.25\n4242 42\n--\n{boot}\n/pod_1 {created}\n"
+    result = await RentedPodOwnershipCheck().run(
+        _ctx(context_factory, _ssh_with_uptime(str(tmp_path), out))
+    )
+    assert result.event.remediation == template.remediation
+    pods = {p["container"]: p for p in result.event.what_we_saw["pods"]}
+    assert pods["pod_1"]["started_after_boot_s"] == 1358
+    assert pods["pod_1"].get("created_before_boot") is before_boot
+
+
+@pytest.mark.parametrize(
+    ("uptime_and_ages", "template"),
+    [
+        # pod_1 restarted 30 s ago on a host up a day, pod_2 started 50 s after boot: one cause does not fit both
+        ("86400\n4242 30\n4343 86350\n", Msg.SHIFTED_MIXED),
+        # pod_2's age not read: the cause is unknown, the host message stays
+        ("86400\n4242 30\n", Msg.SHIFTED),
+    ],
+)
+@pytest.mark.asyncio
+async def test_shifted_pods_with_different_histories_are_not_all_blamed_on_the_host(
+    context_factory, tmp_path, uptime_and_ages, template
+):
+    me = os.getuid()
+    _proc(tmp_path, 4242, f"         0     {me + 200000}      65536\n")
+    _proc(tmp_path, 4343, f"         0     {me + 200000}      65536\n")
+    result = await RentedPodOwnershipCheck().run(
+        _ctx(context_factory, _ssh_with_uptime(str(tmp_path), uptime_and_ages))
+    )
+    assert result.event.remediation == template.remediation
+
+
+@pytest.mark.asyncio
+async def test_each_age_stays_with_its_own_pid_when_one_pid_prints_nothing(context_factory, tmp_path):
+    # stand case e: ps prints nothing for pid 4242 (gone since the read) and 30 s for 4343
+    me = os.getuid()
+    _proc(tmp_path, 4242, f"         0     {me + 200000}      65536\n")
+    _proc(tmp_path, 4343, f"         0     {me + 200000}      65536\n")
+    result = await RentedPodOwnershipCheck().run(
+        _ctx(context_factory, _ssh_with_uptime(str(tmp_path), "86400\n 4343    30\n"))
+    )
+    pods = {p["container"]: p for p in result.event.what_we_saw["pods"]}
+    assert "started_after_boot_s" not in pods["pod_1"]
+    assert pods["pod_2"]["started_after_boot_s"] == 86370
+    assert result.event.remediation == Msg.SHIFTED.remediation  # pod_1's history is unknown
+
+
+UPTIME_S = 100000  # the host booted 100000 s before the read
+
+
+def _starts(ages: str, clock: str | None) -> str:
+    """the check's read, from the fixtures' ages: each last field becomes the kernel start time in ticks since
+    boot (100 a second), then the boot epoch and CLK_TCK (None: not readable)"""
+    out = []
+    for line in ages.splitlines():
+        fields = line.split()
+        if fields and fields[-1].isdigit():
+            fields[-1] = str((UPTIME_S - int(fields[-1])) * 100)
+        out.append(" ".join(fields))
+    return "\n".join(out) + "\n--\n" + (clock if clock is not None else "") + "\n"
+
+
+def _ssh_with_runtime_ages(proc: str, ages: str, clock: str | None = "1794500000\n100"):
+    inner = _ssh(proc)
+
+    async def run(cmd, check=False):
+        if cmd.startswith("ps -eo pid=,ppid=,comm= | grep"):
+            return SimpleNamespace(exit_status=0, stdout=_starts(ages, clock), stderr="")
+        return await inner.run(cmd, check=check)
+
+    return SimpleNamespace(run=run)
+
+
+@pytest.mark.parametrize(
+    ("ages", "restarted"),
+    [
+        # needrestart restarted sysbox-fs and the fabric manager 100 s ago; pod_1 runs for a day, pod_2 for 50 s
+        (
+            "  10     1 sysbox-mgr 90000\n  11     1 sysbox-fs     100\n"
+            "  12 1 nv-fabricmanage 100\n--\n 4242 86400\n 4343 50\n",
+            {"nv-fabricmanager": ["pod_1"], "sysbox-fs": ["pod_1"]},
+        ),
+        # every runtime process is older than both pods (a reboot brings them up first): nothing to flag
+        ("10 1 sysbox-mgr 90000\n11 1 sysbox-fs 90000\n--\n4242 86400\n4343 50\n", None),
+        # a pod age not read flags nothing for that pod
+        ("11 1 sysbox-fs 100\n--\n4343 50\n", None),
+        # the daemons run since boot; their own helpers (re-execs, seconds old): no restart
+        (
+            "10 1 sysbox-mgr 90000\n11 1 sysbox-fs 90000\n900 11 sysbox-fs 1\n901 10 sysbox-mgr 2\n"
+            "--\n4242 86400\n4343 50\n",
+            None,
+        ),
+        # a restarted daemon is flagged even beside an orphaned helper of the old one
+        (
+            "11 1 sysbox-fs 100\n77 1 sysbox-fs 90000\n--\n4242 86400\n4343 50\n",
+            {"sysbox-fs": ["pod_1"]},
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_runtime_process_younger_than_a_pod_is_listed_as_its_own_outcome_without_failing(
+    context_factory, tmp_path, ages, restarted
+):
+    me = os.getuid()
+    _proc(tmp_path, 4242, f"         0     {me}      65536\n")
+    _proc(tmp_path, 4343, f"         0     {me}      65536\n")
+    result = await RentedPodOwnershipCheck().run(
+        _ctx(context_factory, _ssh_with_runtime_ages(str(tmp_path), ages))
+    )
+    assert result.passed is True
+    # its own outcome so the restart is logged at INFO even when the last cycle was OK
+    assert result.event.reason_code == (Msg.RUNTIME_RESTARTED if restarted else Msg.OK).reason
+    assert result.event.what_we_saw.get("runtime_restarted_under_pods") == restarted
+
+
+@pytest.mark.parametrize("template", [Msg.SHIFTED, Msg.SHIFTED_AFTER_CONTAINER_RESTART, Msg.SHIFTED_MIXED])
+def test_shifted_remediation_sends_provider_to_support_not_a_host_ownership_change(template):
+    assert "uid_map" not in template.remediation
+    assert "Contact support" in template.remediation
+    assert "free of charge" in template.remediation
+
+
+@pytest.mark.parametrize(
+    ("created_1", "age_1", "created_2", "age_2", "template"),
+    [
+        # both created before the boot, one started late by the stale-mount recovery: the host stop
+        ("2026-11-17T19:00:00Z", 42, "2026-11-17T19:00:00Z", 1390, Msg.SHIFTED),
+        # one created 30 s after the boot and started 50 s after it: not there at the stop, so not the host's alone
+        ("2026-11-17T20:20:33Z", 1350, "2026-11-17T19:00:00Z", 1390, Msg.SHIFTED_MIXED),
+        # both created after the boot, early and late starts: created or restarted on the running host
+        ("2026-11-17T20:20:33Z", 1350, "2026-11-17T20:30:00Z", 42, Msg.SHIFTED_AFTER_CONTAINER_RESTART),
+        # creation unknown: early start reads as the host stop, late start as a restart
+        ("?", 1350, "?", 42, Msg.SHIFTED_MIXED),
+        ("?", 1350, "2026-11-17T19:00:00Z", 1390, Msg.SHIFTED),
+        ("?", 42, "2026-11-17T20:20:33Z", 1390, Msg.SHIFTED_AFTER_CONTAINER_RESTART),
+    ],
+)
+@pytest.mark.asyncio
+async def test_every_shifted_pod_gets_the_cause_its_creation_and_start_show(
+    context_factory, tmp_path, created_1, age_1, created_2, age_2, template
+):
+    me = os.getuid()
+    _proc(tmp_path, 4242, f"         0     {me + 200000}      65536\n")
+    _proc(tmp_path, 4343, f"         0     {me + 200000}      65536\n")
+    boot = 1794946803  # 2026-11-17T20:20:03Z, uptime 1400 s
+    out = f"1400.25\n4242 {age_1}\n4343 {age_2}\n--\n{boot}\n/pod_1 {created_1}\n/pod_2 {created_2}\n"
+    result = await RentedPodOwnershipCheck().run(_ctx(context_factory, _ssh_with_uptime(str(tmp_path), out)))
+    assert result.event.remediation == template.remediation
+
+
+@pytest.mark.parametrize(
+    ("clock", "started_at"),
+    [
+        # boot epoch and ticks a second both read
+        ("1794500000\n100", "2026-11-13T18:00:00Z"),
+        # boot time or tick rate not readable: the report says unknown instead of leaving the time out
+        ("", "unknown"),
+        ("1794500000", "unknown"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_flagged_runtime_carries_when_it_started_from_the_kernel_start_time(
+    context_factory, tmp_path, clock, started_at
+):
+    """the check first ran days after a restart: the report dates the restart itself, from the kernel's start
+    time of the daemon (boot epoch + ticks since boot), not a clock and an age read apart (arhangel66 on
+    lio#2379: a 3 s later clock read moved the date across midnight)"""
+    me = os.getuid()
+    _proc(tmp_path, 4242, f"         0     {me}      65536\n")
+    _proc(tmp_path, 4343, f"         0     {me}      65536\n")
+    # boot 1794500000 + uptime 100000 = a read at 2026-11-13T20:00:00Z; sysbox-fs started 7200 s before it
+    # (2026-11-13T18:00:00Z), pod_1 50000 s before, pod_2 50 s before (after the restart: not flagged)
+    ages = "10 1 sysbox-mgr 99000\n11 1 sysbox-fs 7200\n--\n4242 50000\n4343 50\n"
+    result = await RentedPodOwnershipCheck().run(
+        _ctx(context_factory, _ssh_with_runtime_ages(str(tmp_path), ages, clock))
+    )
+    assert result.event.reason_code == Msg.RUNTIME_RESTARTED.reason
+    assert result.event.what_we_saw["runtime_restarted_under_pods"] == {"sysbox-fs": ["pod_1"]}
+    assert result.event.what_we_saw["runtime_started_at"] == {"sysbox-fs": started_at}
+
+
+@pytest.mark.asyncio
+async def test_the_runtime_read_runs_in_a_real_shell_and_dates_from_the_kernel(monkeypatch):
+    """the command itself, run by bash on this Linux host: a process started after the "pod" (this test
+    process) is flagged and dated within seconds of now"""
+    import calendar
+    import time
+
+    from neurons.validators.src.services.task.checks import rented_pod_ownership as mod
+
+    monkeypatch.setattr(mod, "RUNTIME_PROCESSES", ("sleep",))
+    daemon = subprocess.Popen(["sleep", "30"])
+    try:
+
+        async def run(cmd, check=False):
+            out = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True, check=False)
+            return SimpleNamespace(exit_status=out.returncode, stdout=out.stdout, stderr=out.stderr)
+
+        restarted, started_at = await RentedPodOwnershipCheck()._runtime_restarted_under(
+            SimpleNamespace(ssh=SimpleNamespace(run=run)), [{"pid": os.getpid(), "container": "pod_1"}]
+        )
+    finally:
+        daemon.kill()
+    assert restarted == {"sleep": ["pod_1"]}
+    started = calendar.timegm(time.strptime(started_at["sleep"], "%Y-%m-%dT%H:%M:%SZ"))
+    assert abs(started - time.time()) < 60

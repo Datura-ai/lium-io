@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 from payload_models.payloads import FailedContainerRequest
-from services.docker_service import DockerService, inflight_creates
+from services.docker_service import DockerService, executor_key, inflight_creates
 from test_deploy_optimizations import _docker_client, _patch_happy, _payload, _run, _ssh_client
 
 
@@ -42,12 +42,12 @@ async def test_a_delete_mid_pull_stops_the_pull_and_closes_the_docker_client(svc
     docker.aclose = AsyncMock()
 
     async def tracked_create():
-        with inflight_creates.track(payload.pod_id):
+        with inflight_creates.track(payload.pod_id, executor_key(payload)):
             return await _run(svc, payload)
 
     create = asyncio.create_task(tracked_create())
     await asyncio.wait_for(pull_started.wait(), 10)
-    assert inflight_creates.cancel(payload.pod_id)
+    assert inflight_creates.cancel(payload.pod_id, executor_key(payload))
     result = await asyncio.wait_for(create, 10)
 
     assert isinstance(result, FailedContainerRequest)
@@ -61,7 +61,7 @@ async def test_a_pull_without_a_delete_runs_to_the_end(svc, monkeypatch):
     payload = _payload()
     _patch_happy(svc, monkeypatch, _ssh_client(inspect_exit=1))
 
-    with inflight_creates.track(payload.pod_id):
+    with inflight_creates.track(payload.pod_id, executor_key(payload)):
         result = await _run(svc, payload)
 
     assert not isinstance(result, FailedContainerRequest)
@@ -71,11 +71,11 @@ async def test_a_pull_without_a_delete_runs_to_the_end(svc, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_wait_cancelled_returns_only_after_the_cancel():
-    with inflight_creates.track("pod-5283"):
+    with inflight_creates.track("pod-5283", ("miner", "exec")):
         waiter = asyncio.create_task(inflight_creates.wait_cancelled("pod-5283"))
         await asyncio.sleep(0)
         assert not waiter.done()
-        inflight_creates.cancel("pod-5283")
+        inflight_creates.cancel("pod-5283", ("miner", "exec"))
         await asyncio.wait_for(waiter, 1)
 
 
@@ -106,17 +106,43 @@ async def test_a_delete_mid_custom_build_stops_the_build_before_its_export_and_t
     payload = _base_payload(dockerfile_content="FROM alpine\n")
 
     async def tracked_build():
-        with inflight_creates.track(payload.pod_id):
+        with inflight_creates.track(payload.pod_id, executor_key(payload)):
             return await svc._custom_build_image(
                 ssh_client=ssh_client, payload=payload, log_tag="t", default_extra={"pod_id": payload.pod_id}
             )
 
     build = asyncio.create_task(tracked_build())
     await asyncio.wait_for(build_started.wait(), 10)
-    assert inflight_creates.cancel(payload.pod_id)
+    assert inflight_creates.cancel(payload.pod_id, executor_key(payload))
     with pytest.raises(_CreateCancelledByDelete):
         await asyncio.wait_for(build, 10)
 
     assert build_cancelled.is_set()
     assert not any("docker save" in c for c in seen)
     assert any("rm -f" in c and "lium-dind-build-" in c for c in ssh_client.calls)
+
+
+@pytest.mark.asyncio
+async def test_a_step_failing_after_the_delete_is_the_renters_cancel_and_holds_no_node(svc, monkeypatch):
+    """DAH-6410: a step that ends in an error after the renter's delete flagged the create (a long node
+    wait, then a failure) is the renter's cancel, not the provider's failure."""
+    payload = _payload()
+    _patch_happy(svc, monkeypatch, _ssh_client(inspect_exit=1))
+    hold = AsyncMock()
+    monkeypatch.setattr(svc, "hold_node_until_probe_passes", hold)
+
+    async def deleted_then_failed(*args, **kwargs):
+        inflight_creates.cancel(payload.pod_id, executor_key(payload))
+        raise RuntimeError("volume plugin refused")
+
+    svc.create_local_volume = AsyncMock(side_effect=deleted_then_failed)
+
+    with inflight_creates.track(payload.pod_id, executor_key(payload)):
+        result = await _run(svc, payload)
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.failure_step == "cancelled_by_delete"
+    assert hold.await_args.args[1] == "cancelled_by_delete"
+    from services.docker_service import is_host_fault_create_failure
+
+    assert not is_host_fault_create_failure(hold.await_args.args[1], hold.await_args.kwargs["error"])

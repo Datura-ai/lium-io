@@ -68,13 +68,8 @@ def _codes(result: JobResult) -> list[str]:
     return [reason.reason for reason in result.zero_incentive_reasons]
 
 
-@pytest.fixture
-def discord_cutoff_passed(monkeypatch):
-    monkeypatch.setattr(settings, "DISCORD_INCENTIVE_CUTOFF", datetime(2020, 1, 1))
-
-
 @pytest.mark.asyncio
-async def test_full_8x_gate_is_recorded_even_when_discord_blocks(monkeypatch, discord_cutoff_passed):
+async def test_full_8x_gate_is_recorded_even_when_discord_blocks(monkeypatch):
 
     result = await _incentive().calculate_executor_score(_idle_full_8x(provider_discord_connected=False))
 
@@ -86,14 +81,17 @@ async def test_full_8x_gate_is_recorded_even_when_discord_blocks(monkeypatch, di
 
 @pytest.mark.asyncio
 async def test_every_hard_exclusion_and_every_enforced_gate_is_recorded_in_order(
-    monkeypatch, discord_cutoff_passed
+    monkeypatch
 ):
     new_cfg = shared_client.config.model_copy(update={"machine_prices_p90": {H200: 0.5}})
     monkeypatch.setattr(shared_client, "_config", new_cfg)
 
     result = await _incentive().calculate_executor_score(
         _idle_full_8x(
-            provider_discord_connected=False, is_new_rentals_paused=True, is_spot=True, spec=dict(SHORT_DISK_SPEC)
+            provider_discord_connected=False,
+            is_new_rentals_paused=True,
+            is_spot=True,
+            spec={**SHORT_DISK_SPEC, "ram": {"total": 16 * 1024**2}},
         )
     )
 
@@ -103,6 +101,7 @@ async def test_every_hard_exclusion_and_every_enforced_gate_is_recorded_in_order
         "new_rentals_paused",
         "price_above_market_p90_soft_limit",
         "insufficient_disk_for_vram",
+        "insufficient_ram_for_vram",
         "flagship_without_ncu_or_split",
     ]
     assert result.mining_score == 0
@@ -144,7 +143,7 @@ GATE_LOG_CASES = [
 @pytest.mark.parametrize("enforced", [False, True], ids=["shadow", "enforced"])
 @pytest.mark.parametrize(("flag", "node", "reason", "log_reason"), GATE_LOG_CASES, ids=lambda v: v if isinstance(v, str) else None)
 async def test_a_gate_logs_only_while_the_node_is_still_eligible(
-    monkeypatch, caplog, discord_cutoff_passed, enforced, flag, node, reason, log_reason
+    monkeypatch, caplog, enforced, flag, node, reason, log_reason
 ):
     # the gate lines count eligible nodes only, as before every reason was recorded; an enforced
     # gate still records its reason on the blocked node
@@ -170,10 +169,8 @@ async def test_a_gate_logs_only_while_the_node_is_still_eligible(
 
 @pytest.mark.asyncio
 async def test_driver_and_sysbox_are_recorded_on_a_node_blocked_before_pricing(
-    monkeypatch, discord_cutoff_passed
+    monkeypatch
 ):
-    monkeypatch.setattr(settings, "MIN_DRIVER_CUTOFF", datetime(2020, 1, 1))
-    monkeypatch.setattr(settings, "PORTION_FOR_SYSBOX_UNRENTED", 1)
 
     result = await _incentive().calculate_executor_score(
         _idle_full_8x(
@@ -419,12 +416,12 @@ async def test_an_excluded_node_with_a_model_the_validator_does_not_know_scores_
     assert result.eligible_for_rental_share is False
 
 
-# ── a rented node whose mining score is zeroed by the Sysbox portion ─────────
+# ── a rented node whose mining score is zeroed for no Sysbox ─────────
 
 
-def _rented(**overrides) -> JobResult:
+def _rented(rental_created_at: datetime = datetime(2030, 1, 1), **overrides) -> JobResult:
     return _idle_full_8x(
-        gpu_count=4, spec=None, is_rented=True, rental_created_at=datetime(2030, 1, 1), **overrides
+        gpu_count=4, spec=None, is_rented=True, rental_created_at=rental_created_at, **overrides
     )
 
 
@@ -440,7 +437,6 @@ async def _score_one_cycle(result: JobResult) -> JobResult:
 
 @pytest.mark.asyncio
 async def test_a_rented_node_without_confirmed_sysbox_names_the_reason(monkeypatch):
-    monkeypatch.setattr(settings, "PORTION_FOR_SYSBOX_RENTED", 1)
     rented = _rented(sysbox_runtime=False)
 
     result = await _score_one_cycle(rented)
@@ -452,8 +448,17 @@ async def test_a_rented_node_without_confirmed_sysbox_names_the_reason(monkeypat
 
 
 @pytest.mark.asyncio
+async def test_a_rental_older_than_april_2026_without_sysbox_also_scores_zero():
+    # the old rule only cut 20% from a rental created before 3 Apr 2026; sysbox is now required for every rental
+    result = await _score_one_cycle(_rented(rental_created_at=datetime(2026, 1, 1), sysbox_runtime=False))
+
+    assert _codes(result) == [ZeroIncentiveReason.RENTED_SYSBOX_NOT_CONFIRMED]
+    assert result.sysbox_multiplier == 0
+    assert result.mining_score == 0
+
+
+@pytest.mark.asyncio
 async def test_a_rented_node_with_confirmed_sysbox_has_no_reason(monkeypatch):
-    monkeypatch.setattr(settings, "PORTION_FOR_SYSBOX_RENTED", 1)
     rented = _rented(sysbox_runtime=True)
 
     result = await _score_one_cycle(rented)
@@ -464,7 +469,6 @@ async def test_a_rented_node_with_confirmed_sysbox_has_no_reason(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_an_idle_node_without_sysbox_keeps_only_the_idle_reason(monkeypatch):
-    monkeypatch.setattr(settings, "PORTION_FOR_SYSBOX_UNRENTED", 1)
     idle = _idle_full_8x(gpu_count=4, spec=None, sysbox_runtime=False)
 
     result = await _score_one_cycle(idle)

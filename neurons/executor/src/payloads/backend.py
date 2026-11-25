@@ -6,12 +6,21 @@ class SignaturePayload(BaseModel):
     signature: str
 
 
-class HardwareUtilizationPayload(SignaturePayload):
+class BoundSignaturePayload(SignaturePayload):
+    """`signature` is the legacy fixed-string form. DAH-6430: `bound_signature` signs
+    "<purpose>:<miner_hotkey>:<timestamp>" (bound_signing_message), so a request is valid only for
+    one miner's nodes and a short window. An executor that predates it ignores the extra fields."""
+    miner_hotkey: str | None = None
+    timestamp: int | None = None
+    bound_signature: str | None = None
+
+
+class HardwareUtilizationPayload(BoundSignaturePayload):
     """Payload for hardware utilization endpoint with signature verification"""
     pass
 
 
-class PingPayload(SignaturePayload):
+class PingPayload(BoundSignaturePayload):
     """Payload for ping endpoint with signature verification"""
     pass
 

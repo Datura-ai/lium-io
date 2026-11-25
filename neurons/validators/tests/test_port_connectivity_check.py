@@ -134,6 +134,7 @@ class DummyConnectivityService:
         port_ranges: tuple[PortRangeResult, ...] = (),
         sysbox_measured: bool | None = None,
         host_runtime_fault: bool = False,
+        dind_skipped: bool = False,
     ):
         """
         Args:
@@ -145,6 +146,7 @@ class DummyConnectivityService:
             dind_ok: Override whether the DinD probe reached its container (default: success)
         """
         self.dind_error = dind_error
+        self.dind_skipped = dind_skipped
         self.host_runtime_fault = host_runtime_fault
         self.sysbox_measured = sysbox_measured
         self.port_ranges = port_ranges
@@ -211,6 +213,7 @@ class DummyConnectivityService:
             port_ranges=self.port_ranges,
             sysbox_measured=self.sysbox_measured,
             host_runtime_fault=self.host_runtime_fault,
+            dind_skipped=self.dind_skipped,
         )
 
 
@@ -2049,3 +2052,53 @@ async def test_host_runtime_fault_is_the_dind_probes_own_reading(context_factory
     result = await PortConnectivityCheck().run(ctx)
 
     assert result.updates["state"].host_runtime_fault is fault
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("known_sysbox", [True, False])
+async def test_a_skipped_dind_probe_keeps_sysbox_and_its_memory(context_factory, known_sysbox):
+    """DAH-6376: no free port for the DinD probe, so nothing was measured: the node keeps its known Sysbox value,
+    the verified-Sysbox memory is not forgotten, and the ports that answered still pass the check."""
+    redis_service = DummyRedis()
+    redis_service.sysbox_verified[("miner-hotkey", "executor-123")] = 86400
+    services = build_services(
+        redis=redis_service,
+        backend=DummyBackendService(),
+        connectivity=DummyConnectivityService(
+            success=True, sysbox_runtime=True, verified_port_count=10, dind_ok=False, dind_skipped=True
+        ),
+    )
+    ctx = context_factory(
+        services=services,
+        config=build_context_config(job_batch_id="batch-123"),
+        state=build_state(sysbox_runtime=known_sysbox),
+    )
+
+    result = await PortConnectivityCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.updates["state"].sysbox_runtime is known_sysbox
+    assert result.updates["default_extra"]["dind_skipped"] is True
+    assert ("miner-hotkey", "executor-123") in redis_service.sysbox_verified
+
+
+@pytest.mark.asyncio
+async def test_a_skipped_dind_probe_after_a_timed_out_scrape_test_is_no_sysbox_miss(context_factory):
+    """DAH-6376 review: an unrented node whose scrape Sysbox test timed out asked the probe for Sysbox; the probe
+    was skipped, so nothing was measured and the cycle must not end on SYSBOX_REQUIRED_MISSING."""
+    services = build_services(
+        redis=DummyRedis(),
+        backend=DummyBackendService(),
+        connectivity=DummyConnectivityService(
+            success=True, sysbox_runtime=True, verified_port_count=100, dind_ok=False, dind_skipped=True
+        ),
+    )
+    ctx = context_factory(
+        services=services,
+        config=build_context_config(job_batch_id="batch-123"),
+        state=build_state(sysbox_runtime=False, specs=dict(TIMED_OUT_SPECS)),
+    )
+
+    result = await PortConnectivityCheck().run(ctx)
+
+    assert result.updates["state"].sysbox_runtime is True

@@ -45,8 +45,9 @@ from collections.abc import Sequence
 from typing import TYPE_CHECKING, NamedTuple
 
 import asyncssh
-
 from services.rental_docker_sdk import GpuDockerConfig, build_gpu_docker_config
+
+from core.utils import _m
 
 if TYPE_CHECKING:
     from services.prerun_host_probe import PrerunHostProbe
@@ -102,18 +103,20 @@ def _emit_missing_rented_gpu(
     default_extra: dict | None,
 ) -> None:
     logger.warning(
-        _KERNEL_GPU_VERDICT_MISSING_MSG,
-        extra={
-            **(default_extra or {}),
-            "kernel_gpu_verdict": "missing_rented_gpu",
-            "executor_id": executor_id,
-            "executor_peer": _ssh_peer(ssh),
-            "requested_gpu_count": len(exc.requested_uuids),
-            "visible_gpu_count": len(exc.visible_uuids),
-            "requested_uuids": exc.requested_uuids,
-            "visible_uuids": exc.visible_uuids,
-            "missing_uuids": exc.missing_uuids,
-        },
+        _m(
+            _KERNEL_GPU_VERDICT_MISSING_MSG,
+            {
+                **(default_extra or {}),
+                "kernel_gpu_verdict": "missing_rented_gpu",
+                "executor_id": executor_id,
+                "executor_peer": _ssh_peer(ssh),
+                "requested_gpu_count": len(exc.requested_uuids),
+                "visible_gpu_count": len(exc.visible_uuids),
+                "requested_uuids": exc.requested_uuids,
+                "visible_uuids": exc.visible_uuids,
+                "missing_uuids": exc.missing_uuids,
+            },
+        )
     )
 
 
@@ -128,22 +131,24 @@ def _emit_kernel_xml_disagreement(
     default_extra: dict | None,
 ) -> None:
     logger.warning(
-        _KERNEL_GPU_VERDICT_DISAGREE_MSG,
-        extra={
-            **(default_extra or {}),
-            "kernel_gpu_verdict": "kernel_xml_disagreement",
-            "executor_id": executor_id,
-            "executor_peer": _ssh_peer(ssh),
-            # proc_unreadable distinguishes the honest case (an unreadable /proc map, which
-            # enforcement also refuses) from a real spoof (proc readable but missing a card the
-            # spoofable XML claims).
-            "proc_unreadable": proc_unreadable,
-            "enforced": True,
-            "requested_uuids": list(gpu_uuids),
-            "kernel_visible_uuids": sorted(proc_map),
-            "xml_visible_uuids": sorted(xml_map),
-            "xml_would_add_uuids": [u for u in gpu_uuids if u not in proc_map and u in xml_map],
-        },
+        _m(
+            _KERNEL_GPU_VERDICT_DISAGREE_MSG,
+            {
+                **(default_extra or {}),
+                "kernel_gpu_verdict": "kernel_xml_disagreement",
+                "executor_id": executor_id,
+                "executor_peer": _ssh_peer(ssh),
+                # proc_unreadable distinguishes the honest case (an unreadable /proc map, which
+                # enforcement also refuses) from a real spoof (proc readable but missing a card the
+                # spoofable XML claims).
+                "proc_unreadable": proc_unreadable,
+                "enforced": True,
+                "requested_uuids": list(gpu_uuids),
+                "kernel_visible_uuids": sorted(proc_map),
+                "xml_visible_uuids": sorted(xml_map),
+                "xml_would_add_uuids": [u for u in gpu_uuids if u not in proc_map and u in xml_map],
+            },
+        )
     )
 
 
@@ -253,10 +258,12 @@ async def build_gpu_docker_config_for_executor(
             # entries. The caller records this create FAILED, the same way gpu_power_cap does.
             raise
         logger.warning(
-            "nvidia_devices: probe failed, falling back to legacy --gpus only "
-            "(pod will not survive systemd daemon-reload on the executor)",
+            _m(
+                "nvidia_devices: probe failed, falling back to legacy --gpus only "
+                "(pod will not survive systemd daemon-reload on the executor)",
+                {"gpu_uuids": list(gpu_uuids) if gpu_uuids else None},
+            ),
             exc_info=True,
-            extra={"gpu_uuids": list(gpu_uuids) if gpu_uuids else None},
         )
         return build_gpu_docker_config(gpu_uuids)
 
@@ -521,33 +528,33 @@ async def read_kernel_gpu_view(
     except Exception as exc:
         if host_view:
             logger.info(
-                "%s failed: %s", what, repr(exc)[:500], extra={"executor_peer": _ssh_peer(ssh)}
+                _m("%s failed: %s", {"executor_peer": _ssh_peer(ssh)}), what, repr(exc)[:500]
             )
             return KernelGpuView(uuids=None, foreign_mounts=[])
         # fail-open by design; the line is what tells ops the kernel view was missing on this host
         logger.warning(
-            "kernel GPU UUID read failed, bans matched on the reported list only: %s",
+            _m(
+                "kernel GPU UUID read failed, bans matched on the reported list only: %s",
+                {"executor_peer": _ssh_peer(ssh)},
+            ),
             repr(exc)[:500],
-            extra={"executor_peer": _ssh_peer(ssh)},
         )
         return KernelGpuView(uuids=None, foreign_mounts=[])
     foreign_mounts = foreign_mounts_over_proc_nvidia_gpus(mountinfo, file_fs, host_view=host_view)
     if foreign_mounts and host_view:
         # the usual case: PID 1 is the container's own init, so this is its mount table again
         logger.info(
-            "%s not usable, mounts over %s: %s",
+            _m("%s not usable, mounts over %s: %s", {"executor_peer": _ssh_peer(ssh)}),
             what,
             PROC_NVIDIA_PATH,
             foreign_mounts,
-            extra={"executor_peer": _ssh_peer(ssh)},
         )
         return KernelGpuView(uuids=None, foreign_mounts=foreign_mounts)
     if foreign_mounts:
         logger.warning(
-            "foreign mount over %s: %s",
+            _m("foreign mount over %s: %s", {"executor_peer": _ssh_peer(ssh)}),
             PROC_NVIDIA_GPUS_PATH,
             foreign_mounts,
-            extra={"executor_peer": _ssh_peer(ssh)},
         )
         return KernelGpuView(uuids=None, foreign_mounts=foreign_mounts)
     uuids = list(_parse_uuid_minor_csv(uuid_lines))
@@ -556,9 +563,8 @@ async def read_kernel_gpu_view(
     procfs_rows = [line for line in file_fs.splitlines() if line.strip().endswith(" proc")]
     if len(procfs_rows) < len(uuids):
         logger.warning(
-            "%s had no procfs evidence for every card; withheld",
+            _m("%s had no procfs evidence for every card; withheld", {"executor_peer": _ssh_peer(ssh)}),
             what,
-            extra={"executor_peer": _ssh_peer(ssh)},
         )
         return KernelGpuView(uuids=None, foreign_mounts=[])
     return KernelGpuView(uuids=uuids or None, foreign_mounts=[])

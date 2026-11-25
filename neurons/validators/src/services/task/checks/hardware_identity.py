@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import re
 
 from services.nvidia_devices import read_kernel_gpu_view
 
@@ -22,6 +23,15 @@ DMI_FILES = " ".join(
 )
 HW_ID_FS_SEPARATOR = "--hw-id-fs--"
 HW_ID_VALUES_SEPARATOR = "--hw-id-values--"
+HW_ID_BOOT_SEPARATOR = "--hw-id-boot--"
+HW_ID_BOOT_FS_SEPARATOR = "--hw-id-boot-fs--"
+HW_ID_BOOT_VALUE_SEPARATOR = "--hw-id-boot-value--"
+BOOT_ID_PATH = "/proc/sys/kernel/random/boot_id"
+# every mount point that could cover the boot id file, the file itself included
+BOOT_ID_COVERING_MOUNTS = ("/proc", "/proc/sys", "/proc/sys/kernel", "/proc/sys/kernel/random", BOOT_ID_PATH)
+BOOT_ID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+# a crash-looping host adds one id per boot; at this many ids the oldest go (a return to one needs this many boots)
+BOOT_HISTORY_MAX = 1000
 # One round-trip, the same shape as nvidia_devices.KERNEL_GPU_VIEW_CMD: mounts on any dmi path,
 # the filesystem each DMI file really lives on (`stat -f %T`: "sysfs"), its kind (no -L, so a
 # symlink shows), then the identity values.
@@ -33,6 +43,11 @@ HW_ID_CMD = (
     + "; ".join(
         f"printf '%s|' \"$(head -c 128 {DMI_ID_PATH}/{name} 2>/dev/null)\"" for name in DMI_IDENTITY_ATTRIBUTES
     )
+    + f"; echo; echo {HW_ID_BOOT_SEPARATOR}; awk '"
+    + "||".join(f'$5=="{m}"' for m in BOOT_ID_COVERING_MOUNTS)
+    + f"' /proc/self/mountinfo 2>/dev/null; echo {HW_ID_BOOT_FS_SEPARATOR}; "
+    f"stat -f -c '%T' {BOOT_ID_PATH} 2>/dev/null; stat -c '%F' {BOOT_ID_PATH} 2>/dev/null; "
+    f"echo {HW_ID_BOOT_VALUE_SEPARATOR}; head -c 64 {BOOT_ID_PATH} 2>/dev/null"
 )
 HW_ID_READ_TIMEOUT_SECONDS = 15
 # sysfs reports a 4096-byte size for its attributes, so `stat -c %F` reads "regular file"
@@ -83,14 +98,61 @@ def digest(values: list[str]) -> str:
     return hashlib.sha256("\n".join(values).encode()).hexdigest()[:16]
 
 
-def dmi_identity_drifted(previous: dict | None, gpus: list[str], dmi_identity: str) -> bool:
-    """DMI identity changed between checks while the GPU set stayed: the board did not change, the overlay did."""
+def trusted_boot_id(section: str) -> str:
+    """The kernel's boot id when procfs serves it, else "" (no reboot exception, nothing remembered).
+
+    Every mount covering the file must be procfs mapping the path to the same procfs file: /proc itself, or a
+    read-only bind of the matching subtree (Docker's /proc/sys). A mount over the file or a parent of another
+    filesystem, or a procfs bind of a different subtree, replaces its contents.
+    """
+    mounts, _, rest = section.partition(HW_ID_BOOT_FS_SEPARATOR)
+    file_fs, _, value = rest.partition(HW_ID_BOOT_VALUE_SEPARATOR)
+    if not mounts.strip():
+        return ""  # /proc is always a mount: no line means the listing failed
+    for line in mounts.splitlines():
+        if not line.strip():
+            continue
+        fields = line.split()
+        if len(fields) < 7 or "-" not in fields[6:]:
+            return ""
+        root, mount_point, fstype = fields[3], fields[4], fields[fields.index("-", 6) + 1]
+        if mount_point not in BOOT_ID_COVERING_MOUNTS:
+            return ""
+        if fstype != "proc" or root.rstrip("/") + BOOT_ID_PATH[len(mount_point) :] != BOOT_ID_PATH[len("/proc") :]:
+            return ""
+    if [line.strip() for line in file_fs.splitlines() if line.strip()][:1] != ["proc"]:
+        return ""
+    if not any(line.strip() in DMI_FILE_KINDS for line in file_fs.splitlines()):
+        return ""
+    value = value.strip()
+    return value if BOOT_ID_RE.fullmatch(value) else ""
+
+
+def boot_history(previous: dict | None) -> list[str]:
+    """Trusted boot ids this node was seen with; a record from before the history seeds it with its one boot id."""
+    if not previous:
+        return []
+    return list(previous.get("boots") or ([previous["boot"]] if previous.get("boot") else []))
+
+
+def dmi_identity_drifted(previous: dict | None, gpus: list[str], dmi_identity: str, boot_id: str = "") -> bool:
+    """DMI identity changed between checks while the GPU set stayed: the board did not change, the overlay did.
+
+    A trusted boot id never seen on this node excuses the change (a hypervisor may assign a new product_uuid on a
+    restart). A boot id already in the history does not, so two machines alternating behind one node are flagged
+    on the return. The history always holds the previous boot id, so "not in it" also means "differs from it".
+    With no history to compare against, nothing is excused.
+    """
+    # a record with no boot history (written before it existed) keeps the old rule: the change is flagged
+    history = boot_history(previous)
+    restarted = bool(boot_id and history and boot_id not in history)
     return bool(
         previous
         and dmi_identity
         and previous.get("dmi")
         and previous.get("gpus") == gpus
         and previous.get("dmi") != dmi_identity
+        and not restarted
     )
 
 
@@ -118,12 +180,14 @@ class HardwareIdentityCheck:
         kernel = sorted(set(kernel_uuids)) if kernel_uuids is not None else None
         gpus = kernel or reported
 
-        mountinfo = file_fs = values = ""
+        mountinfo = file_fs = values = boot_id = ""
         if ctx.ssh is not None:
             try:
                 res = await asyncio.wait_for(ctx.ssh.run(HW_ID_CMD), timeout=HW_ID_READ_TIMEOUT_SECONDS)
                 mountinfo, _, rest = (res.stdout or "").partition(HW_ID_FS_SEPARATOR)
                 file_fs, _, values = rest.partition(HW_ID_VALUES_SEPARATOR)
+                values, _, boot_section = values.partition(HW_ID_BOOT_SEPARATOR)
+                boot_id = trusted_boot_id(boot_section)
             except Exception as exc:
                 logger.warning("hardware identity read failed: %s", repr(exc)[:500], extra=ctx.default_extra)
         overlays = dmi_overlay_findings(mountinfo, file_fs)
@@ -136,8 +200,11 @@ class HardwareIdentityCheck:
             raw = await ctx.services.redis.get(key)
             previous = json.loads(raw) if raw else None
             if gpus and dmi_identity and not overlays:
+                boots = boot_history(previous)
+                if boot_id and boot_id not in boots:
+                    boots = [*boots, boot_id][-BOOT_HISTORY_MAX:]
                 await ctx.services.redis.set(
-                    key, json.dumps({"gpus": gpus, "dmi": dmi_identity}), ex=HW_ID_TTL_SECONDS
+                    key, json.dumps({"gpus": gpus, "dmi": dmi_identity, "boots": boots}), ex=HW_ID_TTL_SECONDS
                 )
         except Exception:
             logger.warning("hardware identity record unavailable", exc_info=True, extra=ctx.default_extra)
@@ -153,7 +220,7 @@ class HardwareIdentityCheck:
             findings.append("dmi_overlaid")
         if gpu_sources_disagree(reported, host_kernel or kernel):
             findings.append("gpu_sources_disagree")
-        if dmi_identity_drifted(previous, gpus, dmi_identity):
+        if dmi_identity_drifted(previous, gpus, dmi_identity, boot_id):
             findings.append("dmi_changed_under_same_gpus")
 
         what = {

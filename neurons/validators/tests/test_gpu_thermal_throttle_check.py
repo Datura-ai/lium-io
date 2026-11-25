@@ -7,7 +7,9 @@ reasons. The check is non-fatal and observe-only: a warning event, the score unc
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import json
@@ -51,8 +53,50 @@ def h100(**overrides: Any) -> dict[str, Any]:
     return row
 
 
+class LoadRunner:
+    """DAH-6469: the validator's load runs until the kill command; the scrape under it reads these rows.
+
+    readings None: the scrape under the load decrypts nothing. load_ends_early: the load exits on its own (a fault,
+    an error) before the reading comes back."""
+
+    def __init__(self, *readings: dict[str, Any], scrape_nothing: bool = False, load_ends_early: bool = False):
+        self.readings = None if scrape_nothing else list(readings)
+        self.load_ends_early = load_ends_early
+        self.calls: list[str] = []
+        self.timeouts: list[float] = []
+        self.killed = asyncio.Event()
+        self.scraped_under_load: list[bool] = []
+
+    async def run(self, cmd, *, timeout=60, check=False, retryable=True, stdin_text=None):
+        self.calls.append(cmd)
+        self.timeouts.append(timeout)
+        if cmd.startswith("pkill"):
+            self.killed.set()
+            return SimpleNamespace(stdout="", stderr="", exit_code=0, success=True, duration_ms=1)
+        if not self.load_ends_early:
+            await self.killed.wait()
+        return SimpleNamespace(stdout="", stderr="", exit_code=-1, success=False, duration_ms=1)
+
+    async def scrape(self, timeout: int) -> list[dict[str, Any]]:
+        if self.load_ends_early:
+            await asyncio.sleep(0)  # the load exits while the scrape runs
+        self.scraped_under_load.append(not self.killed.is_set())
+        return self.readings or []
+
+
+@pytest.fixture(autouse=True)
+def _no_warmup_wait(monkeypatch):
+    monkeypatch.setattr(gpu_thermal_throttle, "LOAD_WARMUP_SECONDS", 0)
+    monkeypatch.setattr(gpu_thermal_throttle, "scrape_gpu_details", lambda ctx, timeout: ctx.runner.scrape(timeout))
+
+
 async def run(
-    context_factory, *rows: dict[str, Any], rented: bool = False, rental_hotkey: str = "miner-hotkey", redis=None
+    context_factory,
+    *rows: dict[str, Any],
+    rented: bool = False,
+    rental_hotkey: str = "miner-hotkey",
+    redis=None,
+    runner=None,
 ):
     rented_data = None
     if rented:
@@ -69,6 +113,8 @@ async def run(
     ctx = context_factory(
         state=build_state(gpu_details=list(rows), rented_data=rented_data),
         services=build_services(redis=redis or FakeRedis()),
+        # a scrape under the load that reads nothing by default: the hold behaves as before DAH-6469
+        runner=runner or LoadRunner(scrape_nothing=True),
     )
     return await GpuThermalThrottleCheck().run(ctx)
 
@@ -176,6 +222,36 @@ async def test_a_low_clock_explained_by_a_power_cap_is_left_to_the_power_limit_c
     result = await run(context_factory, h100(graphics_speed=800, clocks_event_reasons=SW_POWER_CAP))
 
     assert result.event.reason_code == Msg.OK.reason
+
+
+@pytest.mark.asyncio
+async def test_a_low_clock_explained_by_a_lowered_power_limit_is_left_to_the_power_limit_check(context_factory):
+    row = h100(graphics_speed=800, clocks_event_reasons=SW_POWER_CAP, power_limit=350, power_default_limit=700)
+
+    result = await run(context_factory, row)
+
+    assert result.event.reason_code == Msg.OK.reason
+
+
+@pytest.mark.asyncio
+async def test_a_power_cap_at_the_default_limit_holding_the_clock_under_half_is_flagged(context_factory):
+    # ticket-1219: two of eight cards at SW power cap, ~720 MHz of ~2000, power limit 600 W = default
+    row = h100(graphics_speed=720, clocks_event_reasons=SW_POWER_CAP, power_limit=600, power_default_limit=600)
+
+    result = await run(context_factory, row)
+
+    assert result.event.reason_code == Msg.THROTTLED.reason
+    assert result.event.what_we_saw["gpus"][0]["reasons"] == ["clock_below_half_of_max"]
+
+
+@pytest.mark.asyncio
+async def test_a_power_cap_at_the_default_limit_is_never_a_collapse(context_factory):
+    row = h100(graphics_speed=720, clocks_event_reasons=SW_POWER_CAP, power_limit=600, power_default_limit=600)
+
+    result = await run(context_factory, row)
+
+    assert result.passed
+    assert result.event.reason_code != Msg.COLLAPSED.reason
 
 
 @pytest.mark.asyncio
@@ -465,3 +541,278 @@ async def test_a_collapsed_gpu_under_another_miners_rental_on_a_different_endpoi
     result = await run(context_factory, row, rented=True, rental_hotkey="other-miner-hotkey")
 
     assert result.passed is False
+
+
+# --- the event names the cause the driver reports, never heat for a slowdown it does not call thermal ---------
+
+HW_POWER_BRAKE = 0x80
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("bits", "causes", "title", "fix"),
+    [
+        (SW_THERMAL, ["thermal"], "GPU clock collapsed by overheating", "Fix the cooling"),
+        (HW_SLOWDOWN | HW_THERMAL, ["thermal"], "GPU clock collapsed by overheating", "Fix the cooling"),
+        (HW_SLOWDOWN | HW_POWER_BRAKE, ["power_brake"], "GPU clock collapsed by a power brake", "power supply"),
+        (HW_SLOWDOWN, ["hw_slowdown"], "GPU clock collapsed by a hardware slowdown", "without saying why"),
+        (
+            SW_THERMAL | HW_SLOWDOWN | HW_POWER_BRAKE,
+            ["thermal", "power_brake"],
+            "GPU clock collapsed by overheating and a power brake",
+            "power supply",
+        ),
+    ],
+    ids=["sw-thermal", "hw-thermal", "power-brake", "hw-slowdown-only", "thermal-and-brake"],
+)
+async def test_a_collapse_names_the_cause_from_the_reason_bits(context_factory, bits, causes, title, fix):
+    result = await run(context_factory, h100(graphics_speed=500, clocks_event_reasons=bits))
+
+    assert result.passed is False  # the block is the same for every cause
+    assert result.event.reason_code == Msg.COLLAPSED.reason
+    assert result.event.what_we_saw["gpus"][0]["causes"] == causes
+    assert result.event.event == title
+    assert fix in result.event.remediation
+    if "thermal" not in causes:
+        assert "cooling" not in result.event.remediation.split("power supply")[0]
+    # several causes at once: each fix stands, none tells the provider to rule another out
+    assert "not the cooling" not in result.event.remediation
+    for cause in causes:
+        assert gpu_thermal_throttle.CAUSES[cause][1] in result.event.remediation
+    # the portal shows the availability entry's message: it must name the same cause
+    entry = next(e for e in availability_errors([result.event]) if e.reason_code == Msg.COLLAPSED.reason)
+    assert entry.message == title
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("row", "causes", "title"),
+    [
+        (
+            h100(graphics_speed=720, clocks_event_reasons=SW_POWER_CAP, power_limit=600, power_default_limit=600),
+            ["power_cap"],
+            "GPU throttled under load by its power cap",
+        ),
+        (h100(graphics_speed=650, clocks_event_reasons=None), ["low_clock"], "GPU throttled under load by an unreported cause"),
+        (h100(graphics_speed=1700, clocks_event_reasons=HW_SLOWDOWN), ["hw_slowdown"], "GPU throttled under load by a hardware slowdown"),
+    ],
+    ids=["power-cap-at-default", "no-reason", "hw-slowdown-near-full-clock"],
+)
+async def test_a_warning_names_the_cause_from_the_reason_bits(context_factory, row, causes, title):
+    result = await run(context_factory, row)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.THROTTLED.reason
+    assert result.event.what_we_saw["gpus"][0]["causes"] == causes
+    assert result.event.event == title
+
+
+# --------------------------------------------------------------------------------------------------
+# DAH-6469: the validator loads a held node's cards itself
+# --------------------------------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_a_clean_reading_under_the_load_clears_the_hold(context_factory):
+    redis = FakeRedis()
+    await run(context_factory, COLLAPSED_ROW, redis=redis)
+    runner = LoadRunner(h100())
+
+    result = await run(context_factory, IDLE_ROW, redis=redis, runner=runner)
+
+    assert result.passed is True
+    assert await redis.get(_hold_key(context_factory)) is None
+    # the cards were read while the load still ran, and the load was killed before the check returned
+    assert runner.scraped_under_load == [True]
+    load, kill = runner.calls
+    assert "--heat-seconds " in load and "--thermal" not in load
+    assert kill == gpu_thermal_throttle.LOAD_KILL_COMMAND
+    assert runner.killed.is_set()
+
+
+@pytest.mark.asyncio
+async def test_a_collapse_under_the_load_keeps_the_node_out(context_factory):
+    redis = FakeRedis()
+    await run(context_factory, COLLAPSED_ROW, redis=redis)
+
+    result = await run(context_factory, IDLE_ROW, redis=redis, runner=LoadRunner(COLLAPSED_ROW))
+
+    assert result.passed is False
+    assert result.event.what_we_saw["collapsed_count"] == 1
+    assert result.event.what_we_saw["load_probe"]["still_held"] == ["GPU-aaaa"]
+    assert json.loads(redis.store[_hold_key(context_factory)])["gpus"] == ["GPU-aaaa"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "runner",
+    [
+        LoadRunner(scrape_nothing=True),  # no payload decrypted
+        LoadRunner(h100(gpu_utilization=10)),  # the load never showed
+        LoadRunner(h100(uuid="GPU-other")),  # another card's reading does not clear this one
+        # busy above half its clock but still braking for heat (H100, 7 Nov: cleared at 0.682 with the bit set)
+        LoadRunner(h100(graphics_speed=1350, clocks_event_reasons=SW_THERMAL)),
+        LoadRunner(h100(graphics_speed=1350, clocks_event_reasons=HW_THERMAL)),
+        # a clean busy reading, but the load had already exited when it came back
+        LoadRunner(h100(), load_ends_early=True),
+    ],
+)
+async def test_a_reading_that_proves_nothing_keeps_the_hold(context_factory, runner):
+    redis = FakeRedis()
+    await run(context_factory, COLLAPSED_ROW, redis=redis)
+
+    result = await run(context_factory, IDLE_ROW, redis=redis, runner=runner)
+
+    assert result.passed is False
+    assert result.event.what_we_saw["held_gpu_uuids"] == ["GPU-aaaa"]
+    assert _hold_key(context_factory) in redis.store
+
+
+@pytest.mark.asyncio
+async def test_the_usage_checks_keep_the_scrape_from_before_the_load(context_factory):
+    redis = FakeRedis()
+    await run(context_factory, COLLAPSED_ROW, redis=redis)
+    ctx = context_factory(
+        state=build_state(gpu_details=[IDLE_ROW]),
+        services=build_services(redis=redis),
+        runner=LoadRunner(h100(gpu_utilization=100)),
+    )
+
+    await GpuThermalThrottleCheck().run(ctx)
+
+    assert ctx.state.gpu_details == [IDLE_ROW]
+
+
+@pytest.mark.asyncio
+async def test_a_load_that_outlives_the_kill_is_cut_off(context_factory, monkeypatch):
+    class StuckLoad(LoadRunner):
+        async def run(self, cmd, **kwargs):
+            if cmd.startswith("pkill"):
+                self.calls.append(cmd)
+                return SimpleNamespace(stdout="", stderr="no", exit_code=1, success=False, duration_ms=1)
+            await asyncio.Event().wait()  # an SSH call that never returns
+
+    monkeypatch.setattr(gpu_thermal_throttle, "LOAD_KILL_SECONDS", 0.01)
+    redis = FakeRedis()
+    await run(context_factory, COLLAPSED_ROW, redis=redis)
+
+    result = await run(context_factory, IDLE_ROW, redis=redis, runner=StuckLoad(h100()))
+
+    # the check returns, with the reading taken under the load
+    assert result.passed is True
+
+
+@pytest.mark.asyncio
+async def test_the_load_runs_on_every_eligible_held_cycle(context_factory):
+    redis = FakeRedis()
+    await run(context_factory, COLLAPSED_ROW, redis=redis)
+    runners = [LoadRunner(h100(graphics_speed=1350, clocks_event_reasons=SW_THERMAL)) for _ in range(3)]
+
+    for runner in runners:
+        await run(context_factory, IDLE_ROW, redis=redis, runner=runner)
+
+    assert [runner.scraped_under_load for runner in runners] == [[True]] * 3
+
+
+@pytest.mark.asyncio
+async def test_a_busy_scrape_reading_with_the_thermal_bit_does_not_clear_the_hold(context_factory):
+    redis = FakeRedis()
+    await run(context_factory, COLLAPSED_ROW, redis=redis)
+
+    result = await run(context_factory, h100(graphics_speed=1350, clocks_event_reasons=SW_THERMAL), redis=redis)
+
+    assert result.passed is False
+    assert result.event.what_we_saw["held_gpu_uuids"] == ["GPU-aaaa"]
+
+
+@pytest.mark.asyncio
+async def test_a_busy_scrape_reading_without_the_thermal_bit_clears_the_hold(context_factory):
+    redis = FakeRedis()
+    await run(context_factory, COLLAPSED_ROW, redis=redis)
+
+    result = await run(context_factory, h100(clocks_event_reasons=SW_POWER_CAP), redis=redis)
+
+    assert result.passed is True
+    assert await redis.get(_hold_key(context_factory)) is None
+
+
+@pytest.mark.asyncio
+async def test_no_load_when_the_task_has_not_the_whole_sequence_left(context_factory, monkeypatch):
+    redis = FakeRedis()
+    await run(context_factory, COLLAPSED_ROW, redis=redis)
+    monkeypatch.setattr(
+        gpu_thermal_throttle, "task_seconds_left", lambda ctx: gpu_thermal_throttle._load_probe_seconds(ctx) - 1
+    )
+    runner = LoadRunner(h100())
+
+    result = await run(context_factory, IDLE_ROW, redis=redis, runner=runner)
+
+    assert runner.calls == []
+    assert result.event.what_we_saw["held_gpu_uuids"] == ["GPU-aaaa"]
+
+
+@pytest.mark.asyncio
+async def test_no_load_without_a_hold_or_under_a_rental(context_factory):
+    redis = FakeRedis()
+    runner = LoadRunner(h100())
+    await run(context_factory, IDLE_ROW, redis=redis, runner=runner)
+    await run(context_factory, COLLAPSED_ROW, redis=redis, rented=True, runner=runner)
+    await run(context_factory, IDLE_ROW, redis=redis, rented=True, runner=runner)
+
+    assert runner.calls == []
+
+
+@pytest.mark.asyncio
+async def test_the_load_outlasts_the_warmup_and_the_slowest_scrape_and_fits_the_task(context_factory):
+    import re
+
+    from core.config import settings
+
+    redis = FakeRedis()
+    await run(context_factory, COLLAPSED_ROW, redis=redis)
+    runner = LoadRunner(h100())
+    await run(context_factory, IDLE_ROW, redis=redis, runner=runner)
+    ctx = context_factory()
+    timeout = gpu_thermal_throttle._scrape_timeout(ctx)
+
+    heat = float(re.search(r"--heat-seconds (\d+)", runner.calls[0]).group(1))
+    # the fault rounds, then the heat: still running when the slowest scrape returns, until the kill
+    assert gpu_thermal_throttle.PROBE_SECONDS + heat >= gpu_thermal_throttle.LOAD_WARMUP_SECONDS + timeout
+    # the executor task has room for the whole sequence: the load is skipped otherwise, never cut off
+    assert gpu_thermal_throttle._load_probe_seconds(ctx) < settings.JOB_TIME_OUT - 120
+
+
+def test_the_kill_pattern_matches_the_load_and_not_its_own_shell():
+    import re
+
+    pattern = re.compile(gpu_thermal_throttle.LOAD_PROCESS_PATTERN)
+    assert pattern.search("/usr/bin/python3 -I - --seconds 4 --heat-seconds 544")
+    assert not pattern.search(gpu_thermal_throttle.LOAD_KILL_COMMAND)
+    # the ordinary fault probe of the same cycle is not touched
+    assert not pattern.search("/usr/bin/python3 -I - --seconds 4")
+
+
+def test_the_heat_phase_runs_dense_launches_until_its_seconds_are_up(monkeypatch):
+    from miner_jobs import gpu_fault_probe as probe
+
+    calls: list[str] = []
+    cuda = SimpleNamespace(call=lambda name, *args, **kwargs: calls.append(name))
+    monkeypatch.setattr(probe, "_load_kernels", lambda _cuda, ptx, kernels: {"k_heat": object()})
+    monkeypatch.setattr(probe, "_launch", lambda *args: calls.append("launch"))
+
+    report = probe.heat(cuda, None, 1 << 20, 0, 0.05)
+
+    assert report["heat_launches"] >= 1
+    assert report["heat_s"] >= 0.05
+    assert calls.count("launch") == report["heat_launches"]
+
+
+def test_a_heat_kernel_that_does_not_compile_is_reported_not_raised(monkeypatch):
+    from miner_jobs import gpu_fault_probe as probe
+
+    def refuse(*_args):
+        raise probe.ProbeError("PTX JIT failed: CUDA_ERROR_INVALID_PTX")
+
+    monkeypatch.setattr(probe, "_load_kernels", refuse)
+
+    assert probe.heat(SimpleNamespace(call=None), None, 1 << 20, 0, 0.05) == {
+        "heat_error": "PTX JIT failed: CUDA_ERROR_INVALID_PTX"
+    }

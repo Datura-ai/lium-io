@@ -85,3 +85,127 @@ def test_no_ssh_port_when_the_volume_holds_no_keys(monkeypatch, tmp_path):
     monkeypatch.setattr(settings, "SSH_HOST_KEYS_DIR", str(tmp_path))
     monkeypatch.setattr("routes.apis.os.path.ismount", lambda path: True)
     assert "ssh_host_key_port" not in _client().get("/miner-identity", params={"nonce": NONCE}).json()
+
+
+
+def _signing_keys_dir(monkeypatch, tmp_path, *, mounted: bool):
+    """sshd's three host key types, as ssh-keygen -A writes them; returns each public key by its OpenSSH line."""
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import ec, ed25519, rsa
+
+    keys = {
+        "ed25519": ed25519.Ed25519PrivateKey.generate(),
+        "ecdsa": ec.generate_private_key(ec.SECP256R1()),
+        "rsa": rsa.generate_private_key(public_exponent=65537, key_size=2048),
+    }
+    publics = {}
+    for name, key in keys.items():
+        (tmp_path / f"ssh_host_{name}_key").write_bytes(
+            key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.OpenSSH, serialization.NoEncryption())
+        )
+        public = key.public_key()
+        publics[public.public_bytes(serialization.Encoding.OpenSSH, serialization.PublicFormat.OpenSSH).decode()] = public
+    (tmp_path / "ssh_host_ed25519_key.pub").write_text("not read")
+    monkeypatch.setattr(settings, "SSH_HOST_KEYS_DIR", str(tmp_path))
+    monkeypatch.setattr("routes.apis.os.path.ismount", lambda path: mounted and Path(path) == tmp_path)
+    return publics
+
+
+def _verifies(public, signature: bytes, message: bytes) -> bool:
+    from cryptography.exceptions import InvalidSignature
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.asymmetric import ec, ed25519, padding
+
+    try:
+        if isinstance(public, ed25519.Ed25519PublicKey):
+            public.verify(signature, message)
+        elif isinstance(public, ec.EllipticCurvePublicKey):
+            public.verify(signature, message, ec.ECDSA(hashes.SHA256()))
+        else:
+            public.verify(signature, message, padding.PKCS1v15(), hashes.SHA256())
+    except InvalidSignature:
+        return False
+    return True
+
+
+def test_every_host_key_signs_nonce_hotkey_and_claim(monkeypatch, tmp_path):
+    import base64
+
+    from routes.apis import identity_proof_message
+
+    publics = _signing_keys_dir(monkeypatch, tmp_path, mounted=True)
+    monkeypatch.setattr(settings, "MINER_ACCOUNT_CLAIM", "c1" * 16)
+
+    proofs = _client().get("/miner-identity", params={"nonce": NONCE}).json()["host_key_proofs"]
+
+    assert set(proofs) == set(publics)  # one per key type, keyed by the line ssh-keyscan shows
+    message = identity_proof_message(NONCE, settings.MINER_HOTKEY_SS58_ADDRESS, "c1" * 16)
+    other_claim = identity_proof_message(NONCE, settings.MINER_HOTKEY_SS58_ADDRESS, "d2" * 16)
+    for line, public in publics.items():
+        signature = base64.b64decode(proofs[line])
+        assert _verifies(public, signature, message), line
+        assert not _verifies(public, signature, other_claim), line
+
+
+def test_no_host_key_proofs_without_persisted_keys(monkeypatch, tmp_path):
+    _signing_keys_dir(monkeypatch, tmp_path, mounted=False)
+    assert "host_key_proofs" not in _client().get("/miner-identity", params={"nonce": NONCE}).json()
+
+
+def test_no_host_key_proofs_when_no_private_key_can_be_read(monkeypatch, tmp_path):
+    _keys_dir(monkeypatch, tmp_path, mounted=True)  # only the .pub
+    body = _client().get("/miner-identity", params={"nonce": NONCE}).json()
+    assert body["ssh_host_key_port"] and "host_key_proofs" not in body
+
+
+def test_host_keys_are_parsed_once_per_file_version(monkeypatch, tmp_path):
+    import os
+
+    from routes import apis
+
+    publics = _signing_keys_dir(monkeypatch, tmp_path, mounted=True)
+    apis._load_host_key.cache_clear()
+    for _ in range(3):
+        assert set(_client().get("/miner-identity", params={"nonce": NONCE}).json()["host_key_proofs"]) == set(publics)
+    assert apis._load_host_key.cache_info().misses == 3  # one parse per key, not per request
+
+    rsa_key = tmp_path / "ssh_host_rsa_key"
+    os.utime(rsa_key, ns=(rsa_key.stat().st_atime_ns, rsa_key.stat().st_mtime_ns + 1))
+    _client().get("/miner-identity", params={"nonce": NONCE})
+    assert apis._load_host_key.cache_info().misses == 4  # a rewritten key file is read again
+
+
+def _sk_ed25519_private_key() -> bytes:
+    """An OpenSSH `sk-ssh-ed25519@openssh.com` (FIDO) private key file, a type `cryptography` cannot load."""
+    import base64
+    import os
+    import struct
+
+    def string(b: bytes) -> bytes:
+        return struct.pack(">I", len(b)) + b
+
+    key_type, pk, app = b"sk-ssh-ed25519@openssh.com", os.urandom(32), b"ssh:"
+    public = string(key_type) + string(pk) + string(app)
+    private = struct.pack(">II", 7, 7) + public + b"\x01" + string(os.urandom(64)) + string(b"") + string(b"")
+    private += bytes(range(1, 1 + (-len(private)) % 8))
+    blob = b"openssh-key-v1\x00" + string(b"none") + string(b"none") + string(b"") + struct.pack(">I", 1)
+    blob += string(public) + string(private)
+    body = base64.b64encode(blob).decode()
+    lines = "\n".join(body[i : i + 70] for i in range(0, len(body), 70))
+    label = "OPENSSH " + "PRIVATE KEY"
+    return f"-----BEGIN {label}-----\n{lines}\n-----END {label}-----\n".encode()
+
+
+def test_an_unloadable_key_file_is_skipped_not_a_500(monkeypatch, tmp_path):
+    from routes import apis
+
+    publics = _signing_keys_dir(monkeypatch, tmp_path, mounted=True)
+    apis._load_host_key.cache_clear()
+    (tmp_path / "ssh_host_ed25519-sk_key").write_bytes(_sk_ed25519_private_key())
+    (tmp_path / "ssh_host_empty_key").write_bytes(b"")
+    (tmp_path / "ssh_host_garbage_key").write_bytes(b"not a key")
+
+    response = _client().get("/miner-identity", params={"nonce": NONCE})
+
+    assert response.status_code == 200
+    assert set(response.json()["host_key_proofs"]) == set(publics)  # the loadable keys still sign

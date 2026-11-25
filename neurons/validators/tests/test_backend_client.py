@@ -7,7 +7,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import aiohttp
 import bittensor
 import pytest
-from neurons.validators.src.clients.backend_client import BackendClient
+from neurons.validators.src.clients import backend_client as backend_client_module
+from neurons.validators.src.clients.backend_client import BackendClient, HealthCheckTimedOut
 from pydantic import BaseModel
 from tenacity import wait_none
 
@@ -202,6 +203,32 @@ async def test_check_executor_health_sends_loopback_plugin_only_when_given(clien
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("nonce", [None, "4c545331" + "00" * 28])
+async def test_check_executor_health_sends_owner_hotkeys_with_the_dated_nonce_it_was_given(client, nonce):
+    """The backend signs owner hotkeys only with a dated nonce, so the health check sends the owner hotkeys next to the
+    nonce the caller passes (upload_nonce_for_miner: none for a miner not proven to relay it)."""
+    with (
+        patch.object(backend_client_module, "portal_owner_hotkeys", return_value={"5OtherAccount"}),
+        patch.object(client, "_signed_request", AsyncMock(return_value=None)) as post,
+    ):
+        await client.check_executor_health("1.2.3.4", 8001, "hotkey", 9001, upload_nonce=nonce)
+
+    sent = post.await_args.kwargs["json_data"]
+    assert sent["owner_hotkeys"] == ["5OtherAccount"]
+    assert sent.get("upload_nonce") == nonce
+
+
+@pytest.mark.asyncio
+async def test_check_executor_health_sends_the_upload_nonce_only_when_given(client):
+    with patch.object(client, "_signed_request", AsyncMock(return_value=None)) as post:
+        await client.check_executor_health("1.2.3.4", 8001, "hotkey", 9001)
+        await client.check_executor_health("1.2.3.4", 8001, "hotkey", 9001, upload_nonce="ab" * 32)
+
+    assert "upload_nonce" not in post.await_args_list[0].kwargs["json_data"]
+    assert post.await_args_list[1].kwargs["json_data"]["upload_nonce"] == "ab" * 32
+
+
+@pytest.mark.asyncio
 async def test_check_executor_health_bounds_the_whole_call_including_retries(reset_session, client):
     # the first attempt drops late, the retry would start a fresh full-length wait
     async def drop_late():
@@ -224,10 +251,31 @@ async def test_check_executor_health_bounds_the_whole_call_including_retries(res
 
     with patch.object(BackendClient, "get_session", return_value=mock_session):
         started = asyncio.get_running_loop().time()
-        result = await client.check_executor_health("1.2.3.4", 8001, "hotkey", 9001, timeout=0.2)
+        with pytest.raises(HealthCheckTimedOut):
+            await client.check_executor_health("1.2.3.4", 8001, "hotkey", 9001, timeout=0.2)
 
-    assert result is None
     assert asyncio.get_running_loop().time() - started < 0.35
+
+
+@pytest.mark.asyncio
+async def test_a_health_check_that_runs_out_its_wait_is_a_timeout_not_a_failed_request(reset_session, client):
+    # the request's own timeout lies past the wait, so running out of time never reads as an API error (None)
+    async def hang():
+        await asyncio.sleep(10)
+
+    async_cm = AsyncMock()
+    async_cm.__aenter__ = AsyncMock(side_effect=hang)
+    async_cm.__aexit__ = AsyncMock(return_value=None)
+    mock_session = AsyncMock()
+    mock_session.closed = False
+    mock_session.request = MagicMock(return_value=async_cm)
+
+    with patch.object(BackendClient, "get_session", return_value=mock_session):
+        with pytest.raises(HealthCheckTimedOut) as raised:
+            await client.check_executor_health("1.2.3.4", 8001, "hotkey", 9001, timeout=0.2)
+
+    assert raised.value.timeout == 0.2
+    assert mock_session.request.call_args.kwargs["timeout"].total > 0.2
 
 
 @pytest.mark.asyncio
@@ -386,6 +434,28 @@ async def test_get_all_rented_executors_parses_filler_mapping(reset_session, cli
     assert result.filler_containers_by_executor == {
         "executor-123": "filler_5703f4c9-c2f4-4fae-a652-3dee4753030a"
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("cycle_snapshot_block", "path"),
+    [
+        (7200, "/internal/executors/rented?snapshot_cycle=7200"),
+        (None, "/internal/executors/rented"),
+    ],
+)
+async def test_cycle_snapshot_read_adds_the_query_flag(
+    reset_session, client, cycle_snapshot_block, path
+):
+    # DAH-6400: the backend counts only the cycle's read toward a resumed node's idle-pay hold
+    mock_session = create_mock_session(create_mock_response(200, {"executors": {}}))
+
+    with patch.object(BackendClient, "get_session", return_value=mock_session):
+        await client.get_all_rented_executors(cycle_snapshot_block=cycle_snapshot_block)
+
+    call = mock_session.request.call_args
+    url = str(call.args[1] if len(call.args) > 1 else call.kwargs.get("url"))
+    assert url.endswith(path)
 
 
 def create_mock_session_with_attempts(side_effects):
@@ -578,6 +648,17 @@ SIGNED_CALLS = [
         ),
     ),
     ("POST", "/v1/nvml-driver/report-unknown", lambda c: c.report_unknown_driver("580.1")),
+    # calls through the plain get()/post() sign the whole request too (the 12 Nov storage-operations call did not)
+    ("GET", "/internal/storage-operations/op-1/active", lambda c: c.get_storage_operation_active("op-1")),
+    (
+        "POST",
+        "/internal/pods/pod-1/ssh-reachability",
+        lambda c: c.report_pod_ssh_reachability(
+            "pod-1", state="unreachable", since="t0", result="timeout", errno=None, observed_at="t1"
+        ),
+    ),
+    ("GET", "/data?x=1", lambda c: c.get("/data?x=1", SampleResponse)),
+    ("POST", "/submit", lambda c: c.post("/submit", SampleResponse, json_data={"b": 1, "a": 2})),
 ]
 
 
@@ -603,3 +684,20 @@ async def test_backend_calls_sign_the_whole_request(reset_session, method, path,
     message = BackendClient.signed_request_message(method, path, body, headers["timestamp"])
     assert headers["hotkey"] == keypair.ss58_address
     assert keypair.verify(message, bytes.fromhex(headers["signature"].removeprefix("0x")))
+
+
+@pytest.mark.asyncio
+async def test_check_executor_health_sends_the_portals_owner_hotkeys_for_the_listing(client, monkeypatch):
+    # DAH-6740: the backend signs its health-check key for these, as the validator's own uploads do
+    from clients import validator_portal_api
+
+    monkeypatch.setattr(validator_portal_api, "_owner_hotkeys", {})
+    monkeypatch.setattr(validator_portal_api, "_owner_hotkeys_read_at", None)
+    validator_portal_api.remember_owner_hotkeys({"hotkey": ["5OwnerB", "5OwnerA"]})
+    with patch.object(client, "_signed_request", new=AsyncMock(return_value=None)) as signed:
+        await client.check_executor_health("1.2.3.4", 8001, "hotkey", 9001)
+        await client.check_executor_health("1.2.3.4", 8001, "another", 9001)
+
+    owned, other = (call.kwargs["json_data"] for call in signed.await_args_list)
+    assert owned["owner_hotkeys"] == ["5OwnerA", "5OwnerB"]
+    assert "owner_hotkeys" not in other

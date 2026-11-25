@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any, Dict
+import shlex
 import uuid
 
 from ..messages import StartGpuMonitorMessages as Msg, render_message
@@ -40,7 +41,7 @@ class StartGPUMonitorCheck:
 
         script_path = f"{executor.root_dir.rstrip('/')}/{script_relative_path.lstrip('/')}"
 
-        check_cmd = f'ps aux | grep "python.*{script_path}" | grep -v grep'
+        check_cmd = f"ps aux | grep {shlex.quote('python.*' + script_path)} | grep -v grep"
         check_res = await runner.run(check_cmd, timeout=10, retryable=False)
         processes = [line for line in check_res.stdout.splitlines() if "grep" not in line]
 
@@ -64,9 +65,9 @@ class StartGPUMonitorCheck:
             "compute_rest_app_url": compute_rest_app_url,
         }
 
-        args_string = " ".join([f"--{k} {v}" for k, v in command_args.items()])
+        args_string = " ".join([f"--{k} {shlex.quote(str(v))}" for k, v in command_args.items()])
         start_cmd = (
-            f"nohup {executor.python_path} {script_path} {args_string} > /dev/null 2>&1 &"
+            f"nohup {shlex.quote(executor.python_path)} {shlex.quote(script_path)} {args_string} > /dev/null 2>&1 &"
         )
         start_res = await runner.run(start_cmd, timeout=50, retryable=False)
 

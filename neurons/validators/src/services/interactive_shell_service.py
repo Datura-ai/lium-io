@@ -1,10 +1,5 @@
-import gc
-import pexpect
-import tempfile
-import os
 import shlex
 import asyncssh
-import asyncio
 import logging
 import hashlib
 from core.utils import _m, get_extra_info
@@ -15,13 +10,11 @@ logger = logging.getLogger(__name__)
 
 class InteractiveShellService:
     ssh_client: asyncssh.SSHClientConnection
-    priv_key_path: str | None = None
 
     host: str
     username: str
     private_key: str
     port: int
-    remote_dir: str | None = None
 
     def __init__(self, host: str, username: str, private_key: str, port: int, known_hosts: asyncssh.SSHKnownHosts | None = None):
         self.host = host
@@ -34,57 +27,6 @@ class InteractiveShellService:
             "username": username,
             "port": port,
         }
-
-    async def connect_interactive_shell(self):
-        try:
-            # self.i_shell = await self.loop.run_in_executor(None, self._spawn_interactive_shell)
-            await asyncio.to_thread(self._spawn_interactive_shell)
-        except Exception as e:
-            logger.error(_m(
-                "Error: connecting interactive shell",
-                extra=get_extra_info({
-                    **self.log_extra,
-                    "error": str(e),
-                }),
-            ))
-
-    def _spawn_interactive_shell(self):
-        # Build the SSH command
-        ssh_command = f"ssh -p {self.port}"
-
-        with tempfile.NamedTemporaryFile(delete=False) as temp:
-            temp.write(self.private_key.encode())
-            temp_key_path = temp.name
-            self.priv_key_path = temp_key_path
-
-        ssh_command += f" -i {temp_key_path}"
-
-        # Add options to match typical human behavior
-        ssh_command += " -o BatchMode=no -o StrictHostKeyChecking=no"
-
-        # Add the destination
-        ssh_command += f" {self.username}@{self.host}"
-
-        try:
-            i_shell = pexpect.spawn(ssh_command, timeout=10)
-
-            i = i_shell.expect(['password:', 'continue connecting', 'Last login', pexpect.EOF, pexpect.TIMEOUT], timeout=30)
-            if i == 1:  # Host key verification
-                i_shell.sendline('yes')
-
-            # Wait for shell prompt
-            i = i_shell.expect(['root@'], timeout=30)
-
-            # close shell
-            i_shell.sendline("exit")
-            i_shell.expect(pexpect.EOF)
-            i_shell.close()
-
-            gc.collect()  # Run the garbage collector
-        except pexpect.TIMEOUT:
-            raise Exception("i-ssh connection Timeout")
-        except pexpect.EOF:
-            raise Exception("i-ssh connection EOF error")
 
     async def connect_asyncssh(self):
         # a hostname is resolved afresh on every connect, so a node whose IP changed is the same
@@ -103,19 +45,10 @@ class InteractiveShellService:
         )
 
     async def __aenter__(self):
-        # await self.connect_interactive_shell()
         await self.connect_asyncssh()
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        try:
-            await self.clear_remote_directory()
-
-            if self.priv_key_path and os.path.isfile(self.priv_key_path):
-                os.remove(self.priv_key_path)
-        except:
-            pass
-
         # Close the SSH connection to prevent file descriptor leaks
         try:
             if self.ssh_client:
@@ -129,64 +62,6 @@ class InteractiveShellService:
                     "error": str(e),
                 }),
             ))
-
-        # try:
-        #     if self.i_shell:
-        #         if await asyncio.to_thread(self.i_shell.isalive):
-        #             await asyncio.to_thread(self.i_shell.terminate, force=True)
-
-        #         await asyncio.to_thread(self.i_shell.close)
-        # except Exception as e:
-        #     logger.error(_m(
-        #         "Error: close interactive shell",
-        #         extra=get_extra_info({
-        #             **self.log_extra,
-        #             "error": str(e),
-        #         }),
-        #     ))
-
-    async def upload_directory(
-        self, local_dir: str, remote_dir: str
-    ):
-        if not self.ssh_client:
-            return
-
-        self.remote_dir = remote_dir
-
-        await self.clear_remote_directory()
-
-        await self.ssh_client.run(f"mkdir -p {remote_dir}")
-
-        """Uploads a directory recursively to a remote server using AsyncSSH."""
-        async with self.ssh_client.start_sftp_client() as sftp_client:
-            for root, dirs, files in os.walk(local_dir):
-                relative_dir = os.path.relpath(root, local_dir)
-                remote_path = os.path.join(self.remote_dir, relative_dir)
-
-                # Create remote directory if it doesn't exist
-                result = await self.ssh_client.run(f"mkdir -p {remote_path}")
-                if result.exit_status != 0:
-                    raise Exception(f"Failed to create directory {remote_path}: {result.stderr}")
-
-                # Upload files
-                upload_tasks = []
-                for file in files:
-                    local_file = os.path.join(root, file)
-                    remote_file = os.path.join(remote_path, file)
-                    upload_tasks.append(sftp_client.put(local_file, remote_file))
-
-                # Await all upload tasks for the current directory
-                await asyncio.gather(*upload_tasks)
-
-    async def clear_remote_directory(self):
-        if not self.ssh_client or not self.remote_dir:
-            return
-
-        try:
-            await self.ssh_client.run(f"rm -rf {self.remote_dir}", timeout=10)
-            # await self.exec_shell_command(f"rm -rf {self.remote_dir}")
-        except Exception:
-            pass
 
     async def read_file_content_over_scp(self, file_path: str) -> bytes:
         async with self.ssh_client.start_sftp_client() as sftp_client:

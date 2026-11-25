@@ -22,7 +22,7 @@ from services.miner_service import MinerService
 import dependencies.auth as auth
 from core.config import settings
 
-_SSH_KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITestKey123456789abcdef validator@lium"
+_SSH_KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFdStYghocJM65d3WyCC6wtbXYeqq4wUyfjS3e6wskzJ validator@lium"
 
 
 @pytest.fixture(scope="module")

@@ -3,12 +3,13 @@ from __future__ import annotations
 import json
 import math
 import shlex
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 
 import asyncssh
 from services.const import RENTAL_CPU_COUNT_LABEL
 
 from core.config import settings
+from services.host_memory_guard import apply_host_memory_guard
 
 from ..messages import RentedPodResourcesMessages as Msg
 from ..messages import render_message
@@ -25,13 +26,24 @@ _INSPECT_FORMAT = (
 )
 # The failing findings; oom_priority_raised is recorded only, a root renter can raise it themselves.
 SCORED_FINDINGS = ("cpuset_pinned", "cpu_quota_reduced")
+# A host fault the renter cannot fix; reported with its own warning, never scored.
+PROC_FUSE_FINDING = "proc_fuse_disconnected"
+
 # Owner (19 Oct): a host may keep a little CPU back, but the rental must keep at least this share of
 # its advertised cores, in both the cpuset and the CPU quota.
 MIN_RENTAL_CPU_SHARE = 0.95
 _DEFAULT_CPU_PERIOD_US = 100_000
 # Per init PID: oom_score_adj, then (cgroup v2) the effective cpuset and every cpu.max from the pod's
 # cgroup up to the root, so a host that writes the cgroup directly (not via docker update) is seen too.
+# Then 1 when the host's newest sysbox-fs is gone or younger than the pod's init (it died or restarted under the pod;
+# the newest, as an old one left running beside a restarted one would read as older than the pod),
+# and last the error of one read of the pod's own /proc/sys, which a dead sysbox-fs FUSE mount answers with
+# "Transport endpoint is not connected" while the container keeps running. Only both together are a host fault:
+# a renter can stack and kill their own FUSE mount on /proc/sys, but cannot restart the host's sysbox-fs.
 _INIT_READ_SCRIPT = (
+    "se=$(ps -o etimes= -p \"$(pgrep -xn sysbox-fs)\" 2>/dev/null | tr -d ' '); "
+    # the script runs in the executor container: the host's binary is seen through PID 1's root
+    "sb=$([ -x /proc/1/root/usr/bin/sysbox-fs ] && echo 1); "
     "for p in {pids}; do "
     "o=$(cat /proc/$p/oom_score_adj 2>/dev/null); cs=; cm=; "
     "g=$(awk -F: '$1==\"0\"{{print $3}}' /proc/$p/cgroup 2>/dev/null); "
@@ -39,7 +51,10 @@ _INIT_READ_SCRIPT = (
     'd="/sys/fs/cgroup$g"; cs=$(cat "$d/cpuset.cpus.effective" 2>/dev/null); '
     'while [ "$d" != /sys/fs/cgroup ] && [ -n "$d" ]; do '
     'm=$(cat "$d/cpu.max" 2>/dev/null) && cm="$cm;$m"; d="${{d%/*}}"; done; fi; '
-    'echo "$p|$o|$cs|$cm"; done'
+    "pe=$(ps -o etimes= -p $p 2>/dev/null | tr -d ' '); fr=0; "
+    'if [ -n "$se" ]; then [ -n "$pe" ] && [ "$se" -lt "$pe" ] && fr=1; elif [ -n "$sb" ]; then fr=1; fi; '
+    "pf=$(cat /proc/$p/root/proc/sys/kernel/hostname 2>&1 >/dev/null | head -c 200); "
+    'echo "$p|$o|$cs|$cm|$fr|$pf"; done'
 )
 
 
@@ -58,6 +73,7 @@ class InspectedPod:
     init_oom_score_adj: int | None = None
     cgroup_cpuset: str = ""
     cgroup_quota_cpus: float | None = None
+    proc_fuse_disconnected: bool = False
 
 
 @dataclass(frozen=True)
@@ -65,6 +81,10 @@ class InitReading:
     oom_score_adj: int | None
     cgroup_cpuset: str
     cgroup_quota_cpus: float | None
+    proc_fuse_disconnected: bool = False
+    # the pod's /proc/sys read gave an answer: no error, or "not connected" (a host fault only if sysbox-fs restarted
+    # under the pod). Any other error, or no read, is no verdict on the pod
+    proc_sys_answered: bool = False
 
 
 @dataclass(frozen=True)
@@ -85,17 +105,29 @@ class PodVerdict:
     findings: list[str]
 
 
-def running_rented_container_names(ctx: Context) -> list[str]:
-    """Container names of this executor's running rented pods, per the backend's rented list."""
+def _rented_pods(ctx: Context) -> list:
     rented_data = ctx.state.rented_data
     rented_executor = rented_data.executors.get(ctx.executor.uuid) if rented_data else None
     if rented_executor is None or rented_executor.miner_hotkey != ctx.miner_hotkey:
         return []
-    return [
-        pod.docker_container_name
-        for pod in rented_executor.pods
-        if pod.status in (None, POD_STATUS_RUNNING)
-    ]
+    return rented_executor.pods
+
+
+def running_rented_container_names(ctx: Context, statuses=(None, POD_STATUS_RUNNING)) -> list[str]:
+    """Container names of this executor's rented pods in `statuses` (running), per the backend's rented list."""
+    return [pod.docker_container_name for pod in _rented_pods(ctx) if pod.status in statuses]
+
+
+def pod_verdict_updates(ctx: Context, codes_by_container: dict[str, list[str]]) -> dict:
+    """The CheckResult updates adding this check's verdict on each pod it judged to ContextState.rented_pod_faults:
+    the host-side fault codes it found ([] = clean). Another check's codes on the same pod are kept."""
+    pod_ids = {pod.docker_container_name: pod.pod_id for pod in _rented_pods(ctx)}
+    faults = dict(ctx.state.rented_pod_faults or {})
+    for container, codes in codes_by_container.items():
+        pod_id = pod_ids.get(container)
+        if pod_id is not None:
+            faults[pod_id] = sorted({*faults.get(pod_id, []), *codes})
+    return {"state": replace(ctx.state, rented_pod_faults=faults)} if faults else {}
 
 
 class RentedPodResourcesCheck:
@@ -124,6 +156,12 @@ class RentedPodResourcesCheck:
                 passed=True, event=render_message(Msg.NOT_RENTED, ctx=ctx, check_id=self.check_id)
             )
 
+        # a rebooted host loses MemoryMin (DAH-6379); a DRY_RUN validator must not write it on hosts
+        memory_guard = (
+            {"set": [], "failed": []}
+            if settings.DRY_RUN
+            else await apply_host_memory_guard(ctx.ssh, {"executor_uuid": ctx.executor.uuid})
+        )
         try:
             pods = await self._inspect(ctx.ssh, names)
             init_reads_by_pid = await self._read_init(ctx.ssh, [p.pid for p in pods])
@@ -138,13 +176,35 @@ class RentedPodResourcesCheck:
         outcomes = [
             judge_pod(_with_init(pod, init_reads_by_pid.get(pod.pid)), host_cpus) for pod in pods
         ]
-        what = {"executor_uuid": ctx.executor.uuid, "pods": [asdict(o) for o in outcomes]}
+        # a pod is judged only when its /proc/sys read gave an answer: a failed read says nothing, so it must not send
+        # [] and let the backend clear an earlier fault
+        read_names = {pod.name for pod in pods if (r := init_reads_by_pid.get(pod.pid)) and r.proc_sys_answered}
+        verdicts = pod_verdict_updates(
+            ctx,
+            {
+                o.container: [Msg.PROC_FUSE_DISCONNECTED.reason] if PROC_FUSE_FINDING in o.findings else []
+                for o in outcomes
+                if o.container in read_names
+            },
+        )
+        what = {
+            "executor_uuid": ctx.executor.uuid,
+            "pods": [asdict(o) for o in outcomes],
+            "memory_guard": {"set": len(memory_guard["set"]), "failed": memory_guard["failed"]},
+        }
         if any(f in SCORED_FINDINGS for o in outcomes for f in o.findings):
             event = render_message(Msg.RESOURCES_REDUCED, ctx=ctx, check_id=self.check_id, what=what)
-            return CheckResult(passed=False, event=event, updates={"rented_pod_resources_passed": False})
+            return CheckResult(
+                passed=False, event=event, updates={"rented_pod_resources_passed": False, **verdicts}
+            )
+        if any(PROC_FUSE_FINDING in o.findings for o in outcomes):
+            event = render_message(
+                Msg.PROC_FUSE_DISCONNECTED, ctx=ctx, check_id=self.check_id, what=what
+            )
+            return CheckResult(passed=True, event=event, updates=verdicts)
 
         event = render_message(Msg.RESOURCES_OK, ctx=ctx, check_id=self.check_id, what=what)
-        return CheckResult(passed=True, event=event)
+        return CheckResult(passed=True, event=event, updates=verdicts)
 
     async def _inspect(self, ssh, names: list[str]) -> list[InspectedPod]:
         # docker inspect exits 1 when one name is missing but still prints the others
@@ -172,11 +232,15 @@ class RentedPodResourcesCheck:
         )
         reads = {}
         for line in (getattr(res, "stdout", "") or "").splitlines():
-            parts = line.strip().split("|")
-            if len(parts) != 4 or not parts[0].isdigit():
+            parts = line.strip().split("|", 5)
+            if len(parts) < 4 or not parts[0].isdigit():
                 continue
             oom = int(parts[1]) if parts[1].lstrip("-").isdigit() else None
-            reads[int(parts[0])] = InitReading(oom, parts[2].strip(), _cpu_max_cpus(parts[3]))
+            fuse_dead = len(parts) == 6 and parts[4] == "1" and "not connected" in parts[5]
+            reads[int(parts[0])] = InitReading(
+                oom, parts[2].strip(), _cpu_max_cpus(parts[3]), fuse_dead,
+                len(parts) == 6 and (not parts[5].strip() or "not connected" in parts[5]),
+            )
         return reads
 
     def _unknown(self, ctx: Context, *, reason: str, details: dict | None = None) -> CheckResult:
@@ -216,6 +280,7 @@ def _with_init(pod: InspectedPod, read: InitReading | None) -> InspectedPod:
             "init_oom_score_adj": read.oom_score_adj,
             "cgroup_cpuset": read.cgroup_cpuset,
             "cgroup_quota_cpus": read.cgroup_quota_cpus,
+            "proc_fuse_disconnected": read.proc_fuse_disconnected,
         }
     )
 
@@ -266,6 +331,8 @@ def judge_pod(pod: InspectedPod, host_cpus: int | None) -> PodVerdict:
         and init_oom > pod.oom_score_adj_deployed
     ):
         findings.append("oom_priority_raised")
+    if pod.proc_fuse_disconnected:
+        findings.append(PROC_FUSE_FINDING)
     return PodVerdict(
         container=pod.name,
         cpuset=cpuset,

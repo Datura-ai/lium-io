@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import shlex
 import time
 
 from core.utils import _m, get_extra_info
@@ -178,7 +179,8 @@ class CustomBuildOrphanSweepCheck:
         # Defensive — only act on names matching our prefix.
         if not name.startswith(BUILD_DIND_PREFIX):
             return False
-        cmd = f'/usr/bin/docker rm -fv {name} 2>/dev/null || true'
+        # name, image ref and path are node output: quoted, so a planted name cannot run as shell
+        cmd = f'/usr/bin/docker rm -fv {shlex.quote(name)} 2>/dev/null || true'
         try:
             await ssh.run(cmd, check=False)
             return True
@@ -189,7 +191,7 @@ class CustomBuildOrphanSweepCheck:
             return False
 
     async def _remove_image(self, ssh, image_ref: str) -> bool:
-        cmd = f'/usr/bin/docker image rm {image_ref} 2>/dev/null || true'
+        cmd = f'/usr/bin/docker image rm {shlex.quote(image_ref)} 2>/dev/null || true'
         try:
             await ssh.run(cmd, check=False)
             return True
@@ -201,9 +203,9 @@ class CustomBuildOrphanSweepCheck:
 
     async def _remove_scratch(self, ssh, path: str) -> bool:
         # Defensive — only act on paths matching our prefix.
-        if not path.startswith(BUILD_SCRATCH_PREFIX):
+        if not path.startswith(BUILD_SCRATCH_PREFIX) or "/" in path[len(BUILD_SCRATCH_PREFIX):]:
             return False
-        cmd = f'/usr/bin/rm -rf {path}'
+        cmd = f'/usr/bin/rm -rf -- {shlex.quote(path)}'
         try:
             await ssh.run(cmd, check=False)
             return True

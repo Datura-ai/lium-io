@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import time
 import zlib
@@ -9,19 +10,43 @@ from typing import TYPE_CHECKING, Literal
 
 from core.config import settings
 from core.utils import _m, get_extra_info
-from services.const import SECONDS_PER_BLOCK
+from services.const import DEFAULT_JOB_OWNER_LIUM, SECONDS_PER_BLOCK
+from services.gpu_spec_table import normalize_gpu_model
 from services.matrix_validation_service import UUID_MISMATCH_ERROR_PREFIX
 
+from ..availability import ReachSource, ReachTarget
 from ..messages import CapabilityMessages as Msg, MessageTemplate, render_message
 from ..pipeline import CheckResult, Context
+from .gpu_model_truth import (
+    NOT_MEASURED,
+    WORK_PROOF_FAILED,
+    GpuModelMismatch,
+    gpu_model_mismatch,
+    gpu_model_mismatches,
+    judged_cards,
+    not_measured,
+    reported_gpu_model,
+    unmeasured_cards,
+    work_proof_failed,
+)
 from .matmul_speed_log import log_matmul_speed
+from .rental_probe import has_standing_failure
 from .rental_owner import uuid_listed_under_another_miner, rental_of_this_node
+from .sshd_bootstrap import remove_lium_fillers
 
 if TYPE_CHECKING:
     from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
     from services.matrix_validation_service import ValidationResult
 
 logger = logging.getLogger(__name__)
+
+# DAH-6241: each node's last GPU model verdict, one entry per card below its reported model, so a
+# node that runs a filler (no full matmul) is still judged by the last answer each card gave. Keyed
+# by miner and executor, as the post-rental recheck marker is. A run without a verdict is kept for
+# a day only.
+GPU_MODEL_VERDICT_KEY = "gpu_model_verdict:{miner_hotkey}:{executor_uuid}"
+GPU_MODEL_VERDICT_TTL_SECONDS = 7 * 24 * 60 * 60
+GPU_MODEL_NO_VERDICT_TTL_SECONDS = 24 * 60 * 60
 
 
 class CapabilityCheck:
@@ -49,8 +74,35 @@ class CapabilityCheck:
         if filler_container:
             what_filler: dict = {"filler_container": filler_container}
             cycle = _filler_cycle_index(ctx)
-            if _filler_matmul_sample_due(ctx, cycle):
-                what_filler["matmul_sample"] = await _filler_matmul_sample(ctx, specs, cycle)
+            seen, mismatches = await stored_gpu_model_verdict(ctx)
+            # a node with no verdict yet is sampled now, not at its turn up to a day later
+            unjudged = not seen and settings.FILLER_MATMUL_SAMPLE_EVERY_N_CYCLES > 0
+            # a card that failed its work-proof is sampled again every cycle, so it clears as soon as it passes
+            failed_cards = [m.card_index for m in mismatches if m.kind == WORK_PROOF_FAILED]
+            if failed_cards or unjudged or _filler_matmul_sample_due(ctx, cycle):
+                sample, found = await _filler_matmul_sample(ctx, specs, cycle, failed_cards[0] if failed_cards else None)
+                what_filler["matmul_sample"] = sample
+                card = sample.get("card_index", 0)
+                if _filler_sample_failed_card(sample):
+                    # stored like a mismatch: the node fails every cycle until a run on this card passes
+                    mismatches = await judge_gpu_model(ctx, [work_proof_failed(specs, card)], {card})
+                elif found is not None:
+                    mismatches = await judge_gpu_model(ctx, found, {card})
+                elif sample.get("passed") and card in failed_cards:
+                    # a right answer from the failed card clears it, numbers or not
+                    mismatches = await judge_gpu_model(ctx, [], {card})
+                elif not seen:
+                    await _store_gpu_model_verdict(ctx, [], GPU_MODEL_NO_VERDICT_TTL_SECONDS)
+            if mismatches:
+                # the node earns nothing, so Lium's filler no longer runs on it (as SshdBootstrapCheck)
+                rented_data = ctx.state.rented_data
+                if not settings.DRY_RUN and rented_data.get_default_job_owner(ctx.executor.uuid) == DEFAULT_JOB_OWNER_LIUM:
+                    what_filler["removed_fillers"] = await remove_lium_fillers(
+                        ctx, rented_data.get_filler_containers(ctx.executor.uuid)
+                    )
+                return gpu_model_mismatch_result(
+                    ctx, self.check_id, {**mismatches[0].as_dict(), **what_filler, "transport": "filler"}
+                )
             event = render_message(
                 Msg.FILLER_SKIPPED,
                 ctx=ctx,
@@ -71,18 +123,25 @@ class CapabilityCheck:
         # liumd phase 1: LocalVerifyCheck already ran this challenge through `POST /verify` and
         # judged it with evaluate_matmul_output — the same function the SSH path ends in. Only a
         # PASSING local result is consumed; anything else runs over SSH exactly as before.
+        allcards_deferred = False
         local = getattr(ctx.state, "local_verify", None)
         transport = "ssh"
         if local is not None and local.matmul is not None:
             result = local.matmul
             transport = "local_verify"
         else:
+            # A standing rental-probe failure: the all-cards run (up to minutes on a large node) would leave the
+            # probe, the only check that clears it, too little cycle time to ever run (review). The single-card
+            # run still proves card 0, and RentalProbeCheck does not pass this cycle, so every card proves
+            # itself before the node relists, as with VerifyX. In shadow the run decides nothing, so it is only skipped.
+            allcards_deferred = settings.MATMUL_ALLCARDS_CHECK_ENABLED and await has_standing_failure(ctx)
             try:
                 result = await validation_service.validate_gpu_model_and_process_job(
                     ssh_client=ctx.ssh,
                     executor_info=ctx.executor,
                     default_extra=ctx.default_extra,
                     machine_spec=specs,
+                    **({"probe_all_cards": False} if allcards_deferred else {}),
                     **sizing,
                 )
             except Exception as exc:
@@ -92,7 +151,26 @@ class CapabilityCheck:
         log_matmul_speed(specs, result, transport=transport, default_extra=ctx.default_extra)
 
         if result and result.success:
-            what: dict = {"metrics": result.metrics, "transport": transport}
+            # DAH-6241: a correct answer from a card that is not the reported model earns nothing
+            card_metrics = getattr(result, "card_metrics", None)
+            measured_cards = judged_cards(result.metrics, card_metrics)
+            # not measured fails on card 0 of the full matmul only (prod-measured); other cards are logged
+            no_numbers = sorted(unmeasured_cards(specs, result.metrics, card_metrics) - measured_cards - {0})
+            mismatches = await judge_gpu_model(
+                ctx,
+                gpu_model_mismatches(specs, result.metrics, card_metrics),
+                measured_cards,
+                unmeasured_cards(specs, result.metrics),
+            )
+            mismatches = await _remeasure_carried_mismatch(ctx, specs, mismatches, measured_cards)
+            logged = {"no_numbers_cards": no_numbers} if no_numbers else {}
+            if mismatches:
+                return gpu_model_mismatch_result(
+                    ctx,
+                    self.check_id,
+                    {**mismatches[0].as_dict(), "sealed": result.sealed, "transport": transport, **logged},
+                )
+            what: dict = {"metrics": result.metrics, "transport": transport, **logged}
             if sizing:
                 what["first_pass_vram_budget_mb"] = sizing["vram_budget_mb"]
             event = render_message(
@@ -104,9 +182,12 @@ class CapabilityCheck:
             # Carry FP32 TFLOPS metrics into pipeline state so ResultHandler can nest them
             # in the published specs. Only on success and only when present (fail-safe:
             # None leaves state untouched and no gpu_metrics key is ever published).
-            updates: dict = {}
+            state_changes: dict = {}
             if result.metrics is not None:
-                updates["state"] = replace(ctx.state, gpu_metrics=result.metrics)
+                state_changes["gpu_metrics"] = result.metrics
+            if allcards_deferred and allcards_enforced():
+                state_changes["allcards_skipped_for_standing_probe_failure"] = True
+            updates: dict = {"state": replace(ctx.state, **state_changes)} if state_changes else {}
             return CheckResult(passed=True, event=event, updates=updates)
 
         # Build detailed failure information
@@ -169,7 +250,7 @@ def _probe_gave_no_answer(result: ValidationResult | None) -> bool:
     """
     if result is None:
         return False
-    if result.timed_out:
+    if result.timed_out or result.all_cards_no_answer:
         return True
     if not (result.error_message or "").startswith(UUID_MISMATCH_ERROR_PREFIX):
         return False
@@ -318,22 +399,42 @@ def _filler_matmul_sample_due(ctx: Context, cycle: int) -> bool:
     return (cycle + _filler_sample_offset(ctx)) % every == 0
 
 
-async def _filler_matmul_sample(ctx: Context, specs: dict, cycle: int) -> dict:
+async def _filler_matmul_sample(
+    ctx: Context, specs: dict, cycle: int, card_index: int | None = None
+) -> tuple[dict, list[GpuModelMismatch] | None]:
     """A filler-only node skips the matmul for as long as the filler runs, so a card that left the
     node after the filler started is never challenged. This runs the same challenge on a small VRAM
     budget beside the filler and records the answer. A record only: the filler holds the cards, so
     a failed sample proves nothing by itself and the check result never depends on it.
 
     Each sample is pinned to one claimed card, the next one in rotation, so every card is sampled
-    within the budget. One card per sample costs what an unpinned sample did; every card in one
-    sample could run past the job timeout on a wedged node."""
+    within the budget, or `card_index` when given (a card whose work-proof failed). One card per
+    sample costs what an unpinned sample did; every card in one sample could run past the job timeout
+    on a wedged node."""
     sample: dict = {"vram_budget_mb": settings.FILLER_MATMUL_SAMPLE_VRAM_MB}
     details = (specs.get("gpu") or {}).get("details") or []
-    gpu_uuid = None
     if details:
         every = max(settings.FILLER_MATMUL_SAMPLE_EVERY_N_CYCLES, 1)
         sample_index = (cycle + _filler_sample_offset(ctx)) // every
-        card_index = sample_index % len(details)
+        if card_index is None or not 0 <= card_index < len(details):
+            card_index = sample_index % len(details)
+        found = await _card_matmul_sample(ctx, specs, card_index, sample)
+    else:
+        found = await _card_matmul_sample(ctx, specs, None, sample)
+    logger.warning(_m("FILLER_MATMUL_SAMPLE", extra=get_extra_info({**ctx.default_extra, **sample})))
+    return sample, found
+
+
+async def _card_matmul_sample(
+    ctx: Context, specs: dict, card_index: int | None, sample: dict
+) -> list[GpuModelMismatch] | None:
+    """The sealed challenge on a small VRAM budget, pinned to the reported card at `card_index`
+    (unpinned when the specs list no card). Records the run in `sample`; answers the card's GPU
+    model mismatches, or None when the run gave no verdict."""
+    found: list[GpuModelMismatch] | None = None
+    gpu_uuid = None
+    details = (specs.get("gpu") or {}).get("details") or []
+    if card_index is not None:
         gpu_uuid = details[card_index].get("uuid") or ""
         sample.update(card_index=card_index, card_count=len(details), gpu_uuid=gpu_uuid)
     try:
@@ -351,12 +452,151 @@ async def _filler_matmul_sample(ctx: Context, specs: dict, cycle: int) -> dict:
             timed_out=bool(result.timed_out),
             error=result.error_message or None,
         )
-        if not result.success:
+        if result.success:
+            # the same sealed cc and SM count as the full matmul, read off the sampled card
+            card_index = sample.get("card_index", 0)
+            if judged_cards(result.metrics):  # the pinned card is device 0 of its run
+                mismatch = gpu_model_mismatch(specs, result.metrics, card_index)
+                found = [mismatch] if mismatch else []
+                sample["gpu_model_mismatch"] = mismatch.as_dict() if mismatch else None
+            elif unmeasured_cards(specs, None, {card_index: result.metrics}):
+                sample["no_numbers"] = True
+        else:
             sample["error_kind"] = _sample_error_kind(result)
     except Exception as exc:
         sample.update(passed=False, timed_out=False, error=str(exc), error_kind="validator_error")
-    logger.warning(_m("FILLER_MATMUL_SAMPLE", extra=get_extra_info({**ctx.default_extra, **sample})))
-    return sample
+    return found
+
+
+async def _remeasure_carried_mismatch(
+    ctx: Context, specs: dict, mismatches: list[GpuModelMismatch], measured_cards: set[int]
+) -> list[GpuModelMismatch]:
+    """A stored mismatch on a card this run did not measure (all-cards off: the matmul ran on
+    card 0 only) is measured again on that card, pinned, one card per cycle, so a card that was
+    put right clears and a stored mismatch never stands unmeasured. A run with no verdict keeps
+    it."""
+    carried = [m.card_index for m in mismatches if m.card_index not in measured_cards]
+    if not carried:
+        return mismatches
+    sample: dict = {"vram_budget_mb": settings.FILLER_MATMUL_SAMPLE_VRAM_MB, "reason": "carried_gpu_model_mismatch"}
+    found = await _card_matmul_sample(ctx, specs, carried[0], sample)
+    logger.warning(_m("GPU_MODEL_MISMATCH_REMEASURE", extra=get_extra_info({**ctx.default_extra, **sample})))
+    if found is not None:
+        return await judge_gpu_model(ctx, found, {carried[0]})
+    if sample.get("passed") and any(m.card_index == carried[0] and m.kind == WORK_PROOF_FAILED for m in mismatches):
+        # a right answer from a card whose work-proof failed clears that failure, numbers or not (as the filler
+        # path does); any other verdict on the card stands
+        kept = [m for m in mismatches if m.card_index == carried[0] and m.kind != WORK_PROOF_FAILED]
+        return await judge_gpu_model(ctx, kept, {carried[0]})
+    return mismatches  # no_numbers is only logged here: no prod data yet for a pinned sample
+
+
+
+def gpu_model_mismatch_result(ctx: Context, check_id: str, what: dict) -> CheckResult:
+    """DAH-6241 (Rustam, 12 Nov): a card below its reported model fails the node with score 0, clears its verified
+    job info and is an availability entry, so the node is hidden and not relisted once a rental ends. With a renter's
+    pod running it is not fatal: the rental runs on and is still verified."""
+    rental = rental_of_this_node(ctx)
+    event = render_message(
+        {NOT_MEASURED: Msg.GPU_MODEL_NOT_MEASURED, WORK_PROOF_FAILED: Msg.GPU_WORK_PROOF_FAILED}.get(
+            what.get("kind"), Msg.GPU_MODEL_MISMATCH
+        ),
+        ctx=ctx,
+        check_id=check_id,
+        what={**what, "reach_source": str(ReachSource.VALIDATOR), "reach_target": str(ReachTarget.GPU)},
+    )
+    return CheckResult(
+        passed=False,
+        event=event,
+        updates={"gpu_model_passed": False, "clear_verified_job_info": True},
+        fatal=not (rental is not None and rental.pods),
+    )
+
+
+def _gpu_model_verdict_key(ctx: Context) -> str:
+    return GPU_MODEL_VERDICT_KEY.format(miner_hotkey=ctx.miner_hotkey, executor_uuid=ctx.executor.uuid)
+
+
+async def _read_gpu_model_verdict(ctx: Context) -> tuple[bool, list[GpuModelMismatch], set[int], bool]:
+    """(a verdict is stored, the stored mismatches, the cards with a measured pass since their last
+    miss, the read worked). A mismatch stored for a model the node no longer reports on that card
+    is no verdict: the node is judged again."""
+    try:
+        raw = await ctx.services.redis.get(_gpu_model_verdict_key(ctx))
+        if raw is None:
+            return False, [], set(), True
+        stored = json.loads(raw)
+        # a work-proof failure stored under enforcement stops failing the node the moment either flag is off
+        mismatches = [
+            m
+            for m in (GpuModelMismatch(**m) for m in stored.get("mismatches") or [])
+            if m.kind != WORK_PROOF_FAILED or allcards_enforced()
+        ]
+        measured_ok = {int(i) for i in stored.get("measured_ok") or []}
+    except Exception as exc:
+        logger.warning(_m("GPU model verdict read failed", extra=get_extra_info({**ctx.default_extra, "error": str(exc)})))
+        return True, [], set(), False
+    current = [
+        m
+        for m in mismatches
+        if normalize_gpu_model(m.reported_gpu_model)
+        == normalize_gpu_model(reported_gpu_model(ctx.state.specs, m.card_index))
+    ]
+    return len(current) == len(mismatches), current, measured_ok, True
+
+
+async def stored_gpu_model_verdict(ctx: Context) -> tuple[bool, list[GpuModelMismatch]]:
+    """(a verdict is stored, the stored mismatches). A Redis error reads as a stored pass: the
+    node is neither failed nor sampled out of turn for it."""
+    seen, mismatches, _, _ = await _read_gpu_model_verdict(ctx)
+    return seen, mismatches
+
+
+async def judge_gpu_model(
+    ctx: Context,
+    found: list[GpuModelMismatch],
+    measured_cards: set[int],
+    unmeasured: set[int] = frozenset(),
+) -> list[GpuModelMismatch]:
+    """Store and return the node's mismatches after a run that judged `measured_cards`. A stored
+    mismatch of a card this run did not judge stands: a pass on one card never clears another.
+    A judged card in `unmeasured` (its run gave no numbers) passes once after a measured pass and
+    is NOT_MEASURED after that. After a failed read nothing is written, so one failed GET never
+    erases a stored mismatch."""
+    _, stored, measured_ok, read_ok = await _read_gpu_model_verdict(ctx)
+    failed = {m.card_index for m in found}
+    measured_ok = (measured_ok - failed) | (measured_cards - failed)
+    mismatches = [m for m in stored if m.card_index not in measured_cards] + found
+    for card in sorted(unmeasured - measured_cards):
+        if card in measured_ok:
+            measured_ok.discard(card)  # one miss is tolerated; the next one fails
+        elif all(m.card_index != card for m in mismatches):
+            mismatches.append(not_measured(ctx.state.specs, card))
+    if read_ok:
+        await _store_gpu_model_verdict(ctx, mismatches, GPU_MODEL_VERDICT_TTL_SECONDS, measured_ok)
+    return mismatches
+
+
+async def refresh_gpu_model_verdict(ctx: Context) -> None:
+    """Keep a standing mismatch alive while only read (a rented node): it ends with a pass, not the TTL."""
+    if settings.DRY_RUN:
+        return
+    try:
+        await ctx.services.redis.expire(_gpu_model_verdict_key(ctx), GPU_MODEL_VERDICT_TTL_SECONDS)
+    except Exception as exc:
+        logger.warning(_m("GPU model verdict refresh failed", extra=get_extra_info({**ctx.default_extra, "error": str(exc)})))
+
+
+async def _store_gpu_model_verdict(
+    ctx: Context, mismatches: list[GpuModelMismatch], ttl_seconds: int, measured_ok: set[int] = frozenset()
+) -> None:
+    if settings.DRY_RUN:
+        return
+    payload = json.dumps({"mismatches": [m.as_dict() for m in mismatches], "measured_ok": sorted(measured_ok)})
+    try:
+        await ctx.services.redis.set(_gpu_model_verdict_key(ctx), payload, ex=ttl_seconds)
+    except Exception as exc:
+        logger.warning(_m("GPU model verdict write failed", extra=get_extra_info({**ctx.default_extra, "error": str(exc)})))
 
 
 def _sample_error_kind(result: ValidationResult) -> str:
@@ -373,6 +613,19 @@ def _sample_error_kind(result: ValidationResult) -> str:
     if template is Msg.VERIFY_FAILED:
         return "wrong_answer"
     return "no_answer"  # no CUDA device / CUDA not ready
+
+
+def _filler_sample_failed_card(sample: dict) -> bool:
+    """A filler sample whose pinned card gave no answer or a wrong one, under all-cards enforcement.
+
+    `no_memory` and `timeout` stay a record only. Rationale: DAH-6576.
+    """
+    return allcards_enforced() and sample.get("error_kind") in ("no_answer", "wrong_answer")
+
+
+def allcards_enforced() -> bool:
+    """The all-cards work proof runs and fails nodes: enforcement means nothing while the check itself is off."""
+    return settings.MATMUL_ALLCARDS_CHECK_ENABLED and settings.MATMUL_ALLCARDS_ENFORCEMENT_ENABLED
 
 
 def get_filler_only_container(ctx: Context) -> str | None:

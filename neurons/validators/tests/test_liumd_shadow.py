@@ -4,6 +4,7 @@ with VALIDATOR_LIUMD_SHADOW off."""
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 import logging
 import time
 from datetime import UTC, datetime
@@ -18,10 +19,12 @@ from payload_models.payloads import MinerJobRequestPayload
 from protocol.vc_protocol.compute_requests import NetworkEMA, RentedExecutorsResponse
 from protocol.vc_protocol.validator_requests import ValidationEvent
 from services.attestation_service import HostPolicyResult
+from services.liumd_binary_refresh import LiumdRefresh
 from services.liumd_exec_client import LiumdRefusal
 from services.local_verify_client import (
     DETAIL_MAX_CHARS,
     SCHEMA,
+    LocalVerifyAnswer,
     LocalVerifyUnavailable,
     parse_answer,
 )
@@ -33,6 +36,7 @@ from services.task.liumd_shadow import (
     LIUMD_SHADOW_EVENT,
     TodayStep,
     run_liumd_shadow,
+    start_facts_after_scrape,
     today_verdicts,
 )
 from services.task.models import JobResult
@@ -82,6 +86,12 @@ def reserved_executor(monkeypatch):
     )
 
 
+@pytest.fixture(autouse=True)
+def allcards_off(monkeypatch):
+    """The one call carries the matmul only while the all-cards check (on by default) is off."""
+    monkeypatch.setattr(settings, "MATMUL_ALLCARDS_CHECK_ENABLED", False)
+
+
 @pytest.fixture
 def gpu_steps(monkeypatch):
     """The shadow's GPU steps are off by default; these tests cover what they compare."""
@@ -126,6 +136,7 @@ class FakeLiumd:
         matmul=None,
         deadline_hit=False,
         facts=None,
+        specs=None,
     ):
         self.matmul = matmul  # a dict replacing the matmul step's reply
         self.deadline_hit = deadline_hit  # the document-wide flag: any step reached the deadline
@@ -133,6 +144,7 @@ class FakeLiumd:
         self.lib_sha = lib_sha
         self.result = result
         self.facts = facts or {}
+        self.specs = specs or {}
         self.intents: list[dict] = []
         self.timeouts: list[float] = []
 
@@ -178,6 +190,7 @@ class FakeLiumd:
             "elapsed_ms": 91_000,
             "deadline_hit": self.deadline_hit,
             "steps": steps,
+            "specs": self.specs,
         }
         return parse_answer(raw, intent=intent, round_trip_ms=92_000)
 
@@ -329,6 +342,427 @@ async def test_facts_are_compared_when_both_sides_have_them(keypair, monkeypatch
         "ports.port_range",
         "ports.port_mappings",
     }
+
+
+def _docker(*names):
+    return {"docker": {"data": {"containers": [{"name": n, "status": "running"} for n in names]}}}
+
+
+PYTHON_GPU_DETAILS = [
+    {
+        "uuid": "GPU-1",
+        "name": "H100",
+        "capacity": 81559,
+        "temperature": 34,
+        "gpu_utilization": 1,
+        "memory_utilization": 2,
+        "memory_used_mb": 3,
+        "graphics_speed": 4,
+        "memory_speed": 5,
+        "power_limit": 600,
+        "pcie": 16,
+        "pcie_speed": 8000,
+        "clocks_event_reasons": 0,
+    }
+]
+LIUMD_GPU_DETAILS = [
+    {
+        "uuid": "GPU-1",
+        "name": "H100",
+        "capacity": 81559,
+        "temperature": 35,
+        "gpu_utilization": 91,
+        "memory_utilization": 92,
+        "memory_used_mb": 93,
+        "graphics_speed": 94,
+        "memory_speed": 95,
+        "power_limit": 420,
+        "pcie": 8,
+        "pcie_speed": 2500,
+        "clocks_event_reasons": 1,
+    }
+]
+PYTHON_SCRAPE = {
+    **SPECS,
+    "gpu": {"count": 1, "details": PYTHON_GPU_DETAILS},
+    "cpu": {"utilization": 10},
+    "ram": {"free": 1, "used": 2, "available": 3, "utilization": 4},
+    "hard_disk": {
+        "used": 5,
+        "free": 6,
+        "utilization": 7,
+        "engy_cache_used_gb": 8,
+        "containers": 210288,
+        "images": 100,
+        "by_container": {"c1": 100},
+        "by_volume": {"v1": 100},
+        "volumes": 200,
+    },
+    "gpu_processes": [{"pid": 100, "info": "live", "container_name": "c1"}],
+    "docker": {
+        "version": "29.10.0",
+        "host_cpu_percent": 9,
+        "containers": [
+            {"name": "c1", "cpu_percent": 10, "net_rx_bytes": 11, "net_tx_bytes": 12}
+        ],
+    },
+}
+LIUMD_SCRAPE = {
+    **SPECS,
+    "gpu": {"count": 1, "details": LIUMD_GPU_DETAILS},
+    "cpu": {"utilization": 90},
+    "ram": {"free": 91, "used": 92, "available": 93, "utilization": 94},
+    "hard_disk": {
+        "used": 95,
+        "free": 96,
+        "utilization": 97,
+        "engy_cache_used_gb": 98,
+        "containers": 210300,
+        "images": 200,
+        "by_container": {"c1": 112},
+        "by_volume": {"v1": 112},
+        "volumes": 212,
+    },
+    "gpu_processes": [{"pid": 101, "info": "live", "container_name": "c1"}],
+    "docker": {
+        "version": "29.9.3",
+        "host_cpu_percent": 99,
+        "containers": [
+            {"name": "c1", "cpu_percent": 100, "net_rx_bytes": 101, "net_tx_bytes": 102}
+        ],
+    },
+    "vloopback_check": {"verdict": "supported"},
+}
+
+
+@pytest.mark.asyncio
+async def test_specs_are_compared_from_the_post_scrape_snapshot(
+    keypair, monkeypatch, verifyx_service
+):
+    later = {**SPECS, "port_verify_first_miss": True, "split_disk": {"free": 1}}
+    state = build_state(specs=later, scrape_specs=PYTHON_SCRAPE)
+    ctx = _ctx(keypair, monkeypatch, verifyx_service, state=state)
+
+    record = await _shadow(ctx, FakeLiumd(specs=LIUMD_SCRAPE))
+
+    assert record["specs_agree"] is True
+    assert record["specs_diff"] == []
+
+
+@pytest.mark.asyncio
+async def test_live_host_memory_values_are_not_a_specs_difference(
+    keypair, monkeypatch, verifyx_service
+):
+    python_specs = {
+        **PYTHON_SCRAPE,
+        "host_memory": {"mem_total_kb": 100, "mem_available_kb": 50, "mapped_kb": 10},
+    }
+    liumd_specs = {
+        **LIUMD_SCRAPE,
+        "host_memory": {"mem_total_kb": 100, "mem_available_kb": 40, "mapped_kb": 12},
+    }
+    state = build_state(specs=SPECS, scrape_specs=python_specs)
+    ctx = _ctx(keypair, monkeypatch, verifyx_service, state=state)
+
+    record = await _shadow(ctx, FakeLiumd(specs=liumd_specs))
+
+    assert record["specs_agree"] is True
+    assert record["specs_diff"] == []
+
+
+@pytest.mark.asyncio
+async def test_missing_host_memory_is_still_a_specs_difference(
+    keypair, monkeypatch, verifyx_service
+):
+    python_specs = {**PYTHON_SCRAPE, "host_memory": {"mem_total_kb": 100}}
+    state = build_state(specs=SPECS, scrape_specs=python_specs)
+    ctx = _ctx(keypair, monkeypatch, verifyx_service, state=state)
+
+    record = await _shadow(ctx, FakeLiumd(specs=LIUMD_SCRAPE))
+
+    assert record["specs_agree"] is False
+    assert [diff["path"] for diff in record["specs_diff"]] == ["host_memory"]
+
+
+@pytest.mark.asyncio
+async def test_a_stable_host_memory_value_is_still_compared(
+    keypair, monkeypatch, verifyx_service
+):
+    python_specs = {
+        **PYTHON_SCRAPE,
+        "host_memory": {"mem_total_kb": 100, "mem_available_kb": 50},
+    }
+    liumd_specs = {
+        **LIUMD_SCRAPE,
+        "host_memory": {"mem_total_kb": 90, "mem_available_kb": 40},
+    }
+    state = build_state(specs=SPECS, scrape_specs=python_specs)
+    ctx = _ctx(keypair, monkeypatch, verifyx_service, state=state)
+
+    record = await _shadow(ctx, FakeLiumd(specs=liumd_specs))
+
+    assert record["specs_agree"] is False
+    assert [diff["path"] for diff in record["specs_diff"]] == ["host_memory.mem_total_kb"]
+
+
+@pytest.mark.asyncio
+async def test_live_and_python_timeout_fields_are_not_a_specs_difference(
+    keypair, monkeypatch, verifyx_service
+):
+    python_specs = {
+        **PYTHON_SCRAPE,
+        "egress_ip": "1.1.1.1",
+        "infiniband_ports": [{"state": "active"}],
+        "needrestart_guard": "missing",
+        "needrestart_guard_unguarded": ["sysbox.service"],
+        "needrestart_guard_reason": "a later conf file runs code",
+        "storage_limit_supported": False,
+        "storage_limit_scrape_error": "Test command timed out.",
+        "sysbox_runtime": False,
+        "sysbox_runtime_scrape_error": "Test command timed out.",
+        "interconnect_scrape_error": '"parse: IndexError"',
+    }
+    liumd_specs = {
+        **LIUMD_SCRAPE,
+        "egress_ip": "2.2.2.2",
+        "infiniband_ports": [{"state": "down"}],
+        "needrestart_guard": "present",
+        "needrestart_guard_unguarded": [],
+        "needrestart_guard_reason": "a later conf file runs code",
+        "storage_limit_supported": True,
+        "sysbox_runtime": True,
+        "interconnect_scrape_error": "NVMLError(999)",
+    }
+    state = build_state(specs=SPECS, scrape_specs=python_specs)
+    ctx = _ctx(keypair, monkeypatch, verifyx_service, state=state)
+
+    record = await _shadow(ctx, FakeLiumd(specs=liumd_specs))
+
+    assert record["specs_agree"] is True
+    assert record["specs_diff"] == []
+
+
+@pytest.mark.asyncio
+async def test_a_missing_python_needrestart_guard_does_not_beat_the_node_view(
+    keypair, monkeypatch, verifyx_service
+):
+    python_specs = {
+        **PYTHON_SCRAPE,
+        "needrestart_guard": "missing",
+        "needrestart_guard_unguarded": ["sysbox.service"],
+    }
+    liumd_specs = {
+        **LIUMD_SCRAPE,
+        "needrestart_guard": "present",
+        "needrestart_guard_unguarded": [],
+    }
+    state = build_state(specs=SPECS, scrape_specs=python_specs)
+    ctx = _ctx(keypair, monkeypatch, verifyx_service, state=state)
+
+    record = await _shadow(ctx, FakeLiumd(specs=liumd_specs))
+
+    assert record["specs_agree"] is True
+    assert record["specs_diff"] == []
+
+
+@pytest.mark.asyncio
+async def test_specs_agree_is_none_without_the_python_snapshot(
+    keypair, monkeypatch, verifyx_service
+):
+    ctx = _ctx(keypair, monkeypatch, verifyx_service)
+
+    record = await _shadow(ctx, FakeLiumd(specs=SPECS))
+
+    assert record["specs_agree"] is None
+    assert record["specs_diff"] == []
+
+
+@pytest.mark.asyncio
+async def test_a_real_specs_difference_is_reported(keypair, monkeypatch, verifyx_service):
+    changed = {**SPECS, "gpu": {"count": 2, "details": SPECS["gpu"]["details"]}}
+    state = build_state(specs=SPECS, scrape_specs=SPECS)
+    ctx = _ctx(keypair, monkeypatch, verifyx_service, state=state)
+
+    record = await _shadow(ctx, FakeLiumd(specs=changed))
+
+    assert record["specs_agree"] is False
+    assert [diff["path"] for diff in record["specs_diff"]] == ["gpu.count"]
+
+
+@pytest.mark.asyncio
+async def test_docker_facts_come_from_the_scrape_snapshot(
+    keypair, monkeypatch, verifyx_service
+):
+    snapshot = {**SPECS, "docker": {"containers": [{"name": "executor-1", "container_id": "c1"}]}}
+    later = {
+        **SPECS,
+        "docker": {
+            "containers": [
+                {"name": "executor-1", "container_id": "c1"},
+                {"name": "pod_x", "container_id": "c2"},
+            ]
+        },
+    }
+    state = build_state(specs=later, scrape_specs=snapshot)
+    ctx = _ctx(keypair, monkeypatch, verifyx_service, state=state)
+
+    record = await _shadow(ctx, FakeLiumd(facts=_docker("executor-1")))
+
+    assert record["facts_agree"] is True
+
+
+def _with_facts_task(ctx, early):
+    task = start_facts_after_scrape(ctx, early.factory)
+    return task, ctx.model_copy(update={"state": replace(ctx.state, liumd_shadow_facts_task=task)})
+
+
+@pytest.fixture
+def shadow_on(monkeypatch):
+    monkeypatch.setattr(settings, "VALIDATOR_LIUMD_SHADOW", True)
+    monkeypatch.setattr(settings, "DRY_RUN", False)
+
+
+@pytest.mark.asyncio
+async def test_facts_come_from_the_read_right_after_the_scrape(
+    keypair, monkeypatch, verifyx_service, shadow_on
+):
+    # Prod 11 Nov: a read at the end of the run saw the check's own pod_<uuid> the scrape had not.
+    specs = {**SPECS, "docker": {"containers": [{"name": "executor-1", "container_id": "c1"}]}}
+    ctx = _ctx(keypair, monkeypatch, verifyx_service, state=build_state(specs=specs))
+    early = FakeLiumd(facts=_docker("executor-1"))
+    task, ctx = _with_facts_task(ctx, early)
+    late = FakeLiumd(facts=_docker("executor-1", "pod_x"))
+
+    record = await _shadow(ctx, late)
+
+    assert task is not None and record["facts_agree"] is True
+    assert len(early.intents) == 1
+    assert not early.intents[0]["steps"]["matmul"] and not early.intents[0]["steps"]["verifyx"]
+    assert late.intents == []  # GPU steps off: liumd is not called a second time
+
+
+@pytest.mark.asyncio
+async def test_no_late_read_when_the_early_facts_task_is_missing(
+    keypair, monkeypatch, verifyx_service, shadow_on
+):
+    ctx = _ctx(keypair, monkeypatch, verifyx_service)
+    ctx = ctx.model_copy(update={"state": replace(ctx.state, liumd_shadow_facts_attempted=True)})
+    late = FakeLiumd(facts=_docker("executor-1", "pod_x"))
+
+    record = await _shadow(ctx, late)
+
+    assert (record["outcome"], record["reason"]) == ("skipped", "no_facts_read")
+    assert late.intents == []
+
+
+def test_a_malformed_reserved_entry_starts_no_early_read_and_raises_nothing(
+    keypair, monkeypatch, verifyx_service, shadow_on
+):
+    # start_facts_after_scrape runs inside the fatal scrape check: a bad shadow setting must not fail it
+    monkeypatch.setattr(settings, "LIUMD_SHADOW_RESERVED_EXECUTORS", f"{RESERVED},{UUID}")
+    early = FakeLiumd()
+
+    assert start_facts_after_scrape(_ctx(keypair, monkeypatch, verifyx_service), early.factory) is None
+    assert early.intents == []
+
+
+@pytest.mark.asyncio
+async def test_no_post_scrape_read_on_a_rented_node(keypair, monkeypatch, verifyx_service, shadow_on):
+    node = {
+        "miner_hotkey": "5Miner",
+        "executor_ip_address": EXECUTOR_INFO.address,
+        "executor_ip_port": "8001",
+        "pods": [{"pod_id": "p1", "container_name": "c1"}],
+    }
+    rented = RentedExecutorsResponse.model_validate({"executors": {UUID: node}})
+    ctx = _ctx(keypair, monkeypatch, verifyx_service, state=build_state(specs=SPECS, rented_data=rented))
+
+    assert start_facts_after_scrape(ctx, FakeLiumd().factory) is None
+
+
+@pytest.mark.asyncio
+async def test_a_failed_post_scrape_read_is_logged_unavailable(
+    keypair, monkeypatch, verifyx_service, shadow_on
+):
+    ctx = _ctx(keypair, monkeypatch, verifyx_service)
+    _, ctx = _with_facts_task(ctx, FakeLiumd(result=LocalVerifyUnavailable("transport", "closed")))
+
+    record = await _shadow(ctx, FakeLiumd())
+
+    assert (record["outcome"], record["reason"]) == ("unavailable", "transport")
+
+
+@pytest.mark.asyncio
+async def test_a_skipped_repair_keeps_the_stale_answer(keypair, monkeypatch, verifyx_service):
+    monkeypatch.setattr(settings, "LIUMD_BINARY_REFRESH_ENABLED", True)
+    monkeypatch.setattr(settings, "VALIDATOR_LIUMD_SPECS", True)
+    repair = AsyncMock(
+        return_value=LiumdRefresh(False, "old-build", "download failed", skipped=True)
+    )
+    monkeypatch.setattr(liumd_shadow, "refresh_liumd_from_answer", repair)
+    ctx = _ctx(keypair, monkeypatch, verifyx_service)
+    early = FakeLiumd()
+
+    answer = await liumd_shadow._facts_only(ctx, early.factory)
+
+    assert isinstance(answer, LocalVerifyAnswer)
+    repair.assert_awaited_once()
+    assert len(early.intents) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_failed_repair_under_specs_mode_does_not_use_the_stale_answer(
+    keypair, monkeypatch, verifyx_service
+):
+    monkeypatch.setattr(settings, "LIUMD_BINARY_REFRESH_ENABLED", True)
+    monkeypatch.setattr(settings, "VALIDATOR_LIUMD_SPECS", True)
+    repair = AsyncMock(
+        return_value=LiumdRefresh(False, None, "no task budget for the liumd download")
+    )
+    monkeypatch.setattr(liumd_shadow, "refresh_liumd_from_answer", repair)
+    ctx = _ctx(keypair, monkeypatch, verifyx_service)
+    early = FakeLiumd()
+
+    answer = await liumd_shadow._facts_only(ctx, early.factory)
+
+    assert isinstance(answer, LocalVerifyUnavailable)
+    assert answer.reason == "binary_refresh_failed"
+    repair.assert_awaited_once()
+    assert len(early.intents) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_changed_repair_reruns_the_read(keypair, monkeypatch, verifyx_service):
+    monkeypatch.setattr(settings, "LIUMD_BINARY_REFRESH_ENABLED", True)
+    repair = AsyncMock(return_value=LiumdRefresh(True, "new-build", changed=True))
+    monkeypatch.setattr(liumd_shadow, "refresh_liumd_from_answer", repair)
+    ctx = _ctx(keypair, monkeypatch, verifyx_service)
+    early = FakeLiumd()
+
+    answer = await liumd_shadow._facts_only(ctx, early.factory)
+
+    assert isinstance(answer, LocalVerifyAnswer)
+    assert len(early.intents) == 2
+
+
+@pytest.mark.asyncio
+async def test_a_read_without_a_build_checks_the_installed_binary(
+    keypair, monkeypatch, verifyx_service
+):
+    monkeypatch.setattr(settings, "LIUMD_BINARY_REFRESH_ENABLED", True)
+    check = AsyncMock(return_value=None)
+    monkeypatch.setattr(liumd_shadow, "ensure_liumd_binary", check)
+    repair = AsyncMock()
+    monkeypatch.setattr(liumd_shadow, "refresh_liumd_from_answer", repair)
+    ctx = _ctx(keypair, monkeypatch, verifyx_service)
+    early = FakeLiumd(result=LocalVerifyUnavailable("transport", "closed"))
+
+    answer = await liumd_shadow._facts_only(ctx, early.factory)
+
+    assert isinstance(answer, LocalVerifyUnavailable)
+    check.assert_awaited_once()
+    repair.assert_not_awaited()
+    assert len(early.intents) == 1
 
 
 @pytest.mark.asyncio
@@ -912,3 +1346,17 @@ async def test_flag_off_or_dry_run_never_calls_the_shadow(keypair, monkeypatch, 
     [call] = shadow.await_args_list
     assert call.args == (ctx,)
     assert call.kwargs["ok"] is False and call.kwargs["events"] == PASSED[:1]
+
+
+@pytest.mark.asyncio
+async def test_a_failed_post_scrape_read_is_not_overwritten_by_a_later_gpu_answer(
+    keypair, monkeypatch, verifyx_service, shadow_on, gpu_steps
+):
+    ctx = _ctx(keypair, monkeypatch, verifyx_service)
+    _, ctx = _with_facts_task(ctx, FakeLiumd(result=LocalVerifyUnavailable("transport", "closed")))
+    late = FakeLiumd()
+
+    record = await _shadow(ctx, late)
+
+    assert (record["outcome"], record["reason"]) == ("unavailable", "transport")
+    assert late.intents

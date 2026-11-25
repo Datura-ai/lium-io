@@ -21,8 +21,10 @@ from storage.models import (
     StorageOperationSpec,
 )
 from storage.reporting import StorageEventReporter
+from storage.safe_path import SYMLINK_EXIT, safe_enter_command
 from storage.workspace import (
     DockerUserNamespaceWorkspace,
+    DockerVolumeWorkspace,
     LocalWorkspace,
     ResolvedWorkspace,
 )
@@ -54,8 +56,13 @@ STALE_HELPER_AGE = timedelta(minutes=10)
 # sh's own cd error is dropped: StorageEventReporter keeps the first diagnostic, which must be ours.
 # Runs the backup inside a helper (docker volume or encrypted namespace). A missing or empty path exits 66 before
 # restic starts, so nothing is uploaded (DAH-2002); a path that is not a directory fails.
-BACKUP_SOURCE_SCRIPT = '[ -e "$1" ] || exit 66; cd "$1" 2>/dev/null || exit 1; [ -n "$(ls -A)" ] || exit 66; shift; exec "$@"'
 BACKUP_SOURCE_MISSING_EXIT = 66
+# DAH-6447: encrypted backups and restores run restic as a process of the rental (its user, mount and network
+# namespaces, not its PID namespace) through this launcher; see storage/rental_exec.py.
+with open(os.path.join(os.path.dirname(__file__), "rental_exec.py"), encoding="utf-8") as _launcher:
+    RENTAL_EXEC_SOURCE = _launcher.read()
+# the rental image may have no CA bundle; Go reads SSL_CERT_FILE
+CA_BUNDLE = "/etc/ssl/certs/ca-certificates.crt"
 
 # restic 0.19.1 prints this as the exit_error JSON "message" with --json, else as a plain stderr line
 SNAPSHOT_EMPTY_MESSAGE = "Fatal: unable to save snapshot: snapshot is empty"
@@ -339,8 +346,9 @@ class ResticStorageRunner:
             and getattr(self._workspace, "image", None)
             and _dns_lookup_failed(result.stderr or result.stdout)
         ):
-            # The executor's compose-network DNS (127.0.0.11) can fail while the default bridge
-            # resolves fine; the backup itself already runs in a default-bridge helper.
+            # The executor's compose-network DNS (Docker's embedded resolver) can fail while the default bridge
+            # resolves fine, so repository commands retry in a default-bridge helper. Encrypted backups and restores
+            # themselves use the rental's own network (DAH-6447).
             print("Repository DNS lookup failed in the executor; using a helper container", file=sys.stderr, flush=True)
             self._repository_via_helper = True
             return self._run_repository_helper(restic_arguments)
@@ -517,6 +525,8 @@ class ResticStorageRunner:
             return ResticResult("COMPLETED", OperationResultQuality.PARTIAL, snapshot_id, exit_code)
         if exit_code == SIGKILL_EXIT:
             raise ResticOperationError(self._killed_helper_message("backup"))
+        if exit_code == SYMLINK_EXIT and not snapshot_id:
+            raise ResticOperationError("the backup path leads through a symlink, which is not followed")
         raise ResticOperationError(
             f"restic backup failed with exit {exit_code}"
             + (" without a snapshot ID" if not snapshot_id else "")
@@ -549,6 +559,8 @@ class ResticStorageRunner:
         exit_code, summary = self._stream_command(command, cwd)
         if exit_code == SIGKILL_EXIT:
             raise ResticOperationError(self._killed_helper_message("restore"))
+        if exit_code == SYMLINK_EXIT:
+            raise ResticOperationError("the restore target leads through a symlink, which is not followed")
         # restic exits 1 when some files failed (e.g. the live workload removed a dir mid-restore), but also on
         # disk-full and repository errors: only vanished-file errors count as PARTIAL, however many
         # restic counts files it wrote, even ones removed afterwards: the files left are the total less the distinct
@@ -858,18 +870,8 @@ class ResticStorageRunner:
             return restic_command, cwd
 
         if isinstance(self._workspace, DockerUserNamespaceWorkspace):
-            if working_directory:
-                namespace_command = [
-                    "/bin/sh",
-                    "-c",
-                    BACKUP_SOURCE_SCRIPT,
-                    "sh",
-                    str(self._workspace.path),
-                    *restic_command,
-                ]
-            else:
-                namespace_command = restic_command
-            return self._encrypted_helper_command(namespace_command), None
+            # restic runs inside the rental's own root, where a renter symlink resolves in the renter's view only
+            return self._encrypted_restic_command(restic_command[1:], working_directory), None
 
         volume_mode = "ro" if self._workspace.read_only else "rw"
         command = [
@@ -883,14 +885,14 @@ class ResticStorageRunner:
             command.extend(
                 [
                     "--entrypoint",
-                    "/bin/sh",
+                    "python3",
                     self._workspace.image,
-                    "-c",
-                    BACKUP_SOURCE_SCRIPT,
-                    "sh",
-                    str(self._workspace.path),
-                    self._restic_binary,
-                    *restic_command[1:],
+                    *safe_enter_command(
+                        self._workspace.root,
+                        self._workspace.path,
+                        "backup",
+                        [self._restic_binary, *restic_command[1:]],
+                    )[1:],
                 ]
             )
             return command, None
@@ -909,7 +911,7 @@ class ResticStorageRunner:
             "restore",
             "--json",
             "--target",
-            self._workspace_path(),
+            "." if isinstance(self._workspace, DockerVolumeWorkspace) else self._workspace_path(),
             "--sparse",
         ]
         if isinstance(self._workspace, DockerUserNamespaceWorkspace):
@@ -917,12 +919,40 @@ class ResticStorageRunner:
             # that cannot be written from the rental user namespace are skipped.
             arguments.extend(["--exclude-xattr", "security.*", "--exclude-xattr", "trusted.*"])
         arguments.extend(["--", snapshot_id])
+        if isinstance(self._workspace, DockerVolumeWorkspace):
+            restic_command = self._restic_command(arguments)
+            return self._volume_helper_command([self._restic_binary, *restic_command[1:]]), None
         return self._execution_command(arguments, working_directory=False)
+
+    def _entered(self, command: list[str]) -> list[str]:
+        """`command` run with its cwd at the workspace path, reached without following any renter symlink."""
+        workspace = self._workspace
+        if isinstance(workspace, DockerUserNamespaceWorkspace):
+            return safe_enter_command(workspace.helper_root, workspace.helper_path, "restore", command)
+        if isinstance(workspace, DockerVolumeWorkspace):
+            return safe_enter_command(workspace.root, workspace.path, "restore", command)
+        raise ResticOperationError("a local workspace is not entered through the helper")
+
+    def _volume_helper_command(self, command: list[str]) -> list[str]:
+        if not isinstance(self._workspace, DockerVolumeWorkspace):
+            raise ResticOperationError("volume helper requested for a non-volume workspace")
+        return [
+            *self._docker_helper_base(),
+            "--security-opt",
+            "no-new-privileges",
+            "-v",
+            f"{self._workspace.volume_name}:/workspace:rw",
+            "--entrypoint",
+            "python3",
+            self._workspace.image,
+            *self._entered(command)[1:],
+        ]
 
     def _legacy_restore_execution_command(self, object_key: str) -> tuple[list[str], str | None]:
         pipeline_script = (
             'mkdir -p -- "$4"; '
-            '"$1" s3 cp "s3://$2/$3" - --no-progress | '
+            # from /: awscli resolves `-` through getcwd, which fails in the rental's tree under an encrypted helper
+            '(cd / && exec "$1" s3 cp "s3://$2/$3" - --no-progress) | '
             'tar --extract --gzip --file - --directory "$4" --strip-components=1 '
             "--preserve-permissions --same-owner --numeric-owner --xattrs --acls "
             f"--blocking-factor=20 --checkpoint={TAR_CHECKPOINT_RECORDS} "
@@ -938,23 +968,42 @@ class ResticStorageRunner:
             "/usr/bin/aws",
             self._operation.repository.bucket,
             object_key,
-            self._workspace_path(),
+            # helpers: tar writes into ".", the target entered by safe_path (awscli is not static, so the encrypted
+            # legacy restore still runs in the helper, never through a path the renter's symlinks can redirect)
+            self._workspace_path() if isinstance(self._workspace, LocalWorkspace) else ".",
         ]
         if isinstance(self._workspace, LocalWorkspace):
             return pipeline_command, None
         if isinstance(self._workspace, DockerUserNamespaceWorkspace):
-            return self._encrypted_helper_command(pipeline_command), None
+            return self._encrypted_helper_command(self._entered(pipeline_command)), None
+        return self._volume_helper_command(pipeline_command), None
+
+    def _encrypted_restic_command(self, restic_arguments: list[str], working_directory: bool) -> list[str]:
+        workspace = self._workspace
+        if not isinstance(workspace, DockerUserNamespaceWorkspace):
+            raise ResticOperationError("encrypted helper requested for a non-encrypted workspace")
+        cwd = str(workspace.path) if working_directory else "/"
         return [
             *self._docker_helper_base(),
+            "--pid",
+            "host",
+            "--privileged",
             "--security-opt",
-            "no-new-privileges",
-            "-v",
-            f"{self._workspace.volume_name}:/workspace:rw",
+            "label=disable",
             "--entrypoint",
-            "/bin/bash",
-            self._workspace.image,
-            *pipeline_command[1:],
-        ], None
+            "/usr/local/bin/python3",
+            workspace.image,
+            "-I",
+            "-S",
+            "-c",
+            RENTAL_EXEC_SOURCE,
+            str(workspace.pid),
+            cwd,
+            cwd if working_directory else "",  # the missing/empty check runs inside the rental, after joining
+            self._restic_binary,
+            CA_BUNDLE,
+            *restic_arguments,
+        ]
 
     def _encrypted_helper_command(self, namespace_command: list[str]) -> list[str]:
         if not isinstance(self._workspace, DockerUserNamespaceWorkspace):

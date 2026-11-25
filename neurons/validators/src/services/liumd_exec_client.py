@@ -1,7 +1,7 @@
 """Validator side of `liumd run` over an SSH exec channel.
 
-The executor image ships `liumd` at `LIUMD_COMMAND`. On the SSH session the pipeline already holds
-(`Context.ssh`), this client opens one exec channel running `/usr/local/bin/liumd run` — no
+The executor image ships `liumd` at `LIUMD_BINARY_PATH`. On the SSH session the pipeline already holds
+(`Context.ssh`), this client opens one exec channel running `liumd run` (`liumd_command()`) — no
 arguments, no environment, no pty — writes the signed intent (`build_intent` + `sign_intent`, the
 same document `POST /verify` takes) to its stdin, closes stdin, and reads stdout to EOF, at most
 `MAX_ANSWER_BYTES`, plus the exit status. stderr carries log lines only and is drained, not parsed.
@@ -23,12 +23,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import shlex
 import time
 from dataclasses import dataclass
 from typing import Any
 
 import asyncssh
-
 from services.local_verify_client import (
     DETAIL_MAX_CHARS,
     MAX_ANSWER_BYTES,
@@ -38,7 +38,29 @@ from services.local_verify_client import (
     sign_intent,
 )
 
-LIUMD_COMMAND = "/usr/local/bin/liumd run"
+from core.config import settings
+
+USER_LIUMD_PATH = '"$HOME/.local/bin/liumd"'
+
+
+def liumd_paths_sh() -> str:
+    """Shell prefix setting `$b` (the liumd to run) and `$t` (where a refresh installs it).
+
+    Root runs and installs `LIUMD_BINARY_PATH`. A non-root SSH user cannot write that system path
+    (prod 18 Nov: `install: cannot create regular file '/usr/local/bin/liumd': Permission denied`), so
+    it installs `$HOME/.local/bin/liumd` and runs that copy once it exists, else the system one.
+    """
+    system = shlex.quote(settings.LIUMD_BINARY_PATH)
+    return (
+        f"b={system}; t={system}; "
+        f'if [ "$(id -u)" != 0 ]; then t={USER_LIUMD_PATH}; [ -x "$t" ] && b="$t"; fi; '
+    )
+
+
+def liumd_command() -> str:
+    return liumd_paths_sh() + 'exec "$b" run'
+
+
 # The refusal codes each exit status may carry (lium.local_verify/1's ErrorCode). Anything else in
 # a refusal document is reported as `unexpected_error`, so a log label never carries peer text.
 REFUSAL_ERRORS_BY_EXIT: dict[int, frozenset[str]] = {
@@ -136,7 +158,7 @@ class LiumdExecClient:
             # env={} and send_env=[] override whatever the connection's options would send;
             # () would mean "the connection's defaults".
             process = await ssh.create_process(
-                LIUMD_COMMAND,
+                liumd_command(),
                 env={},
                 send_env=[],
                 request_pty=False,
@@ -147,8 +169,13 @@ class LiumdExecClient:
         except (asyncssh.Error, OSError) as exc:
             raise LocalVerifyUnavailable("transport", f"{type(exc).__name__}: {exc}")
         try:
-            process.stdin.write(json.dumps(signed).encode())
-            process.stdin.write_eof()
+            try:
+                process.stdin.write(json.dumps(signed).encode())
+                process.stdin.write_eof()
+            except BrokenPipeError:
+                # The command exited before reading the intent (126/127: no liumd); its exit
+                # status and stderr below say why.
+                pass
             stderr_task = asyncio.ensure_future(_drain_tail(process.stderr, STDERR_TAIL_BYTES, MAX_STDERR_BYTES, process.close)
             )
             try:

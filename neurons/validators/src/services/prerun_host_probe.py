@@ -79,9 +79,13 @@ def parse_container_listing(lines) -> tuple[tuple[str, ...], dict[str, str]]:
             ids[parts[0]] = parts[1]
     return tuple(names), ids
 DOCKER_VOLUME_LS_NAME_DRIVER_CMD = '/usr/bin/docker volume ls --format "{{.Name}} {{.Driver}}"'
+# A container `docker ps -a` lists but `docker inspect` cannot find ("no such object", a daemon
+# ghost that outlives restarts) is skipped: it failed this listing on every create, so the stale
+# volume sweep never ran and full-node rents failed short of disk. Any other inspect error still fails.
 DOCKER_MOUNTED_VOLUME_NAMES_CMD = (
-    "/usr/bin/docker ps -a -q | xargs -r /usr/bin/docker inspect --format "
+    "{ /usr/bin/docker ps -a -q | xargs -r /usr/bin/docker inspect --format "
     '\'{{range .Mounts}}{{if eq .Type "volume"}}{{.Name}}{{"\\n"}}{{end}}{{end}}\''
+    " 2>&1 >&3 | { ! grep -vi '^error: no such object: ' >&2; }; } 3>&1"
 )
 # Printed (untagged) when the awk that prefixes a section's lines fails: an untagged line makes
 # the parser raise, so a prefixing failure is a whole-probe fallback, never an empty listing.

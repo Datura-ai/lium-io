@@ -95,38 +95,33 @@ async def verify_validator_auth_from_headers(
     """
     validator_hotkey = x_validator_hotkey
     
-    # Normalize timestamp to seconds
-    # If timestamp is larger than 1e12, treat it as milliseconds and convert
-    if x_timestamp > 1e12:
-        timestamp_seconds = x_timestamp / 1000
-    else:
-        timestamp_seconds = x_timestamp
-    
+    # Normalize to integer milliseconds (values above 1e12 are milliseconds already); integer math only,
+    # so a huge header value cannot overflow a float, and the window is exact in both directions.
+    timestamp_ms = x_timestamp if x_timestamp > 1e12 else x_timestamp * 1000
+    timestamp_seconds = timestamp_ms // 1000
+
     # Validate timestamp is a reasonable Unix timestamp (after 2000-01-01)
     if timestamp_seconds < 946684800:  # 2000-01-01 00:00:00 UTC
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"X-Timestamp must be a Unix timestamp in seconds. Received invalid value: {x_timestamp}"
         )
-    
-    now = int(time.time())
-    
-    # Check timestamp is within allowed symmetric window
-    # Allow timestamps within AUTH_MESSAGE_MAX_AGE seconds in either direction
-    # to handle small clock differences between validator and miner servers
-    time_diff = abs(now - timestamp_seconds)
-    if time_diff > AUTH_MESSAGE_MAX_AGE:
-        if timestamp_seconds < now - AUTH_MESSAGE_MAX_AGE:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail=f"Authentication message too old. Timestamp is outside the allowed {AUTH_MESSAGE_MAX_AGE}-second window and must be regenerated."
-            )
-        else:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail=f"Authentication message timestamp is too far in the future. Timestamp must be within {AUTH_MESSAGE_MAX_AGE} seconds of current time."
-            )
-    
+
+    now_ms = int(time.time()) * 1000
+    max_age_ms = AUTH_MESSAGE_MAX_AGE * 1000
+
+    # Symmetric window: AUTH_MESSAGE_MAX_AGE seconds either way, for small clock differences between servers
+    if timestamp_ms < now_ms - max_age_ms:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=f"Authentication message too old. Timestamp is outside the allowed {AUTH_MESSAGE_MAX_AGE}-second window and must be regenerated."
+        )
+    if timestamp_ms > now_ms + max_age_ms:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=f"Authentication message timestamp is too far in the future. Timestamp must be within {AUTH_MESSAGE_MAX_AGE} seconds of current time."
+        )
+
     # Check validator registration
     if not validator_service.is_valid_validator(validator_hotkey):
         logger.warning("Validator %s is not registered", validator_hotkey)
@@ -215,9 +210,18 @@ def require_request_names_authenticated_miner(request_miner_hotkey: str, authent
         )
 
 
+# DAH-6430: the signature over the validator's own hotkey is still accepted from validators that do not
+# send the signed headers yet. Set False, then remove the body-signature path, once validators send them.
+ACCEPT_UNBOUND_SIGNATURES = True
+
+
 async def verify_simple_validator_signature(
     request: SimpleValidatorRequest,
     validator_service: Annotated[ValidatorService, Depends(ValidatorService)],
+    x_validator_hotkey: Annotated[str | None, Header(alias="X-Validator-Hotkey")] = None,
+    x_miner_hotkey: Annotated[str | None, Header(alias="X-Miner-Hotkey")] = None,
+    x_timestamp: Annotated[int | None, Header(alias="X-Timestamp")] = None,
+    x_signature: Annotated[str | None, Header(alias="X-Signature")] = None,
 ) -> str:
     """Verify simple validator signature and return validator_hotkey if valid.
 
@@ -235,6 +239,26 @@ async def verify_simple_validator_signature(
         HTTPException: 401 if signature invalid, 403 if validator not registered
     """
     validator_hotkey = request.validator_hotkey
+
+    # DAH-6430: the signed headers bind the request to this miner and a 10 s window; while
+    # ACCEPT_UNBOUND_SIGNATURES a refused header set falls back to the body signature (clock skew)
+    if x_signature is not None:
+        try:
+            if None in (x_validator_hotkey, x_miner_hotkey, x_timestamp) or x_validator_hotkey != validator_hotkey:
+                raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Incomplete signed headers")
+            # /executors returns this wallet's list, also in CENTRAL_MODE (where the header check skips the miner)
+            own_hotkey = core_config.settings.get_bittensor_wallet().get_hotkey().ss58_address
+            if x_miner_hotkey != own_hotkey:
+                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Authentication names another miner")
+            return await verify_validator_auth_from_headers(
+                x_validator_hotkey, x_miner_hotkey, x_timestamp, x_signature, validator_service
+            )
+        except HTTPException as refused:
+            if not ACCEPT_UNBOUND_SIGNATURES:
+                raise
+            logger.warning("Signed headers refused on /executors (%s); checking the body signature", refused.detail)
+    elif not ACCEPT_UNBOUND_SIGNATURES:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Signed headers are required")
 
     # Check validator registration
     if not validator_service.is_valid_validator(validator_hotkey):

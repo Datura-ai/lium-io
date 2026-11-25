@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from services.const import BATCH_PORT_VERIFICATION_SIZE, MIN_PORT_COUNT, UNRENTED_MULTIPLIER
+from services.const import BATCH_PORT_VERIFICATION_SIZE, MIN_PORT_COUNT
 
 from ..messages import FinalizeMessages as Msg, render_message
 from ..pipeline import CheckResult, Context
@@ -33,7 +33,7 @@ class FinalizeCheck:
             "gpu_model": ctx.state.gpu_model,
             "gpu_count": ctx.state.gpu_count if ctx.state.gpu_count is not None else 0,
             "contract_version": ctx.contract_version,
-            "unrented_multiplier": UNRENTED_MULTIPLIER,
+            "unrented_multiplier": 1,  # kept on the wire; the constant it echoed is gone
             "sysbox_runtime": ctx.state.sysbox_runtime,
         }
         # Only a run exempted from PortCountCheck by a pod that then proved stale gets here below the floor.

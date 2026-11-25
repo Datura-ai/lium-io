@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import functools
 import ipaddress
 import json
@@ -13,11 +14,14 @@ from pathlib import Path
 from typing import Annotated, Any, Optional
 
 import docker
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec, ed25519, padding, rsa
 from datura.requests.validator_requests import ssh_pubkey_signing_blob, upload_nonce_issued_at
 from fastapi import APIRouter, Depends, Query, Header, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import ValidationError
 from services.miner_service import MinerService
+from services.ssh_service import check_authorized_key
 from services.pod_log_service import PodLogService
 from services.hardware_service import get_docker_client, get_system_metrics, get_container_metrics
 from services.update_status_service import ExpectedDigestCache, collect_update_status
@@ -35,6 +39,7 @@ from dependencies.auth import (
     verify_container_logs_signature,
     verify_signature,
 )
+from services.validator_trust_service import validator_trust
 from services.local_verify_service import (
     BusyError,
     LocalVerifyService,
@@ -236,6 +241,11 @@ def _validate_ssh_key_consistency(payload: UploadSShKeyPayload) -> None:
     if len(pk_normalized.encode()) > MAX_PUBLIC_KEY_BYTES:
         logger.warning("Rejecting a public_key of %d bytes", len(pk_normalized.encode()))
         raise HTTPException(status_code=400, detail=f"Public key longer than {MAX_PUBLIC_KEY_BYTES} bytes")
+    try:
+        check_authorized_key(pk_normalized)
+    except ValueError as exc:
+        logger.warning("Rejecting a public_key that is not a plain public key line: %s", exc)
+        raise HTTPException(status_code=400, detail="Public key is not a plain public key line")
 
 
 def _validate_validator_signature(payload: UploadSShKeyPayload, require_nonce: bool = False) -> None:
@@ -275,6 +285,24 @@ def _accepted_miner_hotkeys() -> set[str]:
     )
 
 
+def _owner_set_signed(payload: UploadSShKeyPayload, own_hotkey: str) -> bool:
+    """DAH-6740: the validator also signed this key for this node's own hotkey as one of the listing owner's.
+
+    Only the own hotkey counts here: the pool hotkey is accepted by every pool node, so signing it for an own-key
+    listing would bind the key to nothing. The validator (and the backend's health check, on the validator's word) signs
+    only the hotkeys the portal itself names for the listing's owner, never what a miner reports, and an upload needs
+    this node's own or the central miner's auth (MinerMiddleware).
+    """
+    signature = (payload.owner_hotkey_signatures or {}).get(own_hotkey)
+    if not own_hotkey or not signature:
+        return False
+    try:
+        blob = ssh_pubkey_signing_blob(payload.public_key, payload.nonce, own_hotkey)
+        return match_validator_hotkey(blob, signature) is not None
+    except Exception:
+        return False
+
+
 def _check_miner_binding(payload: UploadSShKeyPayload) -> None:
     """Check the validator issued this key for this executor's own miner hotkey or the pool's.
 
@@ -296,6 +324,8 @@ def _check_miner_binding(payload: UploadSShKeyPayload) -> None:
             miner_binding = "mismatch"
         else:
             return
+    if _owner_set_signed(payload, own_hotkey):
+        return
     enforced = settings.REQUIRE_MINER_BOUND_SSH_KEY
     logger.warning(
         _m(
@@ -439,6 +469,8 @@ async def get_version():
         "version": _get_version(),
         "capabilities": [LOCAL_VERIFY_CAPABILITY],
         "local_verify_port": settings.INTERNAL_PORT,
+        # DAH-6590: the validator address and revision this node trusts, so a switch is measured per node
+        "validator_trust": validator_trust.report(),
     }
 
 
@@ -461,12 +493,63 @@ async def get_miner_identity(
     `account_claim`: every node of an e-mail or Google portal account reports the same pool hotkey, so
     the claim is what ties the node to the account that installed it. It is not a secret.
     """
+    claim = settings.MINER_ACCOUNT_CLAIM or None
+    port = _ssh_host_key_port()
     return MinerIdentityResponse(
         miner_hotkey=settings.MINER_HOTKEY_SS58_ADDRESS,
         nonce=nonce,
-        account_claim=settings.MINER_ACCOUNT_CLAIM or None,
-        ssh_host_key_port=_ssh_host_key_port(),
+        account_claim=claim,
+        ssh_host_key_port=port,
+        # off the event loop: an RSA signature still costs ~ms, and this endpoint is public
+        host_key_proofs=(
+            await asyncio.to_thread(_host_key_proofs, nonce, settings.MINER_HOTKEY_SS58_ADDRESS, claim) if port else None
+        ),
     )
+
+
+def identity_proof_message(nonce: str, miner_hotkey: str, account_claim: str | None) -> bytes:
+    """What each `host_key_proofs` signature signs; the portal (lium-platform node_control.py) builds the same bytes."""
+    return b"\n".join([b"lium-miner-identity-v1", nonce.encode(), miner_hotkey.encode(), (account_claim or "").encode()])
+
+
+# ECDSA signs with the hash its curve size calls for (RFC 5656), RSA with SHA-256 (rsa-sha2-256)
+_ECDSA_HASH = {256: hashes.SHA256, 384: hashes.SHA384, 521: hashes.SHA512}
+
+
+def _sign_with_host_key(key, message: bytes) -> bytes | None:
+    if isinstance(key, ed25519.Ed25519PrivateKey):
+        return key.sign(message)
+    if isinstance(key, ec.EllipticCurvePrivateKey) and key.curve.key_size in _ECDSA_HASH:
+        return key.sign(message, ec.ECDSA(_ECDSA_HASH[key.curve.key_size]()))
+    if isinstance(key, rsa.RSAPrivateKey):
+        return key.sign(message, padding.PKCS1v15(), hashes.SHA256())
+    return None
+
+
+@functools.lru_cache(maxsize=16)
+def _load_host_key(path: str, mtime_ns: int, size: int):
+    """Parsed once per key file version: loading (and checking) an RSA private key costs ~100 ms, signing does not."""
+    return serialization.load_ssh_private_key(Path(path).read_bytes(), password=None)
+
+
+def _host_key_proofs(nonce: str, miner_hotkey: str, account_claim: str | None) -> dict[str, str] | None:
+    """A signature by each of sshd's persisted host keys over this answer, keyed by its `<type> <base64>` public line
+    (DAH-5729). The portal binds a hostname node only when every key its SSH scan returned signed the check, so an SSH
+    port, or one key type of it, forwarded to another machine is refused. None when no key can be read."""
+    message = identity_proof_message(nonce, miner_hotkey, account_claim)
+    proofs: dict[str, str] = {}
+    for path in sorted(Path(settings.SSH_HOST_KEYS_DIR).glob("ssh_host_*_key")):
+        try:
+            stat = path.stat()
+            key = _load_host_key(str(path), stat.st_mtime_ns, stat.st_size)
+        except Exception:  # any odd file in the keys dir (e.g. an sk-* FIDO key) is skipped, never a 500
+            continue
+        signature = _sign_with_host_key(key, message)
+        if signature is None:
+            continue
+        public = key.public_key().public_bytes(serialization.Encoding.OpenSSH, serialization.PublicFormat.OpenSSH)
+        proofs[public.decode()] = base64.b64encode(signature).decode()
+    return proofs or None
 
 
 def _ssh_host_key_port() -> int | None:
@@ -586,7 +669,7 @@ async def local_verify(request: Request):
         result.deadline_hit,
         {name: step.status for name, step in result.steps.items()},
     )
-    return result.model_dump(by_alias=True)
+    return {**result.model_dump(by_alias=True), "validator_trust": validator_trust.report()}
 
 
 _expected_digest_cache = ExpectedDigestCache()
