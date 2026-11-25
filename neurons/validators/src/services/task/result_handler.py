@@ -5,6 +5,7 @@ and converting the validation context into a JobResult for reporting.
 """
 
 import logging
+import time
 from datetime import datetime
 from typing import Any, Optional
 
@@ -119,6 +120,9 @@ class ResultHandler:
                     "success": success,
                     "score": context.score,
                     "job_score": context.job_score,
+                    "job_batch_id": miner_info.job_batch_id,
+                    # counted from the executor task's start, as the per-node task limit is
+                    "pipeline_elapsed_s": round(time.monotonic() - context.started_at_monotonic, 1),
                 },
             )
         )
@@ -304,6 +308,7 @@ class ResultHandler:
             pod_states=list(context.state.pod_states) or None,
             host_runtime_fault=context.state.host_runtime_fault,
             rented_pod_faults=context.state.rented_pod_faults,
+            idle_checks_passed=list(dict.fromkeys(context.idle_checks_passed)),
         )
 
     @staticmethod
@@ -432,6 +437,7 @@ class ResultHandler:
                     prev_info=verified_job_info,
                     reason=reason,
                     evidence=evidence,
+                    unrented_only=context.clear_verified_job_unrented_only,
                     reanchor_uuids=(context.state.gpu_uuids or '') if context.gpu_reanchor else '',
                     respec=(context.state.gpu_model_count or '') if context.gpu_respec else '',
                 )

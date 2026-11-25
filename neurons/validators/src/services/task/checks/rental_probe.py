@@ -362,13 +362,18 @@ class RentalProbeCheck:
 
         if outcome.failed_step is None:
             try:
-                await _stamp_last_ok(ctx)
+                # run() drops this pass when VerifyX or the all-cards proof skipped the cycle; a stamp then would hold
+                # the next full probe back a whole interval, so only a pass the cycle keeps is stamped
+                if not _cycle_skipped_a_work_proof(ctx):
+                    await _stamp_last_ok(ctx)
                 await _clear_failure(ctx)
             finally:
                 _teardown_after_verdict(ctx, outcome)
             return CheckResult(
                 passed=True,
                 event=render_message(Msg.PROBE_OK, ctx=ctx, check_id=self.check_id, what=what),
+                # DAH-6784: the probe ran this cycle and its rental succeeded: the full check
+                updates={"idle_check_passed": True},
             )
 
         # A renter may have taken the node while the probe ran: their create sweeps our container
@@ -542,6 +547,9 @@ class RentalProbeCheck:
                     "create_step": failure.create_step,
                     "ssh_port": ssh_port,
                 },
+                # a rented node is left alone (class docstring): a rental placed after the reads above keeps
+                # its node, the backend applies this reset only while no customer pod runs there
+                "clear_verified_job_unrented_only": True,
             },
         )
 
@@ -789,6 +797,13 @@ async def _log_if_long_unprobed(ctx: Context, reason: str) -> None:
                 }
             ),
         )
+    )
+
+
+def _cycle_skipped_a_work_proof(ctx: Context) -> bool:
+    """VerifyX or the all-cards proof skipped this cycle for a standing probe failure: run() never passes it"""
+    return bool(
+        ctx.state.verifyx_skipped_for_standing_probe_failure or ctx.state.allcards_skipped_for_standing_probe_failure
     )
 
 
