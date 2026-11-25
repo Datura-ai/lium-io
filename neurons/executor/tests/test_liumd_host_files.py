@@ -83,6 +83,7 @@ def test_the_host_files_have_the_shapes_liumd_reads(tmp_path):
         validator_hotkeys={"current": "5Current", "next": "5Next"},
         miner_hotkey=" 5Miner \n",
         pool_hotkey="5Pool",
+        account_claim="claim-abc",
         port_range="20000-20010",
         port_mappings=None,
         ssh_port=2200,
@@ -91,12 +92,13 @@ def test_the_host_files_have_the_shapes_liumd_reads(tmp_path):
     assert (etc / "validator_hotkeys").read_text() == "5Current\n5Next\n"
     assert (etc / "miner_hotkey").read_text() == "5Miner\n"
     assert (etc / "pool_hotkey").read_text() == "5Pool\n"
+    assert (etc / "account_claim").read_text() == "claim-abc\n"
     assert json.loads((etc / "ports.json").read_text()) == {
         "port_range": "20000-20010",
         "port_mappings": None,
         "ssh_port": 2200,
     }
-    for name in ("validator_hotkeys", "miner_hotkey", "pool_hotkey", "ports.json"):
+    for name in ("validator_hotkeys", "miner_hotkey", "pool_hotkey", "account_claim", "ports.json"):
         assert stat.S_IMODE((etc / name).stat().st_mode) == 0o644
     assert nonces.is_dir() and os.access(nonces, os.W_OK)
     assert stat.S_IMODE(nonces.stat().st_mode) == 0o700

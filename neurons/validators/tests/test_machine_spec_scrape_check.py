@@ -10,6 +10,7 @@ import pytest
 from neurons.validators.src.services.task.checks.machine_spec_scrape import (
     MachineSpecScrapeCheck,
     _normalize_gpu_details,
+    scrape_gpu_details,
 )
 from neurons.validators.src.services.task.messages import MachineSpecMessages as Msg
 from neurons.validators.src.services.task.messages import (
@@ -18,6 +19,7 @@ from neurons.validators.src.services.task.messages import (
 )
 from neurons.validators.src.services.task.runner import NO_EXIT_STATUS, SSHCommandResult
 
+from services.executor_payload import EXECUTOR_PYTHON
 from tests.helpers import (
     FERNET_TOKEN,
     DummySSHClient,
@@ -301,7 +303,7 @@ async def test_machine_spec_scrape_pipes_source_to_the_executor_interpreter(cont
 
     # Assert
     assert result.passed is True
-    assert runner.called_with.command == "/usr/bin/python -I -"
+    assert runner.called_with.command == f"{EXECUTOR_PYTHON} -I -"
     assert runner.called_with.stdin_text == source
 
 
@@ -366,7 +368,7 @@ async def test_machine_spec_scrape_uploads_the_binary_when_the_source_will_not_r
     assert result.passed is True
     assert result.event.reason_code == Msg.SCRAPE_OK.reason
     assert [call.command for call in runner.calls] == [
-        "/usr/bin/python -I -",
+        f"{EXECUTOR_PYTHON} -I -",
         f"chmod +x {ssh_client.sftp_client.put_called_with.remote_path}/scrape.sh"
         f" && {ssh_client.sftp_client.put_called_with.remote_path}/scrape.sh",
     ]
@@ -714,6 +716,18 @@ async def test_a_provider_reported_split_disk_is_dropped(context_factory):
     assert "split_disk" not in result.updates["state"].specs
 
 
+@pytest.mark.asyncio
+async def test_a_provider_reported_in_pod_download_figure_is_dropped(context_factory):
+    # DAH-6239: the in-pod download figure is the validator's own reading; a scrape-sent one must not reach the
+    # listing on a cycle the download check skips
+    result = await _scrape_ok_event_for(
+        context_factory, {"container_download_mbps": 9999.0, "container_download_measured_at": 1.0}
+    )
+
+    specs = result.updates["state"].specs
+    assert "container_download_mbps" not in specs and "container_download_measured_at" not in specs
+
+
 # Which side failed, from what the scrape run returned. Host side needs an exit status from the
 # host; without one the code is undetermined (lium-platform#714 bills a running pod only through a
 # failure no host fault can produce, and none of these qualifies).
@@ -927,6 +941,120 @@ def test_the_scrape_codes_split_into_host_side_and_undetermined():
     assert SCRAPE_UNDETERMINED_FAILURE_REASONS == {"SCRAPE_TIMEOUT", "SCRAPE_TRANSPORT_FAILED"}
 
 
+class FakeBinaryBuild:
+    def __init__(self, error: Exception | None = None):
+        self.error = error
+        self.ensure_calls = 0
+        self.wait_seconds = None
+
+    async def ensure(self, wait_seconds: float) -> None:
+        self.ensure_calls += 1
+        self.wait_seconds = wait_seconds
+        if self.error:
+            raise self.error
+
+
+def _stdin_scrape_ctx(context_factory, runner, ssh_client, binary_build):
+    return context_factory(
+        services=build_services(ssh=DummySSHService(decrypted_data=RAW_SPECS)),
+        config=build_context_config(machine_scrape_source="print('scrape')", machine_scrape_binary_build=binary_build),
+        state=build_state(upload_local_dir="/local/validator/files"),
+        runner=runner,
+        ssh=ssh_client,
+        encrypt_key="test-encrypt-key",
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_scrape_that_passes_over_stdin_never_builds_the_binary(context_factory):
+    # DAH-5899: a normal cycle delivers the source and must not freeze the binary
+    binary_build = FakeBinaryBuild()
+    runner = DummySSHCommandRunner(result=make_command_result(success=True, stdout=FERNET_TOKEN))
+    ctx = _stdin_scrape_ctx(context_factory, runner, DummySSHClient(), binary_build)
+
+    result = await MachineSpecScrapeCheck().run(ctx)
+
+    assert result.passed is True
+    assert binary_build.ensure_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_a_failed_stdin_scrape_builds_the_binary_before_its_upload_retry(context_factory):
+    binary_build = FakeBinaryBuild()
+    runner = DummySSHCommandRunner(
+        results=[
+            make_command_result(success=False, exit_code=1, stderr="no psutil", duration_ms=1600),
+            make_command_result(success=True, stdout=FERNET_TOKEN),
+        ]
+    )
+    ssh_client = DummySSHClient()
+    ctx = _stdin_scrape_ctx(context_factory, runner, ssh_client, binary_build)
+
+    result = await MachineSpecScrapeCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.what_we_saw["delivery"] == "upload"
+    assert binary_build.ensure_calls == 1
+    assert ssh_client.sftp_client.put_called_with is not None
+
+
+@pytest.mark.asyncio
+async def test_the_build_wait_leaves_time_for_the_upload_and_the_scrape(context_factory, mocker):
+    mocker.patch(
+        "neurons.validators.src.services.task.checks.machine_spec_scrape.task_seconds_left", return_value=700
+    )
+    binary_build = FakeBinaryBuild(TimeoutError())
+    runner = DummySSHCommandRunner(
+        result=make_command_result(success=False, exit_code=1, stderr="no psutil", duration_ms=1600)
+    )
+    ssh_client = DummySSHClient()
+    ctx = _stdin_scrape_ctx(context_factory, runner, ssh_client, binary_build)
+
+    result = await MachineSpecScrapeCheck().run(ctx)
+
+    assert binary_build.wait_seconds == 700 - 300 - 300
+    assert result.event.what_we_saw["delivery"] == "stdin"
+    assert ssh_client.sftp_client.put_called_with is None
+
+
+@pytest.mark.asyncio
+async def test_a_retry_that_no_longer_fits_after_the_build_keeps_the_stdin_verdict(context_factory, mocker):
+    # the build counts against the 780 s task budget; a retry whose upload (300 s) plus scrape cannot finish
+    # is not started, even when the scrape alone would fit
+    mocker.patch(
+        "neurons.validators.src.services.task.checks.machine_spec_scrape.task_seconds_left", side_effect=[700, 599]
+    )
+    runner = DummySSHCommandRunner(
+        result=make_command_result(success=False, exit_code=1, stderr="no psutil", duration_ms=1600)
+    )
+    ssh_client = DummySSHClient()
+    binary_build = FakeBinaryBuild()
+    ctx = _stdin_scrape_ctx(context_factory, runner, ssh_client, binary_build)
+
+    result = await MachineSpecScrapeCheck().run(ctx)
+
+    assert binary_build.ensure_calls == 1
+    assert result.passed is False
+    assert result.event.what_we_saw["delivery"] == "stdin"
+    assert len(runner.calls) == 1
+    assert ssh_client.sftp_client.put_called_with is None
+
+
+@pytest.mark.asyncio
+async def test_a_failed_build_keeps_the_stdin_verdict(context_factory):
+    runner = DummySSHCommandRunner(
+        result=make_command_result(success=False, exit_code=1, stderr="no psutil", duration_ms=1600)
+    )
+    ssh_client = DummySSHClient()
+    ctx = _stdin_scrape_ctx(context_factory, runner, ssh_client, FakeBinaryBuild(RuntimeError("exit 1")))
+
+    result = await MachineSpecScrapeCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.what_we_saw["delivery"] == "stdin"
+    assert ssh_client.sftp_client.put_called_with is None
+
+
 @pytest.mark.asyncio
 async def test_a_provider_reported_host_power_limit_is_dropped(context_factory):
     # DAH-5302: power_host_limit is GpuPowerLimitCheck's, written only under our Pearl cap
@@ -951,3 +1079,33 @@ async def test_a_successful_scrape_starts_the_liumd_facts_read(context_factory, 
     assert result.passed is True
     assert result.updates["state"].liumd_shadow_facts_task is started and len(seen) == 1
     assert result.updates["state"].liumd_shadow_facts_attempted is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "stdout,expected",
+    [
+        # DAH-6469: the cards' rows, normalised as the check stores them
+        (FERNET_TOKEN, [{"name": "NVIDIA A10 Tensor Core GPU", "uuid": "GPU-abc123"}]),
+        # a reading only counts from a payload this validator can decrypt
+        ("GPU-abc123 99 % 1980 MHz", []),
+    ],
+)
+async def test_scrape_gpu_details_reads_the_encrypted_scrape_and_leaves_the_state_alone(
+    context_factory, stdout, expected
+):
+    runner = DummySSHCommandRunner(result=make_command_result(success=True, stdout=stdout))
+    ctx = context_factory(
+        services=build_services(ssh=DummySSHService(decrypted_data=RAW_SPECS, valid_payload=FERNET_TOKEN)),
+        config=build_context_config(machine_scrape_source="print('scrape')"),
+        state=build_state(gpu_details=[{"uuid": "GPU-before"}]),
+        runner=runner,
+        encrypt_key="test-encrypt-key",
+    )
+
+    rows = await scrape_gpu_details(ctx, 120)
+
+    assert rows == expected
+    assert runner.called_with.command == f"{EXECUTOR_PYTHON} -I -"  # never the executor-reported path
+    assert runner.called_with.timeout == 120
+    assert ctx.state.gpu_details == [{"uuid": "GPU-before"}]

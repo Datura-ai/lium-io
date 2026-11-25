@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 from storage.models import StorageAction, StorageOperationSpec, WorkspaceMode
+from storage.safe_path import NOT_A_DIRECTORY_EXIT, NOT_EMPTY_EXIT, SYMLINK_EXIT, safe_enter_command
 
 
 class WorkspaceResolutionError(RuntimeError):
@@ -27,6 +28,7 @@ class DockerVolumeWorkspace:
     volume_name: str
     path: PurePosixPath
     read_only: bool
+    root: PurePosixPath = PurePosixPath("/workspace")
 
 
 @dataclass(frozen=True)
@@ -35,11 +37,29 @@ class DockerUserNamespaceWorkspace:
     container_name: str
     container_id: str
     pid: int
-    path: PurePosixPath
+    path: PurePosixPath  # as the rental sees it (DAH-6447): restic runs inside the rental's own root
     read_only: bool
 
+    @property
+    def helper_root(self) -> PurePosixPath:
+        """the rental's root seen from a host-PID helper; a path under it is only entered through safe_path"""
+        return PurePosixPath("/proc", str(self.pid), "root")
 
-ResolvedWorkspace = LocalWorkspace | DockerVolumeWorkspace | DockerUserNamespaceWorkspace
+    @property
+    def helper_path(self) -> PurePosixPath:
+        """the same path seen from a host-PID helper; resolves outside the rental's root, so never give it to restic"""
+        return self.helper_root / self.path.relative_to("/")
+
+
+@dataclass(frozen=True)
+class NamespaceWorkspace:
+    """Inside the helper: an encrypted workspace, reached by running commands under nsenter -t pid -U."""
+
+    pid: int
+    path: PurePosixPath
+
+
+ResolvedWorkspace = LocalWorkspace | DockerVolumeWorkspace | DockerUserNamespaceWorkspace | NamespaceWorkspace
 
 
 @dataclass(frozen=True)
@@ -93,16 +113,13 @@ class WorkspaceResolver:
             operation.workspace.requested_path,
             operation.workspace.volume_path,
         )
-        visible_path = (
-            PurePosixPath(str(self._proc_root))
-            / str(identity.pid)
-            / "root"
-            / requested_path.relative_to("/")
-        )
+        visible_root = PurePosixPath(str(self._proc_root)) / str(identity.pid) / "root"
+        visible_path = visible_root / requested_path.relative_to("/")
         image = self._helper_image()
         self._validate_encrypted_path(
             image=image,
             pid=identity.pid,
+            visible_root=visible_root,
             visible_path=visible_path,
             requested_path=requested_path,
             action=operation.action,
@@ -117,7 +134,7 @@ class WorkspaceResolver:
             container_name=container_name,
             container_id=identity.container_id,
             pid=identity.pid,
-            path=visible_path,
+            path=requested_path,
             read_only=operation.action is StorageAction.BACKUP,
         )
 
@@ -140,12 +157,6 @@ class WorkspaceResolver:
         return image
 
     def _require_empty_plain_restore_target(self, workspace: DockerVolumeWorkspace) -> None:
-        check_script = (
-            'target="$1"; '
-            'if [ ! -e "$target" ]; then exit 0; fi; '
-            'if [ ! -d "$target" ]; then exit 20; fi; '
-            'if find "$target" -mindepth 1 -maxdepth 1 -print -quit | grep -q .; then exit 21; fi'
-        )
         result = subprocess.run(
             [
                 self._docker_binary,
@@ -156,54 +167,36 @@ class WorkspaceResolver:
                 "-v",
                 f"{workspace.volume_name}:/workspace:rw",
                 "--entrypoint",
-                "sh",
+                "python3",
                 workspace.image,
-                "-c",
-                check_script,
-                "sh",
-                str(workspace.path),
+                *safe_enter_command(workspace.root, workspace.path, "check-restore-empty", [])[1:],
             ],
             capture_output=True,
             text=True,
         )
         error = f"restore target must be new or empty: {workspace.path}"
-        _raise_check_failure(result, (20, 21), error, "restore", workspace.path)
+        _raise_check_failure(result, (NOT_A_DIRECTORY_EXIT, NOT_EMPTY_EXIT, SYMLINK_EXIT), error, "restore", workspace.path)
 
     def _validate_encrypted_path(
         self,
         *,
         image: str,
         pid: int,
+        visible_root: PurePosixPath,
         visible_path: PurePosixPath,
         requested_path: PurePosixPath,
         action: StorageAction,
         overwrite_fresh_target: bool = False,
     ) -> None:
+        # DAH-2002: an absent path passes (backup: EMPTY no-op; restore: created). The path is walked from the
+        # renter's root without following symlinks, so a renter symlink cannot point the check outside the rental.
         if action is StorageAction.BACKUP:
-            # DAH-2002: an absent path passes, so BACKUP_SOURCE_SCRIPT turns it into an EMPTY no-op; a file still fails
-            # ls -ld shows what the path actually is (type or stat errno) in the failure, to prove the cause
-            check_script = '[ ! -e "$1" ] || [ -d "$1" ] || { ls -ld "$1" >&2; exit 20; }'
-            error = f"backup source is not a directory: {requested_path}"
-            codes: tuple[int, ...] = (20,)
+            mode, error = "check-backup", f"backup source is not a directory: {requested_path}"
         elif overwrite_fresh_target:
-            # Create-time restore into the pod's fresh mount (DAH-3274): the entrypoint may have
-            # dropped `.jupyter`, `.bashrc` or a shell history there since `docker run`. The
-            # backup wins. That flips the old order, where the restore ran first and the
-            # entrypoint wrote last; at create time nothing in the mount is the customer's, so the
-            # backup is the right winner. Only the shape is checked — the target must be absent
-            # or a directory, never a file.
-            check_script = 'target="$1"; if [ ! -e "$target" ]; then exit 0; fi; if [ ! -d "$target" ]; then exit 20; fi'
-            error = f"restore target is not a directory: {requested_path}"
-            codes = (20,)
+            # Create-time restore into the pod's fresh mount (DAH-3274): only the shape is checked
+            mode, error = "check-restore", f"restore target is not a directory: {requested_path}"
         else:
-            check_script = (
-                'target="$1"; '
-                'if [ ! -e "$target" ]; then exit 0; fi; '
-                'if [ ! -d "$target" ]; then exit 20; fi; '
-                'if find "$target" -mindepth 1 -maxdepth 1 -print -quit | grep -q .; then exit 21; fi'
-            )
-            error = f"restore target must be new or empty: {requested_path}"
-            codes = (20, 21)
+            mode, error = "check-restore-empty", f"restore target must be new or empty: {requested_path}"
 
         result = subprocess.run(
             [
@@ -229,16 +222,14 @@ class WorkspaceResolver:
                 str(pid),
                 "-U",
                 "--",
-                "/bin/sh",
-                "-c",
-                check_script,
-                "sh",
-                str(visible_path),
+                *safe_enter_command(visible_root, visible_path, mode, []),
             ],
             capture_output=True,
             text=True,
         )
-        _raise_check_failure(result, codes, error, action.value, requested_path)
+        _raise_check_failure(
+            result, (NOT_A_DIRECTORY_EXIT, NOT_EMPTY_EXIT, SYMLINK_EXIT), error, action.value, requested_path
+        )
 
     def _inspect_running_container(self, container_name: str) -> tuple[ContainerIdentity, Mapping[str, object]]:
         result = self._run_docker(["inspect", container_name], "inspect rental container")
@@ -350,6 +341,8 @@ def _raise_check_failure(
     if result.returncode == 0:
         return
     stderr = (result.stderr or "")[-300:].strip()
+    if result.returncode == SYMLINK_EXIT and SYMLINK_EXIT in codes:
+        raise WorkspaceResolutionError(f"{action} path {path} leads through a symlink, which is not followed: {stderr}")
     if result.returncode in codes:
         raise WorkspaceResolutionError(f"{error}: {stderr}" if stderr else error)
     raise WorkspaceResolutionError(f"could not check {action} path {path}: exit {result.returncode}: {stderr}")

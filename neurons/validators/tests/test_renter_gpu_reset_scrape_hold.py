@@ -17,11 +17,16 @@ from payload_models.payloads import GpuResetErrorCode, ResetPodGpuRequest
 from incentive.config import IncentiveConfig
 from incentive.rental_price import RentalPriceIncentive
 from services.docker_service import DockerService
+from core.config import settings
 from core.validator import specs_to_publish
 from services.executor_rollout import (
     ExecutorRolloutTracker,
+    _idle_passes,
     carry_renter_gpu_reset_results,
+    has_renter_gpu_reset_holds,
     remember_rented_scored_results,
+    rollout_grace_reason,
+    session_kept_hotkeys,
 )
 from services.gpu_reset import RECENT_RENTER_GPU_RESET_SECONDS, GpuResetReport, renter_gpu_reset_recent
 from services.redis_service import (
@@ -40,9 +45,15 @@ from protocol.vc_protocol.compute_requests import (
 from services.task.checks import rented_gpu_drop
 from protocol.vc_protocol.validator_requests import ContainerState, PodContainerState
 from services.ssh_service import SSHService
-from services.task.models import build_msg
+from services.task.models import JobResult, build_msg
 from test_executor_rollout_grace import _failed, _scored, _validator_process
 from neurons.validators.src.services.task.messages import GpuFingerprintMessages as FingerprintMsg
+from services.task.messages import (
+    ZEROED_BEFORE_THE_BUDGET_STOP,
+    ExecutorImageMessages,
+    GpuPowerLimitMessages,
+    VerifyXMessages,
+)
 from test_rented_host_gpu_fault_reset import (
     ENCRYPT_KEY,
     EXECUTOR,
@@ -64,12 +75,13 @@ from test_rented_host_gpu_fault_reset import (
 
 from helpers import FakeRedis, build_context_config, build_services, build_state
 from neurons.validators.src.services.task.checks import machine_spec_scrape
-from neurons.validators.src.services.task.checks import gpu_fingerprint
 from neurons.validators.src.services.task.checks.gpu_fingerprint import GpuFingerprintCheck
 from neurons.validators.src.services.task.checks.gpu_loss_hold import GpuLossHoldCheck
 from neurons.validators.src.services.task.checks.machine_spec_scrape import MachineSpecScrapeCheck
 from neurons.validators.src.services.task.checks.rented_machine import TenantEnforcementCheck
 from neurons.validators.src.services.task.messages import MachineSpecMessages as Msg
+from neurons.validators.src.services.task.messages import RentalVerificationMessages
+from neurons.validators.src.services.task.messages import TenantEnforcementMessages as TenantMsg
 from neurons.validators.src.services.task.pipeline import Pipeline
 from neurons.validators.src.services.task.result_handler import ResultHandler
 
@@ -122,6 +134,9 @@ async def _cycle(context_factory, service, *, scrape, pod_gpu_count: int | None 
 
 
 H200_UUIDS = [f"GPU-h200-{i}" for i in range(8)]
+# the cycle's job block, and the one of the cycle before it, which vouched for the kept result it wrote
+JOB_BLOCK = 7500
+PREV_BLOCK = JOB_BLOCK - settings.BLOCKS_FOR_JOB
 
 
 def _gpus_listed(uuids: list[str]):
@@ -193,11 +208,10 @@ async def test_a_split_node_whose_renter_resets_its_four_gpus_is_held_not_zeroed
     """8x H200 split 4+4: the renter resets their 4; the scrape lists only the other 4, so the zero-GPU hold
     never fires. The loss hold must hold the cycle, or GpuFingerprintCheck fails it with GPU_MISSING."""
     service = _redis_service()
-    with patch.object(gpu_fingerprint.settings, "GPU_ANCHOR_HARD_ENABLED", True):
-        await _scored_on_all_eight(context_factory, service)
-        await mark(service, H200_UUIDS[:4])
+    await _scored_on_all_eight(context_factory, service)
+    await mark(service, H200_UUIDS[:4])
 
-        ok, event, ctx, _ = await _cycle(context_factory, service, scrape=_gpus_listed(H200_UUIDS[4:]))
+    ok, event, ctx, _ = await _cycle(context_factory, service, scrape=_gpus_listed(H200_UUIDS[4:]))
 
     assert ok is False
     assert event.check_id == GpuLossHoldCheck.check_id
@@ -224,11 +238,10 @@ async def _old_recent_mark_without_gpus(service, gpu_uuids) -> None:
 @pytest.mark.asyncio
 async def test_a_missing_card_outside_the_reset_gpus_still_fails_the_fingerprint(context_factory, mark, listed):
     service = _redis_service()
-    with patch.object(gpu_fingerprint.settings, "GPU_ANCHOR_HARD_ENABLED", True):
-        await _scored_on_all_eight(context_factory, service)
-        await mark(service, H200_UUIDS[:4])
+    await _scored_on_all_eight(context_factory, service)
+    await mark(service, H200_UUIDS[:4])
 
-        ok, event, ctx, _ = await _cycle(context_factory, service, scrape=_gpus_listed(listed))
+    ok, event, ctx, _ = await _cycle(context_factory, service, scrape=_gpus_listed(listed))
 
     assert ok is False
     assert event.reason_code == FingerprintMsg.GPU_MISSING.reason
@@ -261,18 +274,19 @@ async def test_a_carried_split_node_keeps_only_its_rented_gpus_in_the_mining_poo
     """8x H200 split 4+4, the renter's pod holds 4: the carried result must still say 4 rented, or the
     split pricing reads the whole node as rented for up to the carry TTL."""
     service = _redis_service()
-    with patch.object(gpu_fingerprint.settings, "GPU_ANCHOR_HARD_ENABLED", True):
-        ok, event, ctx, _ = await _cycle(context_factory, service, scrape=_gpus_listed(H200_UUIDS), pod_gpu_count=4)
-        previous = await _job_result(ctx, ok, event)
-        previous.supports_gpu_splitting, previous.gpu_splitting_min_count = True, 4  # the provider's split opt-in
-        await remember_rented_scored_results({RENTAL_OWNER: [previous]}, service)
-        await _reset_in_progress(service, H200_UUIDS[:4])
+    ok, event, ctx, _ = await _cycle(context_factory, service, scrape=_gpus_listed(H200_UUIDS), pod_gpu_count=4)
+    previous = await _job_result(ctx, ok, event)
+    previous.supports_gpu_splitting, previous.gpu_splitting_min_count = True, 4  # the provider's split opt-in
+    await remember_rented_scored_results({RENTAL_OWNER: [previous]}, service, job_block=PREV_BLOCK)
+    await _reset_in_progress(service, H200_UUIDS[:4])
 
-        ok, event, ctx, _ = await _cycle(context_factory, service, scrape=_gpus_listed(H200_UUIDS[4:]), pod_gpu_count=4)
-        held = await _job_result(ctx, ok, event)
+    ok, event, ctx, _ = await _cycle(context_factory, service, scrape=_gpus_listed(H200_UUIDS[4:]), pod_gpu_count=4)
+    held = await _job_result(ctx, ok, event)
     job_results = {RENTAL_OWNER: [held]}
 
-    await carry_renter_gpu_reset_results(job_results, service, {EXECUTOR}, ctx.state.rented_data, {})
+    await carry_renter_gpu_reset_results(
+        job_results, service, {EXECUTOR}, ctx.state.rented_data, {}, ctx.state.rented_data, job_block=JOB_BLOCK
+    )
 
     [carried] = job_results[RENTAL_OWNER]
     assert carried.carried_for_renter_gpu_reset is True
@@ -285,10 +299,9 @@ async def test_a_carried_split_node_keeps_only_its_rented_gpus_in_the_mining_poo
 @pytest.mark.asyncio
 async def test_four_gpus_missing_without_a_renter_reset_still_fail_the_fingerprint(context_factory):
     service = _redis_service()
-    with patch.object(gpu_fingerprint.settings, "GPU_ANCHOR_HARD_ENABLED", True):
-        await _cycle(context_factory, service, scrape=_gpus_listed(H200_UUIDS))
+    await _cycle(context_factory, service, scrape=_gpus_listed(H200_UUIDS))
 
-        ok, event, ctx, _ = await _cycle(context_factory, service, scrape=_gpus_listed(H200_UUIDS[4:]))
+    ok, event, ctx, _ = await _cycle(context_factory, service, scrape=_gpus_listed(H200_UUIDS[4:]))
 
     assert ok is False
     assert event.reason_code == FingerprintMsg.GPU_MISSING.reason
@@ -342,13 +355,24 @@ def _rented_scored(uuid: str):
     result.pod_states = [
         PodContainerState(pod_id=POD_ID, container_state=ContainerState.RUNNING, observed_at=datetime.now(UTC))
     ]
+    result.rental_pod_ids = [POD_ID]
+    result.rented_gpu_count = 8
+    return result
+
+
+def _idle_scored(uuid: str):
+    """An idle pass as ResultHandler records it: scored with no rental."""
+    result = _scored(uuid)
+    result.rental_pod_ids = []
     return result
 
 
 async def _carry_then_withhold(service, results, rented_executor_ids=frozenset({"node-1"})):
     """The cycle's order: carry before the duplicate pass and the GPU count, withhold after."""
     job_results = {"5Miner": results}
-    await carry_renter_gpu_reset_results(job_results, service, rented_executor_ids, None, {})
+    # the snapshot and the cycle-end read list the same rental (pod POD_ID) on the same nodes: nothing changed
+    at_end = _rented_executors(*rented_executor_ids)
+    await carry_renter_gpu_reset_results(job_results, service, rented_executor_ids, at_end, {}, at_end, job_block=JOB_BLOCK)
     validator_process = _validator_process(ExecutorRolloutTracker(redis_service=MagicMock(), grace_cycles=0))
     validator_process.fetch_executor_digest_or_none = AsyncMock(return_value=None)
     validator_process.observe_executor_rollout = AsyncMock(return_value=MagicMock(covers=lambda _: False))
@@ -358,7 +382,7 @@ async def _carry_then_withhold(service, results, rented_executor_ids=frozenset({
 @pytest.mark.asyncio
 async def test_a_held_scrape_carries_the_previous_score_into_the_cycle():
     service = _redis_service()
-    await remember_rented_scored_results({"5Miner": [_rented_scored("node-1")]}, service)
+    await remember_rented_scored_results({"5Miner": [_rented_scored("node-1")]}, service, job_block=PREV_BLOCK)
     held = _failed("node-1", Msg.SCRAPE_GPU_RESET_IN_PROGRESS.reason)
 
     kept, withheld = await _carry_then_withhold(service, [held])
@@ -383,20 +407,21 @@ async def test_a_carried_score_takes_the_pay_flags_of_this_cycle_and_a_fresh_ban
     previous.is_spot = previous.is_on_spot_pay_list = previous.provider_discord_connected = True
     previous.gpu_model = "NVIDIA H100 80GB HBM3"
     previous.default_job_owner, previous.has_lium_filler, previous.filler_revenue_per_gpu_hour = "miner", False, 9.0
-    await remember_rented_scored_results({"5Miner": [previous]}, service)
+    await remember_rented_scored_results({"5Miner": [previous]}, service, job_block=PREV_BLOCK)
     held = _failed("node-1", Msg.SCRAPE_GPU_RESET_IN_PROGRESS.reason)
     held.is_spot = held.is_on_spot_pay_list = held.provider_discord_connected = False
     held.is_provider_email_held = held.is_new_rentals_paused = True
     held.default_job_owner, held.has_lium_filler = "lium", True
     job_results = {"5Miner": [held]}
     rented_data = _rented_executors(
+        "node-1",
         banned_provider_guids=["GPU-banned"],
         filler_revenue_by_gpu_config=[
             FillerRevenueByGpuConfig(base_model="H100", gpu_count=8, usd_per_gpu_hour=2.5, gpu_hours=10_000)
         ],
     )
 
-    await carry_renter_gpu_reset_results(job_results, service, {"node-1"}, rented_data, {})
+    await carry_renter_gpu_reset_results(job_results, service, {"node-1"}, rented_data, {}, rented_data, job_block=JOB_BLOCK)
 
     [carried] = job_results["5Miner"]
     assert carried.carried_for_renter_gpu_reset is True
@@ -423,7 +448,7 @@ async def test_a_held_scrape_without_a_previous_score_is_withheld():
 @pytest.mark.asyncio
 async def test_a_failed_scrape_without_the_mark_keeps_its_zero_score():
     service = _redis_service()
-    await remember_rented_scored_results({"5Miner": [_rented_scored("node-1")]}, service)
+    await remember_rented_scored_results({"5Miner": [_rented_scored("node-1")]}, service, job_block=PREV_BLOCK)
     failed = _failed("node-1", Msg.SCRAPE_FAILED_NO_GPU.reason)
 
     kept, withheld = await _carry_then_withhold(service, [failed])
@@ -445,27 +470,260 @@ async def test_an_unreadable_previous_score_withholds_the_held_scrape():
 
 
 @pytest.mark.asyncio
-async def test_only_scored_rented_results_are_remembered_and_a_redis_error_is_logged_only():
+async def test_only_scored_results_are_remembered_and_a_redis_error_is_logged_only():
     service = _redis_service()
-    idle = _scored("node-idle")
+    idle = _idle_scored("node-idle")
     failed = _failed("node-failed", Msg.SCRAPE_FAILED_NO_GPU.reason)
     failed.is_rented = True
 
-    await remember_rented_scored_results({"5Miner": [_rented_scored("node-1"), idle, failed]}, service)
+    await remember_rented_scored_results({"5Miner": [_rented_scored("node-1"), idle, failed]}, service, job_block=PREV_BLOCK)
+    assert list(_idle_passes) == [("5Miner", "node-idle")]  # an idle pass, in the validator process only
     await remember_rented_scored_results(
-        {"5Miner": [_rented_scored("node-1")]}, MagicMock(write_atomically=AsyncMock(side_effect=ConnectionError))
+        {"5Miner": [_rented_scored("node-1")]}, MagicMock(write_atomically=AsyncMock(side_effect=ConnectionError)), job_block=PREV_BLOCK
     )
 
     assert await service.get(last_scored_result_key("5Miner", "node-1"))
+    # rented passes only, as on main
     assert await service.get(last_scored_result_key("5Miner", "node-idle")) is None
     assert await service.get(last_scored_result_key("5Miner", "node-failed")) is None
+
+
+def _no_task_time(uuid: str):
+    return _failed(uuid, RentalVerificationMessages.NO_TASK_TIME.reason)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "reason", [RentalVerificationMessages.NO_TASK_TIME.reason, VerifyXMessages.NO_TASK_TIME.reason]
+)
+async def test_an_idle_node_the_task_had_no_time_to_probe_keeps_its_last_score_once(reason):
+    """DAH-5933: an idle pass, then a no-time cycle both snapshots saw idle: the pass stands, not a zero, nothing
+    published over the backend row. Once: the next such cycle with no pass between is withheld."""
+    service = _redis_service()
+    await remember_rented_scored_results({"5Miner": [_idle_scored("node-idle")]}, service, job_block=PREV_BLOCK)
+    held = _failed("node-idle", reason)
+
+    kept, withheld = await _carry_then_withhold(service, [held], rented_executor_ids=frozenset())
+
+    [carried] = kept["5Miner"]
+    assert carried.is_successful and carried.score == 1.0 and not carried.is_rented
+    assert carried.carried_for_renter_gpu_reset is True
+    assert carried.job_batch_id == held.job_batch_id
+    assert withheld == []
+    assert specs_to_publish(kept["5Miner"]) == []
+    await remember_rented_scored_results(kept, service, job_block=JOB_BLOCK)
+    assert await service.get(last_scored_result_key("5Miner", "node-idle")) is None
+    second = {"5Miner": [_failed("node-idle", reason)]}
+    await carry_renter_gpu_reset_results(
+        second, service, set(), _listed(), {}, _listed(), job_block=JOB_BLOCK + settings.BLOCKS_FOR_JOB
+    )
+    assert second["5Miner"][0].carried_for_renter_gpu_reset is False
+
+
+@pytest.mark.asyncio
+async def test_an_idle_pass_is_kept_as_it_was_before_scoring_set_its_flags():
+    """F-69: scoring sets flags on the cycle's own result after it is kept, so the kept pass is a copy taken then,
+    as the rented pass's Redis copy is: a later no-time cycle never carries the earlier cycle's Spot eligibility."""
+    service = _redis_service()
+    idle = _idle_scored("node-idle")
+    await remember_rented_scored_results({"5Miner": [idle]}, service, job_block=PREV_BLOCK)
+    idle.spot_pay_candidate = True  # what the incentive engine does to the cycle's result after it is kept
+
+    kept, _ = await _carry_then_withhold(service, [_no_task_time("node-idle")], rented_executor_ids=frozenset())
+
+    [carried] = kept["5Miner"]
+    assert carried.carried_for_renter_gpu_reset is True
+    assert carried.spot_pay_candidate is False
+
+
+@pytest.mark.asyncio
+async def test_a_no_task_time_cycle_without_a_last_score_gets_no_verdict_and_keeps_no_miner_active():
+    # review: the node's own checks can spend the task's time, so running out of it keeps no eligibility
+    service = _redis_service()
+    held = _no_task_time("node-idle")
+
+    kept, withheld = await _carry_then_withhold(service, [held], rented_executor_ids=frozenset())
+
+    assert kept == {"5Miner": []}
+    assert [w.result.executor_info.uuid for w in withheld] == ["node-idle"]
+    assert session_kept_hotkeys(withheld) == set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "reason", [RentalVerificationMessages.NO_TASK_TIME.reason, VerifyXMessages.NO_TASK_TIME.reason]
+)
+async def test_a_second_no_task_time_cycle_without_a_pass_between_is_withheld(reason):
+    # review: a node that stalls its checks past the task's time cannot keep its last pass's score
+    service = _redis_service()
+    await remember_rented_scored_results({"5Miner": [_rented_scored("node-1")]}, service, job_block=PREV_BLOCK)
+
+    first, _ = await _carry_then_withhold(service, [_failed("node-1", reason)])
+    await remember_rented_scored_results(first, service, job_block=PREV_BLOCK)
+    second, withheld = await _carry_then_withhold(
+        service, [_failed("node-1", reason)]
+    )
+
+    assert [r.carried_for_renter_gpu_reset for r in first["5Miner"]] == [True]
+    assert second == {"5Miner": []}
+    assert [w.result.executor_info.uuid for w in withheld] == ["node-1"]
+    assert session_kept_hotkeys(withheld) == set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "reason",
+    [
+        RentalVerificationMessages.NO_TASK_TIME.reason,
+        VerifyXMessages.NO_TASK_TIME.reason,
+        RentalVerificationMessages.RENTED_SINCE_THE_SNAPSHOT.reason,
+    ],
+)
+@pytest.mark.parametrize("earlier_gate", [None, "cpu_truth_passed", "cc_vbios_passed", "price_per_gpu"])
+async def test_a_budget_stop_after_a_check_zeroed_the_score_keeps_that_failure(context_factory, reason, earlier_gate):
+    # review: a check that already ran this cycle and zeroed its score is no budget stop the last pass may replace;
+    # 4d7bf12: a price raised above the cap zeroes it too, with no boolean flag behind it
+    from services.task.service import budget_stop_reason
+
+    ctx = context_factory(state=build_state(specs={"network": {"ema_verifyx_download_speed": 500.0}}))
+    ctx = ctx.model_copy(update={"executor": ctx.executor.model_copy(update={"price_per_gpu": None})})  # a pass
+    gate_event = build_msg(event="CPU count mismatch", reason="CPU_TRUTH_MISMATCH", severity="error", impact="")
+    events = [build_msg(event="ok", reason="VALIDATION_STEP_OK", severity="info", impact="")]
+    if earlier_gate == "price_per_gpu":
+        ctx = ctx.model_copy(update={"executor": ctx.executor.model_copy(update={"price_per_gpu": 1e9})})
+        events.append(gate_event)
+    elif earlier_gate:
+        ctx = ctx.model_copy(update={earlier_gate: False})
+        events.append(gate_event)
+    events.append(build_msg(event="no time", reason=reason, severity="warning", impact=""))
+    service = _redis_service()
+    await remember_rented_scored_results({"5Miner": [_rented_scored("node-1")]}, service, job_block=PREV_BLOCK)
+    result = _failed("node-1", budget_stop_reason(reason, events, ctx))
+
+    kept, withheld = await _carry_then_withhold(service, [result])
+
+    if earlier_gate:
+        [published] = kept["5Miner"]
+        assert published.failure_reason_code == ZEROED_BEFORE_THE_BUDGET_STOP
+        assert published.score == 0 and not published.carried_for_renter_gpu_reset
+        assert withheld == []
+    elif reason == RentalVerificationMessages.RENTED_SINCE_THE_SNAPSHOT.reason:
+        assert kept == {"5Miner": []}  # the node's rentals changed during the cycle: no verdict
+        assert [w.result.executor_info.uuid for w in withheld] == ["node-1"]
+    else:
+        assert [r.carried_for_renter_gpu_reset for r in kept["5Miner"]] == [True]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "reason", [RentalVerificationMessages.NO_TASK_TIME.reason, VerifyXMessages.NO_TASK_TIME.reason]
+)
+async def test_a_warn_only_image_event_after_a_cpu_mismatch_never_lets_a_rollout_hold_the_zero(
+    context_factory, reason
+):
+    # review at ea74f37: CPU truth fails, the image check then logs a warn-only EXECUTOR_IMAGE_OUTDATED, and the
+    # rental check runs out of time during a rollout. The zero is published, not withheld, and the cached pass is
+    # never carried into the next cycle
+    from services.task.service import budget_stop_reason
+    from test_executor_rollout_grace import _open_window, J0
+
+    ctx = context_factory(state=build_state(specs={"network": {"ema_verifyx_download_speed": 500.0}}))
+    ctx = ctx.model_copy(
+        update={"cpu_truth_passed": False, "executor": ctx.executor.model_copy(update={"price_per_gpu": None})}
+    )
+    events = [
+        build_msg(event="CPU count mismatch", reason="CPU_TRUTH_MISMATCH", severity="error", impact=""),
+        build_msg(event="image outdated", reason=ExecutorImageMessages.OUTDATED.reason, severity="warning", impact=""),
+        build_msg(event="no time", reason=reason, severity="warning", impact=""),
+    ]
+    result = _failed("node-idle", budget_stop_reason(reason, events, ctx))
+
+    assert result.failure_reason_code == ZEROED_BEFORE_THE_BUDGET_STOP
+    assert rollout_grace_reason(result, _open_window(), J0) is None
+    service = _redis_service()
+    await remember_rented_scored_results({"5Miner": [_idle_scored("node-idle")]}, service, job_block=PREV_BLOCK)
+    kept, withheld = await _carry_then_withhold(service, [result], rented_executor_ids=frozenset())
+    [published] = kept["5Miner"]
+    assert published.score == 0 and not published.carried_for_renter_gpu_reset and withheld == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "reason", [RentalVerificationMessages.NO_TASK_TIME.reason, VerifyXMessages.NO_TASK_TIME.reason]
+)
+async def test_a_budget_stop_before_verifyx_measured_a_node_stays_a_neutral_stop(context_factory, reason):
+    # review at ea74f37: a new node with no VerifyX speed on record keeps the no-time reason, so it is held (and
+    # carries a recent pass) instead of being published as a failed first pass
+    from services.task.service import budget_stop_reason
+
+    ctx = context_factory(state=build_state(specs={}))
+    ctx = ctx.model_copy(update={"executor": ctx.executor.model_copy(update={"price_per_gpu": None})})
+    events = [build_msg(event="no time", reason=reason, severity="warning", impact="")]
+
+    assert budget_stop_reason(reason, events, ctx) == reason
+
+
+@pytest.mark.asyncio
+async def test_an_idle_pass_never_stands_in_for_a_rented_gpu_reset_cycle():
+    # review case B: idle pass, then a rental, then the renter's GPU reset: withheld as on main, not paid as idle
+    service = _redis_service()
+    await remember_rented_scored_results({"5Miner": [_scored("node-1")]}, service, job_block=PREV_BLOCK)
+    held = _failed("node-1", Msg.SCRAPE_GPU_RESET_IN_PROGRESS.reason)
+
+    kept, withheld = await _carry_then_withhold(service, [held])
+
+    assert kept == {"5Miner": []}
+    assert [w.result.executor_info.uuid for w in withheld] == ["node-1"]
+
+
+@pytest.mark.asyncio
+async def test_a_rented_pass_never_stands_in_for_an_idle_no_task_time_cycle():
+    # review case A: rented pass, the rental ends, then a no-time cycle: not paid as rented emission
+    service = _redis_service()
+    await remember_rented_scored_results({"5Miner": [_rented_scored("node-1")]}, service, job_block=PREV_BLOCK)
+    held = _no_task_time("node-1")
+
+    kept, withheld = await _carry_then_withhold(service, [held], rented_executor_ids=frozenset())
+
+    assert kept == {"5Miner": []}
+    assert [w.result.executor_info.uuid for w in withheld] == ["node-1"]
+
+
+@pytest.mark.asyncio
+async def test_the_gpu_reset_carry_still_needs_the_node_rented():
+    service = _redis_service()
+    await remember_rented_scored_results({"5Miner": [_idle_scored("node-idle")]}, service, job_block=PREV_BLOCK)
+    held = _failed("node-idle", Msg.SCRAPE_GPU_RESET_IN_PROGRESS.reason)
+
+    kept, withheld = await _carry_then_withhold(service, [held], rented_executor_ids=frozenset())
+
+    assert kept == {"5Miner": []}
+    assert [w.result.executor_info.uuid for w in withheld] == ["node-idle"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("previous", ["idle", "rented"])
+@pytest.mark.parametrize("rented_at_end", [frozenset({"node-1"}), frozenset()])
+async def test_a_run_stopped_for_a_renters_create_is_withheld_and_spends_the_kept_result(previous, rented_at_end):
+    # review at 588cafb: the create stop goes through rental_state_unchanged as RENTED_SINCE_THE_SNAPSHOT does; the
+    # node's rentals changed during the cycle (or the create failed), so no verdict, and nothing is left to carry later
+    service = _redis_service()
+    kept_result = _idle_scored("node-1") if previous == "idle" else _rented_scored("node-1")
+    await remember_rented_scored_results({"5Miner": [kept_result]}, service, job_block=PREV_BLOCK)
+    held = _failed("node-1", TenantMsg.RENTED_SINCE_CYCLE_START.reason)
+
+    kept, withheld = await _carry_then_withhold(service, [held], rented_executor_ids=rented_at_end)
+
+    assert kept == {"5Miner": []}
+    assert [w.result.executor_info.uuid for w in withheld] == ["node-1"]
+    assert ("5Miner", "node-1") not in _idle_passes
 
 
 @pytest.mark.asyncio
 async def test_a_failure_of_its_own_after_the_last_score_leaves_nothing_to_carry():
     service = _redis_service()
-    await remember_rented_scored_results({"5Miner": [_rented_scored("node-1")]}, service)
-    await remember_rented_scored_results({"5Miner": [_failed("node-1", Msg.SCRAPE_FAILED_NO_GPU.reason)]}, service)
+    await remember_rented_scored_results({"5Miner": [_rented_scored("node-1")]}, service, job_block=PREV_BLOCK)
+    await remember_rented_scored_results({"5Miner": [_failed("node-1", Msg.SCRAPE_FAILED_NO_GPU.reason)]}, service, job_block=PREV_BLOCK)
     held = _failed("node-1", Msg.SCRAPE_GPU_RESET_IN_PROGRESS.reason)
 
     kept, withheld = await _carry_then_withhold(service, [held])
@@ -477,7 +735,7 @@ async def test_a_failure_of_its_own_after_the_last_score_leaves_nothing_to_carry
 @pytest.mark.asyncio
 async def test_a_rental_that_ended_after_the_reset_carries_nothing():
     service = _redis_service()
-    await remember_rented_scored_results({"5Miner": [_rented_scored("node-1")]}, service)
+    await remember_rented_scored_results({"5Miner": [_rented_scored("node-1")]}, service, job_block=PREV_BLOCK)
     held = _failed("node-1", Msg.SCRAPE_GPU_RESET_IN_PROGRESS.reason)
 
     kept, withheld = await _carry_then_withhold(service, [held], rented_executor_ids=frozenset())
@@ -487,30 +745,41 @@ async def test_a_rental_that_ended_after_the_reset_carries_nothing():
 
 
 def _rented_executors(*executor_ids: str, **fields) -> RentedExecutorsResponse:
-    rented = RentedExecutor(miner_hotkey="5Miner", executor_ip_address="203.0.113.5", executor_ip_port="22", pods=[])
+    rented = RentedExecutor(
+        miner_hotkey="5Miner",
+        executor_ip_address="203.0.113.5",
+        executor_ip_port="22",
+        pods=[RentedPod(pod_id=POD_ID, container_name="tenant-123", gpu_count=8)],
+    )
     return RentedExecutorsResponse(executors={executor_id: rented for executor_id in executor_ids}, **fields)
 
 
 @pytest.mark.parametrize(
     ("rented_now", "snapshot", "carried"),
     [
-        (_rented_executors("NODE-1"), _rented_executors(), True),
-        (None, _rented_executors("NODE-1"), True),
+        (_rented_executors("NODE-1"), _rented_executors("NODE-1"), True),
+        (_rented_executors("NODE-1"), _rented_executors(), False),
+        (None, _rented_executors("NODE-1"), True),  # review at d4f5e64: a GPU-reset hold falls back to the snapshot
         (None, _rented_executors(), False),
     ],
-    ids=["listed-now", "no-answer-cycle-snapshot-lists-it", "no-answer-snapshot-does-not"],
+    ids=["listed-now-and-in-snapshot", "listed-now-not-in-snapshot", "no-answer-snapshot-lists-it", "no-answer"],
 )
 @pytest.mark.asyncio
 async def test_the_cycle_asks_the_backend_once_whether_the_node_is_still_rented(rented_now, snapshot, carried):
     service = _redis_service()
-    await remember_rented_scored_results({"5Miner": [_rented_scored("node-1")]}, service)
+    await remember_rented_scored_results({"5Miner": [_rented_scored("node-1")]}, service, job_block=PREV_BLOCK)
     validator_process = _validator_process(ExecutorRolloutTracker(redis_service=MagicMock(), grace_cycles=0))
     validator_process.redis_service = service
     validator_process.backend_client = MagicMock(get_rented_executors_now=AsyncMock(return_value=rented_now))
     job_results = {"5Miner": [_failed("node-1", Msg.SCRAPE_GPU_RESET_IN_PROGRESS.reason), _scored("node-2")]}
 
-    await validator_process.carry_scores_over_renter_gpu_resets(job_results, snapshot, {})
-    await validator_process.carry_scores_over_renter_gpu_resets({"5Miner": [_scored("node-3")]}, snapshot, {})
+    await validator_process.carry_scores_over_renter_gpu_resets(
+        job_results, snapshot, {}, await validator_process.rented_at_cycle_end(job_results), job_block=JOB_BLOCK
+    )
+    no_hold = {"5Miner": [_scored("node-3")]}
+    await validator_process.carry_scores_over_renter_gpu_resets(
+        no_hold, snapshot, {}, await validator_process.rented_at_cycle_end(no_hold), job_block=JOB_BLOCK
+    )
 
     assert job_results["5Miner"][0].carried_for_renter_gpu_reset is carried
     validator_process.backend_client.get_rented_executors_now.assert_awaited_once()
@@ -618,7 +887,7 @@ async def _reset_with_gpus_lost(service, backend):
     with patch("services.docker_service.reset_pod_gpus", AsyncMock(return_value=GPUS_LOST)):
         result = await _run_reset(service, backend, return_value=connection)
     assert (result.ok, result.error_code, result.detail, result.container_restarted, result.gpus) == (
-        False, GpuResetErrorCode.ResetNotSupported, GPUS_LOST_DETAIL, False, []
+        False, GpuResetErrorCode.GpusLostOnHost, GPUS_LOST_DETAIL, False, []
     )
 
 
@@ -853,3 +1122,310 @@ async def test_no_verified_job_reset_is_sent_just_after_a_renter_reset():
         await client.subscribe_mesages_from_redis()
 
     assert [request.executor_uuid for request in client.message_queue] == [EXECUTOR, "idle"]
+
+
+@pytest.mark.asyncio
+async def test_a_no_task_time_carry_needs_the_cycle_end_read():
+    # review F-21: the start snapshot lists 8 rented GPUs, the run saw the rental close, the end read failed
+    service = _redis_service()
+    previous = _rented_scored("node-1")
+    previous.rented_gpu_count = 8
+    await remember_rented_scored_results({"5Miner": [previous]}, service, job_block=PREV_BLOCK)
+    pod = RentedPod(pod_id=POD_ID, container_name="c", gpu_count=8, status="RUNNING")
+    at_start = RentedExecutorsResponse(
+        executors={
+            "node-1": RentedExecutor(
+                miner_hotkey="5Miner", executor_ip_address="203.0.113.5", executor_ip_port="22", pods=[pod]
+            )
+        }
+    )
+    job_results = {"5Miner": [_no_task_time("node-1")]}
+
+    await carry_renter_gpu_reset_results(job_results, service, {"node-1"}, at_start, {}, None, job_block=JOB_BLOCK)
+
+    [result] = job_results["5Miner"]
+    assert not result.carried_for_renter_gpu_reset
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("owner", "endpoint", "carried"),
+    [
+        ("5Miner", ("198.51.100.9", "22"), True),
+        ("5Other", ("203.0.113.5", "8080"), True),
+        ("5Other", ("198.51.100.9", "22"), False),
+    ],
+    ids=["same-owner", "other-owner-same-endpoint", "other-owner-other-endpoint"],
+)
+async def test_a_no_task_time_rented_carry_counts_only_this_nodes_own_rental(owner, endpoint, carried):
+    # review at a8afce8: the uuid is the miner's word; another miner's eight-GPU rental on another endpoint under the
+    # same uuid never pays this miner's cached rented pass, the end read is owned as the checks own it
+    service = _redis_service()
+    previous = _rented_scored("node-1")
+    previous.rented_gpu_count = 8
+    await remember_rented_scored_results({"5Miner": [previous]}, service, job_block=PREV_BLOCK)
+    pod = RentedPod(pod_id=POD_ID, container_name="c", gpu_count=8, status="RUNNING")
+    at_end = RentedExecutorsResponse(
+        executors={
+            "node-1": RentedExecutor(
+                miner_hotkey=owner, executor_ip_address=endpoint[0], executor_ip_port=endpoint[1], pods=[pod]
+            )
+        }
+    )
+    job_results = {"5Miner": [_no_task_time("node-1")]}
+
+    await carry_renter_gpu_reset_results(job_results, service, {"node-1"}, at_end, {}, at_end, job_block=JOB_BLOCK)
+
+    [result] = job_results["5Miner"]
+    assert result.carried_for_renter_gpu_reset is carried
+
+
+@pytest.mark.parametrize(
+    "reason", [RentalVerificationMessages.NO_TASK_TIME.reason, VerifyXMessages.NO_TASK_TIME.reason]
+)
+@pytest.mark.parametrize("earlier_gate", ["cpu_truth_passed", "price_per_gpu"])
+def test_a_budget_stop_after_a_zeroing_check_shows_the_provider_that_check_not_the_no_time_event(
+    context_factory, reason, earlier_gate
+):
+    # review at a8afce8: the reason was ZEROED_BEFORE_THE_BUDGET_STOP but the published event still said the task had
+    # no time and the last score stands; the provider is shown the zeroing check (or the score's own warning)
+    from services.task.service import budget_stop_event, budget_stop_reason
+
+    ctx = context_factory(state=build_state(specs={"network": {"ema_verifyx_download_speed": 500.0}}))
+    ctx = ctx.model_copy(update={"executor": ctx.executor.model_copy(update={"price_per_gpu": None})})
+    events = [build_msg(event="ok", reason="VALIDATION_STEP_OK", severity="info", impact="")]
+    if earlier_gate == "price_per_gpu":
+        ctx = ctx.model_copy(update={"executor": ctx.executor.model_copy(update={"price_per_gpu": 1e9})})
+    else:
+        ctx = ctx.model_copy(update={earlier_gate: False})
+        events.append(build_msg(event="CPU count mismatch", reason="CPU_TRUTH_MISMATCH", severity="error", impact=""))
+    events.append(build_msg(event="image outdated", reason=ExecutorImageMessages.OUTDATED.reason, severity="warning", impact=""))
+    events.append(build_msg(event="no time", reason=reason, severity="warning", impact=""))
+    assert budget_stop_reason(reason, events, ctx) == ZEROED_BEFORE_THE_BUDGET_STOP
+
+    payload = budget_stop_event(events, ctx).model_dump(mode="json")
+
+    if earlier_gate == "price_per_gpu":
+        assert payload["reason_code"] == ZEROED_BEFORE_THE_BUDGET_STOP and payload["severity"] == "error"
+        assert payload["impact"] and "WARNING" not in payload["impact"]
+    else:
+        assert payload["reason_code"] == "CPU_TRUTH_MISMATCH"
+    assert reason not in json.dumps(payload)
+
+
+def _rented_during_check(uuid: str):
+    return _failed(uuid, RentalVerificationMessages.RENTED_SINCE_THE_SNAPSHOT.reason)
+
+
+def _rented_at_end(gpu_count: int) -> RentedExecutorsResponse:
+    pod = RentedPod(pod_id=POD_ID, container_name="c", gpu_count=gpu_count, status="RUNNING")
+    return RentedExecutorsResponse(
+        executors={
+            "node-1": RentedExecutor(
+                miner_hotkey="5Miner", executor_ip_address="203.0.113.5", executor_ip_port="22", pods=[pod]
+            )
+        }
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_split_node_rented_during_the_check_never_puts_all_its_gpus_in_the_rented_pool():
+    """Review at 1601cba: an 8-GPU node idle in the snapshot gets a 2-GPU rental during the rental check. Scored from the
+    snapshot it went rented with rented_gpu_count None, all 8 GPUs in the rented pool. Held, it asks for the cycle-end
+    read, and the idle last score never stands in for the rented cycle: no verdict, nothing published."""
+    service = _redis_service()
+    await remember_rented_scored_results({"5Miner": [_scored("node-1")]}, service, job_block=PREV_BLOCK)
+    held = _rented_during_check("node-1")
+    job_results = {"5Miner": [held]}
+    assert has_renter_gpu_reset_holds(job_results)  # the cycle-end rented read is taken
+
+    await carry_renter_gpu_reset_results(job_results, service, set(), _rented_executors(), {}, _rented_at_end(2), job_block=JOB_BLOCK)
+    [result] = job_results["5Miner"]
+    assert result.carried_for_renter_gpu_reset is False
+    validator_process = _validator_process(ExecutorRolloutTracker(redis_service=MagicMock(), grace_cycles=0))
+    validator_process.fetch_executor_digest_or_none = AsyncMock(return_value=None)
+    validator_process.observe_executor_rollout = AsyncMock(return_value=MagicMock(covers=lambda _: False))
+    kept, withheld = await validator_process.withhold_verdicts_for_rollout(job_results, 7500, "batch-2", MagicMock())
+
+    assert kept == {"5Miner": []}
+    assert [w.result.executor_info.uuid for w in withheld] == ["node-1"]
+
+
+def _listed(**pods: int | None) -> RentedExecutorsResponse:
+    """node-1 as the backend lists it: no rental when no pod is given, else one rental with these pods' GPU counts."""
+    if not pods:
+        return RentedExecutorsResponse(executors={})
+    return RentedExecutorsResponse(
+        executors={
+            "node-1": RentedExecutor(
+                miner_hotkey="5Miner",
+                executor_ip_address="203.0.113.5",
+                executor_ip_port="22",
+                pods=[RentedPod(pod_id=pod_id, container_name=pod_id, gpu_count=n, status="RUNNING") for pod_id, n in pods.items()],
+            )
+        }
+    )
+
+
+def _kept(pods: dict[str, int | None] | None) -> JobResult:
+    """The node's last pass as ResultHandler kept it: scored idle ({}), rented with these pods, or before the field (None)."""
+    result = _scored("node-1")
+    if pods is None:
+        return result
+    result.is_rented = bool(pods)
+    result.rental_pod_ids = sorted(pods)
+    result.rented_gpu_count = sum(n for n in pods.values() if n) or None if pods else None
+    return result
+
+
+NO_TIME = RentalVerificationMessages.NO_TASK_TIME.reason
+SEEN_RENTED = RentalVerificationMessages.RENTED_SINCE_THE_SNAPSHOT.reason
+GPU_RESET = Msg.SCRAPE_GPU_RESET_IN_PROGRESS.reason
+POWER_TIER = GpuPowerLimitMessages.TIER_STATE_UNKNOWN.reason
+
+# (kept pass, snapshot, what the held cycle saw, cycle-end read, carried): one row per rental timeline. The rule:
+# a kept pass carries only for the exact rental state, no rental or the same pod ids, seen at the cycle's start and
+# at its end read, with no change seen during it.
+RENTAL_TIMELINES = [
+    ({}, {}, NO_TIME, {}, True),  # no rental all along
+    ({"pod-a": 8}, {"pod-a": 8}, NO_TIME, {"pod-a": 8}, True),  # rented the whole cycle by the same rental
+    ({"pod-a": 2}, {"pod-a": 2}, NO_TIME, {"pod-a": 2}, True),  # split node, the same 2-GPU rental throughout
+    ({"pod-a": 8}, {"pod-a": 8}, GPU_RESET, {"pod-a": 8}, True),  # the renter's own GPU reset, same rental
+    ({}, {}, SEEN_RENTED, {"pod-a": 2}, False),  # starts after the snapshot, still rented at the end read
+    ({}, {}, NO_TIME, {"pod-a": 2}, False),  # starts after the snapshot, the check never saw it
+    ({}, {}, SEEN_RENTED, {}, False),  # starts and ends inside the cycle
+    ({"pod-a": 8}, {"pod-a": 8}, NO_TIME, {}, False),  # ends before the end read
+    ({"pod-a": 8}, {"pod-a": 8}, NO_TIME, {"pod-b": 8}, False),  # a new rental replaces the old one inside the cycle
+    ({"pod-a": 8}, {"pod-b": 8}, NO_TIME, {"pod-b": 8}, False),  # the kept pass was scored with the old rental
+    ({"pod-a": 2}, {"pod-a": 2, "pod-b": 2}, NO_TIME, {"pod-a": 2, "pod-b": 2}, False),  # split node, a second rental
+    ({"pod-a": 2}, {"pod-a": 2}, NO_TIME, {"pod-a": 3}, False),  # same pod, other GPU count: not the same allocation
+    ({"pod-a": 8}, {"pod-a": 8}, NO_TIME, {"pod-a": None}, False),  # the end read cannot count the rental's GPUs
+    ({"pod-a": None}, {"pod-a": None}, NO_TIME, {"pod-a": None}, False),  # nobody knows the rented GPU count
+    (None, {}, NO_TIME, {}, False),  # a pass kept before rental pod ids were recorded
+    ({}, {}, GPU_RESET, {}, False),  # the GPU-reset carry stands for a rented node only
+    ({}, {}, NO_TIME, None, False),  # no end read
+    ({"pod-a": 8}, {"pod-a": 8}, NO_TIME, None, False),  # no end read for a rented node
+    ({"pod-a": 2}, {"pod-a": 2}, GPU_RESET, None, True),  # no end read: the reset's own scrape saw the start rental
+    ({}, {}, SEEN_RENTED, None, False),  # a rental seen starting, then no end read
+    # stand check at c795850: an unconfirmed power tier on a rented node carries on the start snapshot, as on main
+    ({"pod-a": 8}, {"pod-a": 8}, POWER_TIER, None, True),
+    ({}, {}, POWER_TIER, None, False),  # the power-tier carry stands for a rented node only
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("kept", "start", "reason", "end", "carried"), RENTAL_TIMELINES)
+async def test_a_kept_pass_carries_only_for_the_exact_rental_state_seen_at_both_ends_of_the_cycle(
+    kept, start, reason, end, carried
+):
+    """Reviews at 1601cba and 1b092ea: one rule for every hold, over each rental timeline. A carried pass is paid from
+    the pool its rental state put it in, so any other state is withheld, never scored or paid, and the kept pass is
+    dropped: the state it was scored with is gone."""
+    service = _redis_service()
+    await remember_rented_scored_results({"5Miner": [_kept(kept)]}, service, job_block=PREV_BLOCK)
+    job_results = {"5Miner": [_failed("node-1", reason)]}
+
+    await carry_renter_gpu_reset_results(
+        job_results, service, set(), _listed(**start), {}, None if end is None else _listed(**end), job_block=JOB_BLOCK
+    )
+
+    [result] = job_results["5Miner"]
+    assert result.carried_for_renter_gpu_reset is carried
+    if carried:
+        assert (result.is_rented, result.rented_gpu_count) == (bool(kept), _kept(kept).rented_gpu_count)
+    else:
+        # dropped when the state the pass was scored with is gone, a change seen by the cycle itself included; kept
+        # when a read is missing and nothing was seen to change, and for an idle pass a GPU-reset hold cannot use
+        dropped = reason == SEEN_RENTED or (end is not None and reason != GPU_RESET) or not _kept(kept).is_rented
+        assert (await service.get(last_scored_result_key("5Miner", "node-1")) is None) is dropped
+    assert ("5Miner", "node-1") not in _idle_passes  # an idle pass is taken by the cycle that reads it
+
+
+@pytest.mark.asyncio
+async def test_a_rental_that_starts_and_closes_inside_the_cycle_pays_nothing_for_it():
+    """Review at 1b092ea: idle in the snapshot, the rental check sees a rental start, the renter closes it before the
+    cycle-end read. The idle pass kept from before is not paid for this cycle, and not for the next either."""
+    service = _redis_service()
+    await remember_rented_scored_results({"5Miner": [_kept({})]}, service, job_block=PREV_BLOCK)
+    job_results = {"5Miner": [_failed("node-1", SEEN_RENTED)]}
+
+    await carry_renter_gpu_reset_results(job_results, service, set(), _listed(), {}, _listed(), job_block=JOB_BLOCK)
+    validator_process = _validator_process(ExecutorRolloutTracker(redis_service=MagicMock(), grace_cycles=0))
+    validator_process.fetch_executor_digest_or_none = AsyncMock(return_value=None)
+    validator_process.observe_executor_rollout = AsyncMock(return_value=MagicMock(covers=lambda _: False))
+    kept, withheld = await validator_process.withhold_verdicts_for_rollout(job_results, 7500, "batch-2", MagicMock())
+
+    assert kept == {"5Miner": []}  # nothing scored, so nothing paid
+    assert [w.result.executor_info.uuid for w in withheld] == ["node-1"]
+    next_cycle = {"5Miner": [_failed("node-1", NO_TIME)]}
+    await carry_renter_gpu_reset_results(next_cycle, service, set(), _listed(), {}, _listed(), job_block=JOB_BLOCK)
+    assert next_cycle["5Miner"][0].carried_for_renter_gpu_reset is False
+
+
+@pytest.mark.asyncio
+async def test_a_kept_pass_carries_on_the_vouch_of_the_cycle_before_and_never_across_a_silent_cycle():
+    """The vouch chain: a pass, then a GPU-reset carry, vouches for each next cycle; a cycle that wrote nothing (a
+    Redis outage) breaks it, so the next held cycle is withheld."""
+    service = _redis_service()
+    await remember_rented_scored_results({"5Miner": [_rented_scored("node-1")]}, service, job_block=PREV_BLOCK)
+    rented = _rented_executors("node-1")
+    for block in (JOB_BLOCK, JOB_BLOCK + settings.BLOCKS_FOR_JOB):
+        held = {"5Miner": [_failed("node-1", GPU_RESET)]}
+        await carry_renter_gpu_reset_results(held, service, {"node-1"}, rented, {}, rented, job_block=block)
+        assert held["5Miner"][0].carried_for_renter_gpu_reset is True
+        await remember_rented_scored_results(held, service, job_block=block)
+    # the cycle at JOB_BLOCK + 2 * BLOCKS_FOR_JOB wrote nothing
+    held = {"5Miner": [_failed("node-1", GPU_RESET)]}
+    await carry_renter_gpu_reset_results(
+        held, service, {"node-1"}, rented, {}, rented, job_block=JOB_BLOCK + 3 * settings.BLOCKS_FOR_JOB
+    )
+    assert held["5Miner"][0].carried_for_renter_gpu_reset is False
+
+
+async def _idle_cycle(service, reason: str, job_block: int) -> list[float]:
+    """One idle cycle end to end, as the validator runs it: carry, withhold, keep. The scores left standing."""
+    job_results = {"5Miner": [_failed("node-1", reason)]}
+    await carry_renter_gpu_reset_results(job_results, service, set(), _listed(), {}, _listed(), job_block=job_block)
+    validator_process = _validator_process(ExecutorRolloutTracker(redis_service=MagicMock(), grace_cycles=0))
+    validator_process.fetch_executor_digest_or_none = AsyncMock(return_value=None)
+    validator_process.observe_executor_rollout = AsyncMock(return_value=MagicMock(covers=lambda _: False))
+    standing, _ = await validator_process.withhold_verdicts_for_rollout(job_results, job_block, "batch", MagicMock())
+    await remember_rented_scored_results(standing, service, job_block=job_block)
+    return [result.score for results in standing.values() for result in results]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failing", ["delete", "delete_then_restart", "read_and_take"])
+@pytest.mark.parametrize("next_block", [JOB_BLOCK, JOB_BLOCK + settings.BLOCKS_FOR_JOB])
+async def test_an_idle_pass_a_rental_start_and_close_invalidated_never_stands_after_redis_recovers(
+    monkeypatch, failing, next_block
+):
+    """Review F-63: an idle pass, then a cycle that sees a rental start and close. Whatever Redis refuses in between
+    (a read, a delete) and whether or not the validator restarts, a later idle cycle with no task time has no score
+    standing for the node: the idle pass lives in the validator process only and that cycle took it."""
+    service = _redis_service()
+    await remember_rented_scored_results({"5Miner": [_kept({})]}, service, job_block=PREV_BLOCK)
+    assert await service.get(last_scored_result_key("5Miner", "node-1")) is None  # never in Redis
+    method = "delete" if failing.startswith("delete") else failing
+    working = getattr(service, method)
+    monkeypatch.setattr(service, method, AsyncMock(side_effect=ConnectionError("redis down")))
+    assert await _idle_cycle(service, SEEN_RENTED, JOB_BLOCK) == []
+    monkeypatch.setattr(service, method, working)
+    if failing == "delete_then_restart":
+        restarted = _redis_service()  # a new process on the same store
+        restarted.redis = service.redis
+        service = restarted
+        _idle_passes.clear()
+
+    assert await _idle_cycle(service, NO_TIME, next_block) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reason", [NO_TIME, VerifyXMessages.NO_TASK_TIME.reason])
+async def test_an_idle_pass_stands_for_the_next_idle_no_task_time_cycle_end_to_end(reason):
+    """The control for the case above: with no rental seen in between, the next idle no-time cycle keeps the pass."""
+    service = _redis_service()
+    await remember_rented_scored_results({"5Miner": [_kept({})]}, service, job_block=PREV_BLOCK)
+
+    assert await _idle_cycle(service, reason, JOB_BLOCK) == [1.0]
+    assert await _idle_cycle(service, reason, JOB_BLOCK + settings.BLOCKS_FOR_JOB) == []  # once

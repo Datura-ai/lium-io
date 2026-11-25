@@ -93,12 +93,12 @@ class ExecutorImageCheck:
                             **ctx.default_extra,
                             "executor_build": {True: "official", False: "unofficial"}.get(published, "unknown"),
                             "observed_digest": report.observed_digest,
-                            "executor_image_unofficial_enforced": settings.EXECUTOR_IMAGE_UNOFFICIAL_ENFORCE,
+                            "executor_image_unofficial_enforced": True,
                         }
                     ),
                 )
             )
-            if published is False and settings.EXECUTOR_IMAGE_UNOFFICIAL_ENFORCE:
+            if published is False:
                 report = replace(report, status=ImageVerdict.UNOFFICIAL)
         updated_state = replace(ctx.state, executor_image_report=report)
         what = report.as_dict()

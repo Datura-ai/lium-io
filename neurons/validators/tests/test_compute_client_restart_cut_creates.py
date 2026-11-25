@@ -32,6 +32,7 @@ from services.redis_service import (
     RedisService,
     create_started_at_key,
     renter_create_id,
+    resumed_create,
 )
 
 
@@ -486,6 +487,26 @@ async def test_the_backends_resend_is_tracked_with_its_resume_counted() -> None:
 
 
 @pytest.mark.asyncio
+async def test_only_the_backends_resend_runs_as_a_resumed_create() -> None:
+    # DAH-6992: the docker create replaces the cut-off attempt's container only on the re-send
+    redis_service = _redis_service()
+    await redis_service.add_inflight_backend_create("pod-1", "miner-hk", "exec-1", WorkloadKind.FILLER)
+    client = _client(redis_service)
+    await client.fail_creates_cut_off_by_restart()
+    resumed_flag_per_create: list[bool] = []
+
+    async def fake_drive_miner_job(job_request: ContainerCreateRequest) -> None:
+        resumed_flag_per_create.append(resumed_create.get())
+
+    client._drive_miner_job = fake_drive_miner_job
+    await client._run_miner_job(_create_request())  # the re-send
+    await client._run_miner_job(_create_request())  # a later fresh create of the pod
+
+    assert resumed_flag_per_create == [True, False]
+    assert resumed_create.get() is False
+
+
+@pytest.mark.asyncio
 async def test_a_create_already_resumed_once_is_reported_failed() -> None:
     redis_service = _redis_service()
     await redis_service.add_inflight_backend_create("pod-1", "miner-hk", "exec-1", WorkloadKind.FILLER, resumes=1)
@@ -620,7 +641,7 @@ async def test_a_delete_before_the_creates_record_write_is_not_undone_by_it() ->
     async def fake_drive_miner_job(job_request: ContainerCreateRequest) -> None:
         seen.append(await redis_service.inflight_backend_creates())
 
-    with inflight_creates.track("pod-1"):  # the create is picked up, its record write still to come
+    with inflight_creates.track("pod-1", ("miner-hk", "exec-1")):  # the create is picked up, its record write still to come
         await client._run_miner_job(
             ContainerDeleteRequest.model_construct(pod_id="pod-1", miner_hotkey="miner-hk", executor_id="exec-1")
         )
@@ -629,6 +650,30 @@ async def test_a_delete_before_the_creates_record_write_is_not_undone_by_it() ->
 
     assert seen == [{}]
     assert await redis_service.inflight_backend_creates() == {}
+
+
+@pytest.mark.asyncio
+async def test_a_delete_on_the_node_a_moved_pod_left_keeps_its_create_on_the_new_node() -> None:
+    """DAH-6540: a moved rent keeps its pod id; the old node's delete retires and blocks only that node's records."""
+    from services.docker_service import inflight_creates
+
+    redis_service = _redis_service()
+    await redis_service.add_inflight_backend_create("pod-1", "miner-hk", "exec-old", WorkloadKind.FILLER, "c-old")
+    client = _client(redis_service)
+    seen: list[dict[str, list[InflightBackendCreate]]] = []
+
+    async def fake_drive_miner_job(job_request) -> None:
+        if isinstance(job_request, ContainerCreateRequest):
+            seen.append(await redis_service.inflight_backend_creates())
+
+    client._drive_miner_job = fake_drive_miner_job
+    with inflight_creates.track("pod-1", ("miner-hk", "exec-old")):  # the old node's create still runs
+        await client._run_miner_job(
+            ContainerDeleteRequest.model_construct(pod_id="pod-1", miner_hotkey="miner-hk", executor_id="exec-old")
+        )
+        await client._run_miner_job(_create_request())  # the move's create, on exec-1
+
+    assert [create.executor_id for create in seen[0]["pod-1"]] == ["exec-1"]
 
 
 @pytest.mark.asyncio
@@ -1330,7 +1375,7 @@ async def test_a_delete_while_the_dispatch_is_being_recorded_cancels_the_create(
     task = await client.miner_drivers.get()
     await asyncio.sleep(0)
 
-    assert inflight_creates.cancel("pod-1")  # what the delete's teardown does first
+    assert inflight_creates.cancel("pod-1", ("miner-hk", "exec-1"))  # what the delete's teardown does first
     assert await asyncio.wait_for(task, 1) is None
     client.miner_driver.assert_not_awaited()
     assert not inflight_creates.is_running("pod-1")

@@ -7,7 +7,8 @@ DEFAULT_PORT_RANGE_TEXT = f"{DEFAULT_PORT_RANGE[0]}-{DEFAULT_PORT_RANGE[1] - 1}"
 def get_all_ports(port_range: str | None, port_mappings: str | None, ssh_port: int) -> list[tuple[int, int]]:
     """Get all available ports sorted ascending, excluding ssh_port."""
     if port_mappings:
-        all_ports: list[tuple[int, int]] = [tuple(p) for p in json.loads(port_mappings)]
+        # miner-sent JSON: converted here, so a string "port" never reaches a docker -p or a script
+        all_ports: list[tuple[int, int]] = [(int(i), int(e)) for i, e in json.loads(port_mappings)]
     elif port_range:
         if "-" in port_range:
             min_port, max_port = map(int, (p.strip() for p in port_range.split("-")))

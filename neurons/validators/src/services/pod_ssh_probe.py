@@ -16,8 +16,7 @@ its own reason and says nothing about our network.
 
 Each node's observations ride on its ``JobResult`` (``attach_pod_ssh``). A rented node the cycle
 has no result for (the miner timed out, failed, or left it out of its answer) gets a minimal result
-carrying only its observations, reason ``EXECUTOR_RESULT_MISSING`` (``pod_ssh_only_results``),
-with ``RENTED_POD_SSH_RESULT_MISSING_REPORT_ENABLED`` on.
+carrying only its observations, reason ``EXECUTOR_RESULT_MISSING`` (``pod_ssh_only_results``).
 """
 
 from __future__ import annotations

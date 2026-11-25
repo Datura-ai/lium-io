@@ -20,7 +20,7 @@ from uuid import uuid4
 import bittensor
 import pytest
 import services.file_encrypt_service as file_encrypt_service
-from clients.validator_portal_api import PortalExecutor, portal_miner_auth_blob
+from clients.validator_portal_api import PortalExecutor, ValidatorPortalAPI, portal_miner_auth_blob
 from core.express_lane import (
     EXPRESS_FAILED_EVENT,
     EXPRESS_PUBLISHED_EVENT,
@@ -239,6 +239,7 @@ class _Harness:
             miner_service.express_queued = frozenset()
             miner_service.express_published = {}
             miner_service.express_published_miner = {}
+            miner_service.express_passed_at = {}
         self.miner_service = miner_service
         self.miner_service.publish_machine_specs = AsyncMock()
         # A self-hosted miner that does not answer its executor list (the portal-snapshot cases).
@@ -258,6 +259,8 @@ class _Harness:
             "results": [_job_result(executor_id, job_batch_id=payload.job_batch_id)],
         }
         self.portal_api = Mock(get_all_executors=AsyncMock(return_value=snapshot))
+        # the tick starts the module's one shared owner read (start_owner_hotkeys_read), which calls this
+        monkeypatch.setattr(ValidatorPortalAPI, "refresh_owner_hotkeys", AsyncMock(return_value=True))
         self.inputs: CycleInputs | None = _cycle_inputs()
         self.lane = ExpressLane(
             miner_service=self.miner_service,
@@ -280,6 +283,25 @@ class _Harness:
         if self.lane._tasks:
             await asyncio.gather(*self.lane._tasks)
         return launched
+
+
+@pytest.mark.asyncio
+async def test_a_stalled_owner_hotkeys_read_never_holds_discovery(monkeypatch, wallet):
+    """DAH-6740 review: the owner-set read runs beside the tick; while it hangs, ticks still read the snapshot and do
+    not start a second read."""
+    harness = _Harness(monkeypatch, {"miner-a": []}, [_Neuron("miner-a")])
+    stalled = asyncio.Event()
+    read = AsyncMock(side_effect=stalled.wait)
+    monkeypatch.setattr(ValidatorPortalAPI, "refresh_owner_hotkeys", read)
+
+    await asyncio.wait_for(harness.lane.tick(), timeout=5)
+    await asyncio.wait_for(harness.lane.tick(), timeout=5)
+
+    assert harness.portal_api.get_all_executors.await_count == 2
+    await asyncio.sleep(0)  # the shared read is a task: let it start
+    assert read.call_count == 1
+    stalled.set()
+    await harness.lane._owner_refresh
 
 
 @pytest.mark.asyncio
@@ -726,6 +748,38 @@ async def test_a_session_lost_in_the_port_check_is_retried_not_a_failed_first_pa
     pending.not_before = 0.0
     assert await harness.tick_and_settle() == 1
     assert new_node not in harness.lane._pending and new_node in harness.lane._left_to_cycle
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("check", ["rental", "verifyx", "rented", "created"])
+async def test_a_rental_probe_the_task_had_no_time_for_is_no_failed_first_pass(monkeypatch, wallet, check):
+    """DAH-5933: the validator's budget left the rental probe (or VerifyX) no time, or the backend found the node
+    rented during the check (review 4656859541): the scored cycle has no verdict for it, so nothing is published, the
+    node is not validated, and it is asked again as a deferral until MAX_ATTEMPTS leaves it to the cycle."""
+    from services.task.messages import RentalVerificationMessages, TenantEnforcementMessages, VerifyXMessages
+
+    no_time_reason = {
+        "rental": RentalVerificationMessages.NO_TASK_TIME.reason,
+        "verifyx": VerifyXMessages.NO_TASK_TIME.reason,
+        "rented": RentalVerificationMessages.RENTED_SINCE_THE_SNAPSHOT.reason,
+        # DAH-5750: a renter's create the run stopped for is deferred the same way
+        "created": TenantEnforcementMessages.RENTED_SINCE_CYCLE_START.reason,
+    }[check]
+
+    new_node = str(uuid4())
+    harness = _Harness(monkeypatch, {"miner-a": [_portal_executor(new_node)]}, [_Neuron("miner-a")])
+
+    def no_time(payload, executor_id):
+        result = _job_result(executor_id, score=0.0)
+        result.failure_reason_code = no_time_reason
+        return {"miner_hotkey": "miner-a", "miner_coldkey": "c", "results": [result]}
+
+    harness.job_for = no_time
+    assert await harness.tick_and_settle() == 1
+    harness.miner_service.publish_machine_specs.assert_not_awaited()
+    pending = harness.lane._pending[new_node]
+    assert (pending.failed_runs, pending.attempts) == (0, 1) and pending.not_before > 0
+    assert await harness.redis_service.get_validated_executors() == set()
 
 
 @pytest.mark.asyncio

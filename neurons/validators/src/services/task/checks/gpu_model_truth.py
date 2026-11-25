@@ -14,7 +14,7 @@ neither number is `not_measured`: one miss after a measured pass is tolerated, a
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from typing import Any
 
 from services.gpu_spec_table import normalize_gpu_model
@@ -38,8 +38,11 @@ EXPECTED_CC_AND_SM: dict[str, tuple[str, int]] = {
     "NVIDIA GeForce RTX 4070 Ti": ("8.9", 60),
     "NVIDIA GeForce RTX 4070 Ti SUPER": ("8.9", 66),
     "NVIDIA GeForce RTX 4080": ("8.9", 76),
-    "NVIDIA GeForce RTX 4080 SUPER": ("8.9", 80),
+    "NVIDIA GeForce RTX 4080 32GB": ("8.9", 76),  # memory-modded cards keep their base chip's SM count, so a
+    "NVIDIA GeForce RTX 4080 SUPER": ("8.9", 80),  # smaller chip (a 4090 D's 114 SMs) cannot pass as the modded
+    "NVIDIA GeForce RTX 4080 SUPER 32GB": ("8.9", 80),  # name (lio#2234 review)
     "NVIDIA GeForce RTX 4090": ("8.9", 128),
+    "NVIDIA GeForce RTX 4090 48GB": ("8.9", 128),
     "NVIDIA GeForce RTX 5060 Ti": ("12.0", 36),
     "NVIDIA GeForce RTX 5070": ("12.0", 48),
     "NVIDIA GeForce RTX 5070 Ti": ("12.0", 70),
@@ -86,16 +89,18 @@ EXPECTED_CC_ONLY: dict[str, str] = {
     "NVIDIA GeForce RTX 2070 SUPER": "7.5",
     "NVIDIA GeForce RTX 2080 SUPER": "7.5",
     "NVIDIA GeForce RTX 2080 Ti": "7.5",
+    "NVIDIA GeForce RTX 2080 Ti 22GB": "7.5",  # memory-modded: the base card's entry
     "NVIDIA GeForce RTX 3050": "8.6",
     "NVIDIA GeForce RTX 3060": "8.6",
     "NVIDIA GeForce RTX 3060 Laptop GPU": "8.6",
     "NVIDIA GeForce RTX 3060 Ti": "8.6",
     "NVIDIA GeForce RTX 3080": "8.6",
+    "NVIDIA GeForce RTX 3080 20GB": "8.6",
     "NVIDIA GeForce RTX 3080 Ti": "8.6",
     "NVIDIA GeForce RTX 4060": "8.9",
     "NVIDIA GeForce RTX 4070": "8.9",
-    "NVIDIA GeForce RTX 4090 48GB": "8.9",
     "NVIDIA GeForce RTX 4090 D": "8.9",
+    "NVIDIA GeForce RTX 4090 D 48GB": "8.9",
     "NVIDIA GeForce RTX 5060": "12.0",
     "NVIDIA GeForce RTX 5090 D": "12.0",
     "NVIDIA H100 NVL": "9.0",
@@ -128,6 +133,8 @@ EXPECTED_CC_ONLY: dict[str, str] = {
 
 BELOW_MODEL = "below_model"
 NOT_MEASURED = "not_measured"
+# a filler sample pinned to the card got no right answer from it (a card CUDA cannot see, or a wrong answer)
+WORK_PROOF_FAILED = "work_proof_failed"
 
 
 @dataclass(frozen=True)
@@ -213,6 +220,12 @@ def not_measured(machine_spec: Any, card_index: int) -> GpuModelMismatch:
         measured_device_name=None,
         kind=NOT_MEASURED,
     )
+
+
+def work_proof_failed(machine_spec: Any, card_index: int) -> GpuModelMismatch:
+    """A card whose pinned work-proof gave no right answer: stored like a mismatch, so the node fails on every
+    cycle until a run on that card passes, not only on the cycle that sampled it (lio#2305 review)."""
+    return replace(not_measured(machine_spec, card_index), kind=WORK_PROOF_FAILED)
 
 
 def gpu_model_mismatches(

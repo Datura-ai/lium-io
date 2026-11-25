@@ -1,0 +1,106 @@
+Thu Nov 12 12:08:16 2026       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 610.43.02              KMD Version: 610.43.02     CUDA UMD Version: 13.3     |
++-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA GeForce RTX 3090        On  |   00000000:3B:00.0 Off |                  N/A |
+| 53%   43C    P8             34W /  390W |       1MiB /  24576MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+|   1  NVIDIA GeForce RTX 3090        On  |   00000000:3C:00.0 Off |                  N/A |
+| 53%   45C    P8             44W /  390W |       1MiB /  24576MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+|   2  NVIDIA GeForce RTX 3090        On  |   00000000:86:00.0 Off |                  N/A |
+| 59%   48C    P8             50W /  390W |       1MiB /  24576MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+|   3  NVIDIA GeForce RTX 3090        On  |   00000000:87:00.0 Off |                  N/A |
+| 54%   45C    P8             39W /  390W |       1MiB /  24576MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+|   4  NVIDIA GeForce RTX 3090        On  |   00000000:AF:00.0 Off |                  N/A |
+| 56%   47C    P8             35W /  390W |       1MiB /  24576MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+|   5  NVIDIA GeForce RTX 3090        On  |   00000000:B0:00.0 Off |                  N/A |
+| 59%   49C    P8             43W /  390W |       1MiB /  24576MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+|   6  NVIDIA GeForce RTX 3090        On  |   00000000:D8:00.0 Off |                  N/A |
+| 53%   44C    P8             37W /  390W |       1MiB /  24576MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+|   7  NVIDIA GeForce RTX 3090        On  |   00000000:D9:00.0 Off |                  N/A |
+| 53%   43C    P8             29W /  350W |       1MiB /  24576MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI              PID   Type   Process name                        GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|  No running processes found                                                             |
++-----------------------------------------------------------------------------------------+
+LIUM_RENTAL_P2P
+ 	[4mGPU0	GPU1	GPU2	GPU3	GPU4	GPU5	GPU6	GPU7	[0m
+ GPU0	X	GNS	GNS	GNS	GNS	GNS	GNS	GNS	
+ GPU1	GNS	X	GNS	GNS	GNS	GNS	GNS	GNS	
+ GPU2	GNS	GNS	X	GNS	GNS	GNS	GNS	GNS	
+ GPU3	GNS	GNS	GNS	X	GNS	GNS	GNS	GNS	
+ GPU4	GNS	GNS	GNS	GNS	X	GNS	GNS	GNS	
+ GPU5	GNS	GNS	GNS	GNS	GNS	X	GNS	GNS	
+ GPU6	GNS	GNS	GNS	GNS	GNS	GNS	X	GNS	
+ GPU7	GNS	GNS	GNS	GNS	GNS	GNS	GNS	X	
+
+Legend:
+
+  X    = Self
+  OK   = Status Ok
+  CNS  = Chipset not supported
+  GNS  = GPU not supported
+  TNS  = Topology not supported
+  NS   = Not supported
+  DR   = Disabled by regkey
+  U    = Unknown
+===TOPO_M
+	[4mGPU0	GPU1	GPU2	GPU3	GPU4	GPU5	GPU6	GPU7	CPU Affinity	NUMA Affinity	GPU NUMA ID[0m
+GPU0	 X 	PHB	SYS	SYS	SYS	SYS	SYS	SYS	0-19,40-59	0		N/A
+GPU1	PHB	 X 	SYS	SYS	SYS	SYS	SYS	SYS	0-19,40-59	0		N/A
+GPU2	SYS	SYS	 X 	PHB	NODE	NODE	NODE	NODE	20-39,60-79	1		N/A
+GPU3	SYS	SYS	PHB	 X 	NODE	NODE	NODE	NODE	20-39,60-79	1		N/A
+GPU4	SYS	SYS	NODE	NODE	 X 	PHB	NODE	NODE	20-39,60-79	1		N/A
+GPU5	SYS	SYS	NODE	NODE	PHB	 X 	NODE	NODE	20-39,60-79	1		N/A
+GPU6	SYS	SYS	NODE	NODE	NODE	NODE	 X 	PHB	20-39,60-79	1		N/A
+GPU7	SYS	SYS	NODE	NODE	NODE	NODE	PHB	 X 	20-39,60-79	1		N/A
+
+Legend:
+
+  X    = Self
+  SYS  = Connection traversing PCIe as well as the SMP interconnect between NUMA nodes (e.g., QPI/UPI)
+  NODE = Connection traversing PCIe as well as the interconnect between PCIe Host Bridges within a NUMA node
+  PHB  = Connection traversing PCIe as well as a PCIe Host Bridge (typically the CPU)
+  PXB  = Connection traversing multiple PCIe bridges (without traversing the PCIe Host Bridge)
+  PIX  = Connection traversing at most a single PCIe bridge
+  NV#  = Connection traversing a bonded set of # NVLinks
+===NVLINK
+GPU 0: NVIDIA GeForce RTX 3090 (UUID: GPU-00000000-0000-0000-0000-000000000000)
+NVML: Unable to retrieve Nvlink information as all links are inActive
+GPU 1: NVIDIA GeForce RTX 3090 (UUID: GPU-00000000-0000-0000-0000-000000000000)
+NVML: Unable to retrieve Nvlink information as all links are inActive
+GPU 2: NVIDIA GeForce RTX 3090 (UUID: GPU-00000000-0000-0000-0000-000000000000)
+NVML: Unable to retrieve Nvlink information as all links are inActive
+GPU 3: NVIDIA GeForce RTX 3090 (UUID: GPU-00000000-0000-0000-0000-000000000000)
+NVML: Unable to retrieve Nvlink information as all links are inActive
+GPU 4: NVIDIA GeForce RTX 3090 (UUID: GPU-00000000-0000-0000-0000-000000000000)
+NVML: Unable to retrieve Nvlink information as all links are inActive
+GPU 5: NVIDIA GeForce RTX 3090 (UUID: GPU-00000000-0000-0000-0000-000000000000)
+NVML: Unable to retrieve Nvlink information as all links are inActive
+GPU 6: NVIDIA GeForce RTX 3090 (UUID: GPU-00000000-0000-0000-0000-000000000000)
+NVML: Unable to retrieve Nvlink information as all links are inActive
+GPU 7: NVIDIA GeForce RTX 3090 (UUID: GPU-00000000-0000-0000-0000-000000000000)
+NVML: Unable to retrieve Nvlink information as all links are inActive

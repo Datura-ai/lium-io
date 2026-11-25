@@ -61,11 +61,13 @@ def test_changes_refuse_an_env_value_with_a_line_break():
 
 def _ssh(
     *, exists: bool, flatten_rc: int = 0, size: int = 24 * 1024**3, driver: str = "overlay2", same_disk_rc=0,
-    docker_version: str = "29.8.0", stderr: str = "boom",
+    docker_version: str = "29.8.0", stderr: str = "boom", listed: str | None = None,
 ):
     async def run(command, check=False, timeout=None):
         if command.startswith("/usr/bin/docker version"):
             return Mock(exit_status=0, stdout=f"{docker_version}\n")
+        if command.startswith("/usr/bin/docker image ls -a --no-trunc"):
+            return Mock(exit_status=0 if listed is not None else 1, stdout=listed or "")
         if "--pid=host" in command:
             return Mock(exit_status=0, stdout="/usr/bin/containerd \n")
         if command == image_flatten.containerd_plugins_command("/run/containerd/containerd.sock"):
@@ -148,15 +150,40 @@ async def test_no_flatten_on_a_store_off_the_measured_disk():
     ssh = _ssh(exists=False, driver="overlayfs", same_disk_rc=1)
     with pytest.raises(RuntimeError, match="storage driver"):
         await flatten_image_on_host(ssh, "model:dev", lease="r1")
-    assert ssh.run.await_count == 4
+    assert ssh.run.await_count == 3
 
 
 @pytest.mark.asyncio
-async def test_no_flatten_on_the_containerd_store_of_a_docker_that_undercounts_image_size():
-    ssh = _ssh(exists=False, driver="overlayfs", docker_version="29.7.2")
-    with pytest.raises(RuntimeError, match="storage driver 'overlayfs': docker version '29.7.2' does not count"):
+async def test_before_docker_29_8_the_containerd_store_copy_is_budgeted_from_the_listed_size():
+    # inspect Size (packed only) says 1 GiB; the list counts the unpacked snapshots too: 24.6GB
+    listed = f"sha256:{'cd' * 32} 3GB\n{_IMAGE_ID} 24.6GB\n{_IMAGE_ID} 24.6GB\n"
+    ssh = _ssh(exists=False, driver="overlayfs", docker_version="29.4.3", size=1024**3, listed=listed)
+    assert await flatten_image_on_host(ssh, "model:dev", lease="r1") == _TAG
+    need = 2 * image_flatten.listed_size_bytes("24.6GB") + FLATTEN_DISK_MARGIN_BYTES
+    assert f'[ "$avail" -ge {need} ]' in ssh.run.await_args_list[-1].args[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("listed", [None, "", f"{'sha256:' + 'cd' * 32} 3GB\n", f"{_IMAGE_ID} 24.6GiB\n"])
+async def test_before_docker_29_8_no_flatten_when_the_listed_size_is_unreadable(listed):
+    ssh = _ssh(exists=False, driver="overlayfs", docker_version="29.4.3", listed=listed)
+    with pytest.raises(RuntimeError, match="size on disk is unreadable"):
         await flatten_image_on_host(ssh, "model:dev", lease="r1")
-    assert ssh.run.await_count == 2
+    assert "docker create" not in ssh.run.await_args_list[-1].args[0]
+
+
+@pytest.mark.parametrize(
+    "word, low, high",
+    [("24.6GB", 24.55e9, 24.6e9 * 1.005), ("1GB", 0.995e9, 1.005e9), ("1e+03kB", 999.5e3, 1.005e6), ("0B", 0, 0),
+     ("999B", 999, 999 * 1.005 + 1)],
+)
+def test_a_listed_size_is_read_up_to_at_least_the_bytes_it_rounds(word, low, high):
+    assert low <= image_flatten.listed_size_bytes(word) <= high + 1
+
+
+@pytest.mark.parametrize("word", ["24.6GiB", "24.6 GB", "N/A", "", "-1GB"])
+def test_a_listed_size_in_any_other_form_is_unreadable(word):
+    assert image_flatten.listed_size_bytes(word) is None
 
 
 @pytest.mark.parametrize(
@@ -209,8 +236,6 @@ def _same_disk_rc(
         f"#!{sys.executable}\n"
         "import subprocess, sys\n"
         "a = sys.argv[1:]\n"
-        "if a[0] == 'version':\n"
-        "    print('29.8.0'); sys.exit(0)\n"
         f"if '--pid=host' in a:\n    print({daemons!r}, end=''); sys.exit(0)\n"
         "if a[0] == 'info':\n"
         f"    print({driver_status!r} if 'DriverStatus' in a[2] else {str(data_root)!r}); sys.exit(0)\n"
@@ -670,7 +695,9 @@ def test_counting_and_copying_share_one_deadline(tmp_path, monkeypatch, export_f
         # the count used 1.5 of the 2 seconds: the copy gets at most what is left, or does not start
         assert limits[0] == 2 and all(n <= 1 for n in limits[1:]) and rc in (0, 98)
     else:
-        assert limits == [2, 2] and rc == 0
+        # the shared deadline is whole seconds (`date +%s`): a second boundary between the two calls leaves 1 s
+        # instead of 2, and both passes still get that same budget
+        assert limits and limits == [limits[0], limits[0]] and 1 <= limits[0] <= 2 and rc == 0
     assert "rm -fv cid1" in _calls(tmp_path)
 
 
@@ -737,6 +764,55 @@ async def test_a_failed_wait_for_a_running_flatten_stops_the_create():
 
 
 @pytest.mark.asyncio
+async def test_only_a_lock_held_past_the_wait_reads_as_the_node_busy(tmp_path):
+    """Prod 23 Nov 2026: the wait command crashed (exit 139) in 13 s with no copy running, and the renter was told the
+    node was still preparing its disk. Only flock timing out on a held lock is that."""
+    lock = tmp_path / "lock"
+    lock.touch()
+    held = subprocess.Popen(["flock", str(lock), "sleep", "30"])
+    try:
+        while subprocess.run(["flock", "-n", str(lock), "true"]).returncode == 0:
+            await asyncio.sleep(0.01)
+        wait = image_flatten.flatten_wait_command().replace(FLATTEN_LOCK_PATH, str(lock))
+        wait = wait.replace(f"-w {image_flatten.FLATTEN_TIMEOUT_SECONDS + 300} ", "-w 0 ")
+        timed_out = subprocess.run(["sh", "-c", wait], env={"PATH": os.environ["PATH"]}).returncode
+    finally:
+        held.kill()
+        held.wait()
+    # review: flock itself crashing (segfault, 139) or erroring is the plain lock failure, not the timeout;
+    # its own status is named on stderr
+    fake = tmp_path / "bin"
+    fake.mkdir()
+    (fake / "flock").write_text("#!/bin/sh\nkill -SEGV $$\n")
+    (fake / "flock").chmod(0o755)
+    crashed = subprocess.run(["sh", "-c", wait], env={"PATH": f"{fake}:{os.environ['PATH']}"}, capture_output=True)
+    flock_crashed = crashed.returncode
+    assert flock_crashed == 1 and b"flock failed: exit 139" in crashed.stderr
+
+    with pytest.raises(image_flatten.FlattenLockTimedOut):
+        await image_flatten.wait_for_node_flatten(Mock(run=AsyncMock(return_value=Mock(exit_status=timed_out))))
+    for crashed in (1, flock_crashed):
+        with pytest.raises(RuntimeError) as raised:
+            await image_flatten.wait_for_node_flatten(Mock(run=AsyncMock(return_value=Mock(exit_status=crashed))))
+        assert not isinstance(raised.value, image_flatten.FlattenLockTimedOut)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [image_flatten.FLATTEN_MEASURE_FAILED_EXIT, 1, 64])
+async def test_a_failed_flock_never_reads_as_a_measure_under_the_held_lock(tmp_path, status):
+    # review: a host flock exiting this command's own measure code must not authorize the fallback sizing
+    (tmp_path / "flock").write_text(f"#!/bin/sh\nexit {status}\n")
+    (tmp_path / "flock").chmod(0o755)
+    wait = image_flatten.flatten_wait_command().replace(FLATTEN_LOCK_PATH, str(tmp_path / "lock"))
+    done = subprocess.run(["sh", "-c", wait], env={"PATH": f"{tmp_path}:{os.environ['PATH']}"}, capture_output=True)
+
+    assert done.returncode == 1 and f"flock failed: exit {status}".encode() in done.stderr
+    with pytest.raises(RuntimeError) as raised:
+        await image_flatten.wait_for_node_flatten(Mock(run=AsyncMock(return_value=Mock(exit_status=done.returncode))))
+    assert not isinstance(raised.value, (image_flatten.FlattenMeasureFailed, image_flatten.FlattenLockTimedOut))
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("broken", ["lock", "mark", "measure"])
 async def test_only_a_failed_measure_under_the_held_lock_and_mark_may_fall_back(tmp_path, monkeypatch, broken):
     # review: a lock or mark that cannot be written must stop the create, not authorize fallback sizing
@@ -797,6 +873,8 @@ _MANY = image_flatten.FLATTEN_BUDGET_MIN_LAYERS
 )
 async def test_flatten_copy_bytes_budgets_only_a_copy_still_to_write(stdout, copy_exit, expected):
     async def run(command, **kwargs):
+        if command.startswith("/usr/bin/docker version"):
+            return Mock(stdout="29.8.0\n")
         if "--format" in command:
             return Mock(stdout=stdout)
         assert "lium-flattened:abc" in command
@@ -805,6 +883,46 @@ async def test_flatten_copy_bytes_budgets_only_a_copy_still_to_write(stdout, cop
         return Mock(exit_status=copy_exit)
 
     assert await image_flatten.flatten_copy_bytes(Mock(run=run), "sglang") == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "version, listed, readable",
+    [("29.4.3\n", "sha256:abc 30GB\n", True), ("29.4.3\n", "", False), (RuntimeError("ssh"), "", False)],
+)
+async def test_flatten_copy_bytes_before_docker_29_8_budgets_the_listed_size(version, listed, readable):
+    # an unreadable size (no list entry, or the version read failing) stops the sizing: never "no copy needed"
+    async def run(command, **kwargs):
+        if command.startswith("/usr/bin/docker version"):
+            if isinstance(version, Exception):
+                raise version
+            return Mock(stdout=version)
+        if command.startswith("/usr/bin/docker image ls"):
+            return Mock(stdout=listed)
+        if "--format" in command:
+            return Mock(stdout=f"{_GIB24} {_MANY} sha256:abc\noverlayfs\n")
+        return Mock(exit_status=1)
+
+    if not readable:
+        with pytest.raises(image_flatten.FlattenSizeUnreadable):
+            await image_flatten.flatten_copy_bytes(Mock(run=run), "sglang")
+        return
+    got = await image_flatten.flatten_copy_bytes(Mock(run=run), "sglang")
+    assert got == 2 * image_flatten.listed_size_bytes("30GB") + FLATTEN_DISK_MARGIN_BYTES
+
+
+@pytest.mark.asyncio
+async def test_an_existing_copy_needs_no_size_so_an_unreadable_one_does_not_stop_the_create():
+    # review at fc11bf3: the flatten reuses the copy, writing nothing; only a new copy needs a readable size
+    async def run(command, **kwargs):
+        if command.startswith("/usr/bin/docker version"):
+            raise RuntimeError("ssh")
+        if "--format" in command:
+            return Mock(stdout=f"{_GIB24} {_MANY} sha256:abc\noverlayfs\n")
+        assert "lium-flattened:abc" in command
+        return Mock(exit_status=0)
+
+    assert await image_flatten.flatten_copy_bytes(Mock(run=run), "sglang") is None
 
 
 @pytest.mark.asyncio

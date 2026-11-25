@@ -43,7 +43,10 @@ class HungHost(FakeHost):
 async def _reset(host: HungHost, pod=POD):
     result = await reset_hung_pod_gpus(host, list(pod))
     for cmd in host.commands:
-        if cmd.startswith("nvidia-smi -r"):
+        if cmd == "nvidia-smi -r":
+            # the whole fabric: only for a pod holding every host GPU while Fabric Manager is stopped
+            assert host.active_during_reset.get(FM) is False and set(pod) == set(U)
+        elif cmd.startswith("nvidia-smi -r"):
             assert " -i " in cmd
             assert set(cmd.split(" -i ")[1].strip("'").split(",")) <= set(pod), "never reset a GPU outside the pod"
     return result
@@ -230,7 +233,8 @@ async def test_a_fabric_manager_pod_owning_every_gpu_stops_fm_around_the_reset()
     host = HungHost(query=_query({U[0]: None}), device_ids=(), count=-1, fabric_manager=True)
     result = await _reset(host, pod=U)
     assert result.warning == W.HungGpuReset
-    assert _resets(host) == [f"nvidia-smi -r -i {','.join(U)}"]
+    # Fabric Manager stopped: the whole baseboard resets, NVSwitches included (no -i)
+    assert _resets(host) == ["nvidia-smi -r"]
     assert host.active_during_reset[FM] is False and host.active[FM] is True
     # stop, reset and start run as one host unit (as in reset_pod_gpus)
     assert ("stop", FM) in host.fm_log and ("start", FM) in host.fm_log
@@ -304,26 +308,6 @@ async def test_the_pending_mark_is_held_from_before_the_reset_until_it_is_done()
     reset_at = host.commands.index(f"nvidia-smi -r -i {U[0]}")
     assert hold.entered <= reset_at and hold.exited == len(host.commands)
     assert host.commands[-1].startswith("CUDA_VISIBLE_DEVICES=")
-
-
-@pytest.mark.parametrize("latch", [False, True])
-@pytest.mark.asyncio
-async def test_shadow_reads_the_host_and_changes_nothing(latch):
-    # HUNG_GPU_RESET_ON_REBOOT_ENABLED off: what would happen goes in the detail, nothing runs
-    host = HungHost(query=_query({U[0]: f"{U[0]}, 100, 0" if latch else None}))
-    hold = _Hold(host)
-    result = await reset_hung_pod_gpus(host, POD, resetting=hold, shadow=True)
-    assert result.hung_uuids == [U[0]] and result.warning is None
-    assert f"reset [{U[0]!r}]" in result.detail and ("latch clear first" in result.detail) == latch
-    assert _resets(host) == [] and not any(cmd.startswith("CUDA_VISIBLE_DEVICES=") for cmd in host.commands)
-    assert hold.entered is None  # no pending mark
-
-
-@pytest.mark.asyncio
-async def test_shadow_says_why_it_would_refuse():
-    host = HungHost(query=_query({U[0]: None}), apps=[(77, U[0])])  # a process outside the pod holds the GPU
-    result = await reset_hung_pod_gpus(host, POD, shadow=True)
-    assert result.warning is None and "refuse the reset" in result.detail and _resets(host) == []
 
 
 @pytest.mark.asyncio

@@ -3,6 +3,7 @@ import json
 import logging
 import random
 import re
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 import shlex
 from typing import Awaitable, Callable, Optional
@@ -74,12 +75,40 @@ DOWNLOAD_TEMPORARY_SWEEP_TIMEOUT_SECONDS = 60
 # Created for good, and dockerd then refuses `volume rm` on the cache it mounts ("volume is in use").
 REMOVE_CACHE_SWEEP_CONTAINER = f"/usr/bin/docker rm -f {CACHE_SWEEP_CONTAINER_NAME} >/dev/null 2>&1"
 
+# the name of a child Python's multiprocessing started with `spawn` or `forkserver`: its command line is
+# `python -c "from multiprocessing.spawn import spawn_main; ..." --multiprocessing-fork`, not the program it runs
+MULTIPROCESSING_CHILD = "multiprocessing-child"
+
+# Every image repository a filler is started from: its workload, the executable names its GPU
+# processes run as (any other GPU process in it is foreign), and whether the reclaims below remove it idle.
+@dataclass(frozen=True)
+class FillerWorkload:
+    strategy: str
+    process_names: tuple[str, ...]
+    image_removed_when_idle: bool = True
+
+
+FILLER_WORKLOADS: dict[str, FillerWorkload] = {
+    # the image's tee_miner serves the model (ENGY_MODEL) through SGLang or vLLM: `python -m sglang.launch_server` and
+    # its children titled `sglang::<role>`, `vllm serve` and `VLLM::EngineCore`, plus the children multiprocessing spawns
+    "ghcr.io/hanlinai/engy-golden-serve": FillerWorkload("ENGY_TEE", ("sglang", "vllm", MULTIPROCESSING_CHILD)),
+    # the worker downloads its inference engine at run time; the engine has been vLLM and sonar, and the engine
+    # starts GPU children through multiprocessing's spawn start method (sonar's P2P probe at engine start)
+    "daturaai/dolphin": FillerWorkload("DPHN", ("dolphinpod", "sonar", "vllm", MULTIPROCESSING_CHILD)),
+    # the first Dolphin image, no longer started: no GPU process of a Lium workload runs in it
+    "daturaai/dlph": FillerWorkload("DPHN", ()),
+    # small and has no cache volume, so a reclaim gains nothing from removing it
+    "daturaai/pearl-miner": FillerWorkload("PEARL", ("peakminer",), image_removed_when_idle=False),
+}
+
 # The images of the fillers whose caches the reclaims below give back (Engy's alone is ~32 GB). No
 # `-f`: dockerd refuses an image any container still uses, running or stopped, so a live filler keeps it.
-FILLER_IMAGE_REPOSITORIES = ("ghcr.io/hanlinai/engy-golden-serve", "daturaai/dolphin", "daturaai/dlph")
+FILLER_IMAGE_REPOSITORIES = tuple(
+    repository for repository, workload in FILLER_WORKLOADS.items() if workload.image_removed_when_idle
+)
 
 
-def _image_repository(image: str) -> str:
+def image_repository(image: str) -> str:
     reference = image.split("@", 1)[0]
     name, _, tag = reference.rpartition(":")
     repository = name if name and "/" not in tag else reference
@@ -89,7 +118,7 @@ def _image_repository(image: str) -> str:
 def idle_filler_images_removal_command(keep_image: str | None = None) -> str:
     """The idle filler images' removal; `keep_image` is the image a create is about to run, whose repository
     is left alone: a renter may rent the Engy image itself, and it has no container until docker run."""
-    keep = _image_repository(keep_image) if keep_image else None
+    keep = image_repository(keep_image) if keep_image else None
     repositories = [repository for repository in FILLER_IMAGE_REPOSITORIES if repository != keep]
     if not repositories:  # `docker image ls` without a filter would list every image
         return "true"
@@ -102,7 +131,7 @@ def idle_filler_images_removal_command(keep_image: str | None = None) -> str:
 
 def idle_filler_images_size_command(keep_image: str | None = None) -> str:
     """Prints the byte size of each image `idle_filler_images_removal_command` would remove, one per line."""
-    keep = _image_repository(keep_image) if keep_image else None
+    keep = image_repository(keep_image) if keep_image else None
     repositories = [repository for repository in FILLER_IMAGE_REPOSITORIES if repository != keep]
     if not repositories:
         return "true"
@@ -242,6 +271,7 @@ def _bound_pod_id_label(container_name: str, label: str) -> str:
 # diagnostic of theirs, is never removed. Only never-started (Created) ones go: a running one is a check
 # in progress.
 CAPABILITY_CHECK_NAME = re.compile(r"^lium_capability_check_[0-9]+_[0-9a-f]{6}$")
+FULL_CONTAINER_ID = re.compile(r"[0-9a-f]{64}")
 LIST_CREATED_CONTAINERS = "/usr/bin/docker ps -a --no-trunc --filter status=created --format '{{.ID}} {{.Names}}'"
 
 
@@ -249,7 +279,8 @@ def never_started_check_containers(listing: str) -> list[str]:
     return [
         fields[0]
         for fields in (line.split() for line in listing.splitlines())
-        if len(fields) == 2 and CAPABILITY_CHECK_NAME.match(fields[1])
+        # the id is node output that goes into `docker rm`: only a full container id is accepted
+        if len(fields) == 2 and CAPABILITY_CHECK_NAME.match(fields[1]) and FULL_CONTAINER_ID.fullmatch(fields[0])
     ]
 
 

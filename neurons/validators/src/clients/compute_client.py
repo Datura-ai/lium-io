@@ -87,7 +87,7 @@ from websockets.asyncio.client import ClientConnection
 from core.config import settings
 from core.utils import _m, get_extra_info
 from clients.subtensor_client import SubtensorClient
-from services.docker_service import create_steps_after_reply, inflight_creates
+from services.docker_service import create_steps_after_reply, executor_key, inflight_creates
 from services.gpu_reset import renter_gpu_reset_in_progress, renter_gpu_reset_recent, reset_caused
 from services.miner_service import MinerService
 from services.task.event_report_fit import MAX_FRAME_BYTES
@@ -106,6 +106,7 @@ from services.redis_service import (
     STREAMING_LOG_CHANNEL,
     NORMALIZED_SCORE_CHANNEL,
     renter_create_id,
+    resumed_create,
 )
 from clients.handlers.backup_handler import BackupHandler
 
@@ -211,8 +212,8 @@ class ComputeClient:
         # pod id -> (resume count, create id) of a create the restart sweep runs again, read when that create is tracked
         self.resume_by_pod_id: dict[str, tuple[int, str]] = {}
         self._restart_reported_create_ids: dict[str, list[str]] = {}
-        # pods deleted while a create of theirs runs: that create's late restart record is not written
-        self.deleted_pod_ids: set[str] = set()
+        # (pod, executor) deleted while a create of theirs runs there: that create's late restart record is not written
+        self.deleted_pod_ids: set[tuple[str, tuple[str, str]]] = set()
         # lium-io#1952: (pod_id, command_id) -> the first acceptance time of a create whose record has not landed yet,
         # reused by its retries and redeliveries so a redelivery never ranks an older dispatch above a newer one.
         # shortcut: only failed records leave an entry here (kept for a later redelivery); cap it if Redis outages grow it
@@ -531,6 +532,8 @@ class ComputeClient:
                             pod_states=data.get("pod_states"),
                             pod_ssh=data.get("pod_ssh"),
                             host_runtime_fault=data.get("host_runtime_fault"),
+                            rented_pod_faults=data.get("rented_pod_faults"),
+                            idle_checks_passed=data.get("idle_checks_passed"),
                             check_started_at=data.get("check_started_at"),
                             ssh_host_key=data.get("ssh_host_key"),
                         )
@@ -616,6 +619,7 @@ class ComputeClient:
                             reason_code=data.get("reason_code"),
                             check_id=data.get("check_id"),
                             evidence=data.get("evidence"),
+                            unrented_only=data.get("unrented_only") is True,
                         )
 
                         async with self.lock:
@@ -1175,18 +1179,20 @@ class ComputeClient:
         # past it and find nothing to cancel — and the create it raced then orphans its container.
         if isinstance(job_request, ContainerDeleteRequest):
             # DAH-5437: the renter deleted this pod; a connector restart must not resume its in-flight create
-            if inflight_creates.is_running(job_request.pod_id):
-                self.deleted_pod_ids.add(job_request.pod_id)
-            await self._retire_backend_create_records_of_pod(job_request.pod_id)
+            executor = executor_key(job_request)
+            if inflight_creates.is_running(job_request.pod_id, executor):
+                self.deleted_pod_ids.add((job_request.pod_id, executor))
+            await self._retire_backend_create_records_of_pod(job_request.pod_id, executor)
         if not isinstance(job_request, ContainerCreateRequest):
             return await self._drive_miner_job(job_request)
-        with inflight_creates.track(job_request.pod_id):
+        executor = executor_key(job_request)
+        with inflight_creates.track(job_request.pod_id, executor):
             redis_service = self.miner_service.redis_service
             pod_id = job_request.pod_id
             resumes, create_id = self.resume_by_pod_id.pop(pod_id, (0, uuid4().hex))
 
             async def add() -> None:
-                if pod_id in self.deleted_pod_ids:
+                if (pod_id, executor) in self.deleted_pod_ids:
                     return  # a delete that landed first already removed the record; writing it now would undo that
                 await redis_service.add_inflight_backend_create(
                     pod_id,
@@ -1201,16 +1207,18 @@ class ComputeClient:
             if not await self._write_backend_create_record(pod_id, add):
                 retrying = asyncio.ensure_future(self._retry_backend_create_record(pod_id, add))
             create_id_token = renter_create_id.set(create_id)  # the create lock's owner, see executor_create_exclusion
+            resumed_token = resumed_create.set(resumes > 0)
             try:
                 return await self._drive_miner_job(job_request)
             finally:
+                resumed_create.reset(resumed_token)
                 renter_create_id.reset(create_id_token)
                 if retrying is not None:
                     retrying.cancel()
                     await asyncio.wait({retrying})
                 await self._retire_backend_create_record(pod_id, create_id)
                 if inflight_creates.is_only_create(pod_id):
-                    self.deleted_pod_ids.discard(pod_id)
+                    self.deleted_pod_ids.discard((pod_id, executor))
 
     async def _accept_create_dispatch(self, job_request: ContainerCreateRequest, accepted_ns: int) -> bool:
         """lium-io#1952: placed by the time its message was taken, before the create runs, so an older dispatch delayed
@@ -1235,7 +1243,7 @@ class ComputeClient:
         backend's resend of it runs. Tracked as in flight from the start, so a delete during the waits cancels it
         instead of answering "deleted" before the create runs and recreates the container."""
         pod_id = job_request.pod_id
-        with inflight_creates.track(pod_id):
+        with inflight_creates.track(pod_id, executor_key(job_request)):
             for delay in CREATE_DISPATCH_RECORD_RETRY_DELAYS:
                 with suppress(asyncio.TimeoutError):
                     await asyncio.wait_for(inflight_creates.wait_cancelled(pod_id), delay)
@@ -1344,15 +1352,17 @@ class ComputeClient:
             _retiring_backend_create_records.add(retiring)
             retiring.add_done_callback(_retiring_backend_create_records.discard)
 
-    async def _retire_backend_create_records_of_pod(self, pod_id: str) -> None:
-        # DAH-5437: every recorded create of the pod, so a connector restart resumes none of them
+    async def _retire_backend_create_records_of_pod(self, pod_id: str, executor: tuple[str, str]) -> None:
+        # DAH-5437: every recorded create of the pod on this executor, so a connector restart resumes none of them;
+        # DAH-6540: a move's create on another node keeps its record
         try:
             pod_creates = (await self.miner_service.redis_service.inflight_backend_creates()).get(pod_id, [])
         except Exception as exc:
             self._log_backend_create_tracking_error(pod_id, exc)
             return
         for create in pod_creates:
-            await self._retire_backend_create_record(pod_id, create.create_id)
+            if (create.miner_hotkey, create.executor_id) == executor:
+                await self._retire_backend_create_record(pod_id, create.create_id)
 
     async def _write_backend_create_record(self, pod_id: str, write: Callable[[], Awaitable[None]]) -> bool:
         try:

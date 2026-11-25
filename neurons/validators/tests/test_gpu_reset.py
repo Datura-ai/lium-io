@@ -145,7 +145,7 @@ class FakeHost:
             for unit in units:
                 self.active[unit] = False
                 self.fm_log.append(("stop", unit))
-            self.commands.append(re.search(r"\{ (nvidia-smi -r [^;]*);", script).group(1))
+            self.commands.append(re.search(r"\{ (nvidia-smi -r\b[^;]*);", script).group(1))
             self.active_during_reset = dict(self.active)
             if self.reset_hangs:
                 # the SSH timeout fires while the host unit still holds the fabric down
@@ -222,7 +222,11 @@ def _assert_invariants(host: FakeHost, backend, report) -> None:
     container = set(json.loads(host.inspect)["HostConfig"]["DeviceRequests"][0]["DeviceIDs"] or U)
     for cmd in host.commands:
         assert "docker exec" not in cmd, "never trust output from inside the pod"
-        if cmd.startswith("nvidia-smi -r"):
+        if cmd == "nvidia-smi -r":
+            # the whole fabric: only for a pod holding every host GPU while Fabric Manager is stopped
+            assert host.active_during_reset.get(FM) is False, "never nvidia-smi -r without -i outside a fabric reset"
+            assert container == set(backend) == set(U)
+        elif cmd.startswith("nvidia-smi -r"):
             assert " -i " in cmd, "never nvidia-smi -r without -i"
             reset_set = set(cmd.split(" -i ")[1].strip("'").split(","))
             assert reset_set <= container and reset_set <= set(backend)
@@ -353,6 +357,30 @@ async def test_a_fabric_manager_node_the_pod_owns_whole_stops_fm_around_the_rese
     assert _fm_commands(host) == [*CHECK_BOTH, ("stop", FM), ("start", FM), ("is-active", FM)]
     assert sum("systemd-run" in cmd for cmd in host.commands) == 1
     start.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_a_fabric_manager_node_the_pod_owns_whole_resets_gpus_and_nvswitches_together():
+    # HGX B300: with Fabric Manager stopped, `-r -i <every GPU>` was refused "in use" with no holder left
+    host = FakeHost(device_ids=(), count=-1, fabric_manager=True)
+    report, _ = await _reset(host, backend=U, indices=[2])
+    assert report.ok and [c for c in host.commands if c.startswith("nvidia-smi -r")] == ["nvidia-smi -r"]
+
+
+@pytest.mark.asyncio
+async def test_an_nvswitch_node_without_fabric_manager_keeps_the_per_gpu_reset():
+    host = FakeHost(device_ids=(), count=-1, nvswitch=True)
+    await _reset(host, backend=U, indices=[0])
+    resets = [c for c in host.commands if c.startswith("nvidia-smi -r")]
+    assert len(resets) == 1 and set(resets[0].split(" -i ")[1].split(",")) == set(U)
+
+
+def test_a_whole_fabric_reset_refuses_a_partial_gpu_set():
+    with pytest.raises(ValueError):
+        build_reset_command(U[:2], container_uuids=U, pod_gpu_uuids=U, whole_fabric=True)
+    with pytest.raises(ValueError):
+        build_reset_command(U[:2], container_uuids=U[:2], pod_gpu_uuids=U, whole_fabric=True)
+    assert build_reset_command(U, container_uuids=U, pod_gpu_uuids=U, whole_fabric=True) == "nvidia-smi -r"
 
 
 @pytest.mark.asyncio
@@ -1142,6 +1170,51 @@ async def test_no_verified_job_reset_is_sent_for_a_node_whose_renter_is_resettin
         ("resetting", "executor.validate.rented_state"),
         ("idle", "executor.validate.rented_state"),
     ]
+
+
+@pytest.mark.asyncio
+async def test_the_forwarded_reset_carries_its_idle_only_mark_as_its_own_field():
+    # DAH-6784: compute_client builds the wire request from the redis payload; drop the key and every idle-only
+    # reset reaches the backend unmarked, ending a rental placed since the check read it
+    import asyncio
+    from unittest.mock import MagicMock
+
+    from clients.compute_client import ComputeClient
+    from services.redis_service import RESET_VERIFIED_JOB_CHANNEL
+
+    def message(executor_uuid: str, **extra):
+        data = {"miner_hotkey": "hk", "executor_uuid": executor_uuid, "reason": 0, "check_id": "c",
+                "reason_code": None, "evidence": None, **extra}
+        return {"channel": RESET_VERIFIED_JOB_CHANNEL.encode(), "data": json.dumps(data)}
+
+    class PubSub:
+        async def listen(self):
+            yield message("marked", unrented_only=True)
+            yield message("older-validator")
+            yield message("garbled", unrented_only="yes")
+            raise asyncio.CancelledError
+
+        async def aclose(self):
+            pass
+
+    redis = PendingRedis()
+    redis.subscribe = AsyncMock(return_value=PubSub())
+    client = ComputeClient.__new__(ComputeClient)
+    client.lock = asyncio.Lock()
+    client.message_queue = []
+    client.logging_extra = {}
+    client.miner_service = MagicMock(redis_service=redis)
+    client.my_hotkey = MagicMock(return_value="validator-hotkey")
+
+    with pytest.raises(asyncio.CancelledError):
+        await client.subscribe_mesages_from_redis()
+
+    assert [(r.executor_uuid, r.unrented_only) for r in client.message_queue] == [
+        ("marked", True),
+        ("older-validator", False),
+        ("garbled", False),
+    ]
+    assert "unrented_only" in client.message_queue[0].model_dump()
 
 
 @pytest.mark.asyncio

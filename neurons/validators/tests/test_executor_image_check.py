@@ -33,11 +33,6 @@ def warn_only(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "EXECUTOR_IMAGE_CHECK_ENFORCE", False)
 
 
-@pytest.fixture
-def unofficial_enforced(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(settings, "EXECUTOR_IMAGE_UNOFFICIAL_ENFORCE", True)
-
-
 def policy() -> ExpectedImageSnapshot:
     return ExpectedImageSnapshot(
         executor=ExpectedImage("executor:latest", EXECUTOR_DIGEST),
@@ -95,7 +90,7 @@ async def test_unrented_outdated_executor_fails_validation(enforce):
 
 @pytest.mark.asyncio
 async def test_unobservable_executor_digest_is_unofficial(
-    enforce, unofficial_enforced, no_registry_lookup_for_executor_build
+    enforce, no_registry_lookup_for_executor_build
 ):
     no_registry_lookup_for_executor_build.side_effect = real_executor_build_published
     context = make_context(
@@ -156,7 +151,7 @@ async def test_outdated_executor_under_another_miners_rental_on_a_different_endp
 
 @pytest.mark.asyncio
 async def test_unrented_executor_on_a_build_we_never_published_fails_even_warn_only(
-    warn_only, unofficial_enforced, no_registry_lookup_for_executor_build
+    warn_only, no_registry_lookup_for_executor_build
 ):
     no_registry_lookup_for_executor_build.return_value = False
     context = make_context(
@@ -173,8 +168,8 @@ async def test_unrented_executor_on_a_build_we_never_published_fails_even_warn_o
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("published", "build"), [(False, "unofficial"), (True, "official"), (None, "unknown")])
-async def test_with_unofficial_enforcement_off_a_build_is_only_logged(
+@pytest.mark.parametrize(("published", "build"), [(True, "official"), (None, "unknown")])
+async def test_an_outdated_build_not_known_unofficial_is_only_logged(
     warn_only, no_registry_lookup_for_executor_build, caplog, published, build
 ):
     no_registry_lookup_for_executor_build.return_value = published
@@ -231,3 +226,26 @@ def test_score_calculator_zeroes_an_unofficial_build_even_warn_only(warn_only, r
     actual_score, _, _ = calculate_scores(context, rented)
 
     assert actual_score == 0.0
+
+
+@pytest.mark.asyncio
+async def test_with_enforcement_the_previous_release_in_its_grace_passes_and_keeps_incentive(enforce):
+    # DAH-6560: CURRENT feeds the image check and the incentive, not only the portal card
+    in_grace = replace(policy(), rollout_previous_digest=STALE_DIGEST)
+    context = make_context(
+        config=build_context_config(executor_image_snapshot=in_grace),
+        state=build_state(specs=specs(executor_digest=STALE_DIGEST), rented_data=SimpleNamespace(executors={})),
+    )
+
+    result = await ExecutorImageCheck().run(context)
+    report = result.updates["state"].executor_image_report
+    scored = make_context(
+        state=build_state(gpu_model="NVIDIA H200", executor_image_report=report), collateral_deposited=True
+    )
+    _, _, warning = calculate_scores(scored, False)
+
+    assert result.passed is True
+    assert report.status is ImageVerdict.CURRENT
+    assert "outdated" not in (warning or "")
+    # after the grace the same node is OUTDATED again
+    assert policy().report(STALE_DIGEST).status is ImageVerdict.OUTDATED

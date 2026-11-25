@@ -43,6 +43,7 @@ from services.gpu_reset import (
     build_reset_command,
     parse_host_gpus,
     plan_host_holders,
+    resets_whole_fabric,
 )
 from services.gpu_wedge import (
     COMPUTE_APPS_QUERY_COMMAND,
@@ -106,12 +107,8 @@ async def reset_hung_pod_gpus(
     *,
     resetting: Callable[[], AbstractAsyncContextManager[list[HungGpuResult] | None]] = contextlib.nullcontext,
     settle_seconds: float = 2.0,
-    shadow: bool = False,
 ) -> HungGpuResult:
     """Call with the pod's container stopped. Changes nothing unless a pod GPU is hung.
-
-    `shadow`: only read the host and say what would happen in `detail` (no latch cure, no reset, `resetting` is
-    never entered, no warning).
 
     `resetting` is entered once a GPU is found hung and held until the reset is over (the caller's
     gpu_reset pending-pod mark, so the rented checks skip the node meanwhile). A list it yields gets the
@@ -125,31 +122,11 @@ async def reset_hung_pod_gpus(
     hung = parse_hung_pod_gpus(gpu_csv, latched, pod_gpu_uuids)
     if not hung:
         return HungGpuResult()
-    if shadow:
-        return HungGpuResult(hung, None, await _shadow_detail(runner, hung, latched, pod_gpu_uuids))
     async with resetting() as reset_result_holder:
         result = await _reset(runner, hung, latched, pod_gpu_uuids, settle_seconds)
         if reset_result_holder is not None:
             reset_result_holder.append(result)  # the caller acts on it while still holding its mark
     return result
-
-
-async def _shadow_detail(
-    runner: SSHCommandRunner, hung: list[str], latched: set[str], pod_gpu_uuids: list[str]
-) -> str:
-    """What _reset would do, from the same read-only checks."""
-    reason = "latched (busy, no memory, no process)" if set(hung) <= latched else "not healthy in the GPU query"
-    if await _reset_unit_pending(runner):
-        return f"{reason}; would refuse: the GPU reset is still running on the host"
-    first = "would try the latch clear first, then " if set(hung) <= latched else "would "
-    try:
-        plan = await _reset_targets_or_refuse(runner, hung, pod_gpu_uuids)
-    except GpuResetRefused as refused:
-        return f"{reason}; {first}refuse the reset: {refused.code.value}: {refused.detail}"
-    where = (
-        f" in the host unit, stopping {plan.host_services + plan.holder_containers}" if plan.owns_host else ""
-    )
-    return f"{reason}; {first}reset {plan.targets}{where}"
 
 
 async def _reset(
@@ -172,7 +149,12 @@ async def _reset(
         warning = _NOT_RESET_WARNING.get(refused.code, ContainerWarningCode.HungGpuNotResetUnsupported)
         return HungGpuResult(hung, warning, refused.detail)
 
-    command = build_reset_command(plan.targets, container_uuids=pod_gpu_uuids, pod_gpu_uuids=pod_gpu_uuids)
+    command = build_reset_command(
+        plan.targets,
+        container_uuids=pod_gpu_uuids,
+        pod_gpu_uuids=pod_gpu_uuids,
+        whole_fabric=resets_whole_fabric(plan.owns_host, plan.host_services),
+    )
     if not plan.owns_host:
         reset = await _run(runner, command, timeout=_RESET_TIMEOUT_SECONDS)
     else:

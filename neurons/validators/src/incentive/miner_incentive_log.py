@@ -11,6 +11,7 @@ HOW A NODE PICKS A POOL:
                                                           mining score is zeroed, e.g. Sysbox
                                                           not confirmed; reason below)
   idle AND model in program AND price ok AND disk >= 1.5x VRAM
+       AND RAM >= half of VRAM (when that gate is enforced)
        AND (not full-8x OR NCU/split/attested-CVM offered) AND power cap appliable
                                AND capacity?            -> unrented pool (earns)
   otherwise                                            -> 0 incentive (reason below)
@@ -28,6 +29,7 @@ WHAT THIS CATALOG HOLDS — every `MinerLogLine` the miner-facing log block
      GPU model not in the unrented program (earns only when rented),
      price above the market soft limit (lower the price to earn),
      total disk below 1.5x total GPU VRAM (add disk to earn),
+     system RAM below half of total GPU VRAM, when enforced (add RAM to earn),
      8x H200/B200/B300 with no NCU profiling, GPU splitting or passed TDX
        attestation (offer any of the three to earn),
      container that cannot apply a GPU power cap (give it CAP_SYS_ADMIN to earn),
@@ -83,10 +85,10 @@ if TYPE_CHECKING:
     from incentive.rental_price import (
         DiskLimitedRemainder,
         InsufficientDisk,
+        InsufficientRam,
         MissingFull8xCapability,
         PortLimitedRemainder,
         PowerCapIncapable,
-        PowerCapReverted,
     )
     from services.task_service import JobResult
 
@@ -112,12 +114,12 @@ class ZeroIncentiveReason(StrEnum):
     NO_UNRENTED_CAPACITY_FOR_GPU_COUNT = "no_unrented_capacity_for_gpu_count"
     NVIDIA_DRIVER_BELOW_MINIMUM = "nvidia_driver_below_minimum"
     INSUFFICIENT_DISK_FOR_VRAM = "insufficient_disk_for_vram"
+    INSUFFICIENT_RAM_FOR_VRAM = "insufficient_ram_for_vram"
     SYSBOX_NOT_ENABLED = "sysbox_not_enabled"
     FULL_8X_WITHOUT_NCU_OR_SPLIT = "flagship_without_ncu_or_split"  # wire code, append-only: consumers key on it (DAH-5197 keeps the value)
     CANNOT_APPLY_GPU_POWER_CAP = "cannot_apply_gpu_power_cap"
     OUTDATED_EXECUTOR_IMAGE = "outdated_executor_image"
     PORT_LIMITED_REMAINDER = "port_limited_remainder"
-    REVERTS_GPU_POWER_CAP = "reverts_gpu_power_cap"
     # Spot-node pay: an idle spot node that is not paid
     SPOT_WITHOUT_LIUM_FILLER = "spot_without_lium_filler"
     SPOT_NO_FILLER_REVENUE_FOR_GPU_CONFIG = "spot_no_filler_revenue_for_gpu_config"
@@ -407,6 +409,28 @@ class MinerLogLine(BaseModel):
         )
 
     @staticmethod
+    def no_payout_because_insufficient_ram_for_vram(
+        result: JobResult, measured: InsufficientRam
+    ) -> MinerLogLine:
+        required_ram_gb: float = measured.required_ram_gb
+        return MinerLogLine._no_payout(
+            result,
+            reason=ZeroIncentiveReason.INSUFFICIENT_RAM_FOR_VRAM,
+            message=(
+                f"No unrented incentive: this executor has {measured.ram_gb} GB of RAM but "
+                f"{measured.vram_gb} GB of GPU VRAM. An idle executor needs system RAM of at least "
+                f"{measured.rate}x its GPU VRAM to earn the unrented incentive. Give it at least "
+                f"{required_ram_gb} GB of RAM, or rent it out to earn."
+            ),
+            extra_fields={
+                "total_vram_gb": measured.vram_gb,
+                "total_ram_gb": measured.ram_gb,
+                "min_ram_to_vram_rate": measured.rate,
+                "required_ram_gb": required_ram_gb,
+            },
+        )
+
+    @staticmethod
     def no_payout_because_no_unrented_capacity_for_gpu_count(
         result: JobResult, count_bucket: int | None
     ) -> MinerLogLine:
@@ -499,30 +523,6 @@ class MinerLogLine(BaseModel):
             extra_fields={
                 "container_cap_eff": incapable.container_cap_eff,
                 "nvidiactl_owner_uid": incapable.nvidiactl_owner_uid,
-            },
-        )
-
-    @staticmethod
-    def no_payout_because_reverts_gpu_power_cap(
-        result: JobResult, reverted: PowerCapReverted
-    ) -> MinerLogLine:
-        return MinerLogLine._no_payout(
-            result,
-            reason=ZeroIncentiveReason.REVERTS_GPU_POWER_CAP,
-            message=(
-                f"No unrented incentive: this executor raised the GPU power limit back "
-                f"{reverted.revert_count} times in the last {reverted.window_hours} hours while a "
-                f"Lium idle job was running. Lium caps the limit for the length of that job only, "
-                f"and restores your own value when it ends. Putting the limit back kills the job, "
-                f"so the node earns the unrented incentive without doing the work. Stop the script "
-                f"or service on the host that re-runs 'nvidia-smi -pl', or rent this executor out "
-                f"to earn."
-            ),
-            extra_fields={
-                "power_cap_revert_count": reverted.revert_count,
-                "power_cap_revert_window_hours": reverted.window_hours,
-                "capped_to_watts": reverted.capped_to_watts,
-                "found_watts": reverted.found_watts,
             },
         )
 
@@ -698,9 +698,7 @@ class MinerLogLine(BaseModel):
     # ── Calculation reports: the per-cycle lines every scored node gets ───────
 
     @staticmethod
-    def mining_score_calculated(
-        result: JobResult, is_rented_after_cutoff: bool, spot_rental_factor: float = 1.0
-    ) -> MinerLogLine:
+    def mining_score_calculated(result: JobResult, spot_rental_factor: float = 1.0) -> MinerLogLine:
         formula: str = (
             "score * gpu_portion * gpu_count / total_gpu_count * sysbox_multiplier * uptime_multiplier "
             "* driver_multiplier"
@@ -724,7 +722,6 @@ class MinerLogLine(BaseModel):
                 "gpu_portion": result.gpu_portion,
                 "total_gpu_count": result.total_gpu_count,
                 "rental_created": result.rental_created_at,
-                "is_rented_after_cutoff": is_rented_after_cutoff,
                 **spot_fields,
             },
         )

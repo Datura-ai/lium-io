@@ -453,7 +453,6 @@ async def test_encrypted_bootstrap_restore_spec_never_carries_the_passphrase(mon
 
 
 
-
 OVERLAY_LINE = "40 1 0:50 / / rw - overlay overlay rw\n"
 
 

@@ -5,7 +5,7 @@ import json
 import shlex
 import time
 from collections import Counter
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import Any
 
 from pydantic import BaseModel
@@ -20,6 +20,7 @@ from services.gpu_power_limit import (
     GpuPowerRestoreRecord,
     detect_cap_revert,
     read_gpu_power_restore_records,
+    reapply_filler_cap_after_reboot,
     record_cap_reverts,
     rental_legacy_pod_key,
     rental_start_ratio_key,
@@ -55,21 +56,39 @@ def _to_float(value: Any) -> float | None:
         return None
 
 
-def _with_host_limits(ctx: Context, records: list[GpuPowerRestoreRecord]) -> dict[str, Any]:
+def _with_host_limits(
+    ctx: Context, records: list[GpuPowerRestoreRecord], recapped_watts: dict[str, int] | None = None
+) -> dict[str, Any]:
     """Specs with ``power_host_limit`` (watts) on each GPU under our live Pearl cap: the host's own limit,
     recorded before the cap and restored when the filler stops. The backend's Reduced power limit badge
-    judges it while ``power_limit`` stays the live cap (DAH-5302). No record = no field."""
+    judges it while ``power_limit`` stays the live cap (DAH-5302). No record = no field. A GPU capped again
+    this cycle (DAH-6555) publishes that cap as ``power_limit``: the scrape read it before the re-cap."""
     host_watts = {record.gpu_uuid: record.watts for record in records}
+    recapped_watts = recapped_watts or {}
     gpu = (ctx.state.specs or {}).get("gpu")
     if not host_watts or not isinstance(gpu, dict) or not isinstance(gpu.get("details"), list):
         return {}
+
+    def published(detail: dict[str, Any]) -> dict[str, Any]:
+        uuid = detail["uuid"]
+        live = {"power_limit": recapped_watts[uuid]} if uuid in recapped_watts else {}
+        return {**detail, "power_host_limit": host_watts[uuid], **live}
+
     details = [
-        {**detail, "power_host_limit": host_watts[detail["uuid"]]}
-        if isinstance(detail, dict) and detail.get("uuid") in host_watts
-        else detail
+        published(detail) if isinstance(detail, dict) and detail.get("uuid") in host_watts else detail
         for detail in gpu["details"]
     ]
-    return {"state": replace(ctx.state, specs={**ctx.state.specs, "gpu": {**gpu, "details": details}})}
+    gpu_details = [
+        {**detail, "power_limit": recapped_watts[detail["uuid"]]}
+        if isinstance(detail, dict) and detail.get("uuid") in recapped_watts
+        else detail
+        for detail in ctx.state.gpu_details or []
+    ]
+    return {
+        "state": replace(
+            ctx.state, specs={**ctx.state.specs, "gpu": {**gpu, "details": details}}, gpu_details=gpu_details
+        )
+    }
 
 
 def _dump_measurements(measurements: list[GpuPowerMeasurement]) -> list[dict[str, Any]]:
@@ -102,6 +121,15 @@ async def _filler_pods_running(ctx: Context, pod_ids: set[str]) -> set[str]:
     return running & pod_ids
 
 
+@dataclass(frozen=True)
+class LiveCapReadout:
+    """What the live-cap pass found: this executor's restore records (the host's own limits under the cap) and the
+    watts of each GPU capped again after a host reboot (DAH-6555)."""
+
+    records: list[GpuPowerRestoreRecord]
+    recapped_watts_by_uuid: dict[str, int]
+
+
 class GpuPowerLimitCheck:
     """Gate validation on the current GPU power cap relative to the default cap."""
 
@@ -126,14 +154,18 @@ class GpuPowerLimitCheck:
             # DAH-2786: this is the only moment we can tell a host that raises our cap back
             # WHILE our job runs from one that merely resets the limit after the job ends. The
             # first kills the job it is paid to host; the second harms nothing.
-            records = await self._record_reverts_of_our_live_cap(ctx)
+            readout = await self._record_reverts_of_our_live_cap(ctx)
             event = render_message(
                 Msg.SKIPPED_ACTIVE_LIUM_FILLER,
                 ctx=ctx,
                 check_id=self.check_id,
                 what={"executor_uuid": ctx.executor.uuid},
             )
-            return CheckResult(passed=True, event=event, updates=_with_host_limits(ctx, records))
+            return CheckResult(
+                passed=True,
+                event=event,
+                updates=_with_host_limits(ctx, readout.records, readout.recapped_watts_by_uuid),
+            )
 
         measurements: list[GpuPowerMeasurement] = []
         incomplete: list[GpuPowerMeasurement] = []
@@ -328,13 +360,15 @@ class GpuPowerLimitCheck:
                         pass  # marked on a later cycle
         return floors
 
-    async def _record_reverts_of_our_live_cap(self, ctx: Context) -> list[GpuPowerRestoreRecord]:
+    async def _record_reverts_of_our_live_cap(self, ctx: Context) -> LiveCapReadout:
         """Note every GPU of this executor whose live limit sits above the cap we applied and
         verified for the Lium job running right now (DAH-2786).
 
-        Read-only towards the host: it changes no limit, it only records what it saw, so the
-        filler keeps running either way. The unrented incentive gate counts these later.
-        Returns this executor's restore records (the host's own limits under the cap).
+        It records what it saw and changes no limit, so the filler keeps running either way; the
+        unrented incentive gate counts these later. The one exception, DAH-6555: a GPU whose host booted
+        again since we capped it (the scan's boot id differs from the one on its record: a reboot reset the
+        limit and docker restarted the filler) gets the cap set again instead; only a pod
+        whose every raised GPU took it again is left unrecorded. A record with no boot id is judged as before.
         """
         live_watts_by_uuid: dict[str, GpuPowerMeasurement] = {
             str(detail.get("uuid")): GpuPowerMeasurement(
@@ -349,14 +383,14 @@ class GpuPowerLimitCheck:
             if detail.get("uuid")
         }
         if not live_watts_by_uuid:
-            return []
+            return LiveCapReadout([], {})
         read_result = await read_gpu_power_restore_records(
             ctx.services.redis, list(live_watts_by_uuid), log_extra=ctx.default_extra
         )
         records = [record for record in read_result.records if record.executor_id == ctx.executor.uuid]
         # same reason the stale-cap rescue is gated: the dry-run pipeline must not write shared state
         if not self.restore_stale_caps:
-            return records
+            return LiveCapReadout(records, {})
         observed_at = time.time()
         reverts: list[GpuPowerCapRevert] = []
         for record in records:
@@ -373,11 +407,42 @@ class GpuPowerLimitCheck:
             # still reports owner "lium" for a STOPPING run: only a job whose container runs now can be reverted
             running = await _filler_pods_running(ctx, {revert.pod_id for revert in reverts})
             reverts = [revert for revert in reverts if revert.pod_id in running]
+            recapped_watts = await self._cap_again_after_reboot(ctx, records, reverts)
+            reverts = [revert for revert in reverts if revert.gpu_uuid not in recapped_watts]
+        else:
+            recapped_watts = {}
         if reverts:
             await record_cap_reverts(
                 ctx.services.redis, ctx.executor.uuid, reverts, ctx.default_extra
             )
-        return records
+        return LiveCapReadout(records, recapped_watts)
+
+    async def _cap_again_after_reboot(
+        self, ctx: Context, records: list[GpuPowerRestoreRecord], reverts: list[GpuPowerCapRevert]
+    ) -> dict[str, int]:
+        """The watts of each raised GPU set back to our cap because its host booted again since the cap (DAH-6555),
+        for pods where every raised GPU took it; a pod with one failed set keeps all its GPUs on the revert path.
+        Not the container's start time: we cap before ``docker run``, so every filler starts after its cap."""
+        boot_id = (ctx.state.specs or {}).get("boot_id")
+        if not isinstance(boot_id, str) or not boot_id:
+            return {}
+        record_by_uuid = {record.gpu_uuid: record for record in records}
+        recapped: dict[str, int] = {}
+        for pod_id in {revert.pod_id for revert in reverts}:
+            pod_reverts = [revert for revert in reverts if revert.pod_id == pod_id]
+            if any(record_by_uuid[revert.gpu_uuid].boot_id in (None, boot_id) for revert in pod_reverts):
+                continue
+            pod_recapped: dict[str, int] = {}
+            for revert in pod_reverts:
+                record = record_by_uuid[revert.gpu_uuid]
+                if not await reapply_filler_cap_after_reboot(
+                    ctx.ssh, ctx.services.redis, record, revert.found_watts, boot_id, ctx.default_extra
+                ):
+                    break
+                pod_recapped[revert.gpu_uuid] = revert.capped_to_watts
+            else:
+                recapped.update(pod_recapped)
+        return recapped
 
     async def _rescue_stale_lium_caps(
         self, ctx: Context, rejected: list[GpuPowerMeasurement]

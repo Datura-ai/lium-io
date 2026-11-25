@@ -7,6 +7,7 @@ import os
 import logging
 import re
 import shlex
+import time
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Dict, NamedTuple, Optional, Tuple, List
@@ -14,6 +15,11 @@ from typing import Any, Dict, NamedTuple, Optional, Tuple, List
 import asyncssh
 
 from core.config import FeatureFlag, settings
+from services import executor_payload
+from services.verifyx_network_probe import (
+    is_cloudflare_probe_failure as _is_cloudflare_probe_failure,
+    is_positive_number as _is_positive_number,
+)
 from core.utils import _m, get_extra_info
 from core.checksums import (
     ARM_VERIFIER_NOT_AVAILABLE,
@@ -47,13 +53,6 @@ VERIFYX_KILL_TIMEOUT_SECONDS = 10
 
 # LIB_PATH is the Cloudflare capacity build (celium-gpu-verifier#25).
 LIB_PATH = "/usr/lib/libverifyx.so"
-# Transport / Cloudflare-side faults only. The word "cloudflare" in an error is not enough:
-# a host that failed the probe for its own reason can mention that URL.
-_CLOUDFLARE_PROBE_FAIL_RX = re.compile(
-    r"429|timeout|timed out|outage|connection refused|rate.?limit"
-    r"|\bDownload request failed for https://speed\.cloudflare\.com/\S*: error sending request\b",
-    re.I,
-)
 # Cloudflare's own 429 on either direction, in the verifier's words (celium-gpu-verifier network.rs
 # validate_speedtest_response). A download 429 means the verifier skipped the upload; an upload 429
 # came after a measured download. The reqwest transport error is left out on purpose: it prints no
@@ -70,6 +69,10 @@ class VerifyXFailureClass(str, Enum):
     EMPTY_RESPONSE = "EMPTY_RESPONSE"
     CIPHER_REJECTED = "CIPHER_REJECTED"
     UNKNOWN = "UNKNOWN"
+
+
+# printed to stderr by the bounded run's wrapper once its deadline has passed on the host
+VERIFYX_DEADLINE_MARKER = "lium-verifyx-deadline-reached"
 
 
 class SSHCapture(NamedTuple):
@@ -242,6 +245,24 @@ class NetworkGateTally:
 NETWORK_GATE_TALLY = NetworkGateTally()
 
 
+# DAH-5933: `timeout -k 10 SECONDS CMD...` for a host without it: the watchdog leads its own process group, which
+# kill_remote_verifyx kills by the recorded PID; at the deadline TERM to the group, then KILL after 10 s.
+_PYTHON_WATCHDOG = (
+    "import os,signal,subprocess,sys\n"
+    "os.setpgid(0,0)\n"
+    "p=subprocess.Popen(sys.argv[2:])\n"
+    "try:\n sys.exit(p.wait(float(sys.argv[1])))\n"
+    "except subprocess.TimeoutExpired:\n pass\n"
+    "signal.signal(signal.SIGTERM,signal.SIG_IGN)\n"
+    # the marker is best effort: a closed SSH reader (EPIPE) must never stop the kill below
+    f"try:\n os.write(2,{(VERIFYX_DEADLINE_MARKER + chr(10)).encode()!r})\nexcept OSError:\n pass\n"
+    "os.killpg(0,signal.SIGTERM)\n"
+    "try:\n p.wait(10)\n"
+    "except subprocess.TimeoutExpired:\n os.killpg(0,signal.SIGKILL)\n"
+    "sys.exit(124)\n"
+)
+
+
 class VerifyXValidationService:
     def __init__(self):
         self.lib_name = LIB_PATH
@@ -372,7 +393,9 @@ class VerifyXValidationService:
         try:
             payload = challenge.validator.verify_response(challenge_response)
             verification_result = _perform_verification_checks(payload, record_tally=record_tally)
-            _log_verifyx_network_speeds(verification_result.get("network") or {}, default_extra)
+            _log_verifyx_network_speeds(
+                verification_result.get("network") or {}, payload["response_data"], default_extra
+            )
             return VerifyXResponse(data=verification_result)
         except Exception as e:
             return self._failure_response(
@@ -389,7 +412,11 @@ class VerifyXValidationService:
         machine_spec: dict,
         challenge_config_overrides: dict | None = None,
         run_dir: str | None = None,
+        deadline_monotonic: float | None = None,
     ):
+        """`deadline_monotonic` (time.monotonic()) bounds a run the validator cuts off: the remote run gets what is
+        left of it after the checksum and the challenge, under a watchdog of its own, and None comes back without a
+        launch once nothing is left (DAH-5933 review)."""
         # The SSH transport: library checksum over the shell → prepare_verifyx_challenge → one
         # remote `verifyx_executor.py` run → evaluate_verifyx_capture. The local transport
         # (checks/local_verify.py) calls the same prepare/evaluate around `POST /verify`.
@@ -480,11 +507,35 @@ class VerifyXValidationService:
                 machine_spec, default_extra, challenge_config_overrides, lib_name=lib_name
             )
 
-            command = self._verifyx_command(executor_info, challenge, lib_name, run_dir)
+            seconds = VERIFYX_COMMAND_TIMEOUT_SECONDS
+            cut = None
+            if deadline_monotonic is not None:
+                remaining = deadline_monotonic - time.monotonic()
+                left = int(remaining)
+                if left <= 0:
+                    return None
+                # The caller's own wait, on this clock, cuts the run at the deadline and kills it
+                # (checks/verifyx.py `_verifyx_within`); the host's watchdog is only the backstop for a kill that never
+                # lands, so it fires after that cut and the kill's own timeout. A run that returns before the cut is
+                # judged as any run: the host's clock never decides a cut (review at ea74f37). Never past the fixed
+                # command cap, which a budget near it would otherwise exceed by the kill's timeout.
+                seconds = min(seconds, left + VERIFYX_KILL_TIMEOUT_SECONDS)
+                # cut only at the deadline, and only when the budget cannot afford the full command and the kill: a
+                # budget that can keeps the uncut 600 s wait, so a run answering before the deadline is always judged
+                # (review r4656251199)
+                cut = remaining if remaining < VERIFYX_COMMAND_TIMEOUT_SECONDS + VERIFYX_KILL_TIMEOUT_SECONDS else None
+            command = self._verifyx_command(
+                executor_info, challenge, lib_name, run_dir, deadline_monotonic is not None, seconds
+            )
 
             logger.info(_m("VerifyX Python Script Command", extra=get_extra_info(challenge.log_extra)))
 
-            ssh_capture = await self._run_ssh_command(shell, command)
+            try:
+                ssh_capture = await asyncio.wait_for(self._run_ssh_command(shell, command), cut)
+            except TimeoutError:
+                return None  # cut, as by the caller's wait: the caller kills the run
+            if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+                return None  # answered past the deadline (a watchdog the cap fired near it): the caller's cut, not a verdict
             return self.evaluate_verifyx_capture(challenge, ssh_capture, default_extra)
 
         except Exception as e:
@@ -623,25 +674,47 @@ class VerifyXValidationService:
         return None
 
     def _verifyx_command(
-        self, executor_info, challenge: "VerifyXChallenge", lib_name: str, run_dir: str | None = None
+        self,
+        executor_info,
+        challenge: "VerifyXChallenge",
+        lib_name: str,
+        run_dir: str | None = None,
+        python_watchdog: bool = False,
+        seconds: int = VERIFYX_COMMAND_TIMEOUT_SECONDS,
     ) -> str:
+        # the script and interpreter are the validator's (services.executor_payload), not the executor's reported paths
         command = (
-            f"{shlex.quote(executor_info.python_path)} {shlex.quote(executor_info.root_dir + '/src/verifyx_executor.py')} "
+            f"{executor_payload.run(executor_payload.VERIFYX)} "
             f"--seed {challenge.seed} --cipher_text {challenge.cipher_text}"
         )
         if run_dir is None:
-            return command
+            return executor_payload.run_once(
+                "verifyx", executor_payload.VERIFYX, f"--seed {challenge.seed} --cipher_text {challenge.cipher_text}"
+            )
         # A run the validator may cut off: its own scratch dir (cwd, so the disk-test file lands in
         # it on the same filesystem) and its PID on record, for kill_remote_verifyx.
         d = shlex.quote(run_dir)
-        return (
-            # a remote deadline of its own: the run cannot outlive its budget even if the kill never lands;
+        # inside the run's dir, so the removal below and kill_remote_verifyx's take the script with it
+        install = executor_payload.install("verifyx", executor_payload.VERIFYX, parent=".")
+        if python_watchdog:
+            # DAH-5933 review F-29/F-32: the bounded first sample runs under the executor's own Python watchdog, the
+            # backstop that stops it after the validator's own cut if that cut's kill never landed. Its marker,
+            # written right before its kill, is a diagnostic in the stderr tail only: nothing decides on it.
+            # the watchdog runs under the validator's interpreter, never the executor's reported python_path (DAH-6681)
+            start = (
+                f"mkdir {d} && cd {d} || exit 1; "
+                f"{install}; "
+                f"{shlex.quote(executor_payload.EXECUTOR_PYTHON)} -E -s -c {shlex.quote(_PYTHON_WATCHDOG)} "
+                f"{int(seconds)} {command} & "
+            )
+        else:
             # a host whose `timeout` lacks -k (busybox) skips the retry, so the first sample stands
-            f"timeout -k 1 1 true 2>/dev/null || {{ echo 'no timeout -k' >&2; exit 1; }}; "
-            f"mkdir {d} && cd {d} || exit 1; "
-            f"timeout -k 10 {VERIFYX_COMMAND_TIMEOUT_SECONDS} {command} & echo $! > pid; wait $!; rc=$?; "
-            f"cd .. && rm -rf {d}; exit $rc"
-        )
+            start = (
+                f"timeout -k 1 1 true 2>/dev/null || {{ echo 'no timeout -k' >&2; exit 1; }}; "
+                f"mkdir {d} && cd {d} || exit 1; {install}; timeout -k 10 {int(seconds)} {command} & "
+            )
+        # a remote deadline of its own: the run cannot outlive its budget even if the kill never lands
+        return f"{start}echo $! > pid; wait $!; rc=$?; cd .. && rm -rf {d}; exit $rc"
 
     async def kill_remote_verifyx(self, shell, run_dir: str, default_extra: dict) -> bool:
         """Kill a VerifyX run started with `run_dir` and cut off by the validator; True once it is gone.
@@ -826,21 +899,6 @@ def _verify_network_package_test(challenge_data: dict, response_data: dict) -> T
     }
 
     return stats, errors
-
-
-def _is_cloudflare_probe_failure(network_execution: dict) -> bool:
-    """True only for a probe-side transport or Cloudflare fault in the probe's own error.
-
-    A failed probe with no error, or an error that only names the Cloudflare URL, is a
-    host-caused failure and does not fall back to the package download.
-    """
-    capacity = (network_execution.get("speedtest") or {}).get("download_mbps")
-    if _is_positive_number(capacity):
-        return False
-    err = str(network_execution.get("error") or "").strip()
-    if not err:
-        return False
-    return bool(_CLOUDFLARE_PROBE_FAIL_RX.search(err))
 
 
 def _cloudflare_upload_mark(network_execution: dict) -> dict:
@@ -1079,10 +1137,6 @@ def _verify_xet_test(challenge_data: dict, response_data: dict) -> Tuple[dict, L
     }, errors
 
 
-def _is_positive_number(value: object) -> bool:
-    return isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0
-
-
 def _is_speed_reading(value: object) -> bool:
     """A usable Mbps reading: a finite positive number, or 0 (how a failed direction reads).
 
@@ -1100,11 +1154,30 @@ def _format_mbps(value: object) -> str:
     return "none"
 
 
-def _log_verifyx_network_speeds(network: dict, default_extra: dict) -> None:
+def _verifyx_test_times_ms(response_data: dict) -> dict:
+    # how long each VerifyX test ran on the executor; a time it did not report is None
+    network_execution = response_data.get("network_execution") or {}
+    download = network_execution.get("download") or {}
+    size, speed_mbps = download.get("size"), download.get("speed_mbps")
+    return {
+        "memory_ms": (response_data.get("memory_execution") or {}).get("execution_time_ms"),
+        "storage_ms": (response_data.get("storage_execution") or {}).get("execution_time_ms"),
+        "network_ms": network_execution.get("execution_time_ms"),
+        # the library always reports the download's `time_ms` as 0; its speed is size * 8 / 1e6 / seconds
+        "package_ms": (
+            round(size * 8 / (speed_mbps * 1000))
+            if _is_positive_number(size) and _is_positive_number(speed_mbps)
+            else None
+        ),
+    }
+
+
+def _log_verifyx_network_speeds(network: dict, response_data: dict, default_extra: dict) -> None:
     package_download_mbps = network.get("package_download_speed")
     cloudflare_download_mbps = network.get("capacity_download_speed")
     cloudflare_upload_mbps = network.get("upload_speed")
     exec_id = default_extra.get("executor_uuid") or "none"
+    test_times_ms = _verifyx_test_times_ms(response_data)
     message = (
         "VerifyX network speeds "
         f"package_download_mbps={_format_mbps(package_download_mbps)} "
@@ -1112,7 +1185,8 @@ def _log_verifyx_network_speeds(network: dict, default_extra: dict) -> None:
         f"cloudflare_upload_mbps={_format_mbps(cloudflare_upload_mbps)} "
         f"success={network.get('success')} "
         f"cloudflare_fallback={network.get('cloudflare_fallback', False)} "
-        f"exec={exec_id}"
+        + "".join(f"{key}={value} " for key, value in test_times_ms.items())
+        + f"exec={exec_id}"
     )
     logger.info(
         _m(
@@ -1124,6 +1198,7 @@ def _log_verifyx_network_speeds(network: dict, default_extra: dict) -> None:
                     "cloudflare_download_mbps": cloudflare_download_mbps,
                     "cloudflare_upload_mbps": cloudflare_upload_mbps,
                     "network_success": network.get("success"),
+                    **test_times_ms,
                 }
             ),
         )

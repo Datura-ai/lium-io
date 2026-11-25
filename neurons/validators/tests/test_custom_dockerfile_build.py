@@ -26,6 +26,8 @@ import logging
 import re
 import subprocess
 from unittest.mock import AsyncMock, Mock
+
+from ssh_channel_double import create_process_answering_through
 from uuid import uuid4
 
 import pytest
@@ -82,7 +84,6 @@ class _FakeRentalDockerClient:
         self.exec_specs = []
         self.created_volumes = []
         self.removed_volumes = []
-        self.pruned_images = 0
         self.pull_error = None
         self.run_error = None
 
@@ -131,9 +132,6 @@ class _FakeRentalDockerClient:
         self.removed_volumes.append(
             {"volume_name": volume_name, "force": force}
         )
-
-    async def prune_images(self) -> None:
-        self.pruned_images += 1
 
 
 class _FakeRentalDockerFactory:
@@ -320,6 +318,8 @@ def _make_dind_ssh(
     def _create_process(command: str):
         if _is_probe(command):
             return _probe_process(command)
+        if command.startswith(("cat /proc/", "ls -1d /dev/nvidia")):  # the bounded host reads
+            return create_process_answering_through(_run)(command)
         raise AssertionError(
             f"unexpected create_process (the streamed steps are stubbed here): {command}"
         )
@@ -521,7 +521,7 @@ async def test_A6_build_timeout_carries_the_step_that_was_running(svc, monkeypat
 async def test_A27_a_resumed_build_replaces_the_build_container_its_cut_off_attempt_left(svc, monkeypatch, only_create):
     """DAH-5437: a create run again after a connector restart meets the DinD (and helpers) of the
     attempt the restart cut off; it removes them first, but never while another create of the pod runs."""
-    from services.docker_service import inflight_creates
+    from services.docker_service import executor_key, inflight_creates
 
     ssh_client = _make_dind_ssh()
     monkeypatch.setattr(svc, "execute_and_stream_logs", _make_esl(build=(False, "Process timed out")))
@@ -529,13 +529,13 @@ async def test_A27_a_resumed_build_replaces_the_build_container_its_cut_off_atte
     payload = _base_payload(dockerfile_content="FROM alpine\n")
     dind = svc._dind_container_name(payload.pod_id)
 
-    with inflight_creates.track(payload.pod_id):
+    with inflight_creates.track(payload.pod_id, executor_key(payload)):
         if not only_create:
-            inflight_creates._creates_by_pod_id[payload.pod_id].running += 1  # a second live create
+            inflight_creates._creates[payload.pod_id, executor_key(payload)].running += 1  # a second live create
         await svc._custom_build_image(
             ssh_client=ssh_client, payload=payload, log_tag="t", default_extra={"pod_id": payload.pod_id}
         )
-        inflight_creates._creates_by_pod_id[payload.pod_id].running = 1
+        inflight_creates._creates[payload.pod_id, executor_key(payload)].running = 1
 
     run_at = next(i for i, c in enumerate(ssh_client.calls) if "run -d --runtime=sysbox-runc" in c)
     before = ssh_client.calls[:run_at]
@@ -547,7 +547,7 @@ async def test_A27_a_resumed_build_replaces_the_build_container_its_cut_off_atte
 @pytest.mark.asyncio
 async def test_A27e_a_resumed_build_whose_old_build_container_cannot_be_stopped_stops_early(svc, monkeypatch):
     """DAH-5666: the old DinD still holds the name, so the create stops before `docker run --name` fails on it."""
-    from services.docker_service import inflight_creates
+    from services.docker_service import executor_key, inflight_creates
 
     ssh_client = _make_dind_ssh()
     inner = ssh_client.run
@@ -563,7 +563,7 @@ async def test_A27e_a_resumed_build_whose_old_build_container_cannot_be_stopped_
     monkeypatch.setattr(svc, "stream_log", AsyncMock())
     payload = _base_payload(dockerfile_content="FROM alpine\n")
 
-    with inflight_creates.track(payload.pod_id):
+    with inflight_creates.track(payload.pod_id, executor_key(payload)):
         ok, step, _ = await svc._custom_build_image(
             ssh_client=ssh_client, payload=payload, log_tag="t", default_extra={"pod_id": payload.pod_id}
         )

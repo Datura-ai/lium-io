@@ -2,11 +2,13 @@ import asyncio
 import json
 import time
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import asyncssh
 import pytest
 from core.config import settings
+from datura.requests.validator_requests import upload_nonce_issued_at
 from neurons.validators.src.core.docker_utils import ContainerDeathDiagnostics
 from neurons.validators.src.protocol.vc_protocol.compute_requests import (
     CPU_QUOTA_EXCEEDS_HOST_REASON,
@@ -17,6 +19,7 @@ from neurons.validators.src.protocol.vc_protocol.compute_requests import (
 )
 from neurons.validators.src.services.container_cleanup import ContainerCleanup
 from neurons.validators.src.services.task.checks.rental_verification import RentalVerificationCheck
+from neurons.validators.src.services.task.messages import CYCLE_END_READ_REASONS
 from neurons.validators.src.services.task.messages import RentalVerificationMessages as Msg
 from neurons.validators.src.services.task.pipeline import CheckResult, Context
 
@@ -36,6 +39,11 @@ class DummyBackendClient:
         self.filler_run_active = filler_run_active
         self.filler_run_active_calls: list[str] = []
         self.filler_run_container_missing_flags: list[bool] = []
+        # the backend's rented list read now (get_rented_executors_now); None: it did not answer
+        self.rented_now: RentedExecutorsResponse | None = None
+
+    async def get_rented_executors_now(self) -> RentedExecutorsResponse | None:
+        return self.rented_now
 
     async def get_filler_run_active(
         self, filler_run_id: str, *, container_missing: bool = False
@@ -55,6 +63,7 @@ class DummyBackendClient:
         gpu_uuids: list[str] | None = None,
         cpu_count: int | None = None,
         loopback_plugin: str | None = None,
+        upload_nonce: str | None = None,
         timeout: int = 300,
     ):
         self.timeout = timeout
@@ -68,6 +77,7 @@ class DummyBackendClient:
             "gpu_uuids": gpu_uuids,
             "cpu_count": cpu_count,
             "loopback_plugin": loopback_plugin,
+            "upload_nonce": upload_nonce,
         }
         return self.response
 
@@ -97,6 +107,27 @@ async def test_rental_verification_selects_loopback_alias_from_the_switches(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("axon_version, dated", [(10_005_000, True), (9_010_001, False)])
+async def test_the_backend_upload_is_dated_for_a_miner_that_relays_the_nonce(
+    context_factory, monkeypatch, axon_version, dated
+):
+    # DAH-6606: the backend's health-check upload carried no nonce, so the executor could not require one
+    from clients.subtensor_client import SubtensorClient
+
+    backend = DummyBackendClient(response=ExecutorHealthCheckResponse(success=True, error=None, details={}))
+    services = build_services(backend=backend, container_cleanup=ContainerCleanup())
+    ctx = context_factory(services=services, state=build_state(specs={"verified_ports": [8080]}))
+    miner = SimpleNamespace(hotkey=ctx.miner_hotkey, axon_info=SimpleNamespace(version=axon_version))
+    fake = SimpleNamespace(miners=[miner], hotkeys_routed_via_central_miner=frozenset())
+    monkeypatch.setattr(SubtensorClient, "get_instance", classmethod(lambda cls: fake))
+
+    await RentalVerificationCheck().run(ctx)
+
+    issued_at = upload_nonce_issued_at(backend.called_with["upload_nonce"])
+    assert (issued_at is not None and abs(issued_at - time.time()) < 5) if dated else issued_at is None
+
+
+@pytest.mark.asyncio
 async def test_rental_verification_always_calls_backend(context_factory):
     """Rental verification always asks the backend; there is no setting that skips it."""
     backend_client = DummyBackendClient(
@@ -117,18 +148,54 @@ async def test_rental_verification_always_calls_backend(context_factory):
 
 @pytest.mark.asyncio
 async def test_rental_verification_health_check_waits_no_longer_than_the_task_has_left(context_factory):
-    # Arrange: 100 s before the executor task is cancelled
+    # Arrange: 200 s before the executor task is cancelled
     backend = DummyBackendClient(response=ExecutorHealthCheckResponse(success=True, error=None, details={}))
     services = build_services(backend=backend, container_cleanup=ContainerCleanup())
     ctx = context_factory(services=services, state=build_state(specs={"verified_ports": [8080]}))
-    elapsed = settings.JOB_TIME_OUT - 120 - 100
+    elapsed = settings.JOB_TIME_OUT - 120 - 200
     ctx = ctx.model_copy(update={"started_at_monotonic": time.monotonic() - elapsed})
 
     # Act
     await RentalVerificationCheck().run(ctx)
 
     # Assert: the wait ends before the cancel, leaving the probe cleanup its time
-    assert 65 <= backend.timeout <= 70
+    assert 165 <= backend.timeout <= 170
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("seconds_left", [149, 31, 1])
+async def test_too_little_task_time_sends_no_probe_and_says_so_not_an_api_error(context_factory, seconds_left):
+    # Arrange: less than the probe's 120 s plus the 30 s cleanup reserve before the task is cancelled
+    backend = DummyBackendClient(response=None)
+    services = build_services(backend=backend, container_cleanup=ContainerCleanup())
+    ctx = context_factory(services=services, state=build_state(specs={"verified_ports": [8080]}))
+    elapsed = settings.JOB_TIME_OUT - 120 - seconds_left
+    ctx = ctx.model_copy(update={"started_at_monotonic": time.monotonic() - elapsed})
+
+    # Act
+    result = await RentalVerificationCheck().run(ctx)
+
+    # Assert
+    assert backend.called_with is None
+    assert result.passed is False
+    assert result.event.reason_code == Msg.NO_TASK_TIME.reason
+    assert result.event.what_we_saw["seconds_left"] <= max(0, seconds_left - 30)
+
+
+@pytest.mark.asyncio
+async def test_the_probe_is_sent_with_exactly_its_minimum_time_left(context_factory):
+    # Arrange: 120 s for the probe once the 30 s cleanup reserve is kept
+    backend = DummyBackendClient(response=ExecutorHealthCheckResponse(success=True, error=None, details={}))
+    services = build_services(backend=backend, container_cleanup=ContainerCleanup())
+    ctx = context_factory(services=services, state=build_state(specs={"verified_ports": [8080]}))
+    ctx = ctx.model_copy(update={"started_at_monotonic": time.monotonic() - (settings.JOB_TIME_OUT - 120 - 151)})
+
+    # Act
+    result = await RentalVerificationCheck().run(ctx)
+
+    # Assert
+    assert result.passed is True
+    assert 120 <= backend.timeout <= 121
 
 
 class StalledCleanup(ContainerCleanup):
@@ -141,12 +208,12 @@ class StalledCleanup(ContainerCleanup):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("seconds_left, cleanup_timeout", [(100, 20), (15, 5), (5, 1)])
 async def test_rental_verification_stalled_cleanup_is_cut_and_the_result_kept(context_factory, seconds_left, cleanup_timeout):
-    # Arrange: a cleanup that hangs, with 100 s left, then inside the 30 s reserve
+    # Arrange: a cleanup that hangs, with 100 s left after the backend's answer, then inside the 30 s reserve
     backend = DummyBackendClient(response=ExecutorHealthCheckResponse(success=True, error=None, details={}))
     services = build_services(backend=backend, container_cleanup=StalledCleanup())
     ctx = context_factory(services=services, state=build_state(specs={"verified_ports": [8080]}))
-    elapsed = settings.JOB_TIME_OUT - 120 - seconds_left
-    ctx = ctx.model_copy(update={"started_at_monotonic": time.monotonic() - elapsed})
+    # the probe starts with 200 s left; the cleanup then runs with `seconds_left`, as after a long backend wait
+    task_time = iter([200, seconds_left])
     waits = []
     real_wait_for = asyncio.wait_for
 
@@ -155,13 +222,19 @@ async def test_rental_verification_stalled_cleanup_is_cut_and_the_result_kept(co
         return await real_wait_for(aw, timeout=0.01)
 
     # Act
-    with patch("neurons.validators.src.services.task.checks.rental_verification.asyncio.wait_for", recording_wait_for):
+    with (
+        patch("neurons.validators.src.services.task.checks.rental_verification.asyncio.wait_for", recording_wait_for),
+        patch(
+            "neurons.validators.src.services.task.checks.rental_verification.task_seconds_left",
+            lambda ctx: next(task_time),
+        ),
+    ):
         result = await RentalVerificationCheck().run(ctx)
 
     # Assert: the cleanup wait is bounded and leaves time for the result, which still arrives
     assert result.passed is True
     assert len(waits) == 1 and cleanup_timeout - 1 <= waits[0] <= cleanup_timeout
-    assert backend.timeout == 1 or seconds_left == 100
+    assert backend.timeout == 170
 
 
 @pytest.mark.asyncio
@@ -236,7 +309,8 @@ async def test_rental_verification_success():
         "rental_in_progress": False,  # no customer rental in this state
         "gpu_uuids": [],  # this state carries no scraped gpu details
         "cpu_count": None,  # this state carries no scraped cpu count
-        "loopback_plugin": "vloopback:v2",  # the plugin alias new rental volumes are created on
+        "loopback_plugin": "vloopback:v3",  # the plugin alias new rental volumes are created on (v3 by default)
+        "upload_nonce": None,  # a miner the metagraph does not show relaying the nonce gets none
     }
 
 
@@ -320,6 +394,8 @@ async def test_rental_verification_nvml_mismatch_clears_verified_job_info():
     assert "failed to initialize NVML" in result.event.what_we_saw["stderr"]
     assert result.updates["clear_verified_job_info"] is True
     assert "clear_verified_job_reason" not in result.updates
+    # judged on a node the backend saw unrented: idle-only, so a rental placed since keeps its node
+    assert result.updates["clear_verified_job_unrented_only"] is True
 
 
 @pytest.mark.asyncio
@@ -367,6 +443,31 @@ async def test_rental_verification_api_error():
     assert result.passed is False
     assert result.event.reason_code == Msg.API_ERROR.reason
     assert "API returned None" in result.event.what_we_saw["error"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "seconds_left, reason",
+    [(200, Msg.NO_TASK_TIME.reason), (500, Msg.API_ERROR.reason)],
+    ids=["wait-cut-by-the-task-time", "full-300s-wait"],
+)
+async def test_a_probe_wait_cut_by_the_task_time_is_no_task_time_not_an_api_error(context_factory, seconds_left, reason):
+    # review: only the task's budget shortened the wait; a timeout at the full 300 s stays an API error
+    from clients.backend_client import HealthCheckTimedOut
+
+    class TimingOutBackend(DummyBackendClient):
+        async def check_executor_health(self, **kwargs):
+            raise HealthCheckTimedOut(kwargs["timeout"])
+
+    backend = TimingOutBackend(response=None)
+    services = build_services(backend=backend, container_cleanup=ContainerCleanup())
+    ctx = context_factory(services=services, state=build_state(specs={"verified_ports": [8080]}))
+    ctx = ctx.model_copy(update={"started_at_monotonic": time.monotonic() - (settings.JOB_TIME_OUT - 120 - seconds_left)})
+
+    result = await RentalVerificationCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.reason_code == reason
 
 
 @pytest.mark.asyncio
@@ -828,7 +929,7 @@ async def test_rental_verification_sends_flag_when_customer_rental():
 
     from tests.helpers import make_context
 
-    ctx = make_context(services=services, state=state)
+    ctx = make_context(services=services, state=state, rented=True)
 
     with patch("neurons.validators.src.services.task.checks.rental_verification.settings"):
         result = await RentalVerificationCheck().run(ctx)
@@ -836,6 +937,49 @@ async def test_rental_verification_sends_flag_when_customer_rental():
     assert result.passed is True
     assert backend_client.called_with is not None
     assert backend_client.called_with["rental_in_progress"] is True
+
+
+class _EchoingBackend(DummyBackendClient):
+    """The backend as it answers: with the rental hint set it skips its probe and says so (skipped_rented)."""
+
+    async def check_executor_health(self, *args, rental_in_progress: bool = False, **kwargs):
+        await super().check_executor_health(*args, rental_in_progress=rental_in_progress, **kwargs)
+        if rental_in_progress:
+            return ExecutorHealthCheckResponse(success=True, error=None, reason_code="skipped_rented", details={})
+        return self.response
+
+
+@pytest.mark.asyncio
+async def test_a_pod_the_halt_judged_closed_is_no_rental_hint_and_the_probe_runs():
+    """DAH-5933 review: the snapshot still lists a customer pod the rented halt judged closed. The hint came from that
+    list, so the backend skipped its probe and its skipped_rented echo read as a rental the snapshot missed. The hint
+    is now this run's verdict (not rented), so the backend probes the node."""
+    backend_client = _EchoingBackend(response=ExecutorHealthCheckResponse(success=True, error=None, details={}))
+    services = build_services(backend=backend_client, container_cleanup=ContainerCleanup())
+    state = build_state(
+        specs={"verified_ports": [8080]},
+        rented_data=RentedExecutorsResponse(
+            executors={
+                "executor-123": RentedExecutor(
+                    miner_hotkey="miner-hotkey",
+                    executor_ip_address="127.0.0.1",
+                    executor_ip_port="8000",
+                    pods=[RentedPod(pod_id="pod-1", container_name="c1")],
+                )
+            }
+        ),
+    )
+
+    from tests.helpers import make_context
+
+    ctx = make_context(services=services, state=state, rented=False)
+
+    with patch("neurons.validators.src.services.task.checks.rental_verification.settings"):
+        result = await RentalVerificationCheck().run(ctx)
+
+    assert backend_client.called_with["rental_in_progress"] is False
+    assert result.event.reason_code != Msg.RENTED_SINCE_THE_SNAPSHOT.reason
+    assert result.passed is True
 
 
 @pytest.mark.asyncio
@@ -1231,7 +1375,7 @@ async def test_rental_verification_filler_create_kill_ignored_for_a_customer_ren
         running_fillers=False,
         create_killed=True,
         rented_pods=[RentedPod(pod_id="pod-1", container_name="pod_1")],
-    )
+    ).model_copy(update={"rented": True})  # the run's rented halt judged the customer rental live
 
     result = await _run_filler_check(ctx)
 
@@ -1444,3 +1588,122 @@ async def test_states_that_do_not_prove_a_death_are_never_punished(docker_status
 
     assert result.passed is True
     assert result.event.reason_code == Msg.FILLER_STATE_UNKNOWN.reason
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reason_code", ["skipped_rented", "rented_during_check"])
+async def test_a_rental_the_snapshot_missed_stops_the_pipeline_as_rented(reason_code):
+    """The backend answers success=True for a node it found rented after this cycle's snapshot: the pipeline stops, so
+    no later check (LocalVerify, VerifyX) loads the renter's pod, and nothing is scored from the snapshot, which still
+    has the node idle (its GPU count of a split rental would be None). The cycle-end rented read decides."""
+    backend_client = DummyBackendClient(
+        response=ExecutorHealthCheckResponse(success=True, error=None, reason_code=reason_code)
+    )
+    backend_client.rented_now = _rented_list_with_this_nodes_pod()
+    services = build_services(
+        backend=backend_client,
+        container_cleanup=ContainerCleanup(),
+        score_calculator=lambda ctx, rented: (1.5, 2.5, "") if rented else (0.0, 0.0, ""),
+    )
+    state = build_state(specs={"verified_ports": [8080]})
+
+    from tests.helpers import make_context
+    ctx = make_context(services=services, state=state)
+
+    with patch("neurons.validators.src.services.task.checks.rental_verification.settings"):
+        result = await RentalVerificationCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.RENTED_SINCE_THE_SNAPSHOT.reason
+    assert result.event.reason_code in CYCLE_END_READ_REASONS
+    assert result.updates == {}
+
+
+def _rented_list_with_this_nodes_pod() -> RentedExecutorsResponse:
+    return RentedExecutorsResponse(
+        executors={
+            "executor-123": RentedExecutor(
+                miner_hotkey="miner-hotkey",
+                executor_ip_address="127.0.0.1",
+                executor_ip_port="8000",
+                pods=[RentedPod(pod_id="pod-1", container_name="c1")],
+            )
+        }
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reason_code", ["skipped_rented", "rented_during_check"])
+@pytest.mark.parametrize(
+    "rented_now", [RentedExecutorsResponse(executors={}), None], ids=["pod-not-listed", "re-read-unanswered"]
+)
+async def test_a_pod_the_backend_is_still_removing_is_no_rental_and_the_check_fails(reason_code, rented_now):
+    """DAH-5933 review: the backend's rented answer counts a pod row it is still removing, which its rented list (the
+    snapshot's and the rented halt's source) leaves out. Such a pod is not a rental that started since the snapshot:
+    the node is not held without a verdict, and with no probe run the check fails."""
+    backend_client = DummyBackendClient(
+        response=ExecutorHealthCheckResponse(success=True, error=None, reason_code=reason_code)
+    )
+    backend_client.rented_now = rented_now
+    services = build_services(backend=backend_client, container_cleanup=ContainerCleanup())
+    state = build_state(specs={"verified_ports": [8080]})
+
+    from tests.helpers import make_context
+    ctx = make_context(services=services, state=state)
+
+    with patch("neurons.validators.src.services.task.checks.rental_verification.settings"):
+        result = await RentalVerificationCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.PROBE_SKIPPED_FOR_AN_UNLISTED_POD.reason
+    assert result.event.reason_code not in CYCLE_END_READ_REASONS
+
+
+# DAH-6784: only a container check the backend really ran on an idle node lists the check as passed in full
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("reason_code", "listed"),
+    [(None, True), ("skipped_filler", False), ("raced_rent", False)],  # skipped_rented fails as a rental (see above)
+)
+async def test_only_a_health_check_the_backend_really_ran_is_the_full_check(reason_code, listed):
+    backend_client = DummyBackendClient(
+        response=ExecutorHealthCheckResponse(success=True, error=None, details={}, reason_code=reason_code)
+    )
+    services = build_services(backend=backend_client, container_cleanup=ContainerCleanup())
+    from tests.helpers import make_context
+
+    ctx = make_context(services=services, state=build_state(specs={"verified_ports": [8080]}))
+    with patch("neurons.validators.src.services.task.checks.rental_verification.settings"):
+        result = await RentalVerificationCheck().run(ctx)
+
+    assert result.passed is True
+    assert (result.updates.get("idle_check_passed") is True) is listed
+
+
+@pytest.mark.asyncio
+async def test_a_pass_on_a_rented_node_is_not_the_full_check():
+    backend_client = DummyBackendClient(response=ExecutorHealthCheckResponse(success=True, error=None, details={}))
+    ctx = _filler_context(
+        backend_client=backend_client,
+        ssh_client=FillerSSHClient(running=True),
+        running_fillers=False,
+        rented_pods=[RentedPod(pod_id="pod-1", container_name="c1")],
+    ).model_copy(update={"rented": True})  # the pipeline sets ctx.rented from the cycle's snapshot
+
+    result = await _run_filler_check(ctx)
+
+    assert result.passed is True and "idle_check_passed" not in result.updates
+
+
+@pytest.mark.asyncio
+async def test_a_verified_filler_is_not_the_full_check():
+    """With a filler on the node the check verifies the filler and runs no container check of its own."""
+    backend_client = DummyBackendClient(response=ExecutorHealthCheckResponse(success=True, error=None, details={}))
+    ctx = _filler_context(backend_client=backend_client, ssh_client=FillerSSHClient(running=True))
+
+    result = await _run_filler_check(ctx)
+
+    assert result.passed is True and "idle_check_passed" not in result.updates
+    assert backend_client.called_with is None

@@ -9,7 +9,8 @@ description: >-
   merged PR already ran its jobs, so main re-runs only the packages it changed (DAH-5201). Any other
   event (workflow_dispatch, a push whose before-commit is unknown) has no diff and selects every package. Documentation never selects a package: *.md and .gitignore files
   wherever they sit, and the root docs/ tree, are dropped from the file list before routing
-  (isDoc), so a PR that only edits neurons/validators/README.md runs no tests and tests-ok still
+  (isDoc; nothing under lium_protocol/changes/ is documentation: those fragments are what
+  scripts/check_version.py reads, so they select protocol), so a PR that only edits neurons/validators/README.md runs no tests and tests-ok still
   reports green — the tests exercise code, and none of those files is code. (A docs/ directory
   inside a package, e.g. neurons/executor/dstacktee/docs/, is not dropped: it is part of that
   package.) Of the rest, only four prefixes select
@@ -24,7 +25,13 @@ description: >-
   output, e2e, is true when any package is or when e2e/ itself changed: the e2e stack builds
   every neuron, so it runs whenever one of them could have changed and skips (green, via
   tests-ok) on a PR that touches none. A file under a neuron's own tests/ directory does not select
-  e2e: the stack runs e2e/tests, never those.
+  e2e, and neither do the files the stack never builds or runs: a neuron's tests/ directory, the
+  vendored liumd/ binary (the image installs and runs it, but the shadow that uses it is off in e2e;
+  tests/test_liumd_binary_manifest.py hashes both files and runs liumd-amd64 version, so liumd/ also
+  selects validators), dstacktee/ (CVM apps), validators/external_prober/ (the deploy-side lambda),
+  validators/src/preflight/ (its own image), the compose and Dockerfile.runner deployment manifests,
+  the docker_build.sh / docker_publish.sh pair, .env templates and the provider-host settings
+  (sysbox .deb, daemon.json, config.toml, run_jupyter.sh).
 
 outputs:
   validators:
@@ -37,6 +44,9 @@ outputs:
     value: ${{ steps.route.outputs.protocol }}
   e2e:
     value: ${{ steps.route.outputs.e2e }}
+  shards:
+    # JSON list of e2e shards this diff selects: ["cycle-protocol", "rental"], one of them, or []
+    value: ${{ steps.route.outputs.shards }}
   approved:
     # "true" on a PR with an approving review (each reviewer's latest approve/request-changes counts), and on any
     # non-PR event; test.yml runs the package jobs and e2e-gate only then (DAH-5832)
@@ -46,7 +56,7 @@ runs:
   using: composite
   steps:
     - id: route
-      uses: actions/github-script@v7
+      uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
       with:
         script: |
           const PACKAGES = { validators: 'neurons/validators/', executor: 'neurons/executor/', miners: 'neurons/miners/', protocol: 'lium_protocol/' };
@@ -54,9 +64,11 @@ runs:
           const SHARED = ['datura/', '.github/'];
           // a change to the wire package also runs the validator's compatibility test against it;
           // a change under dstacktee/ (the measured CVM files and dstack.py) runs the validator's
-          // compose-hash whitelist test (tests/test_tdx_compose_hash_whitelist.py, DAH-3602)
-          const ALSO = { validators: ['lium_protocol/', 'neurons/executor/dstacktee/'] };
-          const isDoc = f => /\.md$|(^|\/)\.gitignore$|^docs\//.test(f);
+          // compose-hash whitelist test (tests/test_tdx_compose_hash_whitelist.py, DAH-3602);
+          // a re-pin under liumd/ runs the manifest tests (tests/test_liumd_binary_manifest.py)
+          const ALSO = { validators: ['lium_protocol/', 'neurons/executor/dstacktee/', 'neurons/executor/liumd/'] };
+          // nothing under changes/ is documentation: scripts/check_version.py reads it, and refuses a misplaced file
+          const isDoc = f => !/^lium_protocol\/changes\//.test(f) && /\.md$|(^|\/)\.gitignore$|^docs\//.test(f);
           const touches = (files, pkg, prefix) =>
             files.some(f => f.startsWith(prefix)) || files.some(f => SHARED.some(s => f.startsWith(s)))
             || files.some(f => (ALSO[pkg] || []).some(s => f.startsWith(s)));
@@ -76,8 +88,29 @@ runs:
             const latest = {};
             // the repo is public: only a member's or collaborator's review counts, not any GitHub user's
             const TEAM = ['OWNER', 'MEMBER', 'COLLABORATOR'];
-            for (const r of reviews) if (r.user && r.state !== 'COMMENTED' && TEAM.includes(r.author_association)) latest[r.user.login] = r.state;
+            // DAH-6518: a member whose org membership is private shows as CONTRIBUTOR to this job's token, so a
+            // review outside TEAM counts when its author can write to the repo (asked once per login)
+            const canWrite = new Map();
+            const writes = async login => {
+              if (!canWrite.has(login)) {
+                const { data } = await github.rest.repos.getCollaboratorPermissionLevel({
+                  owner: context.repo.owner, repo: context.repo.repo, username: login,
+                }).catch(() => ({ data: {} }));
+                canWrite.set(login, ['admin', 'maintain', 'write'].includes(data.permission));
+              }
+              return canWrite.get(login);
+            };
+            for (const r of reviews) {
+              if (!r.user || r.state === 'COMMENTED') continue;
+              if (TEAM.includes(r.author_association) || await writes(r.user.login)) latest[r.user.login] = r.state;
+            }
             approved = Object.values(latest).includes('APPROVED');
+            // an outside approval also starts route (test.yml); it must not launch the suites on a trusted reviewer's
+            // earlier approval, so on a review event the reviewer who triggered the run must count too
+            const trigger = context.payload.review;
+            if (approved && context.eventName === 'pull_request_review' && trigger?.user) {
+              approved = TEAM.includes(trigger.author_association) || await writes(trigger.user.login);
+            }
           } else {
             // merge group: base..head; push: before..after (all zeros on a new branch: no diff, every package)
             const mg = context.payload.merge_group;
@@ -96,8 +129,20 @@ runs:
           }
 
           const rows = [];
-          // the stack never runs a neuron's own tests/, so a change there alone does not select e2e
-          const e2eFiles = files && files.filter(f => !/^neurons\/[^/]+\/tests\//.test(f));
+          // a change that only touches one of these cannot be exercised by the stack, so it does not select e2e
+          const STACK_IRRELEVANT = [
+            /^neurons\/[^/]+\/tests\//,
+            /^neurons\/executor\/liumd\//,
+            /^neurons\/executor\/dstacktee\//,
+            /^neurons\/validators\/external_prober\//,
+            /^neurons\/validators\/src\/preflight\//,
+            /^neurons\/[^/]+\/docker-compose.*\.ya?ml$/,
+            /^neurons\/[^/]+\/\.env(\.dev)?\.template$/,
+            /^neurons\/[^/]+\/docker(_runner)?_(build|publish)\.sh$/,
+            /^neurons\/[^/]+\/Dockerfile\.runner$/,
+            /^neurons\/executor\/(sysbox-ce-.*\.deb|daemon\.json|config\.toml|run_jupyter\.sh)$/,
+          ];
+          const e2eFiles = files && files.filter(f => !STACK_IRRELEVANT.some(rx => rx.test(f)));
           let anyPackage = false;
           for (const [pkg, prefix] of Object.entries(PACKAGES)) {
             const changed = files ? touches(files, pkg, prefix) : true;
@@ -108,7 +153,17 @@ runs:
           // the e2e stack is built from every package: it runs when any of them did, or when e2e/ itself changed
           const e2e = anyPackage || (e2eFiles ? touches(e2eFiles, 'e2e', 'e2e/') : true);
           core.setOutput('e2e', e2e);
-          rows.push(['e2e', e2e ? 'changed' : 'unchanged', why]);
+          // both suites drive all three services, so only an e2e test file narrows the shard set; the shared
+          // helper files and every runtime path select both
+          let shards = null;
+          for (const f of e2eFiles || []) {
+            if (/^e2e\/tests\/(cycle|protocol)\//.test(f)) (shards = shards || new Set()).add('cycle-protocol');
+            else if (/^e2e\/tests\/rental\//.test(f)) (shards = shards || new Set()).add('rental');
+            else { shards = new Set(['cycle-protocol', 'rental']); break; }
+          }
+          const selected = e2e ? [...(shards || new Set(['cycle-protocol', 'rental']))] : [];
+          core.setOutput('shards', JSON.stringify(selected));
+          rows.push(['e2e', e2e ? `changed (${selected.join(', ')})` : 'unchanged', why]);
           core.setOutput('approved', approved);
           rows.push(['approved', String(approved), approved ? 'package jobs and e2e-gate run' : 'lint only until a review approves']);
           core.summary

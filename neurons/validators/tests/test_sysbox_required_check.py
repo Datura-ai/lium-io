@@ -163,6 +163,18 @@ async def test_no_sysbox_without_dind_probe_error_keeps_the_install_advice(conte
     assert "dind_probe_error" not in result.event.what_we_saw
 
 
+@pytest.mark.asyncio
+async def test_no_sysbox_event_carries_the_nodes_own_sysbox_test_error(context_factory):
+    error = "Sysbox runtime does not support GPU access. docker: Error response from daemon: unknown runtime"
+    ctx = context_factory(state=build_state(sysbox_runtime=False, specs={"sysbox_runtime_scrape_error": error}))
+
+    result = await SysboxRequiredCheck().run(ctx)
+
+    assert result.event.reason_code == Msg.SYSBOX_MISSING.reason
+    assert result.event.what_we_saw["sysbox_scrape_error"] == error
+    assert error in result.event.remediation and Msg.SYSBOX_MISSING.remediation in result.event.remediation
+
+
 # DAH-3634 — the probe's `docker run` was refused by the NVIDIA container hook.
 
 # the hook's stderr verbatim from the validator log (`DinD creation failed`, 10 to 17 Sep 2026)
@@ -227,6 +239,26 @@ async def test_other_nvml_failure_gets_the_generic_hook_code(context_factory):
     assert result.event.reason_code == "NVIDIA_CONTAINER_HOOK_FAILED"
     assert "gpu requires reset" in result.event.remediation
     assert "sysbox check runs again" in result.event.remediation
+    assert "Install the sysbox runtime" not in result.event.remediation
+
+
+@pytest.mark.asyncio
+async def test_cdi_mode_toolkit_gets_its_own_code_and_the_config_fix(context_factory):
+    stderr = (
+        "docker: Error response from daemon: failed to create task for container: failed to create shim task: "
+        "OCI runtime create failed: container_linux.go:439: starting container process caused: process_linux.go:608: "
+        "container init caused: Running hook #0:: error running hook: exit status 1, stdout: , stderr: Using requested "
+        "mode 'cdi'\ninvoking the NVIDIA Container Runtime Hook directly (e.g. specifying the docker --gpus flag) is "
+        "not supported. Please use the NVIDIA Container Runtime (e.g. specify the --runtime=nvidia flag) instead: unknown"
+    )
+    ctx = context_factory(state=build_state(sysbox_runtime=False, dind_probe_error=_cause(stderr)))
+
+    result = await SysboxRequiredCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.reason_code == "NVIDIA_TOOLKIT_CDI_MODE"
+    assert "docker said: invoking the NVIDIA Container Runtime Hook directly" in result.event.remediation
+    assert 'mode = "auto"' in result.event.remediation
     assert "Install the sysbox runtime" not in result.event.remediation
 
 

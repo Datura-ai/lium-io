@@ -263,6 +263,7 @@ def aws_cp(args, volume_access: VolumeAccess, backup_path: str, expected_size: i
         backup_path_parent,
         "-czf",
         "-",
+        "--",  # a name like --checkpoint-action=exec=... stays a file name
         backup_path_current,
     ]
     # AWS CLI reads stdin and uploads directly to S3; no local archive is created on miner disk.

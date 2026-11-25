@@ -21,6 +21,7 @@ from fastapi import APIRouter, Depends, Query, Header, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import ValidationError
 from services.miner_service import MinerService
+from services.ssh_service import check_authorized_key
 from services.pod_log_service import PodLogService
 from services.hardware_service import get_docker_client, get_system_metrics, get_container_metrics
 from services.update_status_service import ExpectedDigestCache, collect_update_status
@@ -38,6 +39,7 @@ from dependencies.auth import (
     verify_container_logs_signature,
     verify_signature,
 )
+from services.validator_trust_service import validator_trust
 from services.local_verify_service import (
     BusyError,
     LocalVerifyService,
@@ -239,6 +241,11 @@ def _validate_ssh_key_consistency(payload: UploadSShKeyPayload) -> None:
     if len(pk_normalized.encode()) > MAX_PUBLIC_KEY_BYTES:
         logger.warning("Rejecting a public_key of %d bytes", len(pk_normalized.encode()))
         raise HTTPException(status_code=400, detail=f"Public key longer than {MAX_PUBLIC_KEY_BYTES} bytes")
+    try:
+        check_authorized_key(pk_normalized)
+    except ValueError as exc:
+        logger.warning("Rejecting a public_key that is not a plain public key line: %s", exc)
+        raise HTTPException(status_code=400, detail="Public key is not a plain public key line")
 
 
 def _validate_validator_signature(payload: UploadSShKeyPayload, require_nonce: bool = False) -> None:
@@ -278,6 +285,24 @@ def _accepted_miner_hotkeys() -> set[str]:
     )
 
 
+def _owner_set_signed(payload: UploadSShKeyPayload, own_hotkey: str) -> bool:
+    """DAH-6740: the validator also signed this key for this node's own hotkey as one of the listing owner's.
+
+    Only the own hotkey counts here: the pool hotkey is accepted by every pool node, so signing it for an own-key
+    listing would bind the key to nothing. The validator (and the backend's health check, on the validator's word) signs
+    only the hotkeys the portal itself names for the listing's owner, never what a miner reports, and an upload needs
+    this node's own or the central miner's auth (MinerMiddleware).
+    """
+    signature = (payload.owner_hotkey_signatures or {}).get(own_hotkey)
+    if not own_hotkey or not signature:
+        return False
+    try:
+        blob = ssh_pubkey_signing_blob(payload.public_key, payload.nonce, own_hotkey)
+        return match_validator_hotkey(blob, signature) is not None
+    except Exception:
+        return False
+
+
 def _check_miner_binding(payload: UploadSShKeyPayload) -> None:
     """Check the validator issued this key for this executor's own miner hotkey or the pool's.
 
@@ -299,6 +324,8 @@ def _check_miner_binding(payload: UploadSShKeyPayload) -> None:
             miner_binding = "mismatch"
         else:
             return
+    if _owner_set_signed(payload, own_hotkey):
+        return
     enforced = settings.REQUIRE_MINER_BOUND_SSH_KEY
     logger.warning(
         _m(
@@ -442,6 +469,8 @@ async def get_version():
         "version": _get_version(),
         "capabilities": [LOCAL_VERIFY_CAPABILITY],
         "local_verify_port": settings.INTERNAL_PORT,
+        # DAH-6590: the validator address and revision this node trusts, so a switch is measured per node
+        "validator_trust": validator_trust.report(),
     }
 
 
@@ -453,6 +482,8 @@ MINER_IDENTITY_NONCE_PATTERN = r"^[0-9a-fA-F]{32,128}$"
 @apis_router.get("/miner-identity", response_model_exclude_none=True)
 async def get_miner_identity(
     nonce: Annotated[str, Query(pattern=MINER_IDENTITY_NONCE_PATTERN)],
+    # only on request: a long mapping list would overrun the answer size a caller that does not read it allows
+    declared_ports: Annotated[bool, Query()] = False,
 ) -> MinerIdentityResponse:
     """
     The miner hotkey this executor is configured for (`MINER_HOTKEY_SS58_ADDRESS`), with the
@@ -471,6 +502,16 @@ async def get_miner_identity(
         nonce=nonce,
         account_claim=claim,
         ssh_host_key_port=port,
+        declared_ports=(
+            {
+                "port_range": settings.RENTING_PORT_RANGE,
+                "port_mappings": settings.RENTING_PORT_MAPPINGS,
+                # the SSH port this executor reports to validators (miner_service), which they exclude from rental ports
+                "ssh_port": settings.SSH_PUBLIC_PORT or settings.SSH_PORT,
+            }
+            if declared_ports
+            else None
+        ),
         # off the event loop: an RSA signature still costs ~ms, and this endpoint is public
         host_key_proofs=(
             await asyncio.to_thread(_host_key_proofs, nonce, settings.MINER_HOTKEY_SS58_ADDRESS, claim) if port else None
@@ -640,7 +681,7 @@ async def local_verify(request: Request):
         result.deadline_hit,
         {name: step.status for name, step in result.steps.items()},
     )
-    return result.model_dump(by_alias=True)
+    return {**result.model_dump(by_alias=True), "validator_trust": validator_trust.report()}
 
 
 _expected_digest_cache = ExpectedDigestCache()

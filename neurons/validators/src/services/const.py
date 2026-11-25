@@ -40,9 +40,14 @@ GPU_MODEL_RATES = {
     "NVIDIA GeForce RTX 4060": 0.0,
     "NVIDIA GeForce RTX 4090": 0.05,
     "NVIDIA GeForce RTX 4090 D": 0.02,
-    # DAH-5508: no rental history yet, so no share, as the RTX 5090 D and the Quadro RTX 8000 it was paid as before.
-    # Only reachable with RTX_4090_48GB_MODEL_ENABLED on (see gpu_spec_table.classify_gpu_model).
+    # DAH-5508: memory-modded cards (gpu_spec_table.MODDED_VRAM_MODELS): no rental history yet, so no share, as the
+    # RTX 5090 D and the Quadro RTX 8000 the 48 GB card was paid as before.
     "NVIDIA GeForce RTX 4090 48GB": 0.0,
+    "NVIDIA GeForce RTX 4080 32GB": 0.0,
+    "NVIDIA GeForce RTX 4080 SUPER 32GB": 0.0,
+    "NVIDIA GeForce RTX 4090 D 48GB": 0.0,
+    "NVIDIA GeForce RTX 3080 20GB": 0.0,
+    "NVIDIA GeForce RTX 2080 Ti 22GB": 0.0,
     # "NVIDIA RTX 4000 Ada Generation": 0.005,
     "NVIDIA RTX PRO 2000 Blackwell": 0.0,
     "NVIDIA RTX PRO 4000 Blackwell": 0.0,
@@ -503,6 +508,12 @@ TDX_WHITELIST = {
             # DAH-5243 — runner sha256:f8421a1d… (executor-v1.156, 2026-10-26)
             # includes /miner-identity for portal registration. Measured files unchanged.
             "0cc30085543511090db2952809f104dd30ec7d8630abb9fc4cde8590068ec104": 7,
+            # DAH-6549 — the same runner digest with pre_launch_script.sh keeping the guest's own rsync (the
+            # sysbox installer's static rsync crashed in __libc_early_init). Version 8.
+            "24ddd0868ee11bb38981420c157f00013651491002333c7f90d0ffc30d56377e": 8,
+            # The same runner digest with pre_launch_script.sh stopping the boot when the sysbox install or its
+            # sysbox-runc + --gpus test run fails, the installer pulled only when not cached. Version 9.
+            "fa664c7e89ef0dbbf313673b9bb18c642bf404ec0bf6c97d7210d24575f53ebc": 9,
             # Version 3 (ab4d1433…, July runner sha256:f85b948b…) is gone and its number burned:
             # that runner bakes the STAGING validator hotkey via config_override.py and answers every
             # prod validator with 401. Removed, not demoted: TDX_MINIMUM_COMPOSE_VERSION defaults to 0.

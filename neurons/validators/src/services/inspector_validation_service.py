@@ -24,6 +24,7 @@ from core.checksums import (
 from datura.requests.miner_requests import ExecutorSSHInfo
 
 from core.config import settings
+from services import executor_payload
 from core.utils import _m, get_extra_info
 
 if TYPE_CHECKING:
@@ -42,6 +43,8 @@ _REFRESH_DETAIL_CHARS = 400
 # the collector's start may wait 75 s for health and 10 s for the container index on a busy host, plus its canary
 INSPECTOR_COMMAND_TIMEOUT_SECONDS = 120
 INSPECTOR_STDERR_CAPTURE_TIMEOUT_SECONDS = 10
+# each step of ending a stream whose reply was not read whole waits this long for the channel to close
+PROCESS_CLOSE_WAIT_SECONDS = 5
 INSPECTOR_STDERR_CAPTURE_MAX_BYTES = 8192
 # One protocol response is one line. asyncssh's readline() hands back a PARTIAL line once a single
 # line outgrows the channel receive window (2 MiB by default: the session pauses reading and
@@ -241,7 +244,7 @@ class InspectorValidationService:
         validator = None
         command = self._interactive_command(executor)
         diagnostics: dict[str, Any] = {
-            "command": command,
+            "command": executor_payload.label(executor_payload.INSPECTOR, "--interactive"),
             "executor_uuid": executor.uuid,
             # DAH-3275: what vouches for the sensor binary this report came from. On a dstack
             # CVM the executor image (and the .so in it) is part of the stack the validator
@@ -303,6 +306,10 @@ class InspectorValidationService:
                 await self._send_message(process, {"cmd": "start-collector"})
             except Exception as exc:
                 diagnostics["collector_ensure_error"] = str(exc)
+                if not isinstance(exc, InspectorInteractiveError):
+                    # its reply was not read whole and may still arrive: on this stream it would answer the handshake
+                    await self._end_process(process)
+                    process = await ssh.create_process(command)
 
             open_json = validator.handshake_start()
             handshake_reply = await self._send_message(
@@ -596,8 +603,8 @@ class InspectorValidationService:
         )
 
     def _interactive_command(self, executor: ExecutorSSHInfo) -> str:
-        script = f"{executor.root_dir.rstrip('/')}/src/inspector_executor.py"
-        return f"{shlex.quote(executor.python_path)} {shlex.quote(script)} --interactive"
+        # the script and interpreter are the validator's (services.executor_payload), not the executor's reported paths
+        return executor_payload.run_once("inspector", executor_payload.INSPECTOR, "--interactive")
 
     async def _send_message(self, process, payload: dict[str, Any]) -> str:
         cmd = str(payload.get("cmd", ""))
@@ -713,13 +720,30 @@ class InspectorValidationService:
         stderr_text = "".join(captured).strip()
         return stderr_text or None
 
+    @staticmethod
+    def _terminate(process) -> None:
+        terminate = getattr(process, "terminate", None)
+        if terminate:
+            terminate()
+
+    async def _end_process(self, process) -> None:
+        """End `process` without another command and wait until its channel is closed: a host allowing one
+        session at a time refuses the next one while it is open. TERM, then KILL, then a local channel close."""
+        for escalate in ("terminate", "kill", "close"):
+            step = getattr(process, escalate, None)
+            if step:
+                step()
+            try:
+                await asyncio.wait_for(process.wait_closed(), timeout=PROCESS_CLOSE_WAIT_SECONDS)
+                return
+            except TimeoutError:
+                continue
+
     async def _close_process(self, process) -> None:
         try:
             await self._send_message(process, {"cmd": "quit"})
         except Exception:
-            terminate = getattr(process, "terminate", None)
-            if terminate:
-                terminate()
+            self._terminate(process)
         wait = getattr(process, "wait", None)
         if wait:
             try:
