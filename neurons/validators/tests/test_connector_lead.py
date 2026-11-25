@@ -19,6 +19,8 @@ def _client(server: FakeServer) -> ComputeClient:
     client.logging_extra = {}
     client.miner_service = MagicMock()
     client.miner_service.redis_service.redis = FakeRedis(server=server)
+    client.in_flight_drivers = set()
+    client.message_queue = compute_client.OutgoingMessages()
     return client
 
 
@@ -88,39 +90,98 @@ def test_an_unready_connector_has_no_ready_file(tmp_path, monkeypatch) -> None:
     compute_client.mark_connector_unready()  # already gone: no error
 
 
-@pytest.mark.asyncio
-async def test_sigterm_releases_the_lead_and_exits_0(tmp_path, monkeypatch) -> None:
-    monkeypatch.setattr(compute_client, "CONNECTOR_READY_FILE", str(tmp_path / "ready"))
-
+def _no_lua_release(monkeypatch) -> None:
     # shortcut: fakeredis runs no Lua without lupa; release with a plain compare-and-delete here
     async def do_release(self, expected_token):
         if await self.redis.get(self.name) == expected_token:
             await self.redis.delete(self.name)
 
     monkeypatch.setattr(aioredis.lock.Lock, "do_release", do_release)
+
+
+def _fake_exit(monkeypatch) -> tuple[asyncio.Event, list[int]]:
     exited = asyncio.Event()
-    codes = []
+    codes: list[int] = []
 
     def fake_exit(code):
         codes.append(code)
         exited.set()
 
     monkeypatch.setattr(compute_client.os, "_exit", fake_exit)
-    server = FakeServer()
-    client = _client(server)
-    await client.take_connector_lead()
+    return exited, codes
+
+
+async def _sigterm(client: ComputeClient, exited: asyncio.Event, timeout: float) -> None:
     loop = asyncio.get_running_loop()
     client.exit_on_sigterm(loop)
     try:
         os.kill(os.getpid(), signal.SIGTERM)
-        await asyncio.wait_for(exited.wait(), 3)
+        await asyncio.wait_for(exited.wait(), timeout)
     finally:
         loop.remove_signal_handler(signal.SIGTERM)
+
+
+@pytest.mark.asyncio
+async def test_sigterm_releases_the_lead_and_exits_0(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(compute_client, "CONNECTOR_READY_FILE", str(tmp_path / "ready"))
+    _no_lua_release(monkeypatch)
+    exited, codes = _fake_exit(monkeypatch)
+    server = FakeServer()
+    client = _client(server)
+    await client.take_connector_lead()
+
+    await _sigterm(client, exited, 3)
 
     assert codes == [0]
     assert not await FakeRedis(server=server).exists(compute_client.CONNECTOR_LEAD_LOCK_KEY)  # the new pod leads now
     assert client._lead_task.cancelled() or client._lead_task.done()
     assert not (tmp_path / "ready").exists()
+
+
+@pytest.mark.asyncio
+async def test_sigterm_lets_in_flight_work_finish_after_releasing_the_lead(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(compute_client, "CONNECTOR_READY_FILE", str(tmp_path / "ready"))
+    _no_lua_release(monkeypatch)
+    exited, codes = _fake_exit(monkeypatch)
+    server = FakeServer()
+    client = _client(server)
+    await client.take_connector_lead()
+    lead_held_while_working = []
+    release_work = asyncio.Event()
+
+    async def create() -> None:
+        await release_work.wait()
+        lead_held_while_working.append(await FakeRedis(server=server).exists(compute_client.CONNECTOR_LEAD_LOCK_KEY))
+        client.message_queue.append(MagicMock())  # its reply
+        await asyncio.sleep(0.2)
+        client.message_queue.pop()  # the send loop sent it
+
+    client.track_in_flight_driver(asyncio.create_task(create()))
+    asyncio.get_running_loop().call_later(0.5, release_work.set)
+
+    await _sigterm(client, exited, 5)
+
+    assert codes == [0]
+    assert lead_held_while_working == [0]  # the lead went first, the create still finished
+    assert not client.in_flight_drivers and not client.message_queue  # the create and its reply both done
+
+
+@pytest.mark.asyncio
+async def test_sigterm_exits_at_the_drain_bound_when_work_hangs(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(compute_client, "CONNECTOR_READY_FILE", str(tmp_path / "ready"))
+    monkeypatch.setattr(compute_client, "SIGTERM_DRAIN_SECONDS", 0.5)
+    _no_lua_release(monkeypatch)
+    exited, codes = _fake_exit(monkeypatch)
+    client = _client(FakeServer())
+    await client.take_connector_lead()
+    hung = asyncio.create_task(asyncio.Event().wait())
+    client.track_in_flight_driver(hung)
+
+    await _sigterm(client, exited, 3)
+
+    assert codes == [0]
+    assert not hung.done()  # left for the exit, as the SIGKILL would
+    hung.cancel()
 
 
 def test_run_sh_execs_the_connector() -> None:
