@@ -101,7 +101,7 @@ from services.task.availability import (
     build_rented_executor_not_listed_event,
     RunningOutageTally,
 )
-from services.task.messages import LoginUserMessages, TenantEnforcementMessages
+from services.task.messages import TenantEnforcementMessages
 from incentive.config import BASE_GPU_MAP
 from services.task_service import TaskService, JobResult
 from services.storage_operations import (
@@ -587,8 +587,7 @@ class MinerService:
             if (
                 isinstance(rerun, JobResult)
                 and rerun.log_status != "error"
-                and rerun.failure_reason_code
-                not in (TenantEnforcementMessages.EXECUTOR_TRANSPORT_UNREACHABLE.reason, LoginUserMessages.UNREAD.reason)
+                and rerun.failure_reason_code != TenantEnforcementMessages.EXECUTOR_TRANSPORT_UNREACHABLE.reason
             ):
                 raw_results[i] = rerun
         passed = [r for r in reruns if isinstance(r, JobResult) and r.is_successful]

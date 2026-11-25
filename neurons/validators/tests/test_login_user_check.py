@@ -33,9 +33,9 @@ class _Runner:
 CASES = [
     ("0\n", True, None, "LOGIN_USER_ROOT", True, "sends its errors"),
     ("1000\n", True, None, "LOGIN_USER_NOT_ROOT", False, "hides the node"),
-    ("\n", True, None, "LOGIN_USER_UNREAD", False, "keeps what is stored"),
-    ("root\n", True, None, "LOGIN_USER_UNREAD", False, "keeps what is stored"),
-    ("", False, "timeout", "LOGIN_USER_UNREAD", False, "keeps what is stored"),
+    ("\n", True, None, "EXECUTOR_TRANSPORT_UNREACHABLE", False, "a transport failure"),
+    ("root\n", True, None, "EXECUTOR_TRANSPORT_UNREACHABLE", False, "a transport failure"),
+    ("", False, "timeout", "EXECUTOR_TRANSPORT_UNREACHABLE", False, "a transport failure"),
 ]
 
 
@@ -51,8 +51,9 @@ async def test_only_a_confirmed_root_uid_reaches_the_next_step(stdout, ok, error
     sent = run_availability_errors(result.passed, [result.event])
     if sends == "hides the node":
         assert [e["reason_code"] for e in sent] == [AvailabilityErrorCode.VERIFICATION_FAILED]
-    elif sends == "keeps what is stored":
-        assert sent is None   # no verdict: the backend keeps the node's stored restrictions, a hold is not cleared
+    elif sends == "a transport failure":
+        # an unread uid is the failed first command it is on main: no code of its own, no stored state kept for it
+        assert result.event.category == "transport" and sent is not None
     else:
         assert sent == []
 
@@ -76,7 +77,7 @@ class _NodeShell:
         return SimpleNamespace(exit_status=0 if cmd == "id -u" else 1, stdout=self.uid if cmd == "id -u" else "", stderr="")
 
 
-@pytest.mark.parametrize("uid, reason", [("1000\n", "LOGIN_USER_NOT_ROOT"), ("\n", "LOGIN_USER_UNREAD")])
+@pytest.mark.parametrize("uid, reason", [("1000\n", "LOGIN_USER_NOT_ROOT")])
 @pytest.mark.parametrize("build", ["standard", "fast", "dry_run"])
 async def test_no_host_command_runs_after_a_login_that_is_not_confirmed_root(monkeypatch, build, uid, reason):
     from unittest.mock import AsyncMock
@@ -119,8 +120,8 @@ class _DropsWhileReading:
 
 
 @pytest.mark.parametrize("reconnect_fails", [True, False])
-async def test_a_session_that_drops_while_the_uid_is_read_ends_the_run_with_no_verdict(monkeypatch, reconnect_fails):
-    """review 4693567618: the unread uid stays the run's end; the transport failure would publish a failed validation"""
+async def test_a_session_that_drops_while_the_uid_is_read_ends_the_run_on_the_transport_failure(monkeypatch, reconnect_fails):
+    """an unread uid has no path of its own: a session that drops under the read ends the run as any dropped session does"""
     from unittest.mock import MagicMock
 
     import asyncssh
@@ -148,5 +149,5 @@ async def test_a_session_that_drops_while_the_uid_is_read_ends_the_run_with_no_v
     ok, events, _ = await Pipeline([LoginUserCheck()], _Sink(), reconnect=reconnect).run(
         make_context(ssh=first, runner=_DropsWhileReading(first))
     )
-    assert not ok and events[-1].reason_code == "LOGIN_USER_UNREAD"
-    assert "EXECUTOR_TRANSPORT_UNREACHABLE" not in [e.reason_code for e in events]
+    assert not ok and events[-1].reason_code == "EXECUTOR_TRANSPORT_UNREACHABLE"
+    assert "LOGIN_USER_UNREAD" not in [e.reason_code for e in events]

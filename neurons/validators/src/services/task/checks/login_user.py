@@ -9,9 +9,9 @@ No executor image logs the validator in as anything but root.
 
 from __future__ import annotations
 
-from core.utils import _m, get_extra_info, get_logger
+from core.utils import get_logger
 
-from ..messages import LoginUserMessages as Msg, render_message
+from ..messages import LoginUserMessages as Msg, TenantEnforcementMessages, render_message
 from ..pipeline import CheckResult, Context
 
 logger = get_logger(__name__)
@@ -30,12 +30,11 @@ class LoginUserCheck:
         uid = (result.stdout or "").strip()
         what = {"login_uid": uid, "ssh_username": ctx.executor.ssh_username}
         if not result.success or not uid.isdigit():
-            # no confirmed uid (a timeout, an error, empty or malformed output): nothing is installed without one, so the
-            # run stops here; it is no verdict either, so nothing is reset or hidden (REASONS_THAT_KEEP_STORED) and the
-            # next cycle reads it again
-            what["error"] = (result.error_type or f"exit {result.exit_code}") if not result.success else "not a uid"
-            logger.info(_m("LOGIN_USER_UNREAD", extra=get_extra_info(what)))
-            event = render_message(Msg.UNREAD, ctx=ctx, check_id=self.check_id, what=what)
+            # no confirmed uid (a timeout, an error, empty or malformed output): the node's first command failed, the
+            # same transport failure as on any other first command; nothing is installed and no stored state is kept
+            error = (result.error_type or f"exit {result.exit_code}") if not result.success else "not a uid"
+            what = {"executor_uuid": ctx.executor.uuid, "transport_error": f"`{READ_UID_COMMAND}` failed ({error})"}
+            event = render_message(TenantEnforcementMessages.EXECUTOR_TRANSPORT_UNREACHABLE, ctx=ctx, check_id=self.check_id, what=what)
             return CheckResult(passed=False, event=event, fatal=True)
         if uid == "0":
             return CheckResult(passed=True, event=render_message(Msg.ROOT, ctx=ctx, check_id=self.check_id, what=what))

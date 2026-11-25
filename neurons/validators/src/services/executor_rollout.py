@@ -47,7 +47,6 @@ from services.task.messages import (
     FinalizeMessages,
     GpuPowerLimitMessages,
     GpuUsageMessages,
-    LoginUserMessages,
     MachineSpecMessages,
     NO_TASK_TIME_REASONS,
     PortConnectivityMessages,
@@ -547,7 +546,7 @@ def withhold_renter_gpu_reset_verdicts(
     DAH-5805: neither does a run the validator's own Redis ended; the node is not scored 0 for it.
     DAH-5933: nor a rental probe the task had no time left for, when no last scored result was carried.
     DAH-5851: neither does an idle node's port check deferred for disk pressure; it is never carried, so no
-    idle pay comes from the republished ports. Neither does a run whose login uid could not be read (LOGIN_USER_UNREAD)."""
+    idle pay comes from the republished ports."""
     standing_by_miner: dict[str, list[JobResult]] = {}
     withheld: list[WithheldVerdict] = []
     for miner_hotkey, results in job_results.items():
@@ -555,9 +554,7 @@ def withhold_renter_gpu_reset_verdicts(
         for result in results:
             redis_fault = result.failure_reason_code == VALIDATOR_REDIS_UNAVAILABLE
             port_check_deferred = result.failure_reason_code == _PORT_CHECK_DEFERRED
-            # the login uid could not be read: the run stopped before any check, so it says nothing about the node
-            login_unread = result.failure_reason_code == LoginUserMessages.UNREAD.reason
-            if not (redis_fault or port_check_deferred or login_unread or _held_for_renter_gpu_reset(result)):
+            if not (redis_fault or port_check_deferred or _held_for_renter_gpu_reset(result)):
                 standing_by_miner[miner_hotkey].append(result)
                 continue
             withheld.append(
@@ -576,8 +573,6 @@ def withhold_renter_gpu_reset_verdicts(
                     if redis_fault
                     else "Verdict withheld: the port check was deferred for disk pressure"
                     if port_check_deferred
-                    else "Verdict withheld: the validator's login uid could not be read"
-                    if login_unread
                     else "Verdict withheld: the renter is resetting the node's GPUs, its power tier is unknown, or the task had no time left for a check",
                     extra={
                         "miner_hotkey": miner_hotkey,
