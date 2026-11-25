@@ -414,6 +414,26 @@ async def _operation_state(
     ssh_client: asyncssh.SSHClientConnection,
     files: StorageOperationFiles,
 ) -> str:
+    result = await ssh_client.run(_operation_state_command(files), check=False)
+    return (result.stdout or "").strip()
+
+
+async def report_killed_detached_helper(
+    run: Callable[[str], Awaitable[str | None]], operation_id: str
+) -> bool:
+    """An online job's helper killed whole (OOM, docker kill) cannot report, and no validator is waiting
+    on it: the periodic pass reports it when it sees it. True when it did (the operation is over)."""
+    files = StorageOperationFiles.for_operation(UUID(operation_id))
+    if ((await run(_operation_state_command(files))) or "").strip() != f"STATUS:{KILLED_EXIT}":
+        return False
+    spec = _parse_spec(await run(f"cat {shlex.quote(str(files.spec))}"))
+    if spec is None or not await report_killed_helper(UUID(operation_id), spec):
+        return False
+    await run(_remove_operation_artifacts_command(files))
+    return True
+
+
+def _operation_state_command(files: StorageOperationFiles) -> str:
     status_path = shlex.quote(str(files.status))
     pid_path = shlex.quote(str(files.pid))
     helper = shlex.quote(files.helper)
@@ -421,7 +441,7 @@ async def _operation_state(
         f'{{{{index .Config.Labels "{WRAPPER_LABEL}"}}}} {{{{.State.Status}}}} '
         "{{.State.ExitCode}} {{.State.OOMKilled}}"
     )
-    command = (
+    return (
         # a helper running storage_runner.py is the operation: it survives an executor restart, the files do not.
         # A killed one cannot report: OOMKilled reads as exit 137.
         f"if state=$(/usr/bin/docker inspect -f {shlex.quote(inspect_format)} {helper} 2>/dev/null) "
@@ -435,8 +455,6 @@ async def _operation_state(
         '(*) if kill -0 "$pid" 2>/dev/null; then echo RUNNING; else echo EXITED; fi;; esac; '
         "else echo STARTING; fi"
     )
-    result = await ssh_client.run(command, check=False)
-    return (result.stdout or "").strip()
 
 
 async def cancel_storage_operation(
@@ -485,10 +503,12 @@ async def _read_operation_spec(
         f"cat {shlex.quote(str(spec_path))}",
         check=False,
     )
-    if result.exit_status != 0:
-        return None
+    return _parse_spec(result.stdout) if result.exit_status == 0 else None
+
+
+def _parse_spec(raw: str | None) -> Mapping[str, object] | None:
     try:
-        value = json.loads(result.stdout or "")
+        value = json.loads(raw or "")
     except json.JSONDecodeError:
         return None
     return value if isinstance(value, Mapping) else None
@@ -564,7 +584,11 @@ async def _remove_operation_artifacts(
     ssh_client: asyncssh.SSHClientConnection,
     files: StorageOperationFiles,
 ) -> None:
-    await ssh_client.run(
+    await ssh_client.run(_remove_operation_artifacts_command(files), check=False)
+
+
+def _remove_operation_artifacts_command(files: StorageOperationFiles) -> str:
+    return (
         "rm -f "
         + " ".join(
             shlex.quote(str(path))
@@ -574,8 +598,7 @@ async def _remove_operation_artifacts(
             f"; /usr/bin/docker rm -f -- {shlex.quote(files.helper)} >/dev/null 2>&1 || true"
             if files.helper
             else ""
-        ),
-        check=False,
+        )
     )
 
 
@@ -593,8 +616,8 @@ async def report_launch_failure(
     )
 
 
-async def report_killed_helper(operation_id: UUID, spec: Mapping[str, object]) -> None:
-    await _report_operation_status(
+async def report_killed_helper(operation_id: UUID, spec: Mapping[str, object]) -> bool:
+    return await _report_operation_status(
         operation_id,
         spec,
         status="FAILED",

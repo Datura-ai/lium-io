@@ -5,7 +5,7 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 
@@ -320,3 +320,33 @@ def test_detached_wrapper_keeps_the_log_only_when_the_runner_fails(
         assert log.read_text().splitlines() == ["working", "runner exited 3"]
     else:
         assert not log.exists()
+
+
+@pytest.mark.asyncio
+async def test_the_periodic_pass_reports_an_online_helper_killed_whole(monkeypatch):
+    killed = AsyncMock(return_value=True)
+    monkeypatch.setattr(storage_operations, "report_killed_helper", killed)
+    operation_id = str(uuid4())
+    commands: list[str] = []
+
+    async def run(command: str) -> str:
+        commands.append(command)
+        if command.startswith("cat "):
+            return '{"reporter": {"api_url": "https://x", "auth_token": "t", "resource": "backup"}}'
+        return "STATUS:137\n" if "docker inspect" in command else ""
+
+    assert await storage_operations.report_killed_detached_helper(run, operation_id) is True
+    killed.assert_awaited_once()
+    assert "docker rm -f" in commands[-1]
+
+
+@pytest.mark.asyncio
+async def test_the_periodic_pass_leaves_a_running_helper_alone(monkeypatch):
+    killed = AsyncMock(return_value=True)
+    monkeypatch.setattr(storage_operations, "report_killed_helper", killed)
+
+    async def run(command: str) -> str:
+        return "RUNNING\n"
+
+    assert await storage_operations.report_killed_detached_helper(run, str(uuid4())) is False
+    killed.assert_not_awaited()
