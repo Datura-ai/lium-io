@@ -189,6 +189,8 @@ ORIGINAL_KEYS = {
     'ib_driver': "driver",
     'data_boot_id': "boot_id",
     'data_egress_ip': "egress_ip",
+    # liumd only: each IP echo service's answer, so the backend can tell answers that disagree from no answer
+    'data_egress_ips': "egress_ips",
     'data_container_cap_eff': "container_cap_eff",
     'data_executor_pid_mode_scrape_error': "executor_pid_mode_scrape_error",
     'data_executor_pid_mode': "executor_pid_mode",

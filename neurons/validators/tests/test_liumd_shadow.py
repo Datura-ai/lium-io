@@ -525,6 +525,7 @@ async def test_live_and_python_timeout_fields_are_not_a_specs_difference(
     liumd_specs = {
         **LIUMD_SCRAPE,
         "egress_ip": "2.2.2.2",
+        "egress_ips": {"www.cloudflare.com": "2.2.2.2", "api.ipify.org": "2.2.2.2"},
         "infiniband_ports": [{"state": "down"}],
         "needrestart_guard": "present",
         "needrestart_guard_unguarded": [],
