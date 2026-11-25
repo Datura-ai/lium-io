@@ -405,7 +405,7 @@ async def test_an_exited_helper_with_its_job_open_is_reported_through_the_held_r
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("state", ["RUNNING\n", "STATUS:0\n"])
+@pytest.mark.parametrize("state", ["RUNNING\n", "STATUS:0\n", "STATUS:130\n"])
 async def test_a_running_or_succeeded_helper_is_not_reported(monkeypatch, state):
     report = AsyncMock(return_value=True)
     monkeypatch.setattr(storage_operations, "_report_operation_status", report)
@@ -425,3 +425,17 @@ async def test_a_planted_node_spec_with_no_held_reporter_sends_nothing(monkeypat
         _node("STATUS:137\n", []), _HeldRedis(), str(OPERATION_ID)
     )
     report.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_forget_matches_the_record_and_reporter_whatever_the_id_case():
+    removed: list[str] = []
+    redis = await _held()
+    redis.smembers = AsyncMock(return_value={f"{OPERATION_ID}|1".encode()})
+    redis.srem = AsyncMock(side_effect=lambda key, raw: removed.append(raw))
+    redis.delete = AsyncMock(side_effect=lambda key: redis.values.pop(key, None))
+
+    await storage_operations.forget_storage_helper(redis, "executor", str(OPERATION_ID).upper())
+
+    assert removed == [f"{OPERATION_ID}|1"]
+    assert redis.values == {}

@@ -92,7 +92,7 @@ async def _raw_records(redis: RedisService, executor_id: str) -> list[str]:
 
 
 def _reporter_key(operation_id: UUID | str) -> str:
-    return f"{STORAGE_REPORTER_PREFIX}{operation_id}"
+    return f"{STORAGE_REPORTER_PREFIX}{UUID(str(operation_id))}"
 
 
 async def note_started_storage_helper(
@@ -105,7 +105,7 @@ async def note_started_storage_helper(
     for it: a later report on the operation (killed helper, cancel) never takes its target from the node."""
 
     async def note() -> None:
-        record = StorageHelperRecord(str(operation_id), int(time.time()))
+        record = StorageHelperRecord(str(UUID(str(operation_id))), int(time.time()))
         await redis.sadd(_key(executor_id), record.format())
         await redis.expire(_key(executor_id), STARTED_STORAGE_HELPERS_TTL_SECONDS)
         if spec and isinstance(spec.get("reporter"), Mapping):
@@ -127,7 +127,7 @@ async def forget_storage_helper(
     async def forget() -> None:
         for raw in await _raw_records(redis, executor_id):
             record = StorageHelperRecord.parse(raw)
-            if record and record.operation_id == str(operation_id):
+            if record and record.operation_id == str(UUID(str(operation_id))):
                 await redis.srem(_key(executor_id), raw)
         await redis.delete(_reporter_key(operation_id))
 
@@ -445,8 +445,8 @@ async def report_exited_detached_helper(
     files = StorageOperationFiles.for_operation(UUID(operation_id))
     state = ((await run(_operation_state_command(files))) or "").strip()
     exit_code = state.removeprefix("STATUS:").strip()
-    if not state.startswith("STATUS:") or exit_code == "0":
-        # exit 0: the runner reported success, which may just not have landed yet
+    if not state.startswith("STATUS:") or exit_code in ("0", "130"):
+        # 0 and 130 (cancelled): the runner reported for itself, and its report may just not have landed yet
         return False
     spec = await _held_reporter_spec(redis, operation_id)
     if spec is None or not await _report_operation_status(
