@@ -53,6 +53,7 @@ _SETUP_SCRIPT = r'''
 import fcntl
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -75,11 +76,27 @@ TOO_LITTLE_TIME_TO_PROBE = "too little of the validator's deadline left to probe
 # the validator's state check prints the same: the ID changes with every install, DATA_DIR with `plugin set`
 INSTALLATION_FORMAT = "{{.Id}} {{json .Settings.Env}}"
 
+# the docker call running now, so a reason names the step that hung or failed
+step = "start"
+
+class DockerTimeout(RuntimeError):
+    pass
+
 def end_on_validator_deadline(*_):
     # the validator ends this script with `timeout -k 5`: the reason goes out before the cleanup
     # below runs, so its SIGKILL cannot leave stderr empty
-    print("setup cut short by the validator's deadline", file=sys.stderr, flush=True)
+    print("setup cut short by the validator's deadline during " + step, file=sys.stderr, flush=True)
     sys.exit(1)
+
+def without_credentials(url):
+    # user info ends at the URL's last "@" (a password may hold "@" or "/" unencoded); the query (a signed URL's
+    # signature or token) is a credential too
+    return "://" + re.split(r"[?#]", url.group(1).rpartition("@")[2], maxsplit=1)[0]
+
+def stderr_of(result):
+    # docker's own message on one line, each URL cut to scheme, host and path
+    text = re.sub(r"://([^\s\"']*)", without_credentials, result.stderr or "").strip()[-300:]
+    return ": " + " ".join(text.split()) if text else ""
 
 signal.signal(signal.SIGTERM, end_on_validator_deadline)
 data_dir = "/srv" + root + "/vloopback-" + generation
@@ -90,6 +107,15 @@ def seconds_before_probe_reserve():
     return validator_deadline - PROBE_RESERVE_SECONDS - time.monotonic()
 
 def run_docker(*args, timeout=None):
+    global step
+    called = step = "docker " + " ".join(args[:2])
+    try:
+        return run_docker_step(args, timeout)
+    finally:
+        # a call that returned is no longer where setup waits: a later host read or write names itself
+        step = "the step after " + called
+
+def run_docker_step(args, timeout):
     if timeout is None and probe_image:
         # a probed setup's calls before the probe end where its reserve begins: however long the lock
         # and they took, a failed probe still has the time to clean up and disable the plugin
@@ -97,14 +123,19 @@ def run_docker(*args, timeout=None):
             return subprocess.run([docker, *args], capture_output=True, text=True, check=False,
                                   timeout=max(1, seconds_before_probe_reserve()))
         except subprocess.TimeoutExpired:
-            raise RuntimeError(TOO_LITTLE_TIME_TO_PROBE) from None
-    return subprocess.run([docker, *args], capture_output=True, text=True, check=False,
-                          timeout=120 if timeout is None else timeout)
+            raise RuntimeError(TOO_LITTLE_TIME_TO_PROBE + " (" + step + " timed out)") from None
+    try:
+        return subprocess.run([docker, *args], capture_output=True, text=True, check=False,
+                              timeout=120 if timeout is None else timeout)
+    except subprocess.TimeoutExpired:
+        raise DockerTimeout(step + " timed out") from None
 
 def call(*args):
     return run_docker("plugin", *args)
 
 def read_probe_marker():
+    global step
+    step = "the read of the probe marker"
     try:
         with open(marker_path) as marker:
             return marker.read().strip()
@@ -148,12 +179,12 @@ def mount_probe_volume():
         created = run_docker("volume", "create", "-d", alias, "-o", "size=1g", "-o", "sparse=true", probe_volume,
                              timeout=max(1, deadline - time.monotonic()))
         if created.returncode:
-            raise RuntimeError("probe volume create failed: " + created.stderr.strip()[-300:])
+            raise RuntimeError("probe volume create failed" + stderr_of(created))
         mounted = run_docker("run", "--rm", "--name", probe_container, "--network", "none",
                              "-v", probe_volume + ":/mnt", probe_image, "sh", "-c", "echo probe > /mnt/probe && sync /mnt/probe",
                              timeout=max(1, deadline - time.monotonic()))
         if mounted.returncode:
-            raise RuntimeError("probe volume mount failed: " + mounted.stderr.strip()[-300:])
+            raise RuntimeError("probe volume mount failed" + stderr_of(mounted))
     except BaseException:
         remove_probe_leftovers()
         raise
@@ -176,13 +207,15 @@ def disable_plugin(plugin_id):
         try:
             if run_docker("plugin", "disable", plugin_id, timeout=try_seconds).returncode == 0:
                 return
-        except subprocess.TimeoutExpired:
+        except DockerTimeout:
             pass
     raise RuntimeError("the plugin could not be disabled")
 
 def read_saved_config(plugin_id):
+    global step
     if len(plugin_id) != 64 or any(c not in "0123456789abcdef" for c in plugin_id):
         raise RuntimeError("invalid plugin ID")
+    step = "the read of the plugin's saved config"
     with open(plugins_dir + "/" + plugin_id + "/config.json") as source:
         return json.load(source)
 
@@ -226,7 +259,10 @@ try:
         raise RuntimeError("invalid Docker data root")
     os.makedirs(os.path.dirname(lock_path), exist_ok=True)
     with open(lock_path, "a") as lock:
+        # another setup on this host may hold the lock for most of the deadline: a SIGTERM here names the wait
+        step = "the wait for the setup lock"
         fcntl.flock(lock, fcntl.LOCK_EX)
+        step = "start"
         # the backend's health check compares the marker with the plugin's ID and settings but not with
         # the pinned digest, which it does not know: a marker of another build goes before anything
         # below can fail, so both sides see the same fallback, and one of another installation (the
@@ -244,11 +280,11 @@ try:
         if plugin is None:
             # The daemon may complete an install even if its client reports failure. Inspect
             # the actual result under the lock before deciding whether setup succeeded.
-            call("install", tag, "--disable", "--alias", alias, "--grant-all-permissions",
-                 "DATA_DIR=" + data_dir, "STATE_DIR=" + state_dir)
+            installed = call("install", tag, "--disable", "--alias", alias, "--grant-all-permissions",
+                             "DATA_DIR=" + data_dir, "STATE_DIR=" + state_dir)
             plugin = inspect()
-        if plugin is None:
-            raise RuntimeError("installation did not produce a plugin")
+            if plugin is None:
+                raise RuntimeError("installation did not produce a plugin" + stderr_of(installed))
         plugin_id = plugin["Id"]
         saved = read_saved_config(plugin_id)
         if saved.get("Manifest") != digest or saved.get("plugin", {}).get("Id") != plugin_id:
@@ -257,14 +293,15 @@ try:
         for name, value in (("DATA_DIR", data_dir), ("STATE_DIR", state_dir)):
             if [entry for entry in env if entry.startswith(name + "=")] != [name + "=" + value]:
                 raise RuntimeError("data/state directories do not match this Docker data root")
+        enabled = None
         if not plugin["Enabled"]:
             if probe_image and seconds_before_probe_reserve() <= 0:
                 # enabled now, the plugin would have no time left to be probed or disabled again
                 raise RuntimeError(TOO_LITTLE_TIME_TO_PROBE)
-            call("enable", plugin_id)
+            enabled = call("enable", plugin_id)
             plugin = inspect()
         if not plugin or plugin["Id"] != plugin_id or plugin["Enabled"] is not True:
-            raise RuntimeError("verified plugin remains disabled")
+            raise RuntimeError("verified plugin remains disabled" + (stderr_of(enabled) if enabled else ""))
         verified_probe_proof = probe_proof() if probe_image else None
         if verified_probe_proof is not None and read_probe_marker() != verified_probe_proof:
             # also for a plugin found enabled: an enabled plugin without the marker was never proven
@@ -278,6 +315,7 @@ try:
                 except RuntimeError as disable_error:
                     reason += "; " + str(disable_error)
                 raise RuntimeError(reason) from None
+            step = "the write of the probe marker"
             with open(marker_path, "w") as marker:
                 marker.write(verified_probe_proof)
         print("verified plugin ready")

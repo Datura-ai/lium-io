@@ -25,13 +25,16 @@ from ..host_disk import (
     parse_disk_pressure,
 )
 from ..messages import RentedThroughputMessages as Msg
-from ..messages import render_message
+from ..messages import render_message, rented_throughput_remediation
 from ..pipeline import CheckResult, Context
 from ..runner import SSHCommandResult
 from .container_download_speed import (
+    _DOWNLOAD_SCRIPT,
     _FETCH_SCRIPT,
     _TIMEOUT_EXITS,
+    _UPLOAD_NAMES,
     ContainerDownloadSpeedCheck,
+    _is_slow,
     download_speed_command,
     parse_download_speed,
 )
@@ -45,10 +48,24 @@ DISK_TIMEOUT_SECONDS = 60
 # the 2 s busy window, the disk-pressure reading (2 s snapshots, syncfs poll cap), the disk probe (direct, then
 # buffered), both fetches and a second container start
 COMMAND_TIMEOUT_SECONDS = 270 + SNAPSHOT_SECONDS + SYNCFS_POLL_SECONDS
+# the upload's own fetch time; it runs only while the fleet rule is enforced, so record-only it costs no cycle time
+UPLOAD_SECONDS = 30
 PROBE_SKIPPED_MARKER = "lium_dp_skipped"
 # a reading needs its full command timeout plus the checks after it; started later, the task deadline cuts it off
 # and the node's whole cycle is dropped without a result (316223c6, 30 Oct 17:49Z)
 MIN_TASK_SECONDS_LEFT = COMMAND_TIMEOUT_SECONDS + 30
+
+
+def _with_upload() -> bool:
+    return bool(settings.CONTAINER_SPEED_FLEET_RULE_ENFORCED)
+
+
+def command_timeout_seconds() -> int:
+    return COMMAND_TIMEOUT_SECONDS + (UPLOAD_SECONDS if _with_upload() else 0)
+
+
+def min_task_seconds_left() -> int:
+    return MIN_TASK_SECONDS_LEFT + (UPLOAD_SECONDS if _with_upload() else 0)
 # due readings skipped for lack of cycle time, in a row, that count as a failed reading (the provider controls how long
 # the earlier checks take, so endless late cycles must not keep the score)
 LATE_SKIPS_BEFORE_VERDICT = 3
@@ -158,7 +175,7 @@ def throughput_command(
     probe = (
         download_speed_command(sysbox, _DISK_SCRIPT)
         + "; snap; "
-        + download_speed_command(sysbox, _FETCH_SCRIPT)
+        + download_speed_command(sysbox, _FETCH_SCRIPT if _with_upload() else _DOWNLOAD_SCRIPT)
         + "; snap"
     )
     if not read_pressure:
@@ -371,10 +388,18 @@ def slow_detail(state: _State) -> str:
     reading = state.reading
     parts = []
     if state.net_failures >= READINGS_BEFORE_VERDICT:
-        need = reading.get("min_mbps")
         # only what this reading's network verdict confirmed; a later unjudged reading names no endpoint
         slow = reading.get("net_failed") or []
-        parts.append(f"network: {', '.join(slow)} measured, {need:g} Mbps required" if slow and need else "network")
+        # each failed endpoint against its own minimum: an upload is judged by the upload one (lio#2411)
+        mins = {"download": reading.get("min_mbps"), "upload": reading.get("min_upload_mbps", reading.get("min_mbps"))}
+        kinds = sorted({"upload" if entry.split(" ", 1)[0] in _UPLOAD_NAMES else "download" for entry in slow})
+        if not slow or not all(mins[kind] for kind in kinds):
+            parts.append("network")
+        elif len({mins[kind] for kind in kinds}) == 1:
+            parts.append(f"network: {', '.join(slow)} measured, {mins[kinds[0]]:g} Mbps required")
+        else:
+            need = ", ".join(f"{mins[kind]:g} Mbps {kind}" for kind in kinds)
+            parts.append(f"network: {', '.join(slow)} measured, {need} required")
     if state.disk_failures >= READINGS_BEFORE_VERDICT:
         mb, need = (reading.get("disk") or {}).get("mb_per_s"), reading.get("disk_min_mb_per_s")
         # a standing verdict can carry a later passing, excused or unjudged write; only a write this reading judged
@@ -491,7 +516,7 @@ class RentedThroughputCheck:
             await self._bounded_save(ctx, key, state)
         if now < state.next_due_at():
             return self._verdict(ctx, state, probed=False)
-        if task_seconds_left(ctx) < MIN_TASK_SECONDS_LEFT:
+        if task_seconds_left(ctx) < min_task_seconds_left():
             # no reading this cycle: a standing SLOW stays, otherwise skip; still due, so the next cycle measures
             if state.failures_in_a_row >= READINGS_BEFORE_VERDICT:
                 return self._verdict(ctx, state, probed=False)
@@ -571,7 +596,7 @@ class RentedThroughputCheck:
                 read_pressure=settings.DISK_PRESSURE_CHECK_ENABLED,
                 skip_under_pressure=skip_under_pressure,
             ),
-            timeout=COMMAND_TIMEOUT_SECONDS,
+            timeout=command_timeout_seconds(),
             retryable=False,
         )
         stdout = result.stdout or ""
@@ -589,6 +614,9 @@ class RentedThroughputCheck:
                 _m("Rented throughput: unsolicited skip marker in the output", extra=get_extra_info(ctx.default_extra))
             )
         endpoints = parse_download_speed(stdout)
+        if not _with_upload():
+            # the command sent no upload, so its missing line is not a probe that died early
+            endpoints = [r for r in endpoints if r.endpoint not in _UPLOAD_NAMES]
         disk = parse_disk(stdout)
         net_mbps, disk_busy = parse_busy(stdout)
         during_net, (during_disk, during_iops) = parse_during(stdout)
@@ -609,13 +637,24 @@ class RentedThroughputCheck:
             settings.DISK_PRESSURE_GATE_ENFORCEMENT_ENABLED and pressure is not None and pressure.pressure
         )
 
-        judged = await ContainerDownloadSpeedCheck()._judge(endpoints)
         # a bridge fallback (rentals network not inspectable) did not measure the renter's path
         off_rentals = not endpoints or any(r.network != RENTAL_NETWORK_NAME for r in endpoints)
         net_unsure = net_busy or net_mbps is None or off_rentals
+
+        def net_load(during: tuple[Any, Any]) -> bool:
+            return during[0] is not None and during[0] >= DURING_NET_MBPS
+
+        # the fleet window holds only readings this check judges: an unsure or incomplete measurement is never a pass
+        # or a fail here, and _excuse turns a slow reading under renter load into no verdict
+        loaded = net_load(own) or net_load(maybe)
+        partial = any(r.error == "no_output" for r in endpoints)  # the probe died before reporting every endpoint
+        judged_here = (
+            [] if net_unsure or net_incomplete or partial else [r for r in endpoints if not (loaded and _is_slow(r))]
+        )
+        judged = await ContainerDownloadSpeedCheck()._judge(ctx, endpoints, fleet=judged_here)
         if judged.is_failing:
             net = "fail"
-        elif any(r.error == "no_output" for r in endpoints):
+        elif partial:
             # the fetch container did not start or died before reporting: nothing measured, no strike
             net = "inconclusive"
         elif judged.has_no_verdict:
@@ -623,9 +662,6 @@ class RentedThroughputCheck:
             net = "none"
         else:
             net = "none" if net_unsure else "pass"
-
-        def net_load(during: tuple[Any, Any]) -> bool:
-            return during[0] is not None and during[0] >= DURING_NET_MBPS
 
         def disk_load(during: tuple[Any, Any]) -> bool:
             mb, iops = during[1]
@@ -657,6 +693,7 @@ class RentedThroughputCheck:
             "network_verdict": net,
             "disk_verdict": disk_side,
             "min_mbps": settings.CONTAINER_DOWNLOAD_SPEED_MIN_MBPS,
+            "min_upload_mbps": settings.CONTAINER_UPLOAD_SPEED_MIN_MBPS,
             "disk_min_mb_per_s": settings.RENTED_THROUGHPUT_DISK_MIN_MB_PER_S,
         }
         if net == "fail":
@@ -690,6 +727,17 @@ class RentedThroughputCheck:
             reading["error"] = f"{result.error_type}: {(result.error_message or '')[-200:]}"
         return reading
 
+    @staticmethod
+    def _remediation(state: _State, template) -> str:
+        """SLOW's instructions name the network side its confirmed readings failed on; NOT_RUN keeps its own."""
+        if template is not Msg.SLOW:
+            return template.remediation
+        failed = [e.split(" ", 1)[0] for e in (state.reading.get("net_failed") or [])]
+        upload = any(name in _UPLOAD_NAMES for name in failed)
+        return rented_throughput_remediation(
+            upload=upload, download=not upload or any(name not in _UPLOAD_NAMES for name in failed)
+        )
+
     def _verdict(self, ctx: Context, state: _State, *, probed: bool) -> CheckResult:
         what: dict[str, Any] = {
             **state.reading,
@@ -707,7 +755,7 @@ class RentedThroughputCheck:
                 ctx=ctx,
                 check_id=self.check_id,
                 what={**what, "failed": detail} if detail else what,
-                remediation=f"failed: {detail}. {template.remediation}" if detail else None,
+                remediation=f"failed: {detail}. {self._remediation(state, template)}" if detail else None,
             )
             # NOT_RUN measured nothing, so scoring and the portal must not call it slow
             updates = (

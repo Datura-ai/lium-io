@@ -394,6 +394,8 @@ async def test_rental_verification_nvml_mismatch_clears_verified_job_info():
     assert "failed to initialize NVML" in result.event.what_we_saw["stderr"]
     assert result.updates["clear_verified_job_info"] is True
     assert "clear_verified_job_reason" not in result.updates
+    # judged on a node the backend saw unrented: idle-only, so a rental placed since keeps its node
+    assert result.updates["clear_verified_job_unrented_only"] is True
 
 
 @pytest.mark.asyncio
@@ -1655,3 +1657,53 @@ async def test_a_pod_the_backend_is_still_removing_is_no_rental_and_the_check_fa
     assert result.passed is False
     assert result.event.reason_code == Msg.PROBE_SKIPPED_FOR_AN_UNLISTED_POD.reason
     assert result.event.reason_code not in CYCLE_END_READ_REASONS
+
+
+# DAH-6784: only a container check the backend really ran on an idle node lists the check as passed in full
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("reason_code", "listed"),
+    [(None, True), ("skipped_filler", False), ("raced_rent", False)],  # skipped_rented fails as a rental (see above)
+)
+async def test_only_a_health_check_the_backend_really_ran_is_the_full_check(reason_code, listed):
+    backend_client = DummyBackendClient(
+        response=ExecutorHealthCheckResponse(success=True, error=None, details={}, reason_code=reason_code)
+    )
+    services = build_services(backend=backend_client, container_cleanup=ContainerCleanup())
+    from tests.helpers import make_context
+
+    ctx = make_context(services=services, state=build_state(specs={"verified_ports": [8080]}))
+    with patch("neurons.validators.src.services.task.checks.rental_verification.settings"):
+        result = await RentalVerificationCheck().run(ctx)
+
+    assert result.passed is True
+    assert (result.updates.get("idle_check_passed") is True) is listed
+
+
+@pytest.mark.asyncio
+async def test_a_pass_on_a_rented_node_is_not_the_full_check():
+    backend_client = DummyBackendClient(response=ExecutorHealthCheckResponse(success=True, error=None, details={}))
+    ctx = _filler_context(
+        backend_client=backend_client,
+        ssh_client=FillerSSHClient(running=True),
+        running_fillers=False,
+        rented_pods=[RentedPod(pod_id="pod-1", container_name="c1")],
+    ).model_copy(update={"rented": True})  # the pipeline sets ctx.rented from the cycle's snapshot
+
+    result = await _run_filler_check(ctx)
+
+    assert result.passed is True and "idle_check_passed" not in result.updates
+
+
+@pytest.mark.asyncio
+async def test_a_verified_filler_is_not_the_full_check():
+    """With a filler on the node the check verifies the filler and runs no container check of its own."""
+    backend_client = DummyBackendClient(response=ExecutorHealthCheckResponse(success=True, error=None, details={}))
+    ctx = _filler_context(backend_client=backend_client, ssh_client=FillerSSHClient(running=True))
+
+    result = await _run_filler_check(ctx)
+
+    assert result.passed is True and "idle_check_passed" not in result.updates
+    assert backend_client.called_with is None

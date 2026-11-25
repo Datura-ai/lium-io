@@ -248,7 +248,7 @@ async def test_ssh_timeout_returns_timed_out_result_and_kills_remote(service_wit
     assert run_mock.await_count == 2
     pkill_cmd = run_mock.await_args_list[1].args[0]
     assert "pkill -9 -f" in pkill_cmd
-    assert "decrypt_challenge.py" in pkill_cmd
+    assert "decrypt_challenge" in pkill_cmd
 
 
 @pytest.mark.asyncio
@@ -298,7 +298,7 @@ async def test_cancelling_the_lane_mid_matmul_kills_the_remote_process(service_w
         await lane
     assert len(commands) == 2
     assert "pkill -9 -f" in commands[1]
-    assert "decrypt_challenge.py" in commands[1]
+    assert "decrypt_challenge" in commands[1]
 
 
 @pytest.mark.asyncio

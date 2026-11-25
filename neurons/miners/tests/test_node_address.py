@@ -1,5 +1,6 @@
 """The miner's requests to a node never reach its own network (services/node_address.py)."""
 
+import ipaddress
 import socket
 
 import pytest
@@ -46,6 +47,14 @@ async def local_node():
 )
 def test_internal_addresses_are_not_public(address):
     assert not is_public_address(address)
+
+
+def test_a_dev_stack_admits_only_its_own_private_network(monkeypatch):
+    assert not is_public_address("10.20.30.40")  # secret-scan: allow
+    monkeypatch.setattr(node_address, "ALLOWED_PRIVATE_NETWORKS", (ipaddress.ip_network("10.20.0.0/16"),))  # secret-scan: allow
+    assert is_public_address("10.20.30.40")  # secret-scan: allow
+    assert not is_public_address("10.21.0.1") and not is_public_address("192.168.7.7")  # secret-scan: allow
+    assert not is_public_address("127.0.0.1") and not is_public_address("169.254.169.254")
 
 
 def test_public_addresses_are_public():

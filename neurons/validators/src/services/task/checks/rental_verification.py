@@ -305,7 +305,11 @@ class RentalVerificationCheck:
                 return CheckResult(
                     passed=True,
                     event=event,
-                    updates={},
+                    # DAH-6784: only a container check the backend really ran is the full check; a success it
+                    # answered with a reason (skipped as rented or for a filler, a raced create) ran none
+                    updates={"idle_check_passed": True}
+                    if not has_customer_rental and response.reason_code is None
+                    else {},
                 )
             elif response.reason_code == CPU_QUOTA_EXCEEDS_HOST_REASON:
                 return self._cpu_quota_verdict(ctx, response)
@@ -335,6 +339,9 @@ class RentalVerificationCheck:
                         "job_score": 0.0,
                         "score_warning": quarantine.score_warning,
                         "clear_verified_job_info": True,
+                        # the backend runs the failing container check only on a node it saw unrented: a rental
+                        # placed since keeps its node, the reset applies only while no customer pod runs there
+                        "clear_verified_job_unrented_only": True,
                     },
                 )
             elif (response.error or "").endswith("visible: []"):
