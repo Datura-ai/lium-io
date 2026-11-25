@@ -24,7 +24,7 @@ import logging
 import os
 import time
 from collections import Counter
-from collections.abc import Callable, Iterator
+from collections.abc import Awaitable, Callable, Iterator
 from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -34,6 +34,7 @@ from clients.validator_portal_api import PortalExecutor, ValidatorPortalAPI, sta
 from payload_models.payloads import MinerJobEnryptedFiles, MinerJobRequestPayload
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from services.executor_image_policy import ExpectedImageSnapshot
+from services.executor_rollout import RolloutWindow, rollout_grace_reason
 from services.miner_service import EXPRESS_LANE, MinerService
 from services.redis_service import EXPRESS_REDIS_SLOT
 from services.task.messages import CYCLE_END_READ_REASONS, RentalVerificationMessages
@@ -127,6 +128,8 @@ class CycleInputs:
     # DAH-6013: executor id -> end (UTC) of the provider maintenance window the backend still holds it for. The
     # lane rechecks each node once its window has ended instead of leaving it to the next cycle.
     maintenance_ends: dict[str, datetime] = field(default_factory=dict)
+    # The cycle's job block: the rollout window is read for it (lio#2389 review)
+    job_block: int | None = None
 
 
 @dataclass
@@ -185,6 +188,7 @@ class ExpressLane:
         subtensor_client,
         cycle_inputs: Callable[[], CycleInputs | None],
         portal_api=ValidatorPortalAPI,
+        rollout_window: Callable[[int], Awaitable[RolloutWindow]] | None = None,
     ):
         self.miner_service = miner_service
         self.redis_service = redis_service
@@ -195,6 +199,8 @@ class ExpressLane:
         # before it.
         self.cycle_inputs = cycle_inputs
         self.portal_api = portal_api
+        # The validator's rollout read, the one the cycle end makes (a push in mid-cycle opens the window)
+        self.rollout_window = rollout_window
         self._pending: dict[str, _Pending] = {}
         # The wave leaves what this lane has queued to it (MinerService._claim_for_cycle), through
         # a view of this dict, never rebound, so the wave always reads the current queue.
@@ -698,6 +704,20 @@ class ExpressLane:
             rented = result.failure_reason_code == RentalVerificationMessages.RENTED_SINCE_THE_SNAPSHOT.reason
             self._defer(pending, RENTED_DURING_THE_CHECK if rented else NO_TASK_TIME_FOR_THE_RENTAL_PROBE)
             return
+        if await self._rollout_explains(result):
+            # lio#2389 review: a failure the executor-image rollout explains gets no verdict in the cycle; published
+            # here it would be a zero that takes a node updating right after the push off the rent list
+            self._left_to_cycle.add(executor_id)
+            self._pending.pop(executor_id, None)
+            logger.info(
+                _m(
+                    "[express] Executor left to the normal cycle: the rollout explains its failure",
+                    extra=get_extra_info(
+                        {"executor_uuid": executor_id, "reason_code": result.failure_reason_code, "attempt": pending.attempts}
+                    ),
+                )
+            )
+            return
         passed = result.score > 0 or result.job_score > 0
         should_run_first_pass_again = (
             not passed
@@ -808,6 +828,18 @@ class ExpressLane:
                 ),
             )
         )
+
+    async def _rollout_explains(self, result: JobResult) -> bool:
+        """Whether the rollout grace withholds this result, as `withhold_rollout_verdicts` does at the cycle end."""
+        inputs = self.cycle_inputs()
+        if self.rollout_window is None or inputs is None or inputs.job_block is None:
+            return False
+        try:
+            window = await self.rollout_window(inputs.job_block)
+        except Exception as exc:  # the cycle end decides then
+            logger.warning(_m("[express] Rollout window unreadable", extra=get_extra_info({"error": str(exc)})))
+            return False
+        return rollout_grace_reason(result, window, inputs.job_block) is not None
 
     def _defer(self, pending: _Pending, reason: str) -> None:
         """Try again after retry_seconds_for(reason), or after max_attempts_for(reason) asks leave

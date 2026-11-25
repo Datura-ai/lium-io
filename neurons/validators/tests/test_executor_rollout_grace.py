@@ -386,7 +386,11 @@ def test_an_ssh_drop_under_the_port_probe_during_the_rollout_is_withheld() -> No
 # --- DAH-6560/DAH-6845: the release just replaced reads CURRENT for PREVIOUS_RELEASE_CURRENT_CYCLES ---------------------------
 
 NEWER = "sha256:" + "d" * 64
-G = PREVIOUS_RELEASE_CURRENT_CYCLES  # 16 since DAH-6845
+G = 16  # DAH-6845: written out, so a constant set back to 8 fails the tests below
+
+
+def test_the_previous_release_reads_current_for_16_cycles() -> None:
+    assert PREVIOUS_RELEASE_CURRENT_CYCLES == G
 
 
 @pytest.mark.asyncio
