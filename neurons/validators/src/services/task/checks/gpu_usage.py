@@ -5,6 +5,7 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
+from typing import NamedTuple
 from uuid import UUID
 
 from protocol.vc_protocol.compute_requests import (
@@ -268,7 +269,8 @@ class GpuUsageCheck:
     ) -> CheckResult:
         """The legacy guard: flag GPU load owned by live processes outside our workloads."""
         process_names = {process.get("container_name") for process in gpu_processes}
-        filler_containers, backend_verdicts = await _fillers_of_this_node(ctx, process_names)
+        node_fillers = await _fillers_of_this_node(ctx, process_names)
+        filler_containers, backend_verdicts = node_fillers.fillers, node_fillers.backend_verdicts
         fillers_only = bool(filler_containers) and all(name in filler_containers for name in process_names)
         # judged at any load, also beside a rental pod: a swapped filler can hold VRAM while staying
         # under the utilization limits
@@ -700,7 +702,12 @@ async def _drop_containers_the_backend_still_owns(
     return [process for process in foreign_processes if verdicts.get(process.container_name, False) is False]
 
 
-async def _fillers_of_this_node(ctx: Context, process_names: set[str]) -> tuple[set[str], dict[str, bool | None]]:
+class NodeFillers(NamedTuple):
+    fillers: set[str]
+    backend_verdicts: dict[str, bool | None]
+
+
+async def _fillers_of_this_node(ctx: Context, process_names: set[str]) -> NodeFillers:
     """The node's fillers: the snapshot's, plus a filler started after it that the backend confirms (DAH-7071).
 
     A GPU-split node runs one filler per VRAM bundle (DAH-2465): the GPU is "clean" as long as every
@@ -711,18 +718,22 @@ async def _fillers_of_this_node(ctx: Context, process_names: set[str]) -> tuple[
     """
     rented_data = ctx.state.rented_data
     if rented_data is None:
-        return set(), {}
+        return NodeFillers(set(), {})
     snapshot_fillers: set[str] = set(rented_data.get_filler_containers(ctx.executor.uuid))
     backend_verdicts: dict[str, bool | None] = await _backend_verdicts(
         ctx,
         {name for name in process_names - snapshot_fillers if name and name.startswith(FILLER_CONTAINER_PREFIX)},
     )
-    return snapshot_fillers | {name for name, is_ours in backend_verdicts.items() if is_ours}, backend_verdicts
+    return NodeFillers(
+        snapshot_fillers | {name for name, is_ours in backend_verdicts.items() if is_ours}, backend_verdicts
+    )
 
 
 async def _backend_verdicts(ctx: Context, container_names: set[str]) -> dict[str, bool | None]:
     """The backend's answer per Lium-named container: True ours, False not ours, None no answer.
     A name another executor holds is never asked about."""
+    if not container_names:
+        return {}
     claimed_elsewhere: set[str] = _containers_claimed_by_another_executor(ctx)
     lium_named_containers: list[str] = sorted(name for name in container_names if _pod_name(name) not in claimed_elsewhere)
     if not lium_named_containers:

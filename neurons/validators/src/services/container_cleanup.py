@@ -346,7 +346,7 @@ class ContainerCleanup:
                     continue
 
                 age_minutes = await self._get_container_age_minutes(ssh_client, stripped_name)
-                if age_minutes and age_minutes > self._stale_after_minutes(stripped_name, rented_data):
+                if age_minutes and age_minutes > self._removal_age_minutes_for_unlisted_container(stripped_name, rented_data):
                     if legacy and not await self._legacy_ended(lium_workload_ended, stripped_name):
                         continue
                     if (
@@ -417,14 +417,14 @@ class ContainerCleanup:
 
         return len(removed_names), removed_names, unremovable_names
 
-    def _stale_after_minutes(self, name: str, rented_data: Optional[RentedExecutorsResponse]) -> float:
+    def _removal_age_minutes_for_unlisted_container(self, name: str, rented_data: Optional[RentedExecutorsResponse]) -> float:
         """Minutes old an unlisted container must be before it is removed.
 
         DAH-7071: a filler_ container older than the rented list it is missing from is no live run, so
         it goes once its age (host clock) passes the validator's time since the list was read, plus a
         margin. pod_ and health_check_ containers, and a list with no read time, keep the fixed grace.
         """
-        read_started_at = rented_data._read_started_at if isinstance(rented_data, RentedExecutorsResponse) else None
+        read_started_at = rented_data.read_started_at if isinstance(rented_data, RentedExecutorsResponse) else None
         if not name.startswith(FILLER_CONTAINER_PREFIX) or read_started_at is None:
             return self.stale_threshold_minutes
         return (time.monotonic() - read_started_at) / 60 + FILLER_LIST_READ_MARGIN_MINUTES

@@ -335,6 +335,10 @@ class RentedExecutorsResponse(BaseModel):
             if (filler_names := [name for name in names if name.startswith(FILLER_CONTAINER_PREFIX)])
         }
 
+    @property
+    def read_started_at(self) -> float | None:
+        return self._read_started_at
+
     def get_filler_containers(self, executor_uuid: str) -> list[str]:
         # The full list when the backend sends it; otherwise fall back to the legacy single map, so a
         # backend that predates the list field still protects its one filler.
