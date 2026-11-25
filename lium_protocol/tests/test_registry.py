@@ -54,3 +54,28 @@ def test_failed_request_codes_of_every_version_line_parse(code: str) -> None:
     )
     assert type(message) is FailedContainerRequest
     assert message.error_code is FailedContainerErrorCodes(code)
+
+
+def test_an_idle_only_reset_keeps_its_mark_through_a_round_trip() -> None:
+    # a consumer that parses through VALIDATOR_MESSAGES tells an idle-only reset from an unconditional one
+    from lium_protocol.validator_to_backend import VALIDATOR_MESSAGES, ResetVerifiedJobRequest
+
+    sent = ResetVerifiedJobRequest(validator_hotkey="v", miner_hotkey="m", executor_uuid="e", unrented_only=True)
+    parsed = VALIDATOR_MESSAGES.parse(sent.model_dump_json())
+    assert isinstance(parsed, ResetVerifiedJobRequest) and parsed.unrented_only is True
+    older = VALIDATOR_MESSAGES.parse(
+        '{"message_type":"ResetVerifiedJobRequest","validator_hotkey":"v","miner_hotkey":"m","executor_uuid":"e"}'
+    )
+    assert older.unrented_only is False
+
+
+def test_the_idle_only_checks_that_passed_keep_their_ids_through_a_round_trip() -> None:
+    # the backend lifts a hold an idle-only check left only when that check's id is listed
+    from lium_protocol.recorded import recorded
+    from lium_protocol.validator_to_backend import VALIDATOR_MESSAGES, ExecutorSpecRequest
+
+    [spec, *_] = [e["message"] for e in recorded("validator_to_backend") if e["expect"] == "ExecutorSpecRequest"]
+    assert VALIDATOR_MESSAGES.parse_obj(spec).idle_checks_passed is None  # an older validator sends none
+    sent = {**spec, "idle_checks_passed": ["executor.validate.rental_probe"]}
+    parsed = VALIDATOR_MESSAGES.parse(json.dumps(sent))
+    assert isinstance(parsed, ExecutorSpecRequest) and parsed.idle_checks_passed == ["executor.validate.rental_probe"]
