@@ -49,7 +49,6 @@ from services.docker_service import (
 from services.rental_docker_sdk import (
     ContainerExecResult,
     ContainerNameTakenOnRetry,
-    ContainerOfAnotherRegistration,
     ContainerRunSpec,
     ContainerStateSnapshot,
     RentalDockerOperationError,
@@ -6675,10 +6674,7 @@ async def test_rental_create_removes_the_failed_container_before_the_stale_mount
         async def run_container(self, spec):
             events.append("run")
             if events.count("run") == 1:
-                # the mount fails at start: the failure names the container the create made
-                failed = Exception(_VLOOPBACK_STALE_MOUNT_ERR)
-                failed.rental_container_id = "cid-failed"
-                raise failed
+                raise Exception(_VLOOPBACK_STALE_MOUNT_ERR)
             return "cid"
 
         async def remove_container(self, *, container_name, force, remove_volumes):
@@ -6698,7 +6694,7 @@ async def test_rental_create_removes_the_failed_container_before_the_stale_mount
     )
 
     assert container_id == "cid"
-    assert events == ["run", "rm cid-failed", "run"]
+    assert events == ["run", "rm pod_test", "run"]
 
 
 @contextlib.asynccontextmanager
@@ -6793,246 +6789,6 @@ async def test_rental_create_removes_only_its_own_leftover_container_on_a_name_c
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("conflict", ["409", "retry_found_another_registrations"])
-async def test_rental_create_keeps_a_same_name_container_while_another_registrations_create_of_the_pod_runs(
-    docker_service, monkeypatch, conflict,
-):
-    # DAH-6531: two registrations share a daemon and the pod's name; the other one's container is not a leftover
-    events: list[str] = []
-    registry = docker_service_module.inflight_creates
-    registered, release = asyncio.Event(), asyncio.Event()
-
-    async def replacement_create():
-        with registry.track("test", ("miner-b", "exec-2")):
-            registered.set()
-            await release.wait()
-
-    class FakeRentalClient:
-        async def run_container(self, spec):
-            events.append("run")
-            if conflict == "409":
-                raise Exception(
-                    '409 Client Error: Conflict ("Conflict. The container name "/pod_test" '
-                    'is already in use by container "25b3b093".")'
-                )
-            raise ContainerOfAnotherRegistration("a container named pod_test already exists for another registration")
-
-        async def container_status(self, *, container_name):
-            return "created"
-
-        async def remove_container(self, *, container_name, force, remove_volumes):
-            events.append(f"rm {container_name}")
-
-    monkeypatch.setattr(docker_service, "stream_log", AsyncMock())
-    other = asyncio.create_task(replacement_create(), context=contextvars.Context())
-    await registered.wait()
-    try:
-        with registry.track("test", ("miner-a", "exec")):
-            assert registry.is_only_create("test")  # its own registration's marker: still the only create
-            assert not registry.is_only_create_on_any_registration("test")
-            with pytest.raises(Exception):
-                await docker_service._run_rental_docker_create_with_port_retry(
-                    docker_client=FakeRentalClient(),
-                    ssh_client=Mock(),
-                    run_spec=ContainerRunSpec(image="img", name="pod_test"),
-                    container_name="pod_test",
-                    default_extra={},
-                    pod_id="test",
-                )
-    finally:
-        release.set()
-        await other
-    assert events == ["run"]
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "found_owner, status, expected_events, resumed",
-    [
-        # the replacement's create finished (no longer tracked) and its container exited: still not this create's
-        ("miner-b:exec-2", "exited", ["run"], False),
-        ("miner-b:exec-2", "running", ["run"], False),
-        ("miner-a:exec", "exited", ["run", "rm cid-1", "run"], False),
-        ("", "created", ["run", "rm cid-1", "run"], False),
-        ("miner-a:exec", "running", ["run"], False),
-        # DAH-6992 merged in: a resumed create replaces its own running container, never another registration's
-        ("miner-a:exec", "running", ["run", "rm cid-1", "run"], True),
-        ("miner-b:exec-2", "running", ["run"], True),
-    ],
-)
-async def test_rental_create_removes_a_same_name_leftover_only_of_its_own_registration_by_its_id(
-    docker_service, monkeypatch, found_owner, status, expected_events, resumed,
-):
-    # DAH-6531: the 409's container is removed only when it is stopped and carries this create's registration or no
-    # label, and by the ID inspected, so a container made under the name after the inspect is never the one removed
-    events: list[str] = []
-    runs = iter([Exception('409 Client Error: Conflict ("Conflict. The container name "/pod_test" is already in use")'), "cid-2"])
-
-    class FakeRentalClient:
-        async def run_container(self, spec):
-            events.append("run")
-            result = next(runs)
-            if isinstance(result, Exception):
-                raise result
-            return result
-
-        async def container_owner_state(self, *, container_name):
-            return "cid-1", status, found_owner
-
-        async def container_status(self, *, container_name):
-            return status
-
-        async def remove_container(self, *, container_name, force, remove_volumes):
-            events.append(f"rm {container_name}")
-
-    monkeypatch.setattr(docker_service, "stream_log", AsyncMock())
-    registry = docker_service_module.inflight_creates
-    resumed_token = docker_service_module.resumed_create.set(resumed)
-    with registry.track("test", ("miner-a", "exec")):
-        run = docker_service._run_rental_docker_create_with_port_retry(
-            docker_client=FakeRentalClient(),
-            ssh_client=Mock(),
-            run_spec=ContainerRunSpec(image="img", name="pod_test", labels={"io.lium.executor_id": "miner-a:exec"}),
-            container_name="pod_test",
-            default_extra={},
-            pod_id="test",
-        )
-        if expected_events[-1] == "run" and len(expected_events) > 1:
-            assert await run == "cid-2"
-        else:
-            with pytest.raises(docker_service_module._SameNameContainerKept) as kept:
-                await run
-            # F-12: another registration's container is typed, so the backend can send the create again once the
-            # node-left delete removed it; this registration's running pod is not
-            assert isinstance(kept.value, docker_service_module._SameNameHeldByAnotherRegistration) == (
-                found_owner == "miner-b:exec-2"
-            )
-    docker_service_module.resumed_create.reset(resumed_token)
-    assert events == expected_events
-
-
-@pytest.mark.asyncio
-async def test_a_same_name_conflict_is_reported_as_another_registrations_while_that_create_still_runs(
-    docker_service, monkeypatch,
-):
-    # review on lium-io#2394: the moved pod's create meets the earlier registration's container while that create is
-    # still tracked; the owner is read before the removal guards, so the backend gets the typed answer it retries on
-    events: list[str] = []
-
-    class FakeRentalClient:
-        async def run_container(self, spec):
-            events.append("run")
-            raise Exception('409 Client Error: Conflict ("Conflict. The container name "/pod_test" is already in use")')
-
-        async def container_owner_state(self, *, container_name):
-            return "cid-a", "running", "miner-a:exec"
-
-        async def remove_container(self, *, container_name, force, remove_volumes):
-            events.append(f"rm {container_name}")
-
-    monkeypatch.setattr(docker_service, "stream_log", AsyncMock())
-    registry = docker_service_module.inflight_creates
-    with registry.track("test", ("miner-a", "exec")), registry.track("test", ("miner-b", "exec-2")):
-        with pytest.raises(docker_service_module._SameNameHeldByAnotherRegistration):
-            await docker_service._run_rental_docker_create_with_port_retry(
-                docker_client=FakeRentalClient(),
-                ssh_client=Mock(),
-                run_spec=ContainerRunSpec(
-                    image="img", name="pod_test", labels={"io.lium.executor_id": "miner-b:exec-2"}
-                ),
-                container_name="pod_test",
-                default_extra={},
-                pod_id="test",
-            )
-    assert events == ["run"]
-
-
-@pytest.mark.asyncio
-async def test_a_second_same_name_conflict_after_the_one_checked_removal_keeps_the_container(
-    docker_service, monkeypatch,
-):
-    # DAH-6531: the create removed its own stopped leftover by ID; a replacement took the name before the retry. That
-    # second 409 is kept (typed), so the outer failure cleanup never removes the name
-    events: list[str] = []
-    conflict = '409 Client Error: Conflict ("Conflict. The container name "/pod_test" is already in use")'
-
-    class FakeRentalClient:
-        async def run_container(self, spec):
-            events.append("run")
-            raise Exception(conflict)
-
-        async def container_owner_state(self, *, container_name):
-            return "cid-1", "exited", "miner-a:exec"
-
-        async def remove_container(self, *, container_name, force, remove_volumes):
-            events.append(f"rm {container_name}")
-
-    monkeypatch.setattr(docker_service, "stream_log", AsyncMock())
-    with docker_service_module.inflight_creates.track("test", ("miner-a", "exec")):
-        with pytest.raises(docker_service_module._SameNameContainerKept):
-            await docker_service._run_rental_docker_create_with_port_retry(
-                docker_client=FakeRentalClient(),
-                ssh_client=Mock(),
-                run_spec=ContainerRunSpec(image="img", name="pod_test", labels={"io.lium.executor_id": "miner-a:exec"}),
-                container_name="pod_test",
-                default_extra={},
-                pod_id="test",
-            )
-    assert events == ["run", "rm cid-1", "run"]
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("label", ["miner-b:exec-2", None])
-@pytest.mark.parametrize("freed_again", [False, True])
-async def test_a_same_name_holder_gone_by_the_inspect_sends_the_create_again_once_removing_nothing(
-    docker_service, monkeypatch, label, freed_again,
-):
-    # DAH-6531: the moved pod's create met the left registration's container, whose node-left delete removed it before
-    # the inspect: dockerd's 404 frees the name, so the create runs once more and removes nothing. A second conflict
-    # whose holder is gone again is kept, never a loop
-    events: list[str] = []
-    conflict = Exception('409 Client Error: Conflict ("Conflict. The container name "/pod_test" is already in use")')
-    runs = iter([conflict, conflict if freed_again else "cid-2"])
-
-    class FakeRentalClient:
-        async def run_container(self, spec):
-            events.append("run")
-            result = next(runs)
-            if isinstance(result, Exception):
-                raise result
-            return result
-
-        async def container_owner_state(self, *, container_name):
-            return None
-
-        async def container_status(self, *, container_name):
-            return None
-
-        async def remove_container(self, *, container_name, force, remove_volumes):
-            events.append(f"rm {container_name}")
-
-    monkeypatch.setattr(docker_service, "stream_log", AsyncMock())
-    registry = docker_service_module.inflight_creates
-    with registry.track("test", ("miner-a", "exec")), registry.track("test", ("miner-b", "exec-2")):
-        run = docker_service._run_rental_docker_create_with_port_retry(
-            docker_client=FakeRentalClient(),
-            ssh_client=Mock(),
-            run_spec=ContainerRunSpec(
-                image="img", name="pod_test", labels={"io.lium.executor_id": label} if label else {}
-            ),
-            container_name="pod_test",
-            default_extra={},
-            pod_id="test",
-        )
-        if freed_again:
-            with pytest.raises(docker_service_module._SameNameContainerKept):
-                await run
-        else:
-            assert await run == "cid-2"
-    assert events == ["run", "run"]
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize("race", ["other_create_registers_during_inspect", "pod_started_before_rm"])
 async def test_rental_create_keeps_a_same_name_pod_that_changed_after_its_status_read(
     docker_service, monkeypatch, race,
@@ -7093,9 +6849,10 @@ async def test_rental_create_keeps_a_same_name_pod_that_changed_after_its_status
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("live_creates", [1, 2])
-async def test_failed_create_without_container_id_never_removes_by_name(docker_service, monkeypatch, live_creates):
-    # review on lium-io#2394: with no ID of its own, the name may be another create's that finished meanwhile
+@pytest.mark.parametrize("live_creates, removed", [(1, True), (2, False)])
+async def test_failed_create_without_container_id_removes_by_name_only_when_no_other_create_is_live(
+    docker_service, monkeypatch, live_creates, removed,
+):
     monkeypatch.setattr(
         docker_service, "capture_failed_container_diagnostics", AsyncMock(return_value=Mock(container_missing=False))
     )
@@ -7107,7 +6864,7 @@ async def test_failed_create_without_container_id_never_removes_by_name(docker_s
             await docker_service.cleanup_failed_container_creation(
                 ssh_client=Mock(), default_extra={}, container_name="pod_test", pod_id="test",
             )
-    assert not any("docker rm" in str(call) for call in ssh_commands.call_args_list)
+    assert any("rm -fv pod_test" in str(call) for call in ssh_commands.call_args_list) is removed
 
 
 @pytest.mark.asyncio
@@ -7168,55 +6925,6 @@ async def test_redelivered_create_leaves_a_running_same_name_pod_untouched(
     assert isinstance(result, FailedContainerRequest)
     assert not any(f"pod_{pod_id}" in str(call) for call in ssh_commands.call_args_list)
     assert client.removed_containers == []
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("made_one", [True, False])
-async def test_a_failed_start_removes_only_the_container_this_create_made(docker_service, monkeypatch, made_one):
-    # review on lium-io#2394: the cleanup removes by the ID the create returned or adopted, and by no name
-    _patch_create_container_happy_path(docker_service, monkeypatch)
-    ssh_commands = AsyncMock()
-    monkeypatch.setattr(docker_service_module, "retry_ssh_command", ssh_commands)
-    pod_id = str(uuid4())
-    client = docker_service.rental_docker_client_factory.client
-    client.run_error = RuntimeError("500 Server Error: start failed")
-    if made_one:
-        client.run_error.rental_container_id = "cid-of-this-create"
-    payload = ContainerCreateRequest(
-        miner_hotkey="miner",
-        executor_id=str(uuid4()),
-        pod_id=pod_id,
-        workload_kind=WorkloadKind.CUSTOMER_RENTAL,
-        docker_image="daturaai/dlph:test",
-        user_public_keys=["ssh-ed25519 test-key"],
-        gpu_uuids=["GPU-test"],
-        cpu_count=1,
-        memory_gb=1,
-        volume_limit_gb=2,
-        storage_limit_gb=1,
-        available_ports=[PayloadPortMapping(internal_port=20020, external_port=20020)],
-        pod_mapping=[],
-        active_container_names=[],
-        active_volume_names=[],
-    )
-    executor_info = ExecutorSSHInfo(
-        uuid=payload.executor_id,
-        address="127.0.0.1",
-        port=8080,
-        ssh_username="root",
-        ssh_port=2200,
-        python_path="/usr/bin/python",
-        root_dir="/root/app",
-        ssh_host_key=FAKE_SSH_HOST_KEY,
-    )
-    with docker_service_module.inflight_creates.track(pod_id, docker_service_module.executor_key(payload)):
-        result = await docker_service.create_container(
-            payload=payload, executor_info=executor_info, keypair=Mock(ss58_address="v"), private_key="encrypted",
-        )
-    removals = [str(call) for call in ssh_commands.call_args_list if "docker rm -fv" in str(call)]
-    assert isinstance(result, FailedContainerRequest)
-    assert not any(f"pod_{pod_id}" in removal for removal in removals)
-    assert any("cid-of-this-create" in removal for removal in removals) is made_one
 
 
 @pytest.mark.asyncio
@@ -12021,42 +11729,6 @@ async def test_create_failure_before_the_container_exists_is_not_a_host_kill(
     cleanup.assert_awaited_once()
 
 
-@pytest.mark.parametrize(
-    "kept, expected_error_code",
-    [
-        ("another_registration", FailedContainerErrorCodes.SameNameHeldByNodeLeft),
-        ("own_running", FailedContainerErrorCodes.UnknownError),
-    ],
-)
-@pytest.mark.asyncio
-async def test_a_create_whose_name_another_registration_holds_reports_it_typed(
-    docker_service, monkeypatch, kept, expected_error_code
-):
-    """DAH-6531 F-12: the backend sends a moved pod's create once more only on this code, after the node-left delete
-    removed the left registration's container; the pod's own running container stays the generic failure."""
-    _patch_create_container_happy_path(docker_service, monkeypatch)
-    error = (
-        docker_service_module._SameNameHeldByAnotherRegistration("held")
-        if kept == "another_registration"
-        else docker_service_module._SameNameContainerKept("running")
-    )
-    monkeypatch.setattr(docker_service, "_run_rental_docker_create_with_port_retry", AsyncMock(side_effect=error))
-    cleanup = AsyncMock(return_value=False)
-    monkeypatch.setattr(docker_service, "cleanup_failed_container_creation", cleanup)
-    payload = _filler_create_payload()
-
-    result = await docker_service.create_container(
-        payload=payload,
-        executor_info=_filler_executor_info(payload),
-        keypair=Mock(ss58_address="validator-hotkey"),
-        private_key="encrypted",
-    )
-
-    assert isinstance(result, FailedContainerRequest)
-    assert result.error_code == expected_error_code
-    assert cleanup.await_args.kwargs["keep_container"] is True
-
-
 # DAH-3678: the backend turns an `add_public_keys` failure into the DAH-2624 renter text ("the image's
 # default command exits right after start … restarting while the SSH keys were being installed") only
 # when the validator's failure text carries one of its markers (`is not running`, `is restarting`,
@@ -12506,10 +12178,7 @@ class _SysboxFailingRentalClient:
     async def run_container(self, spec):
         self.events.append(f"run {spec.image}")
         if spec.image in self.fail_images:
-            # sysbox refuses the start: the failure names the container the create made
-            failed = Exception(_SYSBOX_MANY_LAYERS_ERR)
-            failed.rental_container_id = "cid-failed"
-            raise failed
+            raise Exception(_SYSBOX_MANY_LAYERS_ERR)
         return "cid"
 
     async def remove_container(self, *, container_name, force, remove_volumes):
@@ -12566,7 +12235,7 @@ async def test_a_delete_during_the_flatten_retry_rm_stops_the_create_before_the_
     cancelled = AsyncMock(side_effect=[None, docker_service_module._CreateCancelledByDelete("deleted")])
     with pytest.raises(docker_service_module._CreateCancelledByDelete):
         await _create_with_flatten(docker_service, client, flatten, before_retry=cancelled)
-    assert client.events == ["run sglang", "rm cid-failed"]  # no run from the flattened copy
+    assert client.events == ["run sglang", "rm pod_x"]  # no run from the flattened copy
 
 
 _GIB = 1024**3
@@ -12777,7 +12446,7 @@ async def test_sysbox_many_layers_create_retries_once_from_a_flattened_copy_on_t
     client = _SysboxFailingRentalClient({"sglang"})
     flatten = AsyncMock(return_value="lium-flattened:abc")
     assert await _create_with_flatten(docker_service, client, flatten) == "cid"
-    assert client.events == ["run sglang", "rm cid-failed", "run lium-flattened:abc"]
+    assert client.events == ["run sglang", "rm pod_x", "run lium-flattened:abc"]
     flatten.assert_awaited_once()
 
 

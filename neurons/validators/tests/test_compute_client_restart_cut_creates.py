@@ -724,26 +724,6 @@ async def test_only_a_node_left_deletes_answer_echoes_its_command_id(deleted: bo
 
 
 @pytest.mark.asyncio
-async def test_a_deleted_creates_marker_is_cleared_when_it_ends_while_another_registrations_create_runs() -> None:
-    from services.docker_service import inflight_creates
-
-    client = _client(_redis_service())
-
-    async def fake_drive_miner_job(job_request) -> None:
-        if isinstance(job_request, ContainerCreateRequest):
-            await client._run_miner_job(
-                ContainerDeleteRequest.model_construct(pod_id="pod-1", miner_hotkey="miner-hk", executor_id="exec-1")
-            )
-            assert ("pod-1", ("miner-hk", "exec-1")) in client.deleted_pod_ids
-
-    client._drive_miner_job = fake_drive_miner_job
-    with inflight_creates.track("pod-1", ("miner-b", "exec-2")):  # another registration's create of the pod
-        await client._run_miner_job(_create_request())
-
-    assert client.deleted_pod_ids == set()
-
-
-@pytest.mark.asyncio
 async def test_a_create_whose_container_runs_is_not_resumed_after_a_restart() -> None:
     # it ended, but its record removal failed; a re-run would replace the running container by name
     redis_service = _redis_service()

@@ -399,8 +399,7 @@ async def test_a_forged_rental_name_is_counted_and_reported(context_factory):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("build_name", ["lium-dind-build-pod-1", "lium-dind-build-pod-1.ab12cd34"])
-async def test_a_custom_image_build_is_not_the_providers_load(context_factory, build_name):
+async def test_a_custom_image_build_is_not_the_providers_load(context_factory):
     # `lium-dind-build-<pod_id>` is Lium building a renter's image. It is on no rental list,
     # and a build takes cores, so without this the gate zeroes an honest machine.
     specs = {
@@ -409,7 +408,7 @@ async def test_a_custom_image_build_is_not_the_providers_load(context_factory, b
             "host_cpu_percent": 20.0,
             "containers": [
                 {"name": "pod_renter", "cpu_percent": 40.0},
-                {"name": build_name, "cpu_percent": 600.0},
+                {"name": "lium-dind-build-pod-1", "cpu_percent": 600.0},
             ],
         },
     }

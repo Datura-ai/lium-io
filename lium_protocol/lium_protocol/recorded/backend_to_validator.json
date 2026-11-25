@@ -1,6 +1,6 @@
 {
   "direction": "backend_to_validator",
-  "about": "One message per BackendMessageType. Those the backend sends are shaped as its src/protocol/compute_app_requests.py models serialise them (model_dump_json); ContainerStartRequest, ContainerStopRequest and GetPodLogsRequestFromServer are declared by the validator only (payload_models) \u2014 the backend has no model for them and never sends them \u2014 and are shaped from the validator's models. The validator parses all of them with payload_models.BaseServerRequest.parse (test_protocol_compat.py). Addresses are TEST-NET; credentials are placeholders.",
+  "about": "One message per BackendMessageType. Those the backend sends are shaped as its src/protocol/compute_app_requests.py models serialise them (model_dump_json); ContainerStartRequest, ContainerStopRequest and GetPodLogsRequestFromServer are declared by the validator only (payload_models) — the backend has no model for them and never sends them — and are shaped from the validator's models. The validator parses all of them with payload_models.BaseServerRequest.parse (test_protocol_compat.py). Addresses are TEST-NET; credentials are placeholders.",
   "messages": [
     {
       "expect": "ContainerCreateRequest",
@@ -113,8 +113,7 @@
         "ships_sshd": true,
         "gpu_power_limits": null,
         "cache_volumes": null,
-        "whole_host": true,
-        "superseded_command_id": "5d2e8c41-7a9b-4c3f-b1e6-0f4a3d9c2b87"
+        "whole_host": true
       }
     },
     {

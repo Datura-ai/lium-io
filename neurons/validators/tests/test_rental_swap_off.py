@@ -70,30 +70,12 @@ def test_run_spec_swap_off_follows_the_memory_limit(svc, memory_gb, expected):  
     assert (run_spec.memory_gb or None, run_spec.memory_swap_gb, run_spec.oom_score_adj) == expected
 
 
-def test_run_spec_labels_the_container_with_its_pod_id_and_executor(svc):  # noqa: F811
-    """DAH-5117: the stale cleanup reaps only containers carrying the pod label; DAH-6531: the delete for the
-    node a moved pod left removes only a container carrying the left registration's miner:executor pair."""
-    from services.const import (
-        LIUM_CREATE_ATTEMPT_LABEL,
-        LIUM_CREATE_COMMAND_LABEL,
-        LIUM_EXECUTOR_ID_LABEL,
-        LIUM_POD_ID_LABEL,
-    )
-    from services.redis_service import renter_create_id
+def test_run_spec_labels_the_container_with_its_pod_id_and_create(svc):  # noqa: F811
+    """DAH-5117: the stale cleanup reaps only containers carrying the pod label. DAH-6531: the node-left delete removes
+    only the container its create command id made."""
+    from services.const import LIUM_CREATE_COMMAND_LABEL, LIUM_POD_ID_LABEL
 
-    # lio#2394: the create attempt (H1: only its own container is force-removed by a re-sent create) and the
-    # placement's create command id (M1: the node-left delete removes only what the left placement made)
-    token = renter_create_id.set("attempt-1")
-    try:
-        labels = _run_spec(svc, 30, command_id="cmd-1").labels
-    finally:
-        renter_create_id.reset(token)
-    assert labels == {
-        LIUM_POD_ID_LABEL: "pod",
-        LIUM_EXECUTOR_ID_LABEL: "hk:ex",
-        LIUM_CREATE_ATTEMPT_LABEL: "attempt-1",
-        LIUM_CREATE_COMMAND_LABEL: "cmd-1",
-    }
+    assert _run_spec(svc, 30, command_id="cmd-1").labels == {LIUM_POD_ID_LABEL: "pod", LIUM_CREATE_COMMAND_LABEL: "cmd-1"}
 
 
 @pytest.mark.parametrize("value", ["0", "-1", "1001"])

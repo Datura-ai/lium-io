@@ -17,7 +17,7 @@ from services.storage_operations import (
 )
 
 from .cpu_truth import advertised_cpu_count
-from .custom_build_orphan_sweep import BUILD_DIND_PREFIX, dind_build_pod_id
+from .custom_build_orphan_sweep import BUILD_DIND_PREFIX
 from .rental_owner import rental_of_this_node
 from .gpu_usage import (
     carries_a_rental_prefix,
@@ -266,18 +266,13 @@ async def lium_containers(ctx: Context) -> set[str] | None:
     if ctx.state.rented_data is None:
         return None
     containers: set[str] = lium_workload_containers(ctx)
-    specs = ctx.state.specs or {}
-    # A custom image builds in `lium-poddind-<pod_id>.<attempt>`, which is on no rental list and burns
+    # A custom image builds in `lium-dind-build-<pod_id>`, which is on no rental list and burns
     # cores. The pod id keeps the name rename-proof: it has to match a pod the BACKEND reports
     # here, the same rule the orphan sweep removes such a container by.
     rented_executor = rental_of_this_node(ctx)
     if rented_executor:
-        rented_pod_ids = {pod.pod_id for pod in rented_executor.pods}
-        # the name a build had before builds were named per create attempt
-        containers.update(f"{BUILD_DIND_PREFIX}{pod_id}" for pod_id in rented_pod_ids)
-        containers.update(
-            row.name for row in docker_containers(specs) if dind_build_pod_id(row.name) in rented_pod_ids
-        )
+        containers.update(f"{BUILD_DIND_PREFIX}{pod.pod_id}" for pod in rented_executor.pods)
+    specs = ctx.state.specs or {}
     containers.update(await late_started_containers_the_backend_owns(ctx, containers))
     containers.update(await excused_storage_helper_keys(ctx))
     stack_ids: set[str] = executor_stack_container_ids(specs)

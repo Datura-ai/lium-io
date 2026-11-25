@@ -17,7 +17,6 @@ from services.node_host import node_owner
 from services.rental_docker_sdk import (
     ContainerExecSpec,
     ContainerNameTakenOnRetry,
-    ContainerOfAnotherRegistration,
     ContainerRunSpec,
     RentalDockerConnectionError,
     RentalDockerOperationError,
@@ -76,9 +75,7 @@ class _FakeApiClient:
     def create_container(self, **kwargs):
         self.calls.append("create_container")
         self._pop(self.create_container_errors)
-        self.existing_containers[kwargs["name"]] = {
-            "Config": {"Image": kwargs["image"], "Labels": kwargs.get("labels") or {}}
-        }
+        self.existing_containers[kwargs["name"]] = {"Config": {"Image": kwargs["image"]}}
         return {"Id": "cid"}
 
     def start(self, name):
@@ -94,7 +91,7 @@ class _FakeApiClient:
     def create_volume(self, *, name, driver, driver_opts, labels=None):
         self.calls.append("create_volume")
         self._pop(self.create_volume_errors)
-        self.existing_volumes[name] = {"Name": name, "Driver": driver or "local", "Labels": labels or {}}
+        self.existing_volumes[name] = {"Name": name, "Driver": driver or "local"}
         return self.existing_volumes[name]
 
     def inspect_volume(self, name):
@@ -184,30 +181,6 @@ async def test_run_container_retry_refuses_a_same_name_container_on_another_imag
         await _client(api).run_container(_run_spec())
 
     assert api.calls == ["create_container", "inspect_container"]
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("existing_labels, adopted", [({"io.lium.executor_id": "hk-a:ex-1"}, False), ({}, True), ({"io.lium.executor_id": ""}, True), ({"io.lium.executor_id": "hk-b:ex-2"}, True)])
-async def test_run_container_retry_adopts_a_same_name_container_only_of_its_own_or_no_registration(
-    existing_labels, adopted
-):
-    """DAH-6531: on a daemon two registrations share, another registration's pod_<id> on the same image is not
-    adopted, and the refusal is typed so the create never removes it as its own leftover; an unlabelled one (made
-    before the label) or its own is the first attempt's container."""
-    api = _FakeApiClient(adapter=_FakeAdapter())
-    api.create_container_errors = [EOFError()]
-    api.existing_containers["pod_test"] = {"Id": "left", "Config": {"Image": "lium/pod:1", "Labels": existing_labels}}
-    spec = ContainerRunSpec(
-        image="lium/pod:1", name="pod_test", network="lium-rentals", labels={"io.lium.executor_id": "hk-b:ex-2"}
-    )
-
-    if adopted:
-        await _client(api).run_container(spec)
-        assert api.calls.count("create_container") == 1
-    else:
-        with pytest.raises(ContainerOfAnotherRegistration, match="already exists for another registration"):
-            await _client(api).run_container(spec)
-        assert "start" not in api.calls
 
 
 @pytest.mark.asyncio

@@ -95,13 +95,9 @@ class FailedContainerErrorCodes(enum.Enum):
     ContainerVanished = "ContainerVanished"
     # DAH-3338: the miner knows the executor but could not reach it; distinct from InvalidExecutorId
     ExecutorUnreachable = "ExecutorUnreachable"
-    # DAH-6737: the validator's own step left no container of the pod running: not billed, not a host fault
-    PodDownNotHostFault = "PodDownNotHostFault"
-    # 2.18.0: a ContainerDeleteOnNodeLeftRequest reached a host with another boot id; nothing was deleted
+    # a ContainerDeleteOnNodeLeftRequest found a container under the pod's name that the left placement did not
+    # make, or reached another boot; nothing was deleted
     NotTheNodeLeft = "NotTheNodeLeft"
-    # 2.18.0: the create met the pod's name held by another registration's container (for a moved pod, the node-left
-    # delete's); the backend sends the create once more after that delete is confirmed
-    SameNameHeldByNodeLeft = "SameNameHeldByNodeLeft"
 
 
 class FailedContainerErrorTypes(enum.Enum):
@@ -483,7 +479,7 @@ class ContainerStopped(PodContainerResponse):
 @VALIDATOR_MESSAGES.register
 class ContainerDeleted(PodContainerResponse):
     message_type: ValidatorMessageType = ValidatorMessageType.ContainerDeleted
-    # 2.18.0: a ContainerDeleteOnNodeLeftRequest's command_id, echoed so the backend can tell which delete this answers;
+    # a ContainerDeleteOnNodeLeftRequest's command_id, echoed so the backend can tell which delete this answers;
     # empty for any other delete and from older validators
     command_id: str = ""
 
@@ -508,7 +504,7 @@ class SshPubKeyRemoved(PodContainerResponse):
 class FailedContainerRequest(PodContainerResponse):
     message_type: ValidatorMessageType = ValidatorMessageType.FailedRequest
     # the failed request's command_id, echoed for an AddSshPublicKeyRequest, (since lium-io#2028) a
-    # ContainerCreateRequest and (2.18.0) a ContainerDeleteOnNodeLeftRequest; empty otherwise and from older validators
+    # ContainerCreateRequest and a ContainerDeleteOnNodeLeftRequest; empty otherwise and from older validators
     command_id: str = ""
     error_type: FailedContainerErrorTypes = FailedContainerErrorTypes.ContainerCreationFailed
     error_code: FailedContainerErrorCodes | None = None

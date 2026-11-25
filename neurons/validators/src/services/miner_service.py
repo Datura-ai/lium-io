@@ -287,8 +287,8 @@ def _bypasses_renting_in_progress(payload: ContainerBaseRequest) -> bool:
     if payload.workload_kind == WorkloadKind.FILLER:
         return True
     if isinstance(payload, ContainerDeleteOnNodeLeftRequest):
-        # DAH-6531: sent once, it waits for the pod's creates itself; the source create's pending flag outlives its
-        # run while its receipt is processed, and declining here would drop the only delete
+        # DAH-6531: it checks the pod's creates itself; the source create's pending flag outlives its run while its
+        # receipt is processed, and declining here would drop the delete
         return True
     # DAH-2728: the pending-pod flag this guard reads is set by the very create this delete is
     # about to cancel, so declining here would leave that create to finish and orphan its
@@ -2837,8 +2837,8 @@ class MinerService:
                             executor_key(payload),
                             self._log_ssh_key_removal_after_reply(remove_ssh_key, default_extra),
                         )
-                    elif stop_retry is not None or isinstance(payload, ContainerDeleteOnNodeLeftRequest):
-                        # the reply does not wait out the retry's backoff, nor a node-left delete's answer deadline
+                    elif stop_retry is not None:
+                        # the reply does not wait out the retry's backoff
                         removal = asyncio.create_task(self._log_ssh_key_removal_after_reply(remove_ssh_key, default_extra))
                         _KEY_REMOVALS_AFTER_STOP_RETRY.add(removal)
                         removal.add_done_callback(_KEY_REMOVALS_AFTER_STOP_RETRY.discard)

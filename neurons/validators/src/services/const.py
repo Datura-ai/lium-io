@@ -418,15 +418,8 @@ RENTAL_CONTAINER_PREFIXES = ("pod_", "filler_", "container_", "health_check_")
 # the value is the pod id (a filler's run id, a probe's own name). The stale cleanup reaps only a
 # labelled container whose pod is no longer live, so a provider's container is never touched.
 LIUM_POD_ID_LABEL = "io.lium.pod_id"
-# DAH-6531: the executor (registration) a pod container or volume was created for; the delete for the node a
-# moved pod left removes only what carries the left executor's id, never a replacement made on the same host.
-LIUM_EXECUTOR_ID_LABEL = "io.lium.executor_id"
-# lio#2394: the create attempt (redis_service.renter_create_id) that made a pod container. A create re-sent after a
-# connector restart resumes its cut-off attempt's id, so only that attempt's own half-made container carries it; a
-# finished earlier create's (a live pod) never does.
-LIUM_CREATE_ATTEMPT_LABEL = "io.lium.create_attempt"
-# lio#2394: the backend's create command id of the placement that made a pod container (ContainerCreateRequest
-# .command_id; a move gets a new one). The delete for the node a moved pod left removes only what that placement made.
+# DAH-6531: the backend's create command id that made a pod container (ContainerCreateRequest.command_id; every
+# placement gets a new one). The delete for the node a moved pod left removes only what that create made.
 LIUM_CREATE_COMMAND_LABEL = "io.lium.create_command_id"
 # Backend ownership lookups (one sequential request each) the stale cleanup makes per node per cycle;
 # the rest of a host's pod_/filler_ candidates wait for a later cycle, so a host cannot flood the backend.

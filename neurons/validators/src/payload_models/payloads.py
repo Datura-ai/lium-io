@@ -1,20 +1,12 @@
 import enum
 import posixpath
 import re
-import time
 from datetime import datetime
 from typing import Any, Literal
 
 from datura.requests.base import BaseRequest
 from datura.requests.miner_requests import PodLog
-from pydantic import (
-    BaseModel,
-    Field,
-    PrivateAttr,
-    ValidationError,
-    field_validator,
-    model_serializer,
-)
+from pydantic import BaseModel, Field, ValidationError, field_validator, model_serializer
 
 # absolute, no `.`/`..` segment, no shell metacharacter; `/lium-cipher` (the encrypted volume's ciphertext mount) and
 # `/mnt` (where an attached Volume mounts) are reserved
@@ -448,10 +440,6 @@ class ContainerCreateRequest(ContainerBaseRequest):
     # protocol 1.18.0: False when the backend rents the pod part of its host, so it gets no host-wide devices
     # (RDMA, nvidia-caps) even when every GPU the host shows is requested. None from an older backend.
     whole_host: bool | None = None
-    # 2.18.0: the backend's retry after a failed create names that create's `command_id`; the validator removes a
-    # stopped container of the pod in the way only when it carries that id (io.lium.create_command_id). Empty from
-    # an older backend and on any other create: every stopped container is kept, the create fails on the name.
-    superseded_command_id: str = ""
 
 
 class ExecutorRentFinishedRequest(ContainerBaseRequest):
@@ -530,26 +518,17 @@ class ContainerDeleteRequest(ContainerBaseRequest):
     external_volume: str | None = None
 
 
-# lium_protocol 2.18.0 (backend_to_validator): the node-left delete is answered within this many seconds of its start;
-# the backend holds the replacement's SameNameHeldByNodeLeft failure that long
-NODE_LEFT_DELETE_ANSWER_SECONDS = 1800
-
-
 class ContainerDeleteOnNodeLeftRequest(ContainerDeleteRequest):
-    """lium_protocol 2.18.0: the delete for the node a moved pod left. Its registration may point at another host
-    by now, so the delete runs only on a host whose boot id is expected_boot_id (DockerService.delete_container).
-    Empty expected_boot_id: no boot check, only the live container labelled create_command_id is removed."""
+    """lium_protocol ContainerDeleteOnNodeLeftRequest: the delete for the node a moved pod left
+    (DockerService._delete_on_node_left). Only the pod's container labelled create_command_id is removed; with
+    expected_boot_id set, only on that boot and only when pod_placed_on_boot_id is another boot."""
 
     message_type: ContainerRequestType = ContainerRequestType.ContainerDeleteOnNodeLeftRequest
     expected_boot_id: str
     # the create command id of the placement on the node left: only a container that create made is removed
     create_command_id: str
-    # the boot id of the node the pod's current placement is on, as the backend read it when it sent the delete: only
-    # a value that is set and not expected_boot_id proves the pod left this boot; otherwise nothing is removed
+    # the boot id of the node the pod's current placement is on, as the backend read it when it sent the delete
     pod_placed_on_boot_id: str = ""
-    # time.monotonic() when the message was parsed off the backend socket: the answer deadline counts from here, so
-    # the miner handshake before the delete runs inside it instead of before it
-    _received_at: float = PrivateAttr(default_factory=time.monotonic)
 
 
 class GetPodLogsRequestFromServer(ContainerBaseRequest):
@@ -818,7 +797,7 @@ class ContainerStopped(ContainerBaseResponse):
 
 class ContainerDeleted(ContainerBaseResponse):
     message_type: ContainerResponseType = ContainerResponseType.ContainerDeleted
-    # lium_protocol 2.18.0: a ContainerDeleteOnNodeLeftRequest's command_id, echoed; empty for any other delete
+    # a ContainerDeleteOnNodeLeftRequest's command_id, echoed; empty for any other delete
     command_id: str = ""
 
 
@@ -861,10 +840,8 @@ class FailedContainerErrorCodes(enum.Enum):
     # DAH-2703: the container we created was gone from the host before creation finished — a
     # host-side reaper, not a container that failed on its own.
     ContainerVanished = "ContainerVanished"
-    # lium_protocol 2.18.0: a delete for the node a moved pod left reached a host with another boot id
+    # a delete for the node a moved pod left found another placement's container or another boot; nothing deleted
     NotTheNodeLeft = "NotTheNodeLeft"
-    # lium_protocol 2.18.0: the create met the pod's name held by another registration's container on this daemon
-    SameNameHeldByNodeLeft = "SameNameHeldByNodeLeft"
 
 
 class FailedContainerErrorTypes(enum.Enum):

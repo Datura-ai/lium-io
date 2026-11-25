@@ -20,7 +20,7 @@ import urllib3
 
 from core.utils import _m, get_extra_info
 from datura.requests.miner_requests import ExecutorSSHInfo
-from services.const import LIUM_EXECUTOR_ID_LABEL, RENTAL_CPU_COUNT_LABEL
+from services.const import RENTAL_CPU_COUNT_LABEL
 from services.node_host import NodeHostError, dial_validated, reports_registered_host_key, resolve_node_host
 
 
@@ -112,23 +112,6 @@ class ContainerCreateRefused(Exception):
 
 class RentalDockerOperationError(RuntimeError):
     """Raised when Docker SDK reports a rental Docker operation failure."""
-
-
-def created_container_id(exc: BaseException | None) -> str | None:
-    """The ID of the container `run_container` made or adopted before it failed (a failed start), or None when the
-    failure came before any container was this create's; read through the wrapping errors' causes."""
-    seen: set[int] = set()
-    while exc is not None and id(exc) not in seen:
-        seen.add(id(exc))
-        container_id = getattr(exc, "rental_container_id", None)
-        if container_id:
-            return container_id
-        exc = exc.__cause__ or exc.__context__
-    return None
-
-
-class ContainerOfAnotherRegistration(RentalDockerOperationError):
-    """A same-name container on the daemon carries another registration's label: it is never adopted or removed."""
 
 
 class ContainerNameTakenOnRetry(RentalDockerOperationError):
@@ -831,21 +814,6 @@ class RentalDockerSdkClient:
             ) from exc
         return str(info.get("Image") or "")
 
-    async def container_owner_state(self, *, container_name: str) -> tuple[str, str, str] | None:
-        """One inspect: the container's ID, ``State.Status`` and registration label (`io.lium.executor_id`, empty
-        when unlabelled), or None when dockerd no longer knows the name (404)."""
-        try:
-            info = await _in_docker_thread(self._api_client.inspect_container, container_name)
-        except Exception as exc:
-            if _is_docker_not_found_error(exc):
-                return None
-            raise RentalDockerOperationError(_wrap_error_message("Docker SDK inspect container failed", exc)) from exc
-        info = info if isinstance(info, dict) else {}
-        state = info.get("State") if isinstance(info.get("State"), dict) else {}
-        config = info.get("Config") if isinstance(info.get("Config"), dict) else {}
-        labels = config.get("Labels") or {}
-        return str(info.get("Id") or ""), str(state.get("Status") or "").lower(), str(labels.get(LIUM_EXECUTOR_ID_LABEL) or "")
-
     async def container_status(self, *, container_name: str) -> str | None:
         """Return the container's ``State.Status`` (``running``, ``exited``, ``removing``, …), or
         None when dockerd no longer knows the name (404)."""
@@ -1212,24 +1180,19 @@ class RentalDockerSdkClient:
                 adopted_id = self._wait_for_inflight_create_sync(spec)
                 if adopted_id is None:
                     raise
+        if spec.before_start is not None:
+            spec.before_start(
+                [
+                    name.lstrip("/")
+                    for container in self._api_client.containers(all=True)
+                    for name in container.get("Names") or ()
+                ]
+            )
         container_id = created.get("Id") if isinstance(created, dict) else adopted_id
         container_id = container_id if isinstance(container_id, str) and container_id else None
-        try:
-            if spec.before_start is not None:
-                spec.before_start(
-                    [
-                        name.lstrip("/")
-                        for container in self._api_client.containers(all=True)
-                        for name in container.get("Names") or ()
-                    ]
-                )
-            # A create with a start check starts the container it checked, by ID, never a same-name successor.
-            self._api_client.start(container_id if spec.before_start is not None and container_id else spec.name)
-        except BaseException as exc:
-            # the caller removes only a container this create made or adopted, by its ID (created_container_id)
-            if container_id:
-                exc.rental_container_id = container_id
-            raise
+        # A create with a start check starts the container it checked, by ID, never a same-name successor.
+        # Others keep the name: a failed start leaves no ID for the cleanup, which then removes by name.
+        self._api_client.start(container_id if spec.before_start is not None and container_id else spec.name)
         return container_id
 
     def _wait_for_inflight_create_sync(self, spec: ContainerRunSpec) -> str | None:
@@ -1258,17 +1221,6 @@ class RentalDockerSdkClient:
             raise
         config = info.get("Config") if isinstance(info, dict) else None
         existing_image = config.get("Image") if isinstance(config, dict) else None
-        # DAH-6531: one pod keeps its container name on every registration; on a daemon two registrations share, a
-        # same-name container made for another registration is not this create's to adopt
-        wanted_owner = spec.labels.get(LIUM_EXECUTOR_ID_LABEL)
-        existing_labels = (config.get("Labels") if isinstance(config, dict) else None) or {}
-        existing_owner = existing_labels.get(LIUM_EXECUTOR_ID_LABEL)
-        # an empty label is a container made before the label: decided below like the first attempt's 409 (_made_for)
-        if wanted_owner and existing_owner and existing_owner != wanted_owner:
-            raise ContainerOfAnotherRegistration(
-                "Docker SDK run container refused after a transport retry: a container named "
-                f"{spec.name} already exists for another registration"
-            )
         if existing_image == spec.image:
             existing_id = info.get("Id")
             return existing_id if isinstance(existing_id, str) else ""

@@ -10,7 +10,7 @@ from lium_protocol import (
     VALIDATOR_MESSAGES,
     ProtocolError,
 )
-from lium_protocol.validator_to_backend import ContainerDeleted, FailedContainerErrorCodes, FailedContainerRequest
+from lium_protocol.validator_to_backend import ContainerDeleted
 
 A_DELETED = {
     "message_type": "ContainerDeleted",
@@ -43,17 +43,6 @@ def test_a_refused_message_never_carries_the_input_into_the_error() -> None:
     assert {e["loc"][0] for e in errors} >= {"source_volume", "backup_volume_info", "backup_log_id"}
     assert "must-not-leak" not in excinfo.value.msg
     assert all("input" not in e and "url" not in e for e in errors)
-
-
-@pytest.mark.parametrize("code", ["PodDownNotHostFault", "NotTheNodeLeft", "SameNameHeldByNodeLeft"])
-def test_failed_request_codes_of_every_version_line_parse(code: str) -> None:
-    """2.18.0 releases #2352's PodDownNotHostFault together with this line's own codes, so the backend that vendors
-    it accepts both validator changes."""
-    message = VALIDATOR_MESSAGES.parse(
-        json.dumps({**A_DELETED, "message_type": "FailedRequest", "msg": "x", "error_code": code})
-    )
-    assert type(message) is FailedContainerRequest
-    assert message.error_code is FailedContainerErrorCodes(code)
 
 
 def test_an_idle_only_reset_keeps_its_mark_through_a_round_trip() -> None:

@@ -1178,8 +1178,8 @@ class ComputeClient:
         # DAH-2728: track the create from the moment this task picks it up. The axon lookup below
         # fetches the whole miner set on a cold cache, so a delete arriving seconds later can sail
         # past it and find nothing to cancel — and the create it raced then orphans its container.
-        # DAH-6531: a node-left delete may be refused as another host, so it leaves the source create's records alone;
-        # it waits for that create, which retires its own record on exit
+        # DAH-6531: a node-left delete may be refused (another host, or a create of the pod running), so it leaves the
+        # source create's records alone; that create retires its own record on exit
         if isinstance(job_request, ContainerDeleteRequest) and not isinstance(
             job_request, ContainerDeleteOnNodeLeftRequest
         ):

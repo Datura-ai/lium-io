@@ -86,8 +86,7 @@ def _removed_names(ssh_client) -> list[str]:
     # the containers and volumes every `docker rm` / `docker volume rm` the create sent targeted, in order
     commands = [c.args[0] for c in ssh_client.run.await_args_list if c.args]
     removals = [cmd for cmd in commands if cmd.startswith(("/usr/bin/docker rm", "/usr/bin/docker volume rm"))]
-    targets = ("filler_", "filler-container", "pod_", "volume_")
-    return [word for cmd in removals for word in shlex.split(cmd) if word.startswith(targets)]
+    return [word for cmd in removals for word in shlex.split(cmd) if word.startswith(("filler_", "pod_", "volume_"))]
 
 
 @pytest.fixture
@@ -123,10 +122,8 @@ async def test_filler_create_beside_an_unlisted_pod_refuses_and_removes_only_the
     assert result.error_code == FailedContainerErrorCodes.RentingInProgress
     assert result.failure_step == "customer_create_in_flight"
     docker_api.start.assert_not_called()
-    # once created, the filler's container (by the ID its create returned) and volume are removed and its power cap
-    # lifted; the customer's pod never
-    removed = [] if pod_listed_before_the_create else ["filler-container", f"volume_{filler.pod_id}"]
-    assert _removed_names(ssh_client) == removed
+    # once created, the filler's container and volume are removed and its power cap lifted; the customer's pod never
+    assert _removed_names(ssh_client) == ([] if pod_listed_before_the_create else [f"filler_{filler.pod_id}", f"volume_{filler.pod_id}"])
     assert restore_power.await_count == (0 if pod_listed_before_the_create else 1)
     refusals = [r.msg.to_full_string() for r in caplog.records if "filler create refused" in r.getMessage()]
     assert [r.startswith("filler create refused: unlisted pod_* on the node >>> ") and _CUSTOMER_POD in r for r in refusals] == [True]
@@ -161,21 +158,15 @@ async def test_filler_create_without_an_unlisted_pod_starts_its_own_container_by
     ids=["filler", "customer"],
 )
 @pytest.mark.asyncio
-async def test_a_filler_volume_is_labelled_filler_and_a_filler_create_sweeps_only_labelled_volumes(
+async def test_only_a_filler_volume_is_labelled_and_a_filler_create_sweeps_only_labelled_volumes(
     svc, monkeypatch, workload_kind: WorkloadKind, labels: dict[str, str] | None, swept_volumes: list[str]
 ) -> None:
     # a customer create made its encrypted volume and has not run its pod yet (its create lock lapsed or
     # another connector runs it): no `pod_*` exists, so only the volume sweep could touch it
     ssh_client, _ = _create_over_a_host(svc, monkeypatch, [], [_CUSTOMER_VOLUME], ["volume_ended-filler-run"])
 
-    payload = _payload(workload_kind)
-    result = await _run(svc, payload)
+    result = await _run(svc, _payload(workload_kind))
 
     assert type(result).__name__ == "ContainerCreated"
-    # a customer volume carries the registration it was made for (DAH-6531), never the filler label
-    assert svc.create_local_volume.await_args.kwargs["labels"] == (
-        labels
-        if labels is not None
-        else {"io.lium.pod_id": payload.pod_id, "io.lium.executor_id": f"{payload.miner_hotkey}:{payload.executor_id}"}
-    )
+    assert svc.create_local_volume.await_args.kwargs["labels"] == labels
     assert _removed_names(ssh_client) == swept_volumes

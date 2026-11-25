@@ -45,7 +45,7 @@ class BackendMessageType(enum.Enum):
     LockPodGpuClocksRequest = "LockPodGpuClocksRequest"
     # 2.6.0: validate one node now (a provider's "Recheck now")
     RecheckExecutorRequest = "RecheckExecutorRequest"
-    # 2.18.0: delete a moved pod's container on the node it left, only on the host that node booted as
+    # delete a moved pod's container on the node it left, only on the host that node booted as
     ContainerDeleteOnNodeLeftRequest = "ContainerDeleteOnNodeLeftRequest"
 
 
@@ -184,10 +184,6 @@ class ContainerCreateRequest(ContainerRequest):
     # 1.18.0: False when the backend rents the pod part of its host; the validator then withholds the host-wide
     # devices whatever GPUs the host shows. None from an older backend: the validator's own count decides.
     whole_host: bool | None = None
-    # 2.18.0: the backend's retry after a failed create names that create's `command_id`; the validator removes a
-    # stopped container of the pod in the way only when it carries that id (io.lium.create_command_id). Empty from
-    # an older backend and on any other create: every stopped container is kept, the create fails on the name.
-    superseded_command_id: str = ""
 
 
 @BACKEND_MESSAGES.register
@@ -211,21 +207,13 @@ class ContainerDeleteRequest(ContainerRequest):
     external_volume: str | None = None
 
 
-# 2.18.0: a validator answers a ContainerDeleteOnNodeLeftRequest within this many seconds of starting it: its wait for
-# the pod's creates, the connection and the host command together. The backend keeps a replacement's
-# SameNameHeldByNodeLeft failure held for at least as long after sending the delete, so the answer always finds it.
-NODE_LEFT_DELETE_ANSWER_SECONDS = 1800
-
-
 @BACKEND_MESSAGES.register
 class ContainerDeleteOnNodeLeftRequest(ContainerDeleteRequest):
-    """2.18.0: a ContainerDeleteRequest for the node a moved pod left. The node's registration can point at
-    another host by the time it is sent, so the validator deletes only when the host it reaches reports
-    `expected_boot_id` (/proc/sys/kernel/random/boot_id) and otherwise answers a FailedContainerRequest with
-    `NotTheNodeLeft`. Its own type, not a field: a validator that does not know it refuses the message
-    instead of deleting unchecked. An empty `expected_boot_id` (the backend knows no boot of the node left) runs no
-    boot check and removes only the pod's live container labelled with `create_command_id`, never a parked or kept
-    edit container; a live container of another create id still answers `NotTheNodeLeft`."""
+    """A ContainerDeleteRequest for the node a moved pod left. The validator removes, by the inspected ID, only the
+    pod's container labelled with this pod and `create_command_id`; anything else under the name is kept and answered
+    `NotTheNodeLeft`. With `expected_boot_id` set it also runs only on a host whose boot id
+    (/proc/sys/kernel/random/boot_id) is `expected_boot_id`, and only when `pod_placed_on_boot_id` is another boot.
+    Its own type, not a field: a validator that does not know it refuses the message instead of deleting unchecked."""
 
     message_type: BackendMessageType = BackendMessageType.ContainerDeleteOnNodeLeftRequest
     expected_boot_id: str

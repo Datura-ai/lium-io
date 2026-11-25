@@ -250,7 +250,6 @@ def _make_dind_ssh(
     resolv_conf: str = "nameserver 8.8.8.8\n",
     resolv_exit: int = 0,
     remove_helper_exit: int = 0,
-    leftover_dinds: tuple[str, ...] = (),
 ):
     """An ssh client emulating the DAH-2211 DinD build control commands.
 
@@ -286,9 +285,6 @@ def _make_dind_ssh(
                 runtimes += ',"sysbox-runc":{"path":"/usr/bin/sysbox-runc"}'
             runtimes += "}"
             return _ssh_result(stdout=runtimes)
-        # an earlier create's build containers
-        if cmd.startswith("/usr/bin/docker ps -a --format '{{.Names}}' --filter"):
-            return _ssh_result(stdout="".join(f"{name}\n" for name in leftover_dinds))
         if "run -d --runtime=sysbox-runc" in cmd:
             if dind_start_hangs:
                 raise asyncio.TimeoutError()
@@ -527,14 +523,11 @@ async def test_A27_a_resumed_build_replaces_the_build_container_its_cut_off_atte
     attempt the restart cut off; it removes them first, but never while another create of the pod runs."""
     from services.docker_service import executor_key, inflight_creates
 
-    payload = _base_payload(dockerfile_content="FROM alpine\n")
-    dind = svc._dind_container_name(payload.pod_id, "c0ff0001")
-    # the cut-off attempt's DinD, its firewall helper (left to the teardown) and one named before attempts were
-    ssh_client = _make_dind_ssh(
-        leftover_dinds=(dind, f"{dind}-fw-apply", f"lium-dind-build-{payload.pod_id}")
-    )
+    ssh_client = _make_dind_ssh()
     monkeypatch.setattr(svc, "execute_and_stream_logs", _make_esl(build=(False, "Process timed out")))
     monkeypatch.setattr(svc, "stream_log", AsyncMock())
+    payload = _base_payload(dockerfile_content="FROM alpine\n")
+    dind = svc._dind_container_name(payload.pod_id)
 
     with inflight_creates.track(payload.pod_id, executor_key(payload)):
         if not only_create:
@@ -549,133 +542,14 @@ async def test_A27_a_resumed_build_replaces_the_build_container_its_cut_off_atte
     # the full teardown: the old DinD's egress rules (by its IP) go too, not only the container
     assert any("--network=host" in c and "-D DOCKER-USER" in c and "172.20.0.2" in c for c in before) is only_create
     assert any(c.startswith(f"/usr/bin/docker rm -fv {dind} ") for c in before) is only_create
-    assert any(c.startswith(f"/usr/bin/docker rm -fv lium-dind-build-{payload.pod_id} ") for c in before) is only_create
-
-
-@pytest.mark.asyncio
-async def test_A27f_two_builds_of_one_pod_never_reach_each_others_build_container_image_or_scratch(svc, monkeypatch):
-    """Review on lium-io#2394: each create attempt builds under its own names, so a build that starts beside
-    another create of the pod tears down and cleans up only its own."""
-    from services.docker_service import executor_key, inflight_creates
-
-    payload = _base_payload(dockerfile_content="FROM alpine\n")
-    other = svc._dind_container_name(payload.pod_id, "aaaa0000")
-    ssh_client = _make_dind_ssh(leftover_dinds=(other,))
-    monkeypatch.setattr(svc, "execute_and_stream_logs", _make_esl(build=(False, "boom")))
-    monkeypatch.setattr(svc, "stream_log", AsyncMock())
-
-    with inflight_creates.track(payload.pod_id, executor_key(payload)):
-        inflight_creates._creates[payload.pod_id, executor_key(payload)].running += 1  # the other create, still live
-        await svc._custom_build_image(
-            ssh_client=ssh_client, payload=payload, log_tag="t", default_extra={}, build_attempt="bbbb0000"
-        )
-        inflight_creates._creates[payload.pod_id, executor_key(payload)].running = 1
-    await svc._cleanup_custom_build_artifacts(
-        ssh_client=ssh_client, pod_id=payload.pod_id, default_extra={}, build_attempt="bbbb0000"
-    )
-
-    assert not any(".aaaa0000" in c for c in ssh_client.calls)
-    assert any(c.startswith(f"/usr/bin/docker rm -fv lium-poddind-{payload.pod_id}.bbbb0000 ") for c in ssh_client.calls)
-    assert any(f"image rm lium-podbuild-{payload.pod_id}.bbbb0000 " in c for c in ssh_client.calls)
-    assert any(f"rm -rf /tmp/lium-podbuild-{payload.pod_id}.bbbb0000" in c for c in ssh_client.calls)
-
-
-@pytest.mark.asyncio
-async def test_A27g_the_pods_delete_cleans_up_the_build_artifacts_of_every_attempt(svc):
-    ssh_client = _make_dind_ssh()
-
-    await svc._cleanup_custom_build_artifacts(ssh_client=ssh_client, pod_id="pod-1", default_extra={})
-
-    image_rm = next(c for c in ssh_client.calls if "image rm" in c)
-    assert "awk -v p=lium-build-pod-1 -v a=lium-podbuild-pod-1. '$0 == p || index($0, a) == 1'" in image_rm
-    assert any(c == "/usr/bin/rm -rf /tmp/lium-build-pod-1 /tmp/lium-podbuild-pod-1.*" for c in ssh_client.calls)
-
-
-async def _another_registrations_create(pod_id: str, registered: asyncio.Event, release: asyncio.Event) -> None:
-    """A create of the pod on another registration (a moved pod's other node, which may share the daemon)."""
-    from services.docker_service import inflight_creates
-
-    with inflight_creates.track(pod_id, ("other-hotkey", "other-executor")):
-        registered.set()
-        await release.wait()
-
-
-def _registering_another_create_during(ssh_client, command_start: str, pod_id: str, release: asyncio.Event, tasks):
-    """The other registration's create registers while the first command starting `command_start` runs."""
-    run = ssh_client.run
-
-    async def _run(cmd, **kw):
-        if cmd.startswith(command_start) and not tasks:
-            registered = asyncio.Event()
-            tasks.append(asyncio.create_task(_another_registrations_create(pod_id, registered, release)))
-            await registered.wait()
-        return await run(cmd, **kw)
-
-    ssh_client.run = _run
-
-
-@pytest.mark.asyncio
-async def test_A27h_a_create_that_registers_during_the_earlier_build_container_listing_keeps_its_own(
-    svc, monkeypatch
-):
-    """Stand check 2394-23: a create of the pod on another registration registers while a resumed build lists the
-    pod's earlier build containers, and the listing shows its build container; nothing listed is torn down."""
-    from services.docker_service import executor_key, inflight_creates
-
-    payload = _base_payload(dockerfile_content="FROM alpine\n")
-    others = svc._dind_container_name(payload.pod_id, "deadbeef")
-    ssh_client = _make_dind_ssh(leftover_dinds=(others,))
-    release, tasks = asyncio.Event(), []
-    _registering_another_create_during(ssh_client, "/usr/bin/docker ps -a --format", payload.pod_id, release, tasks)
-    monkeypatch.setattr(svc, "execute_and_stream_logs", _make_esl(build=(False, "boom")))
-    monkeypatch.setattr(svc, "stream_log", AsyncMock())
-
-    try:
-        with inflight_creates.track(payload.pod_id, executor_key(payload)):
-            await svc._custom_build_image(
-                ssh_client=ssh_client, payload=payload, log_tag="t", default_extra={}, build_attempt="bbbb0000"
-            )
-    finally:
-        release.set()
-        await asyncio.gather(*tasks)
-
-    assert tasks and any(c.startswith("/usr/bin/docker ps -a --format") for c in ssh_client.calls)
-    assert not any(others in c for c in ssh_client.calls if not c.startswith("/usr/bin/docker ps -a"))
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("registers_during", [None, "/usr/bin/docker image rm"], ids=["before", "during_image_rm"])
-async def test_A27i_the_pods_delete_leaves_the_build_artifacts_while_another_registrations_create_runs(
-    svc, registers_during
-):
-    """Stand check 2394-24: the delete's cleanup selects every attempt by the pod alone, so with a create of the pod
-    running on another registration it removes none of them (that create's own attempt is among them)."""
-    ssh_client = _make_dind_ssh()
-    release, tasks = asyncio.Event(), []
-    if registers_during is None:
-        registered = asyncio.Event()
-        tasks.append(asyncio.create_task(_another_registrations_create("pod-1", registered, release)))
-        await registered.wait()
-    else:
-        _registering_another_create_during(ssh_client, registers_during, "pod-1", release, tasks)
-
-    try:
-        await svc._cleanup_custom_build_artifacts(ssh_client=ssh_client, pod_id="pod-1", default_extra={})
-    finally:
-        release.set()
-        await asyncio.gather(*tasks)
-
-    assert not any(c.startswith("/usr/bin/rm -rf") for c in ssh_client.calls)
-    assert any("image rm" in c for c in ssh_client.calls) is (registers_during is not None)
 
 
 @pytest.mark.asyncio
 async def test_A27e_a_resumed_build_whose_old_build_container_cannot_be_stopped_stops_early(svc, monkeypatch):
-    """DAH-5666: the old DinD still runs with its egress rules, so the create stops before a second build starts."""
+    """DAH-5666: the old DinD still holds the name, so the create stops before `docker run --name` fails on it."""
     from services.docker_service import executor_key, inflight_creates
 
-    payload = _base_payload(dockerfile_content="FROM alpine\n")
-    ssh_client = _make_dind_ssh(leftover_dinds=(f"lium-poddind-{payload.pod_id}.c0ff0001",))
+    ssh_client = _make_dind_ssh()
     inner = ssh_client.run
 
     async def _run(cmd, **kw):
@@ -687,6 +561,7 @@ async def test_A27e_a_resumed_build_whose_old_build_container_cannot_be_stopped_
     ssh_client.run = _run
     monkeypatch.setattr(svc, "execute_and_stream_logs", _make_esl(build=(False, "Process timed out")))
     monkeypatch.setattr(svc, "stream_log", AsyncMock())
+    payload = _base_payload(dockerfile_content="FROM alpine\n")
 
     with inflight_creates.track(payload.pod_id, executor_key(payload)):
         ok, step, _ = await svc._custom_build_image(

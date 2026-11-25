@@ -23,7 +23,6 @@ from core.docker_utils import DockerCommand
 from core.utils import retry_ssh_command
 from services import docker_service
 from services.docker_service import (
-    _registration_label_command,
     EDIT_PARKED_SUFFIX,
     DockerService,
     _layer_data_check,
@@ -144,7 +143,7 @@ def _docker(commands: list[str], verb: str) -> list[str]:
 
 @pytest.mark.asyncio
 async def test_edit_parks_the_current_container_before_the_sweep_and_removes_it_after_success(svc, monkeypatch):
-    payload = _edit_payload(superseded_command_id="cmd-failed")
+    payload = _edit_payload()
     ssh = _ssh_recording()
     _patch_happy(svc, monkeypatch, ssh)
     name, parked = _pod_name(payload), _kept(payload)
@@ -161,10 +160,6 @@ async def test_edit_parks_the_current_container_before_the_sweep_and_removes_it_
     # the sweep was told the parked name is not stale
     protected = svc.clean_existing_containers.await_args.kwargs["active_container_names"]
     assert protected == ["pod_someone_else", parked]
-    # DAH-6531: the pod's own name is swept only as this registration's stopped leftover
-    assert svc.clean_existing_containers.await_args.kwargs["pod_owner"] == f"{payload.miner_hotkey}:{payload.executor_id}"
-    # lio#2394: a stopped leftover goes only when the backend named its create as superseded
-    assert svc.clean_existing_containers.await_args.kwargs["superseded_command_id"] == payload.superseded_command_id
     # only after the replacement is up is the old container removed, by its ID: a later edit may park
     # another container under the same name before a late rm lands; the new one is never removed
     assert _docker(ssh.commands, "rm -fv")[-1] == f"/usr/bin/docker rm -fv id-{name}"
@@ -205,8 +200,6 @@ async def test_a_successful_edit_runs_the_same_host_commands(svc, monkeypatch):
         ),
         f'/usr/bin/docker ps -a --no-trunc --format "{{{{.Names}}}} {{{{.ID}}}}" --filter name=^{name}$ --filter name=^{name}{EDIT_PARKED_SUFFIX}$ '
         f"--filter name=^kept_unmounted_{payload.pod_id}_",
-        # DAH-6531: the listed container is this registration's before anything touches it
-        _registration_label_command(f"id-{name}"),
         # the layer read: renter files under the volume path keep it after the edit
         _layer_data_check(name, "/root"),
         # the mount read: a failed edit brings it back mounted as it was
@@ -677,9 +670,7 @@ async def test_a_leftover_parked_container_next_to_the_pod_is_removed_before_par
     result = await _run(svc, payload)
 
     assert isinstance(result, ContainerCreated)
-    # stand check 2394-18: by the ID whose label and layer were checked; the name may be a foreign replacement's by now
-    assert ssh.commands.index(f"/usr/bin/docker rm -fv id-{prev} 2>/dev/null || true") < ssh.commands.index(f"/usr/bin/docker rename {name} {parked}")
-    assert not any(c.startswith(f"/usr/bin/docker rm -fv {prev}") for c in ssh.commands)
+    assert ssh.commands.index(f"/usr/bin/docker rm -fv {prev} 2>/dev/null || true") < ssh.commands.index(f"/usr/bin/docker rename {name} {parked}")
 
 
 def test_the_cycle_cleanup_protects_the_parked_twin_of_every_rented_pod():
@@ -1914,63 +1905,3 @@ async def test_a_probe_that_may_still_hold_the_session_stops_the_edit_before_it_
     assert _docker(ssh.commands, "rename") == []
     assert _docker(ssh.commands, "stop") == []
     svc._bring_up_existing_container.assert_not_awaited()
-
-
-@pytest.mark.parametrize(
-    ("label", "parks"),
-    [("miner-a:ex-1", True), ("", True), ("miner-b:ex-2", False), (None, False)],
-    ids=["own", "unlabelled", "another-registration", "unreadable"],
-)
-@pytest.mark.asyncio
-async def test_an_edit_parks_the_pods_container_only_when_made_for_its_registration(label, parks):
-    """DAH-6531: on a daemon two registrations share, the pod's name may hold the other's container; it is never
-    renamed aside or stopped by this edit."""
-    from services.docker_service import _EditSwap
-
-    ssh = _ssh_recording()
-    answer = ssh.run.side_effect
-
-    def side(cmd, *args, **kwargs):
-        if cmd.startswith("/usr/bin/docker inspect --type container -f") and "io.lium.executor_id" in cmd:
-            ssh.commands.append(cmd)
-            assert "id-pod_abc" in cmd
-            return _ssh_result(exit_status=1) if label is None else _ssh_result(stdout=f"{label}\n")
-        return answer(cmd, *args, **kwargs)
-
-    ssh.run.side_effect = side
-    swap = _EditSwap(ssh, "pod_abc", {}, redis=AsyncMock(), executor_id="ex-1", owner="miner-a:ex-1")
-
-    if parks:
-        assert await swap.park()
-        assert _docker(ssh.commands, "stop")
-    else:
-        with pytest.raises(Exception, match="not made for this registration"):
-            await swap.park()
-        assert _docker(ssh.commands, "rename") == [] and _docker(ssh.commands, "stop") == []
-        assert _docker(ssh.commands, "rm") == []
-
-
-@pytest.mark.asyncio
-async def test_an_edit_leaves_another_registrations_kept_copy_alone():
-    """Review on lium-io#2394: each kept copy under the pod's kept prefix is checked by its own ID before the edit
-    recovers, writes into or removes it; another registration's copy is not this edit's."""
-    from services.docker_service import _EditSwap
-
-    ssh = _ssh_recording()
-    foreign = "kept_unmounted_abc_1700000000"
-    ssh.kept = [foreign]
-    answer = ssh.run.side_effect
-
-    def side(cmd, *args, **kwargs):
-        if cmd.startswith("/usr/bin/docker inspect --type container -f") and "io.lium.executor_id" in cmd:
-            ssh.commands.append(cmd)
-            return _ssh_result(stdout="miner-b:ex-2\n" if f"id-{foreign}" in cmd else "miner-a:ex-1\n")
-        return answer(cmd, *args, **kwargs)
-
-    ssh.run.side_effect = side
-    swap = _EditSwap(ssh, "pod_abc", {}, redis=AsyncMock(), executor_id="ex-1", owner="miner-a:ex-1")
-
-    assert await swap.park()
-    touched = [cmd for cmd in ssh.commands if foreign in cmd and "io.lium.executor_id" not in cmd]
-    verbs = ("docker rm", "docker cp", "docker rename", "docker start")
-    assert not any(verb in cmd for cmd in touched for verb in verbs)
