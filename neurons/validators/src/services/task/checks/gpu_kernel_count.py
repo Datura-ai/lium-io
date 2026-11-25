@@ -197,7 +197,8 @@ class GpuKernelCountCheck:
     A container list that is missing (unreadable, empty, read failed, withheld behind a foreign
     mount) is replaced by the host's list (DAH-6273): one that covers the reported cards is
     match_host_view; one that is shorter is count_lower_host_view, which fails only with
-    GPU_KERNEL_COUNT_HOST_FALLBACK_ENFORCEMENT_ENABLED. With neither list there is no failure:
+    GPU_KERNEL_COUNT_HOST_FALLBACK_ENFORCEMENT_ENABLED. A short list read from the host first
+    (kernel_view_source host_pid1_root) is count_lower_host_view too. With neither list there is no failure:
     the verdict is GPU_KERNEL_COUNT_NOT_EVALUATED. One exception
     (DAH-5519): behind a foreign mount, a reported card the create step cannot attach fails like a
     short list (verdict unattachable), since no renter can start a container on it. That failure is
@@ -238,8 +239,11 @@ class GpuKernelCountCheck:
             kernel_uuids=kernel_uuids,
         ).as_fields()
         kernel_check_fields["kernel_view_source"] = source
-        # a short list from the host stands: one host inventory per cycle, a later read never overrides it
-        if kernel_check_fields["kernel_verdict"] == "count_lower" and source != KERNEL_VIEW_SOURCE_HOST:
+        # a short list from the host stands (one host inventory per cycle, a later read never
+        # overrides it) and is judged as a short host list: enforced only behind the setting
+        if kernel_check_fields["kernel_verdict"] == "count_lower" and source == KERNEL_VIEW_SOURCE_HOST:
+            kernel_check_fields["kernel_verdict"] = "count_lower_host_view"
+        if kernel_check_fields["kernel_verdict"] == "count_lower":
             kernel_check_fields["container_kernel_gpu_count"] = kernel_check_fields[
                 "kernel_gpu_count"
             ]

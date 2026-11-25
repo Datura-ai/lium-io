@@ -870,7 +870,25 @@ async def test_a_short_host_list_stands_and_the_host_is_not_read_again(context_f
 
     result = await GpuKernelCountCheck().run(ctx)
 
-    assert result.passed is False
-    assert result.event.what_we_saw["kernel_verdict"] == "count_lower"
+    # a short host list is judged as on main: recorded, failing only behind the enforcement setting
+    assert result.passed is True
+    assert result.event.reason_code == Msg.COUNT_MISMATCH_HOST_SHADOW.reason
+    assert result.event.what_we_saw["kernel_verdict"] == "count_lower_host_view"
     assert result.event.what_we_saw["kernel_view_source"] == "host_pid1_root"
+    assert result.event.what_we_saw["would_fail"] is True
     ctx.ssh.run.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_short_list_read_from_the_host_first_fails_when_enforced(
+    context_factory, check_enabled, host_fallback_enforced
+):
+    ctx = _ctx(context_factory, reported=REAL[:2], kernel=REAL[:1], host=_host_stdout(REAL[:2]))
+    ctx = ctx.model_copy(update={"state": replace(ctx.state, kernel_gpu_view_source="host_pid1_root")})
+
+    result = await GpuKernelCountCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.updates == {"gpu_kernel_count_passed": False}
+    assert result.event.reason_code == Msg.COUNT_MISMATCH.reason
+    assert result.event.what_we_saw["kernel_verdict"] == "count_lower_host_view"
