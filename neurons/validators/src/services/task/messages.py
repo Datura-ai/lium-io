@@ -2295,6 +2295,12 @@ class CapabilityMessages:
         impact="Not scored this cycle; every card proves itself in the next idle cycle.",
         remediation="Keep the node reachable over SSH.",
     )
+    # impact of a deferral (RENTED_SKIPPED / ALLCARDS_DEFERRED) on a node with no live all-cards pass: the rental
+    # probe then does not pass the cycle (CYCLE_WITHOUT_ALLCARDS), so the score is not left unchanged
+    ALLCARDS_DEFERRED_WITHOUT_PASS_IMPACT = (
+        "Score set to 0 this cycle: the node has no valid all-cards pass, so it is not offered until every card "
+        "proves itself in the next idle cycle."
+    )
     VERIFY_FAILED = MessageTemplate(
         event="GPU capability verification failed",
         reason="GPU_VERIFY_FAILED",

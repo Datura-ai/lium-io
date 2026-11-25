@@ -191,6 +191,26 @@ async def test_a_deferral_without_a_live_pass_keeps_the_node_off_new_offers(cont
 
     assert result.passed is True
     assert state.allcards_not_proven is True
+    # the rental probe then sets the score to 0, so the deferral never says the score is unchanged
+    assert "Score unchanged" not in result.event.impact
+    assert "Score set to 0" in result.event.impact
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("proven", [True, False], ids=["live_pass", "no_pass"])
+async def test_a_deferral_message_states_the_score_outcome(context_factory, svc, proven):  # noqa: F811
+    """The same deferral with and without a live last pass: only the one with a pass leaves the score unchanged."""
+    busy = ({i: OOM for i in range(4)}, _filler_on(range(4)))
+    lost = ({i: ConnectionResetError() for i in range(8)}, None)
+    for answers, fresh in (busy, lost):
+        ssh, _ = _node(answers)
+        redis = _proven(FakeRedis()) if proven else FakeRedis()
+
+        result, state = await _cycle(context_factory, svc, ssh, redis=redis, fresh=fresh)
+
+        assert result.passed is True and state.allcards_not_proven is (not proven)
+        assert ("Score set to 0" in result.event.impact) is (not proven)
+        assert ("Score unchanged" in result.event.impact or "Not scored" in result.event.impact) is proven
 
 
 @pytest.mark.asyncio

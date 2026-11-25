@@ -436,7 +436,11 @@ def _allcards_deferred_result(
 ) -> CheckResult:
     template = Msg.RENTED_SKIPPED if allcards.reason == "lium_workload" else Msg.ALLCARDS_DEFERRED
     event = render_message(
-        template, ctx=ctx, check_id=check_id, what={"allcards": allcards.as_dict(), "probe": failure_details}
+        template,
+        ctx=ctx,
+        check_id=check_id,
+        what={"allcards": allcards.as_dict(), "probe": failure_details},
+        impact=None if allcards.listed else Msg.ALLCARDS_DEFERRED_WITHOUT_PASS_IMPACT,
     )
     state_changes: dict = {"allcards_not_proven": not allcards.listed}
     if allcards.snapshot is not None:
