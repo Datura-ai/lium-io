@@ -35,12 +35,16 @@ RESTART_STOP_TIMEOUT_S = 30
 
 ALIVE = "alive"
 DOWN = "down"
+AUTOHEAL_SERVICE_LABEL = "com.docker.compose.service=autoheal"
+
+_NO_PROXY = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
 def probe_http(url: str, timeout: float = PROBE_TIMEOUT_S) -> str:
     """ALIVE when the API answers at all (an error status is still an answer), DOWN when it does not."""
     try:
-        with urllib.request.urlopen(url, timeout=timeout):
+        # never through an environment proxy: its answer is not the executor's
+        with _NO_PROXY.open(url, timeout=timeout):
             return ALIVE
     except urllib.error.HTTPError:
         return ALIVE
@@ -107,6 +111,7 @@ class ExecutorApiWatcher:
         self.backoff = BACKOFF_FIRST_S
         self.next_restart_at = 0.0
         self.restarting = False
+        self.legacy_autoheal_gone = False
 
     def _url(self, target: Target) -> str:
         return f"http://{target.ip}:{self.port}/version"
@@ -127,6 +132,21 @@ class ExecutorApiWatcher:
             return None
         return None
 
+    def _remove_legacy_autoheal(self) -> None:
+        """The autoheal service left the compose file, but compose keeps its container; this stack's own is removed
+        here, tick after tick until it is gone, never a neighbour's. It is harmless meanwhile: no executor carries
+        its label any more."""
+        if self.legacy_autoheal_gone or not self.project:
+            return
+        try:
+            labels = [AUTOHEAL_SERVICE_LABEL, f"{PROJECT_LABEL}={self.project}"]
+            for container in self.client.containers.list(all=True, filters={"label": labels}):
+                container.remove(force=True)
+                self.report("legacy_autoheal_removed", container.name)
+            self.legacy_autoheal_gone = True
+        except Exception:
+            pass  # Docker busy or the removal failed: the next tick tries again
+
     def _healthy(self) -> None:
         self.failures = 0
         self.backoff = BACKOFF_FIRST_S
@@ -138,6 +158,7 @@ class ExecutorApiWatcher:
             self.target = self._resolve()
             if self.target is None:
                 return None  # unknown: nothing to probe yet
+        self._remove_legacy_autoheal()
         if self.probe(self._url(self.target)) == ALIVE:
             self._healthy()
             return None

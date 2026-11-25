@@ -3,6 +3,7 @@ could not start an exec (the healthcheck + autoheal path restarted live nodes un
 
 import http.server
 import threading
+import urllib.request
 from datetime import datetime, timezone
 
 from services import api_watcher
@@ -31,6 +32,7 @@ class FakeContainers:
         self.executor = executor
         self.docker_up = True
         self.filters = []
+        self.autoheals = []
 
     def get(self, name):
         if not self.docker_up:
@@ -43,7 +45,24 @@ class FakeContainers:
         if not self.docker_up:
             raise TimeoutError("docker does not answer")
         self.filters.append(filters)
+        if "com.docker.compose.service=autoheal" in filters["label"]:
+            return [c for c in self.autoheals if f"com.docker.compose.project={c.project}" in filters["label"]]
         return [self.executor]
+
+
+class FakeAutoheal:
+    def __init__(self, project, failures=0):
+        self.project = project
+        self.name = f"{project}-autoheal-1"
+        self.failures = failures  # removals that fail before one succeeds
+        self.removed = False
+
+    def remove(self, force):
+        assert force
+        if self.failures:
+            self.failures -= 1
+            raise RuntimeError("docker refused the removal")
+        self.removed = True
 
 
 class Harness:
@@ -212,3 +231,46 @@ def test_probe_http_counts_any_answer_as_alive():
         server.shutdown()
         server.server_close()
     assert probe_http(f"http://127.0.0.1:{port}/version", timeout=1) == DOWN
+
+
+def test_the_stacks_own_old_autoheal_is_removed_and_retried_until_gone_but_a_neighbours_stays():
+    h = Harness()
+    h.answers = [ALIVE]
+    own, neighbour = FakeAutoheal("executor", failures=1), FakeAutoheal("other")
+    h.containers.autoheals = [own, neighbour]
+
+    h.ticks(1)  # the first removal fails
+    assert not own.removed
+    h.ticks(1)
+    assert own.removed
+    assert not neighbour.removed
+    assert h.reports == ["legacy_autoheal_removed"]
+
+    h.containers.autoheals = []
+    calls = len(h.containers.filters)
+    h.ticks(3)
+    assert len(h.containers.filters) == calls  # once gone, Docker is not asked again
+
+
+def test_an_environment_proxy_never_answers_for_the_executor(monkeypatch):
+    class Proxy(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(500)
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    proxy = http.server.HTTPServer(("127.0.0.1", 0), Proxy)
+    threading.Thread(target=proxy.serve_forever, daemon=True).start()
+    silent = http.server.HTTPServer(("127.0.0.1", 0), Proxy)
+    port = silent.server_address[1]
+    silent.server_close()
+    monkeypatch.setenv("http_proxy", f"http://127.0.0.1:{proxy.server_address[1]}")
+    monkeypatch.setenv("no_proxy", "")
+    monkeypatch.setattr(urllib.request, "_opener", None)  # urlopen caches the opener (and its proxies) at first use
+    try:
+        assert probe_http(f"http://127.0.0.1:{port}/version", timeout=1) == DOWN
+    finally:
+        proxy.shutdown()
+        proxy.server_close()
