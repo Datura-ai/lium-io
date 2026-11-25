@@ -6722,7 +6722,7 @@ class DockerService:
             # not full); the tight-disk sweep evicts it later if the pod's writes need the room. The Engy cache is
             # listed as free disk, so it still gives way until the floor fits too.
             volume_needs_free_gb = rental_needs_free_gb - DPHN_CACHE_LISTING_FLOOR_GB + DPHN_CACHE_FREE_MARGIN_GB
-            listed_as_free_prefixes = cache_prefixes("listed_as_free")
+            listed_as_free_prefixes = cache_prefixes(lambda kind: kind.listed_as_free)
             volumes_listed_as_free: set[str] = {
                 name for name in cache_volumes if is_cache_volume_name(name, listed_as_free_prefixes)
             }

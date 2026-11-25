@@ -1,5 +1,6 @@
 import math
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import StrEnum
 
@@ -419,6 +420,9 @@ class CacheKind:
     swept_by_launches_of: frozenset[str]
 
 
+# the backend's whole job cache name (build_job_cache_volume), its size (the provider's limit) in group 1
+JOB_CACHE_VOLUME_NAME = re.compile(rf"^{JOB_CACHE_VOLUME_PREFIX}(\d+)gb_[0-9a-f]{{12}}$")
+
 CACHE_KINDS: tuple[CacheKind, ...] = (
     CacheKind(
         prefix=DPHN_CACHE_VOLUME_PREFIX,
@@ -448,11 +452,10 @@ CACHE_KINDS: tuple[CacheKind, ...] = (
     ),
     CacheKind(
         prefix=JOB_CACHE_VOLUME_PREFIX,
-        # the backend's whole name (build_job_cache_volume): a provider's own volume with the prefix stays theirs
-        name=re.compile(rf"^{JOB_CACHE_VOLUME_PREFIX}(\d+)gb_[0-9a-f]{{12}}$"),
+        # the whole name: a provider's own volume with the prefix stays theirs
+        name=JOB_CACHE_VOLUME_NAME,
         fixed_size_gb=None,
-        # the size in the name is the provider's limit
-        size_in_name=re.compile(rf"^{JOB_CACHE_VOLUME_PREFIX}(\d+)gb_[0-9a-f]{{12}}$"),
+        size_in_name=JOB_CACHE_VOLUME_NAME,
         charge=CacheCharge.REST_OF_SIZE,
         unmeasured_charged_whole=True,
         listed_as_free=True,
@@ -473,9 +476,9 @@ def cache_kind(name: str) -> CacheKind | None:
     return None
 
 
-def cache_prefixes(rule: str) -> tuple[str, ...]:
-    """The prefixes of the kinds whose boolean rule `rule` (a CacheKind field) holds."""
-    return tuple(kind.prefix for kind in CACHE_KINDS if getattr(kind, rule))
+def cache_prefixes(rule: Callable[[CacheKind], bool]) -> tuple[str, ...]:
+    """The prefixes of the kinds for which `rule` holds, e.g. `cache_prefixes(lambda kind: kind.listed_as_free)`."""
+    return tuple(kind.prefix for kind in CACHE_KINDS if rule(kind))
 
 
 def is_cache_volume_name(name: str, prefixes: tuple[str, ...]) -> bool:

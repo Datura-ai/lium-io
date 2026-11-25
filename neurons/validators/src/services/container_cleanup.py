@@ -516,7 +516,7 @@ class ContainerCleanup:
         """The caches among ``cache_volumes`` whose kind is reclaimed beside a live filler once no container
         mounts them (CacheKind.reclaimed_beside_filler_when_unmounted): their run is gone, but they still hold disk."""
         unmounted: set[str] = set(await self._get_dangling_volumes(ssh_client) or [])
-        kinds = cache_prefixes("reclaimed_beside_filler_when_unmounted")
+        kinds = cache_prefixes(lambda kind: kind.reclaimed_beside_filler_when_unmounted)
         return [name for name in cache_volumes if is_cache_volume_name(name, kinds) and name in unmounted]
 
     async def reclaim_dphn_cache_when_disk_is_tight(
@@ -774,7 +774,7 @@ class ContainerCleanup:
         extra = {"executor_uuid": executor_uuid}
         try:
             cache_volumes: list[str] = await self._get_cache_volumes(
-                ssh_client, cache_prefixes("download_temporaries_swept")
+                ssh_client, cache_prefixes(lambda kind: kind.download_temporaries_swept)
             )
             if not cache_volumes:
                 return 0

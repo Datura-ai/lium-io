@@ -993,9 +993,9 @@ def test_each_cache_kind_reads_its_size_and_charge_from_one_table(name, size_gb,
 
 
 def test_the_per_kind_rules_come_from_the_table():
-    assert cache_prefixes("listed_as_free") == ("engy_cache_", "job_cache_")
-    assert cache_prefixes("reclaimed_beside_filler_when_unmounted") == ("job_cache_",)
-    assert cache_prefixes("download_temporaries_swept") == ("dphn_cache_", "engy_cache_")
+    assert cache_prefixes(lambda kind: kind.listed_as_free) == ("engy_cache_", "job_cache_")
+    assert cache_prefixes(lambda kind: kind.reclaimed_beside_filler_when_unmounted) == ("job_cache_",)
+    assert cache_prefixes(lambda kind: kind.download_temporaries_swept) == ("dphn_cache_", "engy_cache_")
     # a provider's own volume that only starts with the prefix is no cache of ours
     assert cache_kind("job_cache_mine") is None
 
