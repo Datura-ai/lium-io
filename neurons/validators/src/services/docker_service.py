@@ -2333,8 +2333,13 @@ class _EditSwap:
             # dockerd lost the exit event (F-1633), so waiting for it to report one first waits for nothing:
             # kill init + shim directly now, as the delete path does (DAH-2991)
             direct = (await self._run(DockerCommand.kill_container_processes(parked), _seconds_left(deadline))).stdout or ""
-        # init=alive waits too: a pid-namespace init still reaping its dying children reads alive for a moment
-        return direct, await self._docker_reports_stopped(parked, deadline)
+        # init=alive waits too: a pid-namespace init still reaping its dying children reads alive for a moment,
+        # so init is re-read with each State.Running read and the verdict uses the last reading (DAH-7025 review)
+        probe = DockerCommand.init_state(direct) if direct else None
+        stopped, init_gone = await self._docker_reports_stopped(parked, deadline, probe)
+        if init_gone:
+            direct = re.sub(r"init=\w+", "init=gone", direct)
+        return direct, stopped
 
     async def _unless_deleted(self, work: Awaitable):
         """The work's result, unless the pod's delete cancels this edit first: a delete waits
@@ -2354,10 +2359,12 @@ class _EditSwap:
         self.left_to_delete = True
         raise _CreateCancelledByDelete("the pod's delete arrived while its container was being stopped for the edit")
 
-    async def _docker_reports_stopped(self, parked: str, deadline: float) -> bool:
+    async def _docker_reports_stopped(self, parked: str, deadline: float, init_probe: str | None = None) -> tuple[bool, bool]:
         """Re-read the container's state every _PARK_KILL_SETTLE_SECONDS until the deadline; each read ends by it.
-        Leaves running_after_kill set when the last read answered that the container still runs."""
+        Leaves running_after_kill set when the last read answered that the container still runs. With init_probe,
+        init is re-read after each read that still finds it running; returns (stopped, init seen gone)."""
         self.running_after_kill = False
+        init_gone = False
         for _ in range(max(1, _PARK_KILL_WAIT_SECONDS // max(_PARK_KILL_SETTLE_SECONDS, 1))):
             await asyncio.sleep(_PARK_KILL_SETTLE_SECONDS)
             if time.monotonic() >= deadline:
@@ -2367,9 +2374,12 @@ class _EditSwap:
             )
             answered = (running.stdout or "").strip() if running.exit_status == 0 else None
             if answered == "false":
-                return True
+                return True, init_gone
             self.running_after_kill = answered == "true"
-        return False
+            if init_probe is not None and not init_gone and time.monotonic() < deadline:
+                read = await self._run(init_probe, _seconds_left(deadline))
+                init_gone = (read.stdout or "").strip() == "init=gone"
+        return False, init_gone
 
     async def _record_parked(self, parked: bool) -> None:
         """Best effort: unrecorded, a parked container's GPU load counts as the provider's."""

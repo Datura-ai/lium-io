@@ -612,6 +612,61 @@ async def test_a_delete_during_the_wait_after_the_kill_ends_the_edit_inside_its_
     svc._bring_up_existing_container.assert_not_awaited()
 
 
+@pytest.mark.parametrize(("init_exits_on_read", "step"), [(2, "park_current_container"), (None, "container_cleanup")],
+                         ids=["init_exits_before_the_deadline", "init_survives_to_the_deadline"])
+@pytest.mark.asyncio
+async def test_an_init_that_exits_after_the_first_reading_is_not_unkillable(svc, monkeypatch, init_exits_on_read, step):
+    # DAH-7025 review: init read alive once at 3 s, exited at 10 s, Docker said Running=true to the deadline
+    monkeypatch.setattr("services.docker_service._PARK_KILL_SETTLE_SECONDS", 0)
+    monkeypatch.setattr("services.docker_service._PARK_KILL_WAIT_SECONDS", 10)
+    payload = _edit_payload()
+    ssh = _ssh_recording(stop_exit=1)
+    inner = ssh.run
+    direct = "killed pid=4242 started=777 shim=4241 init=alive\n"
+    probe = DockerCommand.init_state(direct)
+    init_reads = []
+
+    async def slow(cmd, *args, **kwargs):
+        if cmd.startswith("/usr/bin/docker kill"):
+            ssh.commands.append(cmd)
+            return _ssh_result(exit_status=1, stderr="cannot kill container: tried to kill container, but did not receive an exit event")
+        if cmd == DockerCommand.kill_container_processes(_kept(payload)):
+            ssh.commands.append(cmd)
+            return _ssh_result(stdout=direct)
+        if cmd == probe:
+            init_reads.append(cmd)
+            gone = init_exits_on_read is not None and len(init_reads) >= init_exits_on_read
+            return _ssh_result(stdout="init=gone\n" if gone else "init=alive\n")
+        if "docker inspect -f '{{.State.Running}}'" in cmd:
+            return _ssh_result(stdout="true\n")
+        return await inner(cmd, *args, **kwargs)
+
+    ssh.run = slow
+    _patch_happy(svc, monkeypatch, ssh)
+
+    result = await _run(svc, payload)
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.failure_step == step
+    assert init_reads, "init was never re-read"
+    svc._run_rental_docker_create_with_port_retry.assert_not_awaited()
+
+
+def test_the_init_reread_tells_a_live_init_from_an_exited_one():
+    import subprocess
+
+    assert DockerCommand.init_state("killed pid=42 started=9 shim=none init=gone") is None
+    child = subprocess.Popen(["sleep", "60"])
+    try:
+        started = open(f"/proc/{child.pid}/stat").read().rsplit(") ", 1)[1].split()[19]
+        alive = DockerCommand.init_state(f"killed pid={child.pid} started={started} shim=none init=alive")
+        assert subprocess.run(["sh", "-c", alive], capture_output=True, text=True).stdout.strip() == "init=alive"
+    finally:
+        child.kill()
+    child.wait()
+    assert subprocess.run(["sh", "-c", alive], capture_output=True, text=True).stdout.strip() == "init=gone"
+
+
 def test_the_direct_kill_reads_a_killed_init_as_gone():
     # the script's own /proc reading, on a real process: the pid lookup stands in for docker inspect
     import subprocess

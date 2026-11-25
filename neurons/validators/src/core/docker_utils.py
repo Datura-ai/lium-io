@@ -112,7 +112,22 @@ class DockerCommand:
             # no /proc entry at all: init exited and was reaped before the lookup, Docker just has not caught up
             "if [ -z \"$started\" ]; then [ -e /proc/$pid ] && init=unknown; "
             "elif [ \"${now#* }\" = \"$started\" ] && [ \"${now%% *}\" != Z ]; then init=alive; fi; "
-            "echo \"killed pid=$pid shim=${shim:-none} init=$init\"; fi; true"
+            "echo \"killed pid=$pid started=$started shim=${shim:-none} init=$init\"; fi; true"
+        )
+
+    @staticmethod
+    def init_state(direct: str) -> str | None:
+        """Re-read the init a direct kill reported alive or unknown (its pid and start time from that output):
+        prints ``init=alive|unknown|gone`` by the same reading. None when the output names none to re-read."""
+        found = re.search(r"pid=(\d+) started=(\d*) .*init=(alive|unknown)\b", direct)
+        if found is None:
+            return None
+        pid, started = found.group(1), found.group(2)
+        return (
+            f"now=$(sed 's/.*) //' /proc/{pid}/stat 2>/dev/null | cut -d' ' -f1,20); init=gone; "
+            f"if [ -z \"{started}\" ]; then [ -e /proc/{pid} ] && init=unknown; "
+            f"elif [ \"${{now#* }}\" = \"{started}\" ] && [ \"${{now%% *}}\" != Z ]; then init=alive; fi; "
+            "echo \"init=$init\""
         )
 
     @staticmethod
