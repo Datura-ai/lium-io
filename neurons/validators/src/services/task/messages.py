@@ -2861,6 +2861,11 @@ class SpecFloorMessages:
             "counted GPU, and each card's own GPU UUID."
         ),
     )
+    # DAH-2621: appended for a new node below the RAM/VRAM rule, filled from the check's what
+    RAM_BELOW_HALF_VRAM_REMEDIATION = (
+        " A new node needs system RAM of at least half its total GPU VRAM: {vram_gb} GB of VRAM needs at least"
+        " {required_ram_gb} GB of RAM, this node reports {ram_gb} GB. Add RAM, then run the check again."
+    )
 
 
 class DockerCpuMessages:

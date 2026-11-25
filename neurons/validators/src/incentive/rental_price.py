@@ -21,6 +21,7 @@ from core.utils import _m, get_logger
 from incentive.config import BASE_GPU_MAP
 from incentive.eligibility import earns_spot_rental_incentive, is_missing_discord_after_cutoff
 from incentive.miner_incentive_log import MinerLogLine, ZeroIncentiveReason
+from incentive.ram_vram import InsufficientRam, insufficient_ram, ram_and_vram_gb
 
 if TYPE_CHECKING:
     from incentive.config import IncentiveConfig
@@ -45,12 +46,8 @@ logger = get_logger(__name__)
 # incentive but stays active.
 MIN_DISK_TO_VRAM_RATE = 1.5
 
-# DAH-2621 — unrented incentive RAM/VRAM gate. An unrented executor whose system RAM is below this share of its
-# summed GPU VRAM cannot stage a model into its GPUs, so it forfeits the unrented incentive but stays active.
-# Half, not all of it: stock 8x B200/B300 boards carry 0.9x and real offenders sit far below (DAH-2621 fleet data).
-MIN_RAM_TO_VRAM_RATE = 0.5
-# MemTotal reports a few percent less than the installed RAM (24 GB installed reads 23.5 GB)
-RAM_MEMTOTAL_TOLERANCE = 1.05
+# DAH-2621 — unrented incentive RAM/VRAM gate (rule in incentive/ram_vram.py, shared with onboarding): an unrented
+# executor below it forfeits the unrented incentive but stays active.
 
 # DAH-2546 — full 8x capability gate. An unrented 8x machine of these base models must
 # have NCU profiling counters open on the host, real GPU splitting enabled, or a verified TDX
@@ -89,15 +86,6 @@ class InsufficientDisk(BaseModel):
     vram_gb: float
     disk_gb: float
     rate: float  # required disk-to-VRAM margin the machine failed to clear
-
-
-class InsufficientRam(BaseModel):
-    """Measured totals of a machine whose system RAM is below the required share of its GPU VRAM."""
-
-    vram_gb: float
-    ram_gb: float
-    rate: float  # required RAM-to-VRAM share the machine failed to clear
-    required_ram_gb: float  # the RAM reading that clears it
 
 
 class MissingFull8xCapability(BaseModel):
@@ -396,9 +384,7 @@ class RentalPriceIncentive(DefaultIncentive):
         if not spec:
             return None
         try:
-            gpu_details = (spec.get("gpu") or {}).get("details") or []
-            vram_gb = sum(float(gpu.get("capacity") or 0) for gpu in gpu_details) / 1024  # capacity is MB
-            ram_gb = float((spec.get("ram") or {}).get("total") or 0) / 1024**2  # MemTotal, kB
+            ram_gb, vram_gb = ram_and_vram_gb(spec)
         except (AttributeError, TypeError, ValueError, OverflowError) as exc:
             if log_if_cannot_measure:
                 self._log_insufficient_ram_unmeasured(result, f"unreadable scrape: {exc!r}")
@@ -407,19 +393,7 @@ class RentalPriceIncentive(DefaultIncentive):
             if log_if_cannot_measure:
                 self._log_insufficient_ram_unmeasured(result, "vram or ram missing from the scrape")
             return None
-        if ram_gb * RAM_MEMTOTAL_TOLERANCE >= vram_gb * MIN_RAM_TO_VRAM_RATE:
-            return None
-        required_ram_gb = round(vram_gb * MIN_RAM_TO_VRAM_RATE / RAM_MEMTOTAL_TOLERANCE, 1)
-        if required_ram_gb * RAM_MEMTOTAL_TOLERANCE < vram_gb * MIN_RAM_TO_VRAM_RATE:
-            # nearest rounding went below the floor: name the next reading the check above accepts
-            required_ram_gb = round(required_ram_gb + 0.1, 1)
-        # rounded only for the report: the check above must use the raw readings
-        return InsufficientRam(
-            vram_gb=round(vram_gb, 1),
-            ram_gb=round(ram_gb, 1),
-            rate=MIN_RAM_TO_VRAM_RATE,
-            required_ram_gb=required_ram_gb,
-        )
+        return insufficient_ram(ram_gb, vram_gb)
 
     def _log_insufficient_ram_unmeasured(self, result: JobResult, cause: str) -> None:
         # gate could not run: a shadow report must not read this executor as "RAM is fine"
