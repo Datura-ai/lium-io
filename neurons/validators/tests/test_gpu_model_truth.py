@@ -233,7 +233,7 @@ async def test_a_failed_first_sample_is_retried_next_cycle(context_factory, samp
 
     ctx, service = _filler_ctx(context_factory, redis, None, success=False)
     assert (await CapabilityCheck().run(ctx)).passed is True
-    assert service.budgets != []
+    assert len(service.budgets) == 1
 
 
 @pytest.mark.asyncio
@@ -692,3 +692,21 @@ async def test_a_carried_work_proof_failure_clears_on_a_right_answer_with_no_num
     assert service.gpu_uuids == ["GPU-1"]
     assert result.passed is True
     assert json.loads(redis.store[_verdict_key()])["mismatches"] == []
+
+
+@pytest.mark.asyncio
+async def test_an_out_of_turn_retry_moves_to_the_next_card_each_cycle(context_factory, monkeypatch):
+    # lio#2456 review: a node with no verdict is retried every cycle; on the next card, not one card for a day
+    picked = []
+
+    async def card_sample(ctx, specs, card_index, sample):
+        picked.append(card_index)
+
+    monkeypatch.setattr(capability, "_card_matmul_sample", card_sample)
+    monkeypatch.setattr(capability.settings, "FILLER_MATMUL_SAMPLE_EVERY_N_CYCLES", 24)
+    ctx = context_factory()
+    specs = {"gpu": {"details": [{"uuid": f"GPU-{i}"} for i in range(4)]}}
+    for cycle in range(100, 104):
+        await capability._filler_matmul_sample(ctx, specs, cycle, on_turn=False)
+
+    assert sorted(picked) == [0, 1, 2, 3]

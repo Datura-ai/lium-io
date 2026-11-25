@@ -78,8 +78,11 @@ class CapabilityCheck:
             unjudged = not seen and settings.FILLER_MATMUL_SAMPLE_EVERY_N_CYCLES > 0
             # a card that failed its work-proof is sampled again every cycle, so it clears as soon as it passes
             failed_cards = [m.card_index for m in mismatches if m.kind == WORK_PROOF_FAILED]
-            if failed_cards or unjudged or _filler_matmul_sample_due(ctx, cycle):
-                sample, found = await _filler_matmul_sample(ctx, specs, cycle, failed_cards[0] if failed_cards else None)
+            on_turn = _filler_matmul_sample_due(ctx, cycle)
+            if failed_cards or unjudged or on_turn:
+                sample, found = await _filler_matmul_sample(
+                    ctx, specs, cycle, failed_cards[0] if failed_cards else None, on_turn=on_turn
+                )
                 what_filler["matmul_sample"] = sample
                 card = sample.get("card_index", 0)
                 if _filler_sample_failed_card(sample):
@@ -92,7 +95,7 @@ class CapabilityCheck:
                     mismatches = await judge_gpu_model(ctx, [], {card})
                 elif not seen and sample.get("passed"):
                     # a right answer without numbers is still a verdict; a sample with none is retried next cycle
-                    await _store_gpu_model_verdict(ctx, [], GPU_MODEL_VERDICT_TTL_SECONDS)
+                    mismatches = await judge_gpu_model(ctx, [], set())
             if mismatches:
                 # the node earns nothing, so Lium's filler no longer runs on it (as SshdBootstrapCheck)
                 rented_data = ctx.state.rented_data
@@ -400,7 +403,7 @@ def _filler_matmul_sample_due(ctx: Context, cycle: int) -> bool:
 
 
 async def _filler_matmul_sample(
-    ctx: Context, specs: dict, cycle: int, card_index: int | None = None
+    ctx: Context, specs: dict, cycle: int, card_index: int | None = None, on_turn: bool = True
 ) -> tuple[dict, list[GpuModelMismatch] | None]:
     """A filler-only node skips the matmul for as long as the filler runs, so a card that left the
     node after the filler started is never challenged. This runs the same challenge on a small VRAM
@@ -410,12 +413,13 @@ async def _filler_matmul_sample(
     Each sample is pinned to one claimed card, the next one in rotation, so every card is sampled
     within the budget, or `card_index` when given (a card whose work-proof failed). One card per
     sample costs what an unpinned sample did; every card in one sample could run past the job timeout
-    on a wedged node."""
+    on a wedged node. An out-of-turn sample (a node with no verdict yet) moves to the next card every
+    cycle, so a retry never hits the same card for the whole rotation step."""
     sample: dict = {"vram_budget_mb": settings.FILLER_MATMUL_SAMPLE_VRAM_MB}
     details = (specs.get("gpu") or {}).get("details") or []
     if details:
         every = max(settings.FILLER_MATMUL_SAMPLE_EVERY_N_CYCLES, 1)
-        sample_index = (cycle + _filler_sample_offset(ctx)) // every
+        sample_index = (cycle + _filler_sample_offset(ctx)) // (every if on_turn else 1)
         if card_index is None or not 0 <= card_index < len(details):
             card_index = sample_index % len(details)
         found = await _card_matmul_sample(ctx, specs, card_index, sample)
