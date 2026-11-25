@@ -481,6 +481,19 @@ class ContainerCleanup:
             )
             return 0
 
+    async def _job_caches_no_container_mounts(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        cache_volumes: list[str],
+    ) -> list[str]:
+        """The provider job caches among ``cache_volumes`` that no container mounts.
+
+        A live filler's caches are in use, but a job cache no container mounts (left beside a rental:
+        the job's run is gone) still holds disk and goes like any other (DAH-6406).
+        """
+        unmounted: set[str] = set(await self._get_dangling_volumes(ssh_client) or [])
+        return [name for name in cache_volumes if name.startswith(JOB_CACHE_VOLUME_PREFIX) and name in unmounted]
+
     async def reclaim_dphn_cache_when_disk_is_tight(
         self,
         ssh_client: asyncssh.SSHClientConnection,
@@ -517,12 +530,7 @@ class ContainerCleanup:
             # RUNNING only: _get_all_rental_containers uses `docker ps -a`, so one long-exited
             # filler_* would make "no live filler" false forever and the reclaim would never fire.
             if await self._has_running_filler(ssh_client):
-                # a live filler's caches are in use, but a provider job cache no container mounts (left beside a
-                # rental: the job's run is gone) still holds disk and goes like any other
-                unmounted: set[str] = set(await self._get_dangling_volumes(ssh_client) or [])
-                cache_volumes = [
-                    name for name in cache_volumes if name.startswith(JOB_CACHE_VOLUME_PREFIX) and name in unmounted
-                ]
+                cache_volumes = await self._job_caches_no_container_mounts(ssh_client, cache_volumes)
                 if not cache_volumes:
                     return 0
 
