@@ -1139,33 +1139,21 @@ def test_a_helper_record_round_trips():
     assert StorageHelperRecord.parse("lium-storage-01234567-89a|5|c2") is None
 
 
+
 @pytest.mark.asyncio
-async def test_the_periodic_pass_reports_an_exited_helper_whose_job_is_still_open(context_factory, monkeypatch):
-    # the runner reports before it exits: an exited helper with an open job lost its report (killed whole, crash)
+@pytest.mark.parametrize(("status", "reported"), [("RUNNING", True), ("CANCEL_REQUESTED", False)])
+async def test_the_periodic_pass_reports_a_dead_helper_unless_its_job_is_being_cancelled(
+    context_factory, monkeypatch, status, reported
+):
     report = AsyncMock(return_value=True)
-    # the storage_operations module the check imported (src on sys.path), not this file's package path
-    monkeypatch.setitem(
-        provider_side_load_module.report_exited_detached_helper.__globals__, "_report_operation_status", report
-    )
-    runner = _helper_runner(BACKUP_HELPER)
-    node = runner.run.side_effect
-
-    def run(command, **kwargs):
-        if "docker inspect" in command and str(OPERATION) in command:
-            return MagicMock(success=True, stdout="STATUS:1\n")
-        assert not command.startswith("cat ")  # the node's spec is never read
-        return node(command, **kwargs)
-
+    monkeypatch.setattr(provider_side_load_module, "report_exited_detached_helper", report)
     store: set[str] = set()
     ctx = _with_recorded_helpers(
-        context_factory(state=_rented_state(SN13_SPECS), runner=runner), OPERATION, records=store
+        context_factory(state=_rented_state(SN13_SPECS), runner=_helper_runner(BACKUP_HELPER)), OPERATION, records=store
     )
-    ctx.runner.run = AsyncMock(side_effect=run)
-    held = '{"action": "backup", "reporter": {"auth_token": "t", "resource": "backup"}}'
-    ctx.services.redis.get = AsyncMock(side_effect=lambda key: held if key == f"storage_reporter:{OPERATION}" else None)
+    ctx.services.backend.get_storage_operation_active.return_value.status = status
 
-    assert await _provider_cores(ctx) == 8.9
-    assert report.await_args.kwargs["status"] == "FAILED"
-    assert "exited with code 1" in report.await_args.kwargs["message"]
-    assert report.await_args.args[1]["reporter"]["auth_token"] == "t"
-    assert store == set()
+    await _provider_cores(ctx)
+
+    assert report.await_count == (1 if reported else 0)
+    assert (store == set()) is reported

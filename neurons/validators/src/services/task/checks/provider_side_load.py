@@ -303,7 +303,8 @@ async def storage_operation_open(ctx: Context, operation_id: str) -> bool | None
         return None
     if answer is None or not answer.active:
         return None if answer is None else False
-    if ctx.runner is not None and await report_exited_detached_helper(
+    # a cancel the backend is running stops the helper itself and reports CANCELLED; a dead helper then is not lost
+    if answer.status != "CANCEL_REQUESTED" and ctx.runner is not None and await report_exited_detached_helper(
         lambda command: _stdout(ctx, command), ctx.services.redis, operation_id
     ):
         return False

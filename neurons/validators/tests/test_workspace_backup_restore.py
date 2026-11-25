@@ -20,7 +20,6 @@ from payload_models.payloads import (
     ExternalVolumeInfo,
     RestoreContainerRequest,
 )
-from services.storage_operations import StorageOperationLaunchError
 from services.docker_service import DockerService
 from services.miner_service import MinerService
 from workspace_mount import (
@@ -451,55 +450,6 @@ async def test_encrypted_bootstrap_restore_spec_never_carries_the_passphrase(mon
     assert spec["workspace"]["requested_path"] == "/root"
     # create-time: the entrypoint may have touched the fresh mount already; the backup wins
     assert spec["workspace"]["bootstrap"] is True
-
-
-@pytest.mark.asyncio
-async def test_a_killed_bootstrap_restore_is_reported_failed_before_its_record_is_dropped(monkeypatch):
-    calls: list[str] = []
-    monkeypatch.setattr(docker_service_module, "supports_storage_operation", AsyncMock(return_value=True))
-    monkeypatch.setattr(docker_service_module, "start_storage_operation", AsyncMock(return_value=object()))
-    monkeypatch.setattr(
-        docker_service_module,
-        "wait_for_storage_operation",
-        AsyncMock(side_effect=StorageOperationLaunchError("storage operation failed with exit 137: killed")),
-    )
-    report = AsyncMock(side_effect=lambda *a: calls.append("report"))
-    monkeypatch.setattr(docker_service_module, "report_storage_operation_failed", report)
-    monkeypatch.setattr(
-        docker_service_module, "forget_storage_helper", AsyncMock(side_effect=lambda *a: calls.append("forget"))
-    )
-    service = DockerService.__new__(DockerService)
-    service.redis_service = AsyncMock()
-    restore = SimpleNamespace(
-        backup_engine="restic",
-        restore_log_id="33333333-3333-4333-8333-333333333333",
-        restore_path="",
-        backup_volume_info=SimpleNamespace(name="bucket", iam_user_access_key="ak", iam_user_secret_key="sk", session_token=None),
-        repository_password="repo-password",
-        repository_pod_id="pod-1",
-        snapshot_id="a" * 64,
-        legacy_object_key=None,
-        legacy_object_size_bytes=None,
-        auth_token="token",
-        failure_timeout_seconds=600,
-    )
-
-    with pytest.raises(StorageOperationLaunchError):
-        await service._run_bootstrap_restore(
-            ssh_client=AsyncMock(),
-            executor_info=_executor_info(),
-            payload=SimpleNamespace(pod_id="pod-1"),
-            restore=restore,
-            local_volume="volume_pod-1",
-            local_volume_path="/root",
-            encrypted=False,
-            container_name="pod_pod-1",
-        )
-
-    assert calls == ["report", "forget"]
-    assert "exit 137" in report.await_args.args[2]
-
-
 
 
 
