@@ -2,6 +2,7 @@
 signed request per miner per cycle, off the hot path, never failing the run."""
 
 import asyncio
+import time
 import logging
 from datetime import UTC, datetime
 from types import SimpleNamespace
@@ -263,12 +264,14 @@ def _miner_service_recording(order: list[str]) -> MinerService:
     service.express_queued = frozenset()
     service.miners_awaiting_wave_list = {}
     service.rented_missed_last_cycle = {}
+    service.deadlines = []
 
     def report(miner_info, executors):
         order.append(f"report:{miner_info.miner_hotkey}:{','.join(e.uuid for e in executors)}")
 
     async def create_task(**kwargs):
         order.append(f"create_task:{kwargs['executor_info'].uuid}")
+        service.deadlines.append(kwargs.get("deadline_monotonic"))
         return SimpleNamespace(executor_info=kwargs["executor_info"], score=1)
 
     service.task_service = SimpleNamespace(
@@ -312,6 +315,30 @@ async def test_rest_path_reports_the_miner_once_before_launching_its_executors(m
 
     assert order[0] == "report:5Miner:exec-a,exec-b"
     assert sorted(order[1:]) == [f"create_task:{u}" for u in uuids]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("job_timeout", [None, 110.0])
+async def test_an_express_recheck_deadline_reaches_the_task(monkeypatch, job_timeout):
+    # DAH-5933 review: a recheck's wait ends before JOB_TIME_OUT; its checks budget against that deadline
+    service = _miner_service_recording([])
+    service._generate_auth_headers = MagicMock(return_value={})
+    service._make_rest_request = AsyncMock(return_value=(200, _accepted("exec-a").model_dump(mode="json")))
+    service._remove_ssh_key_via_rest = AsyncMock()
+    monkeypatch.setattr(settings, "JOB_TIME_OUT", 900)
+    monkeypatch.setattr(type(settings), "get_bittensor_wallet", lambda self: _wallet())
+    before = time.monotonic()
+
+    with patch("services.miner_service.measure_and_attach", AsyncMock()):
+        await service.request_job_to_miner(
+            _payload(), MagicMock(), RentedExecutorsResponse(executors={}), {}, job_timeout=job_timeout
+        )
+
+    [deadline] = service.deadlines
+    if job_timeout is None:
+        assert deadline is None
+    else:
+        assert before + job_timeout <= deadline <= time.monotonic() + job_timeout
 
 
 @pytest.mark.asyncio

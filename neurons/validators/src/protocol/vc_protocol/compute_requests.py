@@ -167,6 +167,9 @@ class MaintenanceWindow(BaseModel):
 
 class RentedExecutorsResponse(BaseModel):
     """Response with executors dict and banned GUIDs."""
+    # epoch s when the backend client sent this read (set by the client, never by the backend): a create stamped
+    # after it may have a pod this list does not hold
+    read_at: float | None = None
     executors: dict[str, RentedExecutor]  # key = executor_id
     # Legacy single-filler map (one container per executor), kept for a backend that predates the
     # list field. Read via get_filler_containers' fallback, never directly.

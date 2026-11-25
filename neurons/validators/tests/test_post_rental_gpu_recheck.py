@@ -12,6 +12,7 @@ from neurons.validators.src.services.task.checks import (
     GpuModelValidCheck,
     PinnedMemoryProbeCheck,
     PostRentalGpuRecheckCheck,
+    RentedSinceStartCheck,
     ScoreCheck,
     TenantEnforcementCheck,
 )
@@ -490,7 +491,9 @@ def test_the_recheck_runs_unrented_after_the_gpu_probes_before_the_score(build):
 
     at = kinds.index(PostRentalGpuRecheckCheck)
     assert kinds.index(TenantEnforcementCheck) < kinds.index(GpuFaultProbeCheck) < at
-    assert kinds[at - 1] is PinnedMemoryProbeCheck
+    # the fast path halts a customer pod the pinned-memory probe found right after it, before the recheck
+    probes = [k for k in kinds[:at] if k is not RentedSinceStartCheck]
+    assert probes[-1] is PinnedMemoryProbeCheck
     assert at < kinds.index(ScoreCheck)
 
 

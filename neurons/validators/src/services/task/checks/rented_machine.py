@@ -559,6 +559,9 @@ class TenantEnforcementCheck:
                                 "default_extra": extra,
                                 "rented": False,
                                 "ssh_pub_keys": None,
+                                # a later halt judges only a fresher rental read, never this listing twice (a
+                                # second answer could differ)
+                                "rentals_judged_closed": ctx.state.rented_data,
                                 **reprobed,
                             },
                         )
@@ -856,6 +859,30 @@ class HostGpuContainerFailure(BaseModel):
     stderr_tail: str
     stdout_tail: str
 
+
+
+class RentedSinceStartCheck:
+    """DAH-5933 review, fast path: the rented halt again after a check that re-reads the rentals. PortCountCheck and
+    CapabilityCheck can find a customer pod that started during the run and put it in the snapshot; the halt then
+    handles that rental before `POST /verify` or VerifyX puts load on the node. A node still idle passes, and so does
+    the same snapshot an earlier halt judged all closed, until a fresher rental read lists a pod."""
+
+    check_id = TenantEnforcementCheck.check_id
+    replays_after_session_drop = TenantEnforcementCheck.replays_after_session_drop
+    fatal = True
+
+    def __init__(self, halt: TenantEnforcementCheck):
+        self.halt = halt
+
+    async def run(self, ctx: Context) -> CheckResult:
+        rented_executor = rental_of_this_node(ctx)
+        # the same snapshot an earlier halt judged all closed is not judged again; a fresher rental read is
+        if rented_executor and rented_executor.pods and ctx.state.rented_data is not ctx.rentals_judged_closed:
+            return await self.halt.run(ctx)
+        event = render_message(
+            Msg.STILL_NOT_RENTED, ctx=ctx, check_id=self.check_id, what={"executor_uuid": ctx.executor.uuid}
+        )
+        return CheckResult(passed=True, event=event)
 
 async def _host_gpu_container_failure(
     ctx: Context, pod_status: str | None

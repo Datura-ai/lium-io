@@ -10,6 +10,7 @@ import contextvars
 import functools
 import ipaddress
 import logging
+import os
 import socket
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -64,14 +65,20 @@ class _CheckedAddresses(list):
     host: str = ""
 
 
-def _refused(host: str, port: int, reason: str, addresses: list[str] | None = None) -> NodeHostError:
+class NonPublicAddressError(NodeHostError):
+    """The address, or one the name resolves to, is not public. Unlike a failed lookup, retrying does not change it."""
+
+
+def _refused(
+    host: str, port: int, reason: str, addresses: list[str] | None = None, error: type[NodeHostError] = NodeHostError
+) -> NodeHostError:
     logger.warning(
         _m(
             f"Refused hostname node {host}:{port}: {reason}",
             extra=get_extra_info({"host": host, "port": port, "addresses": addresses or [], "reason": reason}),
         )
     )
-    return NodeHostError(f"{host} {reason}")
+    return error(f"{host} {reason}")
 
 
 def _log_dialed(infos: list, sockaddr: tuple) -> None:
@@ -193,6 +200,9 @@ class _QuotaSlotExecutor:
 
 
 NAT64_PREFIX = ipaddress.ip_network("64:ff9b::/96")  # RFC 6052 well-known prefix: the IPv4 address in the last 32 bits
+ALLOWED_PRIVATE_NETWORKS = tuple(  # comma-separated CIDRs
+    ipaddress.ip_network(n.strip()) for n in os.environ.get("NODE_ADDRESS_ALLOWED_NETWORKS", "").split(",") if n.strip()
+)
 
 
 def is_public_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
@@ -203,6 +213,11 @@ def is_public_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
     ip = getattr(ip, "ipv4_mapped", None) or ip
     if ip.version == 6 and ip in NAT64_PREFIX:
         ip = ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF)
+    # a dev stack (a /temp-dev copy) names its own private network, where its nodes sit by design; unset in production
+    if any(ip in network for network in ALLOWED_PRIVATE_NETWORKS) and ip.is_private and not (
+        ip.is_loopback or ip.is_link_local or ip.is_unspecified
+    ):
+        return True
     return ip.is_global and not ip.is_multicast and not ip.is_reserved and not getattr(ip, "is_site_local", False)
 
 
@@ -211,7 +226,7 @@ def _check_literal(host: str, port: int) -> None:
     and 127.0.0.1 or the metadata address would have the validator connect to its own host."""
     address = host.strip("[]").split("%", 1)[0]
     if not is_public_ip(ipaddress.ip_address(address)):
-        raise _refused(host, port, "is not a public address", [address])
+        raise _refused(host, port, "is not a public address", [address], NonPublicAddressError)
 
 
 async def resolve_public_host(host: str, port: int = 22, executor=None) -> list:
@@ -239,7 +254,8 @@ async def resolve_public_host(host: str, port: int = 22, executor=None) -> list:
         raise _refused(host, port, "resolves to no address")
     blocked = sorted(str(a) for a in addresses if not is_public_ip(a))
     if blocked:
-        raise _refused(host, port, f"resolves to a non-public address: {', '.join(blocked)}", blocked)
+        reason = f"resolves to a non-public address: {', '.join(blocked)}"
+        raise _refused(host, port, reason, blocked, NonPublicAddressError)
     checked = _CheckedAddresses(infos)
     checked.host = host
     return checked

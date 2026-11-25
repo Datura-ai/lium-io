@@ -171,6 +171,16 @@ def get_system_metrics():
     }
 
 
+def memory_used_without_cache(memory_stats: dict) -> int:
+    """Container memory in use, without the reclaimable page cache: Docker's `usage` counts every file the
+    container has read, so a pod that streams a large dataset would show its RAM full. Same rule as `docker stats`:
+    usage minus `total_inactive_file` (cgroup v1) or `inactive_file` (cgroup v2)."""
+    usage = memory_stats.get("usage", 0)
+    stats = memory_stats.get("stats") or {}
+    inactive_file = stats.get("total_inactive_file", stats.get("inactive_file", 0))
+    return usage - inactive_file if 0 < inactive_file < usage else usage
+
+
 def get_container_metrics(container_name: str, gpu_uuids: list[str]):
     """
     Collect hardware utilization metrics for a specific container.
@@ -187,7 +197,7 @@ def get_container_metrics(container_name: str, gpu_uuids: list[str]):
                     "limit": float            # CPU limit (number of cores)
                 },
                 "memory": {
-                    "used": int,              # Memory usage in bytes
+                    "used": int,              # Memory in use in bytes, without reclaimable page cache
                     "limit": int,             # Memory limit in bytes
                     "utilization": float      # Memory usage percentage
                 },
@@ -238,7 +248,7 @@ def get_container_metrics(container_name: str, gpu_uuids: list[str]):
             cpu_limit = container.attrs["HostConfig"]["NanoCpus"] / 1e9  # Convert from nano CPUs to number of cores
 
         # Calculate memory usage
-        memory_usage = stats["memory_stats"].get("usage", 0)
+        memory_usage = memory_used_without_cache(stats["memory_stats"])
         memory_limit = stats["memory_stats"].get("limit", 0)
         memory_utilization = 0.0
         if memory_limit > 0:

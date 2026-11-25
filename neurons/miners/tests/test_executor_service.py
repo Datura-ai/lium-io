@@ -752,3 +752,42 @@ async def test_standalone_miner_sends_no_expected_host_key(executor_service, tes
     ))
     registration = await executor_service.register_pubkey("v", "m", _SSH_KEY.encode(), "0xaa")
     assert registration.accepted[0].expected_ssh_host_key is None
+
+
+@pytest.mark.asyncio
+async def test_register_pubkey_relays_the_answer_of_a_node_that_refused_the_key(executor_service, test_executor):
+    """22 Nov: a node with its clock off answered 401 "Stale upload nonce" 14 times and the validator said "could not
+    reach". The miner now names the refusal, so the validator can tell a reachable node that said no from a dead one."""
+    mock_session = _make_mock_session()
+    refusal = _response(401, b'{"detail":"Stale upload nonce"}')
+    mock_session.post.return_value.__aenter__ = AsyncMock(return_value=refusal)
+    es.settings.RENTAL_REQUEST_HOOK = None
+    executor_service.get_executors_for_validator = AsyncMock(return_value=[test_executor])
+
+    with patch("services.executor_service.aiohttp.ClientSession", return_value=mock_session):
+        registration = await executor_service.register_pubkey("v", "m", _SSH_KEY.encode(), "0xaa")
+
+    assert registration.accepted == []
+    assert registration.refused == {str(test_executor.uuid): "HTTP 401: Stale upload nonce"}
+
+
+def test_a_refusal_that_is_no_fastapi_error_is_its_body_cut_short():
+    assert es._refusal_text(500, "Internal\n  Server Error") == "HTTP 500: Internal Server Error"
+    assert len(es._refusal_text(502, "x" * 5000)) == es.MAX_REFUSAL_CHARS
+
+
+@pytest.mark.asyncio
+async def test_a_node_answering_a_field_outside_its_format_is_not_accepted(executor_service, test_executor):
+    """The miner parses the node's answer with the shared model, so a node whose SSH fields are not a plain user
+    name, absolute path, port list or SSH key is left out of the answer, and asked once."""
+    answer = json.dumps({"ssh_username": "root", "ssh_port": 22, "python_path": "/bin/true; id", "root_dir": "/r"})
+    session = _make_mock_session()
+    session.post.return_value.__aenter__ = AsyncMock(return_value=_response(200, answer.encode()))
+
+    with patch("services.executor_service.aiohttp.ClientSession", return_value=session):
+        assert await executor_service.send_pubkey_to_executor(test_executor, _SSH_KEY, "0xaa") is None
+    assert session.post.call_count == 1
+
+    session.post.return_value.__aenter__ = AsyncMock(return_value=_response(200, _SSH_ANSWER))
+    with patch("services.executor_service.aiohttp.ClientSession", return_value=session):
+        assert (await executor_service.send_pubkey_to_executor(test_executor, _SSH_KEY, "0xaa")).python_path == "/p"

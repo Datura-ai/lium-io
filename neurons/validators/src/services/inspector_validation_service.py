@@ -24,6 +24,7 @@ from core.checksums import (
 from datura.requests.miner_requests import ExecutorSSHInfo
 
 from core.config import settings
+from services import executor_payload
 from core.utils import _m, get_extra_info
 
 if TYPE_CHECKING:
@@ -243,7 +244,7 @@ class InspectorValidationService:
         validator = None
         command = self._interactive_command(executor)
         diagnostics: dict[str, Any] = {
-            "command": command,
+            "command": executor_payload.label(executor_payload.INSPECTOR, "--interactive"),
             "executor_uuid": executor.uuid,
             # DAH-3275: what vouches for the sensor binary this report came from. On a dstack
             # CVM the executor image (and the .so in it) is part of the stack the validator
@@ -602,8 +603,8 @@ class InspectorValidationService:
         )
 
     def _interactive_command(self, executor: ExecutorSSHInfo) -> str:
-        script = f"{executor.root_dir.rstrip('/')}/src/inspector_executor.py"
-        return f"{shlex.quote(executor.python_path)} {shlex.quote(script)} --interactive"
+        # the script and interpreter are the validator's (services.executor_payload), not the executor's reported paths
+        return executor_payload.run_once("inspector", executor_payload.INSPECTOR, "--interactive")
 
     async def _send_message(self, process, payload: dict[str, Any]) -> str:
         cmd = str(payload.get("cmd", ""))
