@@ -182,6 +182,23 @@ def test_install_layer_reset_mode_never_runs_the_reset_or_restarts_docker():
     assert not re.search(r"systemctl (re)?start|systemctl restart|/usr/local/sbin/lium-sysbox-layer-reset|--dry-run", branch)
 
 
+@pytest.mark.parametrize("body, answer", [
+    ("echo noise; return 0", "layer_reset_installed 9"),
+    ("echo noise; return 1", "layer_reset_failed install"),
+    ("printf 'Failed to enable unit:\\n\\tUnit file is masked.\\n' >&2; return 1",
+     "layer_reset_failed install Failed to enable unit: Unit file is masked."),
+])
+def test_install_layer_reset_mode_names_why_the_install_failed_under_set_e(body, answer):
+    # DAH-7052 rollout: hosts failing every cycle said only "install"; the step's own error now rides on the line
+    branch = re.search(r"^    --install-layer-reset\)\n(.*?^        ;;)$", open(SCRIPT).read(), re.S | re.M).group(1)
+    script = (
+        "set -e\nLAYER_RESET_VERSION=9\nid() { echo 0; }\ncommand() { return 0; }\n"
+        f"shift_sysbox_layers_back_at_boot() {{ {body}; }}\ncase x in\n    x)\n{branch}\nesac\n"
+    )
+    result = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=60)
+    assert (result.returncode, result.stdout) == (0, answer + "\n"), result.stderr
+
+
 def _remove_on_a_live_host(root, disable_fails: bool = False) -> subprocess.CompletedProcess:
     log = root / "systemctl.log"
     script = (

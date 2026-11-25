@@ -694,7 +694,7 @@ UNIT
         systemctl is-active -q docker && touch /run/lium-docker-started  # this boot's Docker already started
         # Docker must never depend on a unit that is not enabled: no drop-in until enable succeeded, none left after
         # a failure (an older install's drop-in included)
-        if ! { systemctl daemon-reload && systemctl enable lium-sysbox-layer-reset.service >/dev/null 2>&1; }; then
+        if ! { systemctl daemon-reload && systemctl enable lium-sysbox-layer-reset.service >/dev/null; }; then
             rm -f "$dropin"; systemctl daemon-reload >/dev/null 2>&1; return 1
         fi
     fi
@@ -1560,8 +1560,16 @@ case "${1:-}" in
         if [ "$(id -u)" != 0 ]; then echo "layer_reset_skipped not_root"
         elif [ ! -x /usr/bin/python3 ]; then echo "layer_reset_skipped no_python3"
         elif ! command -v sysbox-runc >/dev/null 2>&1; then echo "layer_reset_skipped no_sysbox"
-        elif shift_sysbox_layers_back_at_boot >/dev/null 2>&1; then echo "layer_reset_installed $LAYER_RESET_VERSION"
-        else echo "layer_reset_failed install"; fi
+        else
+            # the failing step's own error rides on the result line (one line, cut short), so the validator's event
+            # names why a host keeps failing instead of only that it did
+            rc=0; err=$(shift_sysbox_layers_back_at_boot 2>&1 >/dev/null) || rc=$?
+            if [ "$rc" = 0 ]; then echo "layer_reset_installed $LAYER_RESET_VERSION"
+            else
+                err=$(printf '%s' "$err" | tr -s '\n\t' '  ' | cut -c1-160)
+                echo "layer_reset_failed install${err:+ $err}"
+            fi
+        fi
         exit 0
         ;;
     --remove-layer-reset)
