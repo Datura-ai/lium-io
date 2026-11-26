@@ -441,11 +441,12 @@ REASONS_THAT_HIDE_AT_ONCE = frozenset(
 
 
 # runs that stop before the checks that re-read the stored restrictions: [] would clear what those checks keep
-# (DAH-6546: a pod left unread after a GPU-set move stops the run, and its rerun looks again)
+# (DAH-6546: a pod left unread after a GPU-set move stops the run, and its rerun looks again; DAH-7050: a library
+# mismatch not confirmed)
 # (DAH-7044: an unreadable rental-probe record, or a probe the validator cannot run for a reason on its own side,
 # neither lists an unproven node nor hides a proven one)
 REASONS_THAT_KEEP_STORED = frozenset(
-    {"GPU_LOST_POD_UNREAD", "RENTAL_PROBE_PROOF_UNREADABLE", "RENTAL_PROBE_NOT_RUN_ON_VALIDATOR"}
+    {"GPU_LOST_POD_UNREAD", "NVML_DIGEST_UNREAD", "RENTAL_PROBE_PROOF_UNREADABLE", "RENTAL_PROBE_NOT_RUN_ON_VALIDATOR"}
 )
 
 
