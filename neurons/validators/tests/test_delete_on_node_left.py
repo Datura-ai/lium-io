@@ -1,6 +1,5 @@
 """DAH-6531: the delete for the node a moved pod left removes, by the inspected ID, only the pod's container that the
-left placement's create made (labelled with the pod and its create command id). With a boot id it runs only on that
-boot, and only when the delete names another boot for the pod's current placement."""
+left placement's create made (labelled with the pod and its create command id)."""
 
 # ruff: noqa: F811 — the docker_service fixture is imported from test_docker_service
 from __future__ import annotations
@@ -28,21 +27,15 @@ from tests.test_docker_service import (  # noqa: F401
     mock_dependencies,
 )
 
-HOST_BOOT = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
-OTHER_BOOT = "11111111-2222-4333-8444-555555555555"
-# the boot the backend read the pod's current placement on: another node's
-PLACED_ELSEWHERE_BOOT = "99999999-8888-4777-8666-555555555555"
 LEFT_PLACEMENT = "placement-left"
 
 
-def _payload(boot: str = HOST_BOOT, placed_on: str = PLACED_ELSEWHERE_BOOT) -> ContainerDeleteOnNodeLeftRequest:
+def _payload() -> ContainerDeleteOnNodeLeftRequest:
     delete = _delete_payload()
     return ContainerDeleteOnNodeLeftRequest(
         **delete.model_dump(exclude={"message_type", "container_name"}),
         container_name=f"pod_{delete.pod_id}",
-        expected_boot_id=boot,
         create_command_id=LEFT_PLACEMENT,
-        pod_placed_on_boot_id=placed_on,
     )
 
 
@@ -78,9 +71,8 @@ def _run(tmp_path: Path, payload, containers: dict[str, str], **stub) -> tuple[i
     return done.returncode, {path.name for path in (tmp_path / "containers").iterdir()}
 
 
-@pytest.mark.parametrize("boot", [HOST_BOOT, ""], ids=["boot-checked", "no-boot-id"])
-def test_only_the_left_placements_container_goes_and_edit_containers_stay(tmp_path, boot):
-    payload = _payload(boot)
+def test_only_the_left_placements_container_goes_and_edit_containers_stay(tmp_path):
+    payload = _payload()
     name = payload.container_name
     edit_copies = {f"{name}__prev": f"pid {payload.pod_id} {LEFT_PLACEMENT}",
                    f"kept_unmounted_{payload.pod_id}_1": f"kid {payload.pod_id} {LEFT_PLACEMENT}"}
@@ -90,37 +82,16 @@ def test_only_the_left_placements_container_goes_and_edit_containers_stay(tmp_pa
     assert (status, left) == (0, set(edit_copies))
 
 
-@pytest.mark.parametrize("boot", [HOST_BOOT, ""], ids=["boot-checked", "no-boot-id"])
 @pytest.mark.parametrize(
     "labels",
     ["{pod} placement-later", "{pod} ", "other-pod placement-left", " "],
     ids=["placed-back-later", "made-before-the-label", "another-pods", "unlabelled"],
 )
-def test_any_other_container_under_the_name_is_kept_and_answered_not_the_node_left(tmp_path, boot, labels):
-    payload = _payload(boot)
+def test_any_other_container_under_the_name_is_kept_and_answered_not_the_node_left(tmp_path, labels):
+    payload = _payload()
     containers = {payload.container_name: "cid " + labels.format(pod=payload.pod_id)}
 
     assert _run(tmp_path, payload, containers) == (97, {payload.container_name})
-
-
-def test_another_boot_runs_no_docker_command(tmp_path):
-    payload = _payload(OTHER_BOOT)
-
-    assert _run(tmp_path, payload, {payload.container_name: f"cid {payload.pod_id} {LEFT_PLACEMENT}"})[0] == 97
-    assert not (tmp_path / "calls").exists()
-
-
-def test_a_host_boot_id_that_cannot_be_read_never_matches(tmp_path):
-    payload = _payload()
-    docker = _daemon(tmp_path, {payload.container_name: f"cid {payload.pod_id} {LEFT_PLACEMENT}"})
-    command = (
-        _node_left_delete_command(payload)
-        .replace("/usr/bin/docker", str(docker))
-        .replace("/proc/sys/kernel/random/boot_id", str(tmp_path / "missing"))
-    )
-
-    assert subprocess.run(["sh", "-c", command], capture_output=True).returncode == 97
-    assert not (tmp_path / "calls").exists()
 
 
 def test_no_container_under_the_name_is_done(tmp_path):
@@ -133,28 +104,14 @@ def test_a_container_still_there_after_the_removal_fails_the_delete(tmp_path):
     assert _run(tmp_path, payload, {payload.container_name: f"cid {payload.pod_id} {LEFT_PLACEMENT}"}, sticky=True)[0] == 1
 
 
-NOT_A_BOOT_ID = {
-    "upper-case": HOST_BOOT.upper(),
-    "trailing-newline": HOST_BOOT + "\n",
-    "padded": f" {HOST_BOOT} ",
-    "no-dashes": HOST_BOOT.replace("-", ""),
-    "braces": "{" + HOST_BOOT + "}",
-    "garbage": "garbage",
-}
-
-
 @pytest.mark.parametrize(
     "update",
     [
         {"create_command_id": ""},
         {"container_name": "pod_another-pod"},
-        # with a boot id the delete itself must prove the pod left this boot: a live container's absence never does
-        {"pod_placed_on_boot_id": ""},
-        {"pod_placed_on_boot_id": HOST_BOOT},
-        *({field: spelling} for field in ("expected_boot_id", "pod_placed_on_boot_id") for spelling in NOT_A_BOOT_ID.values()),
     ],
 )
-def test_a_delete_that_names_no_placement_or_proves_no_move_is_refused(update):
+def test_a_delete_that_names_no_placement_or_another_pod_is_refused(update):
     with pytest.raises(ValueError):
         _node_left_delete_command(_payload().model_copy(update=update))
 

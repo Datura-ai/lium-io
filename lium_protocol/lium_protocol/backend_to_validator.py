@@ -211,20 +211,14 @@ class ContainerDeleteRequest(ContainerRequest):
 class ContainerDeleteOnNodeLeftRequest(ContainerDeleteRequest):
     """A ContainerDeleteRequest for the node a moved pod left. The validator removes, by the inspected ID, only the
     pod's container labelled with this pod and `create_command_id`; anything else under the name is kept and answered
-    `NotTheNodeLeft`. With `expected_boot_id` set it also runs only on a host whose boot id
-    (/proc/sys/kernel/random/boot_id) is `expected_boot_id`, and only when `pod_placed_on_boot_id` is another boot.
+    `NotTheNodeLeft`. The delete is sent before the replacement create, which gets another create id, so the label
+    alone tells the container the pod left from any later one.
     Its own type, not a field: a validator that does not know it refuses the message instead of deleting unchecked."""
 
     message_type: BackendMessageType = BackendMessageType.ContainerDeleteOnNodeLeftRequest
-    expected_boot_id: str
     # the `command_id` of the ContainerCreateRequest that placed the pod on the node it left (the pod's create command
     # id there): the validator removes only a container that create made, never a later placement's on the same boot
     create_command_id: str
-    # the boot id of the node the pod's current placement is on, as the backend read it when it sent this delete. It
-    # proves the pod left this boot only when set and not `expected_boot_id`; empty (unknown) or equal, the validator
-    # removes nothing. When the backend cannot tell the two boots apart it sends `expected_boot_id` empty: then
-    # only the create-id label decides, and this field is unused
-    pod_placed_on_boot_id: str = ""
 
 
 @BACKEND_MESSAGES.register

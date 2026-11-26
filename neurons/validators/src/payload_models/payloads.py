@@ -520,15 +520,11 @@ class ContainerDeleteRequest(ContainerBaseRequest):
 
 class ContainerDeleteOnNodeLeftRequest(ContainerDeleteRequest):
     """lium_protocol ContainerDeleteOnNodeLeftRequest: the delete for the node a moved pod left
-    (DockerService._delete_on_node_left). Only the pod's container labelled create_command_id is removed; with
-    expected_boot_id set, only on that boot and only when pod_placed_on_boot_id is another boot."""
+    (DockerService._delete_on_node_left). Only the pod's container labelled create_command_id is removed."""
 
     message_type: ContainerRequestType = ContainerRequestType.ContainerDeleteOnNodeLeftRequest
-    expected_boot_id: str
     # the create command id of the placement on the node left: only a container that create made is removed
     create_command_id: str
-    # the boot id of the node the pod's current placement is on, as the backend read it when it sent the delete
-    pod_placed_on_boot_id: str = ""
 
 
 class GetPodLogsRequestFromServer(ContainerBaseRequest):

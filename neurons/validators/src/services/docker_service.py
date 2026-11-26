@@ -1900,36 +1900,20 @@ def _kept_container_prefix(container_name: str) -> str:
 
 
 _NOT_THE_NODE_LEFT_EXIT = 97
-# /proc/sys/kernel/random/boot_id's own spelling; any other spelling of a boot proves nothing
-_BOOT_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 
 
 def _node_left_delete_command(payload: ContainerDeleteOnNodeLeftRequest) -> str:
-    """Exits 97 when the host is not on `expected_boot_id`, or the pod's container there is not labelled with this pod
-    and `create_command_id` (a later placement of the pod on this node has another create id); 0 once the left
-    placement's container is gone, removed by the inspected ID. Kept or parked edit containers are never touched.
-
-    ValueError (nothing runs) unless a set `expected_boot_id` comes with a `pod_placed_on_boot_id` that is another boot,
-    both in /proc's lowercase UUID form: the delete's own proof that the pod left this boot. An empty
-    `expected_boot_id` (the backend knows no boot of the node left) runs no boot check; the create id label alone
-    decides. The pod's volume stays until the pod ends, as before this delete."""
+    """Exits 97 when the pod's container there is not labelled with this pod and `create_command_id` (a later
+    placement of the pod on this node has another create id); 0 once the left placement's container is gone, removed
+    by the inspected ID. Kept or parked edit containers are never touched. The pod's volume stays until the pod ends,
+    as before this delete."""
     if not payload.create_command_id:
         raise ValueError("the delete names no placement")
     if payload.container_name != DockerService.get_container_name(payload):
         raise ValueError("the delete names another pod's container")
-    expected, placed_on = payload.expected_boot_id, payload.pod_placed_on_boot_id
-    lines = []
-    if expected:
-        if not (_BOOT_ID.fullmatch(expected) and _BOOT_ID.fullmatch(placed_on)) or placed_on == expected:
-            raise ValueError("the delete does not prove the pod left this boot")
-        # an unreadable boot id is not this node's
-        lines.append(
-            f'boot=$(cat /proc/sys/kernel/random/boot_id) && [ "$boot" = {shlex.quote(expected)} ] '
-            f"|| exit {_NOT_THE_NODE_LEFT_EXIT}"
-        )
     name = shlex.quote(payload.container_name)
     found = f'{{{{.Id}}}} {{{{index .Config.Labels "{LIUM_POD_ID_LABEL}"}}}} {{{{index .Config.Labels "{LIUM_CREATE_COMMAND_LABEL}"}}}}'
-    lines += [
+    lines = [
         # a failed inspect is absence only when a listing that succeeded shows no container under the name
         f"found=$(/usr/bin/docker inspect --type container -f {shlex.quote(found)} {name} 2>/dev/null) "
         f'|| {{ named=$(/usr/bin/docker ps -aq --no-trunc --filter name=^{name}$) && [ -z "$named" ] && exit 0; exit 1; }}',
@@ -15245,7 +15229,7 @@ class DockerService:
         keypair: bittensor.Keypair,
         private_key: str,
     ):
-        """The registration may point at another host by now, so the boot check and the removal run as one shell on
+        """The registration may point at another host by now, so the label check and the removal run as one shell on
         one connection. Refused while a create of the pod runs (any registration): it could make its container after
         the removal."""
         log = _BoundLog(_delete_container_log_extra(payload, executor_info))
@@ -15272,7 +15256,7 @@ class DockerService:
             log.error("Delete for the node a moved pod left failed", error=str(exc))
             return self._failed_delete(payload, msg=f"Unknown Error delete_container: {exc}")
         if result.exit_status == _NOT_THE_NODE_LEFT_EXIT:
-            log.warning("Delete for the node a moved pod left found another host, boot or placement; nothing deleted")
+            log.warning("Delete for the node a moved pod left found another placement; nothing deleted")
             return self._failed_delete(
                 payload, msg="The host reached is not the node the pod left", error_code=FailedContainerErrorCodes.NotTheNodeLeft
             )

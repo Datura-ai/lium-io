@@ -1285,7 +1285,7 @@
       "type": "object"
     },
     "ContainerDeleteOnNodeLeftRequest": {
-      "description": "A ContainerDeleteRequest for the node a moved pod left. The validator removes, by the inspected ID, only the\npod's container labelled with this pod and `create_command_id`; anything else under the name is kept and answered\n`NotTheNodeLeft`. With `expected_boot_id` set it also runs only on a host whose boot id\n(/proc/sys/kernel/random/boot_id) is `expected_boot_id`, and only when `pod_placed_on_boot_id` is another boot.\nIts own type, not a field: a validator that does not know it refuses the message instead of deleting unchecked.",
+      "description": "A ContainerDeleteRequest for the node a moved pod left. The validator removes, by the inspected ID, only the\npod's container labelled with this pod and `create_command_id`; anything else under the name is kept and answered\n`NotTheNodeLeft`. The delete is sent before the replacement create, which gets another create id, so the label\nalone tells the container the pod left from any later one.\nIts own type, not a field: a validator that does not know it refuses the message instead of deleting unchecked.",
       "properties": {
         "command_id": {
           "default": "",
@@ -1302,10 +1302,6 @@
         },
         "executor_id": {
           "title": "Executor Id",
-          "type": "string"
-        },
-        "expected_boot_id": {
-          "title": "Expected Boot Id",
           "type": "string"
         },
         "external_volume": {
@@ -1368,11 +1364,6 @@
           "title": "Pod Id",
           "type": "string"
         },
-        "pod_placed_on_boot_id": {
-          "default": "",
-          "title": "Pod Placed On Boot Id",
-          "type": "string"
-        },
         "workload_kind": {
           "$ref": "#/$defs/WorkloadKind",
           "default": "CUSTOMER_RENTAL"
@@ -1383,7 +1374,6 @@
         "executor_id",
         "pod_id",
         "container_name",
-        "expected_boot_id",
         "create_command_id"
       ],
       "title": "ContainerDeleteOnNodeLeftRequest",

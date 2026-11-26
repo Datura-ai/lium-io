@@ -691,7 +691,7 @@ async def test_a_node_left_delete_keeps_the_source_creates_record_for_a_restart(
     with inflight_creates.track("pod-1", ("miner-hk", "exec-1")):
         await client._run_miner_job(
             ContainerDeleteOnNodeLeftRequest.model_construct(
-                pod_id="pod-1", miner_hotkey="miner-hk", executor_id="exec-1", expected_boot_id="b"
+                pod_id="pod-1", miner_hotkey="miner-hk", executor_id="exec-1"
             )
         )
 
@@ -713,7 +713,7 @@ async def test_only_a_node_left_deletes_answer_echoes_its_command_id(deleted: bo
     )
     fields = {**ids, "container_name": "", "command_id": "cmd-1"}
     request = (
-        ContainerDeleteOnNodeLeftRequest(**fields, expected_boot_id="b", create_command_id="c")
+        ContainerDeleteOnNodeLeftRequest(**fields, create_command_id="c")
         if node_left
         else ContainerDeleteRequest(**fields)
     )
