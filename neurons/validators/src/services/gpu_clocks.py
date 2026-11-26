@@ -169,21 +169,26 @@ def _app_mem_outcome(code: str, rgc_exit: str | None) -> str:
     return "no_answer" if code in ("unknown", _KILLED_EXIT) else "failed"
 
 
+def _app_mem_outcomes(uuids: list[str], lines: list[list[str]]) -> dict[tuple[str, str], tuple[str, str]]:
+    """(uuid, flag) -> (outcome, exit) of each -rac/-rmc."""
+    rgc_exits = {p[0]: p[1] for p in lines if len(p) == 2}
+    exits = {(p[0], p[1]): p[2] for p in lines if len(p) >= 3}
+    return {
+        (uuid, flag): (_app_mem_outcome(code, rgc_exits.get(uuid)), code)
+        for uuid in uuids for flag in _APP_MEM_FLAGS for code in [exits.get((uuid, flag), "unknown")]
+    }
+
+
 def _log_reset_outcome(
     purpose: str, pod_id: str | None, uuids: list[str], lines: list[list[str]], failures: dict[str, str | None], result
 ) -> None:
-    """One line per reset call, success too, so the resets can be counted; plus one warning per -rac/-rmc that failed
-    or gave no answer (never changes a GPU's -rgc verdict or its lock record)."""
-    rgc_exits = {p[0]: p[1] for p in lines if len(p) == 2}
-    exits = {(p[0], p[1]): p[2] for p in lines if len(p) >= 3}
+    """One line per reset call, success too, so the resets can be counted (`failures` are the -rgc verdicts); plus one
+    warning per -rac/-rmc that failed or gave no answer."""
     counts = dict.fromkeys(("ok", "unsupported", "not_found", "failed", "no_answer"), 0)
-    for uuid in uuids:
-        for flag in _APP_MEM_FLAGS:
-            code = exits.get((uuid, flag), "unknown")
-            outcome = _app_mem_outcome(code, rgc_exits.get(uuid))
-            counts[outcome] += 1
-            if outcome in ("failed", "no_answer"):
-                logger.warning("gpu_clock_action=rac_rmc_failed gpu=%s flag=%s exit=%s", uuid, flag, code)
+    for (uuid, flag), (outcome, code) in _app_mem_outcomes(uuids, lines).items():
+        counts[outcome] += 1
+        if outcome in ("failed", "no_answer"):
+            logger.warning("gpu_clock_action=rac_rmc_failed gpu=%s flag=%s exit=%s", uuid, flag, code)
     rgc = list(failures.values())
     logger.info(
         "gpu_clock_action=reset_outcome purpose=%s pod=%s gpus=%d rgc_ok=%d rgc_failed=%d rgc_no_answer=%d "
@@ -274,7 +279,8 @@ async def _reset_gpu_clocks(
     forget: bool = True,
 ) -> dict[str, str | None]:
     """`-rgc`, `-rac`, `-rmc` on every GPU, the GPUs in parallel, in one SSH call (a create runs this on every GPU);
-    the record goes only once its -rgc succeeded (forget=False: the caller drops it). uuid -> failure (None = reset)."""
+    the record goes only once its -rgc succeeded and its -rac/-rmc answered (forget=False: the caller drops it).
+    uuid -> failure (None = reset)."""
     if not uuids:
         _log_reset_outcome(purpose, pod_id, [], [], {}, None)
         return {}
@@ -284,7 +290,8 @@ async def _reset_gpu_clocks(
     if result.exit_code != 0:
         # the answer was lost (budget overrun, channel closed): what the GPUs wrote so far; a reset still running
         # after this read writes a line nobody reads (a few bytes left in /tmp), its GPU counted as no answer
-        stdout = (await _run(runner, f"cat {results} 2>/dev/null; rm -f {results}")).stdout or ""
+        # 10 s (review): the create's wait stays under the budget it had before the read-back
+        stdout = (await _run(runner, f"cat {results} 2>/dev/null; rm -f {results}", timeout=10)).stdout or ""
     lines = [line.split() for line in stdout.splitlines()]
     # the -rgc lines (a -rac/-rmc line has 3 fields); a killed -rgc gave no verdict, as a lost answer
     exits = {p[0]: p[1] for p in lines if len(p) == 2 and p[1] != _KILLED_EXIT}
@@ -293,6 +300,11 @@ async def _reset_gpu_clocks(
         for uuid in uuids
     }
     _log_reset_outcome(purpose, pod_id, uuids, lines, failures, result)
+    # a -rac/-rmc that gave no answer leaves that GPU's application or memory clocks unknown: the GPU fails closed as a
+    # no-answer -rgc does. An answered failure or not-found (exit 6 beside an answered -rgc) stays logged only
+    for (uuid, flag), (outcome, _code) in _app_mem_outcomes(uuids, lines).items():
+        if outcome == "no_answer" and (failures[uuid] is None or failures[uuid] in _NO_CLOCK_CONTROL):
+            failures[uuid] = f"nvidia-smi {flag} gave no answer"
     if forget:
         await _forget(redis, [uuid for uuid, failure in failures.items() if failure is None])
     return failures

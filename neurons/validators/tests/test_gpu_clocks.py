@@ -382,27 +382,50 @@ async def test_a_stalled_reset_is_killed_on_the_host_and_every_other_line_still_
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("app_mem_exit", [None, 1])
-async def test_a_stalled_or_failed_application_or_memory_reset_keeps_the_rgc_results_and_the_create(
+@pytest.mark.parametrize("app_mem_exit", [1, 6])
+async def test_an_answered_failed_or_not_found_application_or_memory_reset_keeps_the_rgc_results_and_the_create(
     app_mem_exit, caplog
 ):
-    """Review: a -rac/-rmc that times out (killed on the host) or fails never erases the -rgc results: the GPUs' lock
-    records from a previous rental go, the create is not refused, and each failure is logged; exit 3 (not supported)
-    is not."""
+    """Review: a -rac/-rmc that answered a failure, or 6 "not found" beside an answered -rgc, never erases the -rgc
+    results: the GPUs' lock records from a previous rental go and the create is not refused; a failure is logged, and
+    exit 3 (not supported) is not."""
     host, redis = FakeHost(app_mem_exit=app_mem_exit), FakeRedis()
     for u in (U[0], U[1]):
         redis.store[f"gpu_clock_lock:{u}"] = json.dumps({"pod_id": "old"})
     with caplog.at_level("WARNING", logger="services.gpu_clocks"):
         assert await reset_leftover_clock_locks(host, redis, [U[0], U[1]]) == []
     assert not any(k.startswith("gpu_clock_lock:") for k in redis.store)
-    expected = "unknown" if app_mem_exit is None else "1"
-    assert caplog.text.count("gpu_clock_action=rac_rmc_failed") == 4 and f"exit={expected}" in caplog.text
+    assert caplog.text.count("gpu_clock_action=rac_rmc_failed") == (4 if app_mem_exit == 1 else 0)
 
     caplog.clear()
     host.app_mem_exit = 3
     with caplog.at_level("WARNING", logger="services.gpu_clocks"):
         assert await reset_leftover_clock_locks(host, redis, [U[0]]) == []
     assert "rac_rmc_failed" not in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("app_mem_exit", [None, 137], ids=["no-line", "killed"])
+@pytest.mark.parametrize("rgc_exit", [0, 3, 4])
+@pytest.mark.parametrize("recorded", [False, True])
+async def test_an_application_or_memory_reset_that_gave_no_answer_refuses_the_create_as_a_no_answer_rgc_does(
+    app_mem_exit, rgc_exit, recorded
+):
+    """Ruling: any clock reset of a GPU that gave no answer (graphics, application or memory) leaves its clocks
+    unknown, so the GPU refuses the create, with or without a lock record, and a record stays for the next try."""
+    host, redis = FakeHost(rgc_exit=rgc_exit, app_mem_exit=app_mem_exit), FakeRedis()
+    if recorded:
+        redis.store[f"gpu_clock_lock:{U[0]}"] = json.dumps({"pod_id": "old"})
+    assert await reset_leftover_clock_locks(host, redis, [U[0], U[1]]) == [U[0], U[1]]
+    assert (f"gpu_clock_lock:{U[0]}" in redis.store) == recorded
+
+
+@pytest.mark.asyncio
+async def test_a_lost_answers_read_back_is_bounded_to_10_seconds():
+    """Review: the read-back after a lost answer keeps the create's wait under its old budget."""
+    host = FakeHost(rgc_exit=None, answered=[U[0]])
+    await reset_leftover_clock_locks(host, FakeRedis(), [U[0], U[1]])
+    assert host.commands[-1].startswith("cat /tmp/lium-gpu-clock-reset-") and host.timeouts[-1] == 10
 
 
 @pytest.mark.asyncio
