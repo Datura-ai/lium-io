@@ -1401,3 +1401,22 @@ def test_create_request_str_leaves_out_renter_supplied_values():
         assert marker not in logged
     assert payload.custom_options.environment["HOSTILE_ENV"] == HOSTILE_ENV_VALUE
     assert "HOSTILE_ENV" in payload.model_dump_json()
+
+
+@pytest.mark.asyncio
+async def test_the_half_started_stop_is_a_teardown_and_the_start_lock_is_not():
+    """lio#1742 review: the half-started pod's stop and its mount read only tear down, so a TCB status cannot keep the
+    pod up unmounted; the host start lock is taken by every start and remount, which stay fail-closed."""
+    service = DockerService.__new__(DockerService)
+    service._prepare_known_hosts_policy = AsyncMock(return_value=None)
+    executor = SimpleNamespace(uuid="executor", address="127.0.0.1", ssh_port=22, ssh_username="root")
+
+    assert await service._holds_its_encrypted_mount(executor, "key", "cid", "/plain") is None
+    with pytest.raises(RentalDockerOperationError):
+        await service._stop_if_still_the_run_read(executor, "key", "pod", "cid", "started", "/plain", 1)
+    with pytest.raises(RentalDockerOperationError):
+        async with service._hold_pod_start_host_lock(executor, "key", "pod"):
+            pass
+
+    teardown = [c.kwargs.get("teardown", False) for c in service._prepare_known_hosts_policy.await_args_list]
+    assert teardown == [True, True, False]

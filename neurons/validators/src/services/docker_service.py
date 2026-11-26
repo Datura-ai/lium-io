@@ -13202,7 +13202,10 @@ class DockerService:
         """_encrypted_mount_probe's 0 (mounted), 1 (not mounted) or 2 (no encrypted volume), read on the host over the
         executor's pinned SSH; None when it could not be read."""
         try:
-            policy = await self._prepare_known_hosts_policy(executor_info, None, {"container_id": container_id})
+            # a teardown read: it only decides whether the half-started pod's stop goes ahead (lio#1742 review)
+            policy = await self._prepare_known_hosts_policy(
+                executor_info, None, {"container_id": container_id}, teardown=True
+            )
             if policy is None:
                 # an unpinned endpoint could report the mount present while the real pod runs without it
                 return None
@@ -13258,8 +13261,10 @@ class DockerService:
         """Stop the run the retry read, fenced on the host (_fenced_stop_command): True once stopped, False when it now
         holds its encrypted mount. Raises (record stays pending, nothing stopped) when it cannot be proven the same
         unmounted run, e.g. a start the Redis pod lock did not keep out (Redis down, a lapsed lease) is in progress or
-        landed since the read."""
-        policy = await self._prepare_known_hosts_policy(executor_info, None, {"container_id": container_id})
+        landed since the read. A teardown like stop_container: a TCB status never keeps a half-started pod up."""
+        policy = await self._prepare_known_hosts_policy(
+            executor_info, None, {"container_id": container_id}, teardown=True
+        )
         if policy is None:
             raise RentalDockerOperationError("no pinned host key to stop over")
         result = await _run_on_own_ssh_connection(
