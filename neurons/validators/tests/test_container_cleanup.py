@@ -10,6 +10,7 @@ import asyncio
 import json
 import logging
 import random
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -33,9 +34,22 @@ def _ssh_mock_from_calls(call_handler):
     return ssh
 
 
-def _ps_line(name: str, label: str) -> str:
-    """One `docker ps` line as the listing's format prints it: a JSON [name, pod id label]."""
-    return json.dumps([name, label])
+NOW_TS = 1_000_000_000
+
+
+def _ps_line(name: str, label: str, age_min: float | None = 120, now: int = NOW_TS) -> str:
+    """One `docker ps` line as the listing prints it: JSON [name, pod id label, CreatedAt]."""
+    created = "" if age_min is None else _created_at(now - int(age_min * 60))
+    return json.dumps([name, label, created])
+
+
+def _created_at(ts: int) -> str:
+    return datetime.fromtimestamp(ts, UTC).strftime("%Y-%m-%d %H:%M:%S +0000 UTC")
+
+
+def _ps_out(*lines: str, now: int = NOW_TS) -> str:
+    """The listing's stdout: the host's `date +%s`, then one line per container."""
+    return "\n".join([str(now), *lines])
 
 
 def _label_of(name: str) -> str:
@@ -54,9 +68,8 @@ def _make_ssh_mock(
     unlabelled: tuple[str, ...] = (),
 ):
     """Build an ssh mock that simulates:
-      - docker ps -a filter -> newline list of `name|pod id label` (none for `unlabelled`)
-      - docker inspect ... Created -> age seconds (current_ts - age_seconds*60)
-      - date +%s -> current_ts
+      - date +%s && docker ps -a filter -> current_ts, then one [name, pod id label, CreatedAt] per
+        container (no label for `unlabelled`, no readable CreatedAt when not in ages_by_name)
       - docker rm -fv / volume rm -> success
     """
     rm_calls: list[str] = []
@@ -65,21 +78,12 @@ def _make_ssh_mock(
         # docker ps -a ... --filter name=... returns the container list
         if "docker ps -a" in cmd:
             lines = [
-                _ps_line(name, "" if name in unlabelled else _label_of(name)) for name in containers
+                _ps_line(
+                    name, "" if name in unlabelled else _label_of(name), ages_by_name.get(name), current_ts
+                )
+                for name in containers
             ]
-            return MagicMock(exit_status=0, stdout="\n".join(lines), stderr="")
-        # current time on host
-        if cmd.strip() == "date +%s":
-            return MagicMock(exit_status=0, stdout=str(current_ts), stderr="")
-        # docker inspect --format '{{json .Created}}' | xargs -I {} date -d {} +%s
-        if "docker inspect" in cmd and "Created" in cmd:
-            # match which container
-            for name in ages_by_name:
-                if name in cmd:
-                    age_min = ages_by_name[name]
-                    created_ts = current_ts - int(age_min * 60)
-                    return MagicMock(exit_status=0, stdout=str(created_ts), stderr="")
-            return MagicMock(exit_status=1, stdout="", stderr="not found")
+            return MagicMock(exit_status=0, stdout=_ps_out(*lines, now=current_ts), stderr="")
         # docker rm -f / docker rm -fv
         if "docker rm -f" in cmd:
             rm_calls.append(cmd)
@@ -684,11 +688,7 @@ def _make_unkillable_ssh_mock(name: str, rm_failures: int, current_ts: int = 1_0
     async def handler(cmd, *args, **kwargs):
         calls.append(cmd)
         if "docker ps -a" in cmd:
-            return MagicMock(exit_status=0, stdout=_ps_line(name, _label_of(name)), stderr="")
-        if cmd.strip() == "date +%s":
-            return MagicMock(exit_status=0, stdout=str(current_ts), stderr="")
-        if "docker inspect" in cmd and "Created" in cmd:
-            return MagicMock(exit_status=0, stdout=str(current_ts - 120 * 60), stderr="")
+            return MagicMock(exit_status=0, stdout=_ps_out(_ps_line(name, _label_of(name), 120, current_ts), now=current_ts), stderr="")
         if "docker rm -f" in cmd:
             if state["rm_left"] > 0:
                 state["rm_left"] -= 1
@@ -1007,7 +1007,7 @@ async def test_an_inherited_label_naming_another_live_pod_does_not_keep_an_ended
 
     async def inherited_label(cmd, *args, **kwargs):
         if "docker ps -a" in cmd:
-            return MagicMock(exit_status=0, stdout=_ps_line(name, LIVE_POD.removeprefix("pod_")), stderr="")
+            return MagicMock(exit_status=0, stdout=_ps_out(_ps_line(name, LIVE_POD.removeprefix("pod_"), 60)), stderr="")
         return await handler(cmd, *args, **kwargs)
 
     ssh.run.side_effect = inherited_label
@@ -1047,7 +1047,7 @@ async def test_the_listing_reads_each_containers_pod_id_label():
 
     async def handler(cmd, *args, **kwargs):
         seen.append(cmd)
-        stdout = f'{_ps_line("pod_a", "a")}\n{_ps_line("podman", "")}\n'
+        stdout = _ps_out(_ps_line("pod_a", "a"), _ps_line("podman", "")) + "\n"
         return MagicMock(exit_status=0, stdout=stdout, stderr="")
 
     ssh = AsyncMock()
@@ -1055,8 +1055,10 @@ async def test_the_listing_reads_each_containers_pod_id_label():
 
     listed = await ContainerCleanup()._get_all_rental_containers(ssh)
 
-    assert listed == [("pod_a", "a"), ("podman", "")]
-    assert """--format '[{{json .Names}},{{json (.Label "io.lium.pod_id")}}]'""" in seen[0]
+    assert listed == [("pod_a", "a", 120), ("podman", "", 120)]
+    assert len(seen) == 1  # DAH-7109: ages come with the listing, no per-container inspect or date
+    assert seen[0].startswith("date +%s && ")
+    assert """--format '[{{json .Names}},{{json (.Label "io.lium.pod_id")}},{{json .CreatedAt}}]'""" in seen[0]
 
 
 @pytest.mark.asyncio
@@ -1064,26 +1066,37 @@ async def test_a_multiline_pod_id_label_cannot_forge_a_second_container_record()
     forged = "ignored\nprovider_db|provider_db\n[\"provider_db\",\"provider_db\"]"
 
     async def handler(cmd, *args, **kwargs):
-        return MagicMock(exit_status=0, stdout=_ps_line("pod_a", forged) + "\n", stderr="")
+        return MagicMock(exit_status=0, stdout=_ps_out(_ps_line("pod_a", forged)) + "\n", stderr="")
 
     ssh = AsyncMock()
     ssh.run = AsyncMock(side_effect=handler)
 
     listed = await ContainerCleanup()._get_all_rental_containers(ssh)
 
-    assert listed == [("pod_a", forged)]  # one container, one record; the label stays inside it
+    assert listed == [("pod_a", forged, 120)]  # one container, one record; the label stays inside it
 
 
 @pytest.mark.asyncio
 async def test_an_unparseable_listing_line_is_skipped():
     async def handler(cmd, *args, **kwargs):
-        stdout = 'provider_db|provider_db\n["x"]\n' + _ps_line("pod_a", "a")
+        stdout = _ps_out('provider_db|provider_db', '["x"]', _ps_line("pod_a", "a"))
         return MagicMock(exit_status=0, stdout=stdout, stderr="")
 
     ssh = AsyncMock()
     ssh.run = AsyncMock(side_effect=handler)
 
-    assert await ContainerCleanup()._get_all_rental_containers(ssh) == [("pod_a", "a")]
+    assert await ContainerCleanup()._get_all_rental_containers(ssh) == [("pod_a", "a", 120)]
+
+
+@pytest.mark.asyncio
+async def test_a_listing_without_the_host_clock_gives_no_age_so_nothing_is_old_enough_to_remove():
+    async def handler(cmd, *args, **kwargs):
+        return MagicMock(exit_status=0, stdout="not-a-time\n" + _ps_line("pod_a", "a"), stderr="")
+
+    ssh = AsyncMock()
+    ssh.run = AsyncMock(side_effect=handler)
+
+    assert await ContainerCleanup()._get_all_rental_containers(ssh) == [("pod_a", "a", None)]
 
 
 def _cleanup_check_ctx(removed: list[str], gpu_processes: list[dict], backend=None, redis=None):
@@ -1656,8 +1669,9 @@ async def test_the_cleanup_runs_once_and_its_removed_filler_stays_excluded_when_
 
 @pytest.mark.asyncio
 async def test_an_unlisted_filler_older_than_the_rented_list_goes_at_once_and_a_newer_one_stays():
-    """DAH-7071: a filler_ container created before the rented list was read, and missing from it, is no
-    live run; one created after the read may be a run the list does not show yet. pod_ keeps its grace."""
+    """DAH-7071: a filler_ container created before the rented list was read, and missing from it, goes once the
+    backend's record says it ended; one whose record still runs (a late create callback) stays, and so does one
+    created after the read, which may be a run the list does not show yet. pod_ keeps its grace."""
     import time
 
     from services.const import FILLER_CONTAINER_GRACE_MINUTES, FILLER_LIST_READ_MARGIN_MINUTES
@@ -1666,18 +1680,20 @@ async def test_an_unlisted_filler_older_than_the_rented_list_goes_at_once_and_a_
     before_read = "filler_00000000-0000-4000-8000-0000000000b1"
     after_read = "filler_00000000-0000-4000-8000-0000000000b2"
     young_pod = "pod_00000000-0000-4000-8000-0000000000b3"
+    late_callback = "filler_00000000-0000-4000-8000-0000000000b4"
     older = read_minutes_ago + FILLER_LIST_READ_MARGIN_MINUTES + 1
     assert older < FILLER_CONTAINER_GRACE_MINUTES  # the fixed grace alone would keep it
     ssh, rm_calls = _make_ssh_mock(
-        containers=[before_read, after_read, young_pod],
-        ages_by_name={before_read: older, after_read: read_minutes_ago - 1, young_pod: older},
+        containers=[before_read, after_read, young_pod, late_callback],
+        ages_by_name={before_read: older, after_read: read_minutes_ago - 1, young_pod: older, late_callback: older},
     )
+    ended = AsyncMock(side_effect=lambda name: name == before_read)
     rented_data = _real_rented_data(EXECUTOR_UUID, [LIVE_POD])
-    rented_data._read_started_at = time.monotonic() - read_minutes_ago * 60
+    rented_data.read_at = time.time() - read_minutes_ago * 60
 
     _, removed_names, _ = await ContainerCleanup().cleanup(
-        ssh_client=ssh, rented_data=rented_data, executor_uuid=EXECUTOR_UUID
+        ssh_client=ssh, rented_data=rented_data, executor_uuid=EXECUTOR_UUID, lium_workload_ended=ended
     )
 
     assert removed_names == [before_read]
-    assert not any(after_read in c or young_pod in c for c in rm_calls)
+    assert not any(name in c for c in rm_calls for name in (after_read, young_pod, late_callback))

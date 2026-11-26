@@ -704,14 +704,13 @@ async def test_check_executor_health_sends_the_portals_owner_hotkeys_for_the_lis
 
 
 @pytest.mark.asyncio
-async def test_a_rented_list_read_carries_its_read_start_and_the_wire_cannot_set_it(client):
+async def test_a_rented_list_read_carries_the_time_this_validator_asked_not_a_wire_value(client):
     """DAH-7071: the container cleanup measures a filler's age against the moment this validator asked."""
-    answer = RentedExecutorsResponse.model_validate({"executors": {}, "_read_started_at": 1.0})
-    assert answer.read_started_at is None
+    answer = RentedExecutorsResponse.model_validate({"executors": {}, "read_at": 1.0})
     with (
-        patch.object(backend_client_module.time, "monotonic", return_value=123.0),
+        patch.object(backend_client_module.time, "time", return_value=123.0),
         patch.object(client, "_signed_request", AsyncMock(return_value=answer)),
     ):
         rented = await client.get_rented_executors_now()
 
-    assert rented.read_started_at == 123.0
+    assert rented.read_at == 123.0

@@ -3,7 +3,7 @@ import math
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, PrivateAttr, RootModel, ValidationError, field_validator
+from pydantic import BaseModel, RootModel, ValidationError, field_validator
 
 from services.const import FILLER_CONTAINER_PREFIX, POD_CONTAINER_PREFIX
 
@@ -164,10 +164,10 @@ class MaintenanceWindow(BaseModel):
 
 class RentedExecutorsResponse(BaseModel):
     """Response with executors dict and banned GUIDs."""
+    # epoch s when the backend client sent this read (set by the client, never by the backend): a create stamped
+    # after it may have a pod this list does not hold
+    read_at: float | None = None
     executors: dict[str, RentedExecutor]  # key = executor_id
-    # time.monotonic() on this validator just before the request that returned this list; set by
-    # BackendClient, never parsed from the wire. None for a list built any other way.
-    _read_started_at: float | None = PrivateAttr(default=None)
     # Legacy single-filler map (one container per executor), kept for a backend that predates the
     # list field. Read via get_filler_containers' fallback, never directly.
     filler_containers_by_executor: dict[str, str] = {}  # executor_id -> filler_<FillerRun.id>
@@ -334,10 +334,6 @@ class RentedExecutorsResponse(BaseModel):
             for executor_id, names in value.items()
             if (filler_names := [name for name in names if name.startswith(FILLER_CONTAINER_PREFIX)])
         }
-
-    @property
-    def read_started_at(self) -> float | None:
-        return self._read_started_at
 
     def get_filler_containers(self, executor_uuid: str) -> list[str]:
         # The full list when the backend sends it; otherwise fall back to the legacy single map, so a

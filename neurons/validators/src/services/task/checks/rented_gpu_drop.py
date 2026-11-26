@@ -310,6 +310,13 @@ def _gpus(count: int | None) -> int | None:
     return None if count is None else min(max(count, 0), MAX_REPORTED_GPU_COUNT)
 
 
+def _count(value) -> int | None:
+    """A scraped count as the backend takes it: a positive whole number, else None (not sent)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 1:
+        return None
+    return int(value)
+
+
 def _listed_uuids(gpu_details: list[dict]) -> list[str]:
     return [
         str(detail["uuid"])
@@ -659,6 +666,10 @@ class RentedGpuDropCheck:
         observed_at: str,
     ) -> RentedGpuDropResponse | None:
         # Never fatal: a backend that is down, older (404) or raising is no answer, and the next cycle asks again.
+        specs = ctx.state.specs or {}
+        # the anchored cards are gone: the cards the node lists now, so the pod can move onto them, and the host's
+        # counts, so its recreate fits the host it is on now (DAH-7143)
+        swapped = bool(drop and FAULT_ANCHORED_MISSING in drop.faults)
         try:
             answer = await ctx.services.backend.report_rented_gpu_drop(
                 pod.pod_id,
@@ -675,10 +686,9 @@ class RentedGpuDropCheck:
                 rented_gpu_count=_gpus(rented_total),
                 nvml_gpu_count=_gpus(nvml_count),
                 observed_at=observed_at,
-                # the anchored cards are gone: the cards the node lists now, so the pod can move onto them
-                gpu_details=((ctx.state.specs or {}).get("gpu") or {}).get("details")
-                if drop and FAULT_ANCHORED_MISSING in drop.faults
-                else None,
+                gpu_details=(specs.get("gpu") or {}).get("details") if swapped else None,
+                cpu_count=_count((specs.get("cpu") or {}).get("count")) if swapped else None,
+                ram_total=_count((specs.get("ram") or {}).get("total")) if swapped else None,
             )
         except Exception:
             logger.warning(

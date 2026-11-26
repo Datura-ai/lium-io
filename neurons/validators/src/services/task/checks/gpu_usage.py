@@ -28,7 +28,7 @@ from services.const import (
     RENTAL_CLOSE_CLOCK_SKEW_MINUTES,
     RENTAL_TEARDOWN_GRACE_MINUTES,
 )
-from services.container_cleanup import image_repository
+from services.container_cleanup import FILLER_WORKLOADS, MULTIPROCESSING_CHILD, FillerWorkload, image_repository
 from services.gpu_reset import renter_gpu_resets
 from services.redis_service import (
     EDIT_PARKED_CONTAINER_PREFIX,
@@ -55,28 +55,9 @@ from .rental_owner import rental_of_this_node
 
 logger = logging.getLogger(__name__)
 
-# The filler workloads whose GPU processes are known, by the image repository the validator started
-# the filler from: its workload and the executable names its GPU processes run as. A name matches the start
-# of the executable's basename, or of the script or module an interpreter runs, or the part before "::"
-# of a renamed process title (vLLM's engine child shows as "VLLM::EngineCore"). A repository not
-# listed here is not judged.
-# the name of a child Python's multiprocessing started with `spawn` or `forkserver`: its command line is
-# `python -c "from multiprocessing.spawn import spawn_main; ..." --multiprocessing-fork`, not the program it runs
-MULTIPROCESSING_CHILD = "multiprocessing-child"
-
-
-@dataclass(frozen=True)
-class FillerWorkload:
-    strategy: str
-    process_names: tuple[str, ...]
-
-
-FILLER_PROCESS_ALLOWLISTS: dict[str, FillerWorkload] = {
-    "daturaai/pearl-miner": FillerWorkload("PEARL", ("peakminer",)),
-    # the worker downloads its inference engine at run time; the engine has been vLLM and sonar, and the engine
-    # starts GPU children through multiprocessing's spawn start method (sonar's P2P probe at engine start)
-    "daturaai/dolphin": FillerWorkload("DPHN", ("dolphinpod", "sonar", "vllm", MULTIPROCESSING_CHILD)),
-}
+# A filler's GPU process names (FILLER_WORKLOADS, by the image repository the validator started the
+# filler from) match the start of the executable's basename, or of the script or module an interpreter
+# runs, or the part before "::" of a renamed process title (vLLM's engine child shows as "VLLM::EngineCore").
 _INTERPRETER = re.compile(r"python[0-9.]*")
 # interpreter options that take the next argument as their value (`-W ignore`, `-X faulthandler`)
 _INTERPRETER_OPTIONS_WITH_VALUE = {"-W", "-X", "--check-hash-based-pycs"}
@@ -129,6 +110,18 @@ class PodContainerRental:
     rental_executor_id: str | None = None
 
 
+class BackendVerdict(Enum):
+    """The backend's answer on whether a Lium-named container is a live run of ours."""
+
+    OURS = "ours"
+    NOT_OURS = "not ours"
+    NO_ANSWER = "no answer"
+
+    @classmethod
+    def of(cls, is_ours: bool) -> "BackendVerdict":
+        return cls.OURS if is_ours else cls.NOT_OURS
+
+
 class GpuUsageCheck:
     """Re-use the legacy GPU utilisation guard for both rented and idle states."""
 
@@ -167,7 +160,7 @@ class GpuUsageCheck:
         gpu_details: list[dict],
         gpu_processes: list[dict],
         filler_containers: set[str],
-        backend_verdicts: dict[str, bool | None],
+        backend_verdicts: dict[str, BackendVerdict],
     ) -> CheckResult | None:
         """Judge an idle card by WHO holds it, not by how hard it is being used (DAH-2735).
 
@@ -632,7 +625,7 @@ async def _foreign_processes_in_fillers(
                 recorded,
                 live,
             )
-        if workload := FILLER_PROCESS_ALLOWLISTS.get(recorded or live or ""):
+        if workload := FILLER_WORKLOADS.get(recorded or live or ""):
             workloads[name] = workload
     foreign: list[tuple[str, str]] = []
     for process in gpu_processes:
@@ -678,7 +671,7 @@ def _carries_a_lium_prefix(process: ForeignGpuProcess) -> bool:
 
 
 async def _drop_containers_the_backend_still_owns(
-    ctx: Context, foreign_processes: list[ForeignGpuProcess], backend_verdicts: dict[str, bool | None]
+    ctx: Context, foreign_processes: list[ForeignGpuProcess], backend_verdicts: dict[str, BackendVerdict]
 ) -> list[ForeignGpuProcess]:
     """Ask the backend about a Lium-named container that this cycle's snapshot does not hold.
 
@@ -698,13 +691,17 @@ async def _drop_containers_the_backend_still_owns(
         for process in foreign_processes
         if _carries_a_lium_prefix(process) and process.container_name not in backend_verdicts
     }
-    verdicts: dict[str, bool | None] = {**backend_verdicts, **await _backend_verdicts(ctx, unasked)}
-    return [process for process in foreign_processes if verdicts.get(process.container_name, False) is False]
+    verdicts: dict[str, BackendVerdict] = {**backend_verdicts, **await _backend_verdicts(ctx, unasked)}
+    return [
+        process
+        for process in foreign_processes
+        if verdicts.get(process.container_name, BackendVerdict.NOT_OURS) is BackendVerdict.NOT_OURS
+    ]
 
 
 class NodeFillers(NamedTuple):
     fillers: set[str]
-    backend_verdicts: dict[str, bool | None]
+    backend_verdicts: dict[str, BackendVerdict]
 
 
 async def _fillers_of_this_node(ctx: Context, process_names: set[str]) -> NodeFillers:
@@ -720,25 +717,25 @@ async def _fillers_of_this_node(ctx: Context, process_names: set[str]) -> NodeFi
     if rented_data is None:
         return NodeFillers(set(), {})
     snapshot_fillers: set[str] = set(rented_data.get_filler_containers(ctx.executor.uuid))
-    backend_verdicts: dict[str, bool | None] = await _backend_verdicts(
+    backend_verdicts: dict[str, BackendVerdict] = await _backend_verdicts(
         ctx,
         {name for name in process_names - snapshot_fillers if name and name.startswith(FILLER_CONTAINER_PREFIX)},
     )
     return NodeFillers(
-        snapshot_fillers | {name for name, is_ours in backend_verdicts.items() if is_ours}, backend_verdicts
+        snapshot_fillers | {name for name, verdict in backend_verdicts.items() if verdict is BackendVerdict.OURS},
+        backend_verdicts,
     )
 
 
-async def _backend_verdicts(ctx: Context, container_names: set[str]) -> dict[str, bool | None]:
-    """The backend's answer per Lium-named container: True ours, False not ours, None no answer.
-    A name another executor holds is never asked about."""
+async def _backend_verdicts(ctx: Context, container_names: set[str]) -> dict[str, BackendVerdict]:
+    """The backend's answer per Lium-named container. A name another executor holds is never asked about."""
     if not container_names:
         return {}
     claimed_elsewhere: set[str] = _containers_claimed_by_another_executor(ctx)
     lium_named_containers: list[str] = sorted(name for name in container_names if _pod_name(name) not in claimed_elsewhere)
     if not lium_named_containers:
         return {}
-    answers: list[bool | None] = await asyncio.gather(
+    answers: list[BackendVerdict] = await asyncio.gather(
         *(_backend_ownership(ctx, name) for name in lium_named_containers)
     )
     return dict(zip(lium_named_containers, answers))
@@ -752,49 +749,49 @@ async def the_backend_still_owns(ctx: Context, container_name: str) -> bool:
     Mirrors the filler re-check in rental_verification. Fail-open on an unreachable backend
     (no answer): an inability to measure never withholds money here.
     """
-    return await _backend_ownership(ctx, container_name) is not False
+    return await _backend_ownership(ctx, container_name) is not BackendVerdict.NOT_OURS
 
 
-async def _backend_ownership(ctx: Context, container_name: str) -> bool | None:
-    """The backend's verdict on the id inside the container name; None when the backend did not answer."""
+async def _backend_ownership(ctx: Context, container_name: str) -> BackendVerdict:
+    """The backend's verdict on the id inside the container name."""
     is_filler: bool = container_name.startswith(FILLER_CONTAINER_PREFIX)
     prefix: str = FILLER_CONTAINER_PREFIX if is_filler else POD_CONTAINER_PREFIX
     # a parked pod container (pod_<id>__prev, __stopped) is ours only under a name this validator
     # recorded parking: anyone can start a container under that name
     if not is_filler and _pod_name(container_name) != container_name:
         if await _parked_by_this_validator(ctx, container_name) is False:
-            return False
+            return BackendVerdict.NOT_OURS
     backend_issued_id: str | None = _uuid_after_prefix(
         container_name if is_filler else _pod_name(container_name), prefix
     )
     if backend_issued_id is None:
-        return False
+        return BackendVerdict.NOT_OURS
 
     if is_filler:
         filler_run: FillerRunActiveResponse | None = await ctx.services.backend.get_filler_run_active(
             backend_issued_id
         )
         if filler_run is None:
-            return None
+            return BackendVerdict.NO_ANSWER
         if not _the_answer_is_about_this_node(ctx, filler_run.executor_id):
-            return False
+            return BackendVerdict.NOT_OURS
         # `active` alone means RUNNING. The status carries the two transitional states, which is
         # where a filler the snapshot missed usually sits — but a backend that sends no status
         # must not turn a run it calls active into a foreign workload.
-        return filler_run.active or filler_run.status in LIVE_FILLER_RUN_STATUSES
+        return BackendVerdict.of(filler_run.active or filler_run.status in LIVE_FILLER_RUN_STATUSES)
 
     pod_rental: PodRentalActiveResponse | None = await ctx.services.backend.get_pod_rental_active(
         backend_issued_id
     )
     if pod_rental is None:
-        return None
+        return BackendVerdict.NO_ANSWER
     if not _the_answer_is_about_this_node(ctx, pod_rental.executor_id):
-        return False
+        return BackendVerdict.NOT_OURS
     if _a_broken_pod_the_reaper_has_not_collected_yet(pod_rental):
-        return True
+        return BackendVerdict.OURS
     # A pod that ended within its teardown grace gets the same verdict at 0% load as above the limit.
     rental = _pod_container_rental_from(ctx, container_name, backend_issued_id, pod_rental)
-    return rental.state not in _ORPHAN_STATES
+    return BackendVerdict.of(rental.state not in _ORPHAN_STATES)
 
 
 async def _parked_by_this_validator(ctx: Context, container_name: str) -> bool | None:

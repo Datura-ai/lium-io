@@ -24,6 +24,9 @@ from services.docker_service import (
     NoUsableLoopbackPluginError,
     SshSessionMayStillBeTakenError,
     VolumeHostProbe,
+    _docker_root_dir_shell,
+    _parse_docker_root_dir,
+    _parse_volume_host_probe,
     _run_with_host_timeout,
     _volume_host_probe_command,
 )
@@ -510,6 +513,19 @@ async def test_create_local_volume_without_a_docker_data_root_never_installs_v2(
 
 
 @pytest.mark.asyncio
+async def test_the_fallback_without_a_data_root_names_why_docker_info_gave_none(docker_service, monkeypatch):
+    warning = Mock()
+    monkeypatch.setattr(docker_service_module.logger, "warning", warning)
+    ssh_client = _plugin_host(v2_state="absent", old_state="true", docker_root="ROOTERR\t1 context deadline exceeded")
+
+    created = await _create_volume(docker_service, ssh_client, None)
+
+    assert [volume["driver"] for volume in created] == ["vloopback"]
+    (logged,), _ = warning.call_args
+    assert logged.extra["reason"] == "Docker data root unknown (docker info exit 1: context deadline exceeded)"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("v2_state", ["true", "false"])
 @pytest.mark.parametrize("old_state", ["absent", "false", "true"])
 async def test_create_local_volume_without_probe_keeps_v2_when_its_install_says_already_exists(
@@ -802,3 +818,131 @@ async def test_plugin_setup_runs_under_the_probed_budget_only_for_the_generation
     assert setup_commands[0].startswith(f"timeout -k 5 {budget} ")
     # the script measures its probe against the same deadline
     assert shlex.split(shlex.split(setup_commands[0])[-1])[9] == budget
+
+
+# a host whose `docker info` prints no DockerRootDir while the volume API answers (seen on live
+# hosts): local volumes in $VOLUMES live under /data/fs/docker
+_DATA_ROOT_FAKE_DOCKER = r"""#!/bin/sh
+case "$1 $2" in
+  "info --format") [ -n "$CALLS" ] && echo info >> "$CALLS"; echo "error during connect: context deadline exceeded" >&2; exit 1 ;;
+  "volume ls")
+    case "$*" in *"-q"*) [ -n "$VOLUMES" ] && printf '%s\n' $VOLUMES ;; esac; exit 0 ;;
+  "volume inspect") eval "name=\${$#}"; echo "/data/fs/docker/volumes/$name/_data" ;;
+  "plugin inspect") exit 1 ;;
+esac
+"""
+
+
+def _run_with_fake_docker(tmp_path, command: str, **env: str) -> str:
+    docker = tmp_path / "docker"
+    docker.write_text(_DATA_ROOT_FAKE_DOCKER)
+    docker.chmod(0o755)
+    result = subprocess.run(
+        ["sh", "-c", command.replace("/usr/bin/docker", str(docker))],
+        capture_output=True, text=True, timeout=10, env={"PATH": "/usr/bin:/bin", **env},
+    )
+    return result.stdout
+
+
+def test_the_host_probe_reads_the_data_root_from_a_local_volume_when_docker_info_prints_none(tmp_path):
+    # Act: the real probe command under sh, an empty ROOT from docker info next to a working volume list
+    stdout = _run_with_fake_docker(tmp_path, _volume_host_probe_command(with_df=False), VOLUMES="renter_cache other")
+    probe = _parse_volume_host_probe(stdout, with_df=False)
+
+    # Assert: the root the volume API shows
+    assert probe.docker_root_dir == "/data/fs/docker"
+    assert "ROOTERR\t1 error during connect: context deadline exceeded" in stdout
+
+
+def test_an_unknown_data_root_names_why_docker_info_gave_none(tmp_path):
+    # Act: no local volume to read the root from
+    stdout = _run_with_fake_docker(tmp_path, _docker_root_dir_shell() + "printf '%s\\n' \"$root\"")
+
+    # Assert
+    assert _parse_docker_root_dir(stdout) == ("", "docker info exit 1: error during connect: context deadline exceeded")
+    probe = _parse_volume_host_probe(
+        _run_with_fake_docker(tmp_path, _volume_host_probe_command(with_df=True)), with_df=True
+    )
+    # the probe's answer stands (no root, and why), so no caller asks docker info again
+    assert (probe.docker_root_dir, probe.root_error) == (
+        "", "docker info exit 1: error during connect: context deadline exceeded"
+    )
+    assert probe.df_avail_bytes is None
+
+
+def test_a_failing_docker_info_is_asked_once_per_reader(tmp_path):
+    # review 23 Nov: a docker info failing after 16 s was asked twice by the probe and twice more by the
+    # fallback reader, so the v2 fallback took 62 s; each reader now calls it once
+    calls = tmp_path / "calls"
+    for command in (_docker_root_dir_shell() + "printf '%s\\n' \"$root\"", _volume_host_probe_command(with_df=False)):
+        calls.write_text("")
+        stdout = _run_with_fake_docker(tmp_path, command, CALLS=str(calls))
+        assert calls.read_text().count("info") == 1
+        assert "ROOTERR\t1 error during connect" in stdout
+
+
+@pytest.mark.asyncio
+async def test_a_probe_without_a_root_falls_back_to_v2_without_asking_docker_again(monkeypatch):
+    service = DockerService.__new__(DockerService)
+    probe = VolumeHostProbe(
+        docker_root_dir="", df_avail_bytes=None, vloopback_volume_names=[],
+        loopback_plugin_enabled=False, root_error="docker info exit 1: boom",
+    )
+    asked = []
+
+    async def ask(*_args, **_kwargs):
+        asked.append(_args)
+        raise AssertionError("docker asked again")
+
+    fallbacks = []
+
+    async def fall_back(_ssh, _timeout, _extra, reason, _root):
+        fallbacks.append(reason)
+        return "v2"
+
+    monkeypatch.setattr(DockerService, "read_docker_root_dir", staticmethod(ask))
+    monkeypatch.setattr(service, "_get_current_loopback_plugin_state", ask)
+    monkeypatch.setattr(service, "_fall_back_to_old_loopback_plugin", fall_back)
+    monkeypatch.setattr(docker_service_module.settings, "LOOPBACK_PLUGIN_V2_ENABLED", True)
+
+    assert await service._pick_loopback_driver_for_new_volume(object(), 10, {}, probe) == "v2"
+    assert fallbacks == ["Docker data root unknown (docker info exit 1: boom)"] and not asked
+
+
+_ROOT_FAKE_DOCKER = r"""#!/bin/sh
+case "$1 $2" in
+  "info --format") echo "WARNING: No swap limit support" >&2; echo DOCKERROOT=/var/lib/docker ;;
+  "volume ls") exit 0 ;;
+  "plugin inspect") exit 1 ;;
+esac
+"""
+
+
+def test_both_data_root_readers_need_no_temporary_file(tmp_path):
+    # Arrange: a working docker info (with a warning on stderr) on a host where mktemp fails, as with no
+    # writable /tmp (review 23 Nov: a redirect into the empty name stopped docker info before it ran)
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "mktemp").write_text("#!/bin/sh\nexit 1\n")
+    (bin_dir / "mktemp").chmod(0o755)
+    docker = tmp_path / "docker"
+    docker.write_text(_ROOT_FAKE_DOCKER)
+    docker.chmod(0o755)
+
+    def run(command: str) -> str:
+        return subprocess.run(
+            ["sh", "-c", command.replace("/usr/bin/docker", str(docker))],
+            capture_output=True, text=True, env={"PATH": f"{bin_dir}:/usr/bin:/bin"},
+        ).stdout
+
+    # Act
+    plain = run(_docker_root_dir_shell() + "printf '%s\\n' \"$root\"")
+    probe = _parse_volume_host_probe(run(_volume_host_probe_command(with_df=False)), with_df=False)
+
+    # Assert: both readers get the root docker info gives, and no error is reported
+    assert _parse_docker_root_dir(plain) == ("/var/lib/docker", "")
+    assert probe.docker_root_dir == "/var/lib/docker"
+
+
+def test_a_readable_data_root_is_read_as_before():
+    assert _parse_docker_root_dir("/var/lib/docker\n") == ("/var/lib/docker", "")

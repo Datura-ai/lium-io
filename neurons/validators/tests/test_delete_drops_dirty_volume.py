@@ -447,7 +447,8 @@ async def test_delete_removes_the_pods_kept_edit_containers_before_its_volume(do
 @pytest.mark.asyncio
 async def test_delete_answers_in_progress_until_the_kept_edit_containers_are_removed(docker_service, monkeypatch):
     # DAH-5773 review: nothing else removes a kept container, so a failed removal must not close the pod
-    rm_exit = iter([1, 0])
+    # the first ask's rm fails before and after the direct kill
+    rm_exit = iter([1, 1, 0])
 
     async def answer(command: str):
         if "docker ps -a" in command and "kept_unmounted_dirty_" in command:
@@ -477,3 +478,56 @@ async def test_delete_answers_in_progress_until_the_kept_edit_containers_are_rem
 
     assert isinstance(retried, ContainerDeleted)
     assert ("remove_volume", "volume_dirty") in order
+
+
+@pytest.mark.asyncio
+async def test_delete_kills_a_kept_container_whose_exit_event_was_lost_and_removes_it(docker_service, monkeypatch):
+    # DAH-7025 review: a delete that cut off the edit's direct kill finds the parked container wedged ("did not
+    # receive an exit event"); rm -f alone fails on every re-ask, so the delete kills it directly and removes it
+    killed = []
+
+    async def answer(command: str):
+        if "docker ps -a" in command and "kept_unmounted_dirty_" in command:
+            return _make_ssh_command_result(stdout="kept_unmounted_dirty_1700 idkept\n")
+        if "kill -9" in command and "idkept" in command:
+            killed.append(command)
+            return _make_ssh_command_result(stdout="killed pid=7 shim=8 init=gone\n")
+        if "docker rm -fv" in command and not killed:
+            return _make_ssh_command_result(
+                exit_status=1, stderr="tried to kill container, but did not receive an exit event"
+            )
+        return await _host_answers()(command)
+
+    _wire_delete(docker_service, monkeypatch, answer)
+
+    result = await _delete(docker_service, _delete_payload())
+
+    assert isinstance(result, ContainerDeleted)
+    assert len(killed) == 1
+
+
+@pytest.mark.asyncio
+async def test_delete_answers_in_progress_when_the_rm_after_the_direct_kill_does_not_answer(docker_service, monkeypatch):
+    # DAH-7025 review: the first rm fails, the direct kill completes, the retry rm times out: the kept container is
+    # still there, so the delete must not close the pod
+    killed = []
+
+    async def answer(command: str):
+        if "docker ps -a" in command and "kept_unmounted_dirty_" in command:
+            return _make_ssh_command_result(stdout="kept_unmounted_dirty_1700 idkept\n")
+        if "kill -9" in command and "idkept" in command:
+            killed.append(command)
+            return _make_ssh_command_result(stdout="killed pid=7 shim=8 init=gone\n")
+        if "docker rm -fv" in command:
+            if killed:
+                raise TimeoutError
+            return _make_ssh_command_result(exit_status=1, stderr="did not receive an exit event")
+        return await _host_answers()(command)
+
+    _wire_delete(docker_service, monkeypatch, answer)
+
+    result = await _delete(docker_service, _delete_payload())
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.error_code == FailedContainerErrorCodes.DeletionInProgress
+    assert len(killed) == 1

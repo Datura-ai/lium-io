@@ -6,7 +6,11 @@ import pytest
 
 from payload_models.payloads import CacheVolume, ContainerCreateRequest, WorkloadKind
 from services.const import DPHN_CACHE_FREE_MARGIN_GB, DPHN_CACHE_LISTING_FLOOR_GB
-from services.container_cleanup import idle_filler_images_removal_command
+from services.container_cleanup import (
+    FILLER_IMAGE_REPOSITORIES,
+    FILLER_WORKLOADS,
+    idle_filler_images_removal_command,
+)
 from services.docker_service import (
     DockerService,
     RentalDiskFit,
@@ -897,6 +901,20 @@ def test_the_idle_filler_removal_keeps_the_rented_image_under_any_docker_hub_pre
 
     assert "reference=daturaai/dolphin " not in command
     assert "reference=daturaai/dlph " in command
+
+
+# The image whose every GPU process is foreign: no Lium workload runs on dlph any more.
+_FILLER_IMAGES_WITHOUT_PROCESS_NAMES = {"daturaai/dlph"}
+
+
+def test_every_filler_image_is_judged_by_its_gpu_process_names():
+    assert {repository for repository, workload in FILLER_WORKLOADS.items() if not workload.process_names} == (
+        _FILLER_IMAGES_WITHOUT_PROCESS_NAMES
+    )
+
+
+def test_the_idle_filler_image_removal_takes_every_filler_image_but_pearl_miner():
+    assert FILLER_IMAGE_REPOSITORIES == ("ghcr.io/hanlinai/engy-golden-serve", "daturaai/dolphin", "daturaai/dlph")
 
 
 class CacheDuHostSshClient(RemovingHostSshClient):

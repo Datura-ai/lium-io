@@ -77,6 +77,8 @@ class AvailabilityErrorCode(StrEnum):
     NODE_ACCOUNT_MISMATCH = "NODE_ACCOUNT_MISMATCH"
     # DAH-6539: the account read failed or stalled; a reach failure, so silenced with our own outage like one.
     NODE_ACCOUNT_UNVERIFIED = "NODE_ACCOUNT_UNVERIFIED"
+    # DAH-7041: the host answered a kernel.pid_max the create refuses every rental on (HostPidMaxCheck).
+    HOST_PID_MAX_UNUSABLE = "HOST_PID_MAX_UNUSABLE"
 
 
 # Faults the node itself proved: never a sign of our own outage, and never silenced with one.
@@ -91,6 +93,8 @@ NODE_GPU_FAULT_CODES = frozenset(
         AvailabilityErrorCode.GPU_WORK_PROOF_FAILED,
         # read off the machine itself (its host key or account files)
         AvailabilityErrorCode.NODE_ACCOUNT_MISMATCH,
+        # the host's own answer to the read, never a read that got none
+        AvailabilityErrorCode.HOST_PID_MAX_UNUSABLE,
         # only raised for REASONS_THAT_HIDE_AT_ONCE, all read off the node's own report or probe
         AvailabilityErrorCode.VERIFICATION_FAILED,
     }
@@ -430,12 +434,13 @@ class RunningOutageTally:
 
 
 # DAH-5395: the failure reasons that hide the node at once. Any other failed run keeps the backend's usual rule.
-REASONS_THAT_HIDE_AT_ONCE = frozenset({"GPU_DETAILS_MISMATCH", "GPU_UUID_CHANGED", "NVLINK_FAULT"})
+REASONS_THAT_HIDE_AT_ONCE = frozenset({"GPU_DETAILS_MISMATCH", "GPU_UUID_CHANGED", "LOGIN_USER_NOT_ROOT", "NVLINK_FAULT"})
 
 
 # runs that stop before the checks that re-read the stored restrictions: [] would clear what those checks keep
-# (DAH-6546: a pod left unread after a GPU-set move stops the run, and its rerun looks again)
-REASONS_THAT_KEEP_STORED = frozenset({"GPU_LOST_POD_UNREAD"})
+# (DAH-6546: a pod left unread after a GPU-set move stops the run, and its rerun looks again; DAH-7050: a library
+# mismatch not confirmed)
+REASONS_THAT_KEEP_STORED = frozenset({"GPU_LOST_POD_UNREAD", "NVML_DIGEST_UNREAD"})
 
 
 def run_availability_errors(ok: bool, events: list[ValidationEvent]) -> list[dict] | None:

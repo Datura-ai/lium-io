@@ -34,7 +34,7 @@ The script installs the [`lium`](https://github.com/Datura-ai/lium) CLI and runs
 1. clones this repository into `./compute-subnet` (or pulls the branch if the directory already exists),
 2. runs `scripts/install_executor_on_ubuntu.sh` (Docker Engine and the compose plugin), then checks prerequisites — `nvidia-smi`, `nvidia-container-cli`, `docker info`,
 3. renders `neurons/executor/.env` from `.env.template` with the hotkey and the ports — you are prompted for the service port (`8080`), the node SSH port (`2200`), an optional public SSH port and an optional renting port range; pass `--auto` to accept the defaults without prompts,
-4. starts the executor with `docker compose up -d` and waits for the container to report `healthy`,
+4. starts the executor with `docker compose up -d` and waits for the node API to answer,
 5. runs the validator's own check against the node (`daturaai/compute-subnet-validator:preflight`).
 
 At the end it prints the node's endpoint, GPU type and count, and a `provider.lium.io/nodes?action=add&…` link that pre-fills the **Add Node** form in the [Provider Portal](https://provider.lium.io) with those values. Other options: `-d/--dir` (checkout directory, default `compute-subnet`) and `-b/--branch` (default `main`); `lium mine --help` lists them.
@@ -304,6 +304,8 @@ The executor checks the backup repository (before a backup and before a restore)
 ## The executor image
 
 `Dockerfile` starts from `python:3.11-slim` pinned by digest; the comment above the `FROM` line names the tag and the date the digest was taken. To move to a newer base, resolve the tag (`docker buildx imagetools inspect python:3.11-slim`), put the new digest on that line and rebuild. The build ends with `sshd_setup.sh`: its drop-in `/etc/ssh/sshd_config.d/lium.conf` sets `LoginGraceTime 20` and `MaxStartups 60:30:200` and, when the base's OpenSSH knows `PerSourcePenalties` (9.8 and later), `PerSourceMaxStartups 10`, `PerSourcePenalties yes` and a `PerSourcePenaltyExemptList` of the private ranges and the image's validator SSH sources; it fails the build when `sshd -T` rejects the rendered configuration. At start `run.sh` calls `sshd_setup.sh start`, which puts the build's off drop-in (`PerSourceMaxStartups none`, `PerSourcePenalties no`) in front of `lium.conf` when `EXECUTOR_SSH_SOURCE_LIMITS=false` or the executor runs in a CVM, where every client reaches sshd from one address; `sshd_log_receiver.py` does the same and reloads sshd on the first connection from a private address (sshd's `Connection from` line, before authentication). The same drop-in sets `LogLevel VERBOSE`, so every login records the key fingerprint that opened it. The container runs no syslog: `run.sh` starts `sshd_log_receiver.py` as `/dev/log`, which keeps the `Accepted` lines with sshd's time and pid in `/var/log/sshd-auth.log` (renamed to `.1` past 50 MB). Each cycle the validator logs the lines it has not read yet as `Executor sshd logins` and moves its cursor in `/var/log/sshd-auth.cursor` only after that.
+
+Backups and restores keep running when the executor container is restarted or updated. The executor only resolves the workspace and starts the operation's `lium-storage-…` helper container. Inside the helper, `src/storage_runner.py` runs restic, retries and reports progress, so a release never interrupts an operation. Cancelling an operation still stops it.
 
 ### Validator hotkeys and uploaded ssh keys
 
