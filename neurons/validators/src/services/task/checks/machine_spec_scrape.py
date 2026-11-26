@@ -444,6 +444,11 @@ class MachineSpecScrapeCheck:
             result, fallback_reason = await self._scrape_with_liumd(ctx, timeout)
             if result.passed or fallback_reason is None:
                 return result
+            if settings.VALIDATOR_LIUMD_EVIDENCE_MODE == "enforce":
+                # Enforce is fail-closed: without the scrape's identity block the node cannot be
+                # verified, and the Python scrape would bypass the gate.
+                result.event.what_we_saw["liumd_fallback_refused"] = fallback_reason
+                return result
             detail = str(result.event.what_we_saw.get("detail") or "")[:300]
             logger.warning(
                 _m(

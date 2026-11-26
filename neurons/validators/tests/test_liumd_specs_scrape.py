@@ -470,3 +470,18 @@ async def test_enforce_fails_when_the_binary_sends_no_identity_block(monkeypatch
     assert result.passed is False
     assert result.event.reason_code == Msg.GPU_IDENTITY_MISMATCH.reason
     assert result.event.what_we_saw["reasons"] == ["identity_missing"]
+
+
+@pytest.mark.asyncio
+async def test_enforce_refuses_the_python_fallback(monkeypatch):
+    _liumd_on(monkeypatch)
+    monkeypatch.setattr(machine_spec_scrape.settings, "VALIDATOR_LIUMD_EVIDENCE_MODE", "enforce")
+    _start_reading(monkeypatch, LocalVerifyUnavailable("not_supported", "exit 127: no liumd"))
+    runner = DummySSHCommandRunner(result=make_command_result(success=True, stdout=FERNET_TOKEN))
+
+    result = await MachineSpecScrapeCheck().run(_ctx(runner))
+
+    assert result.passed is False
+    assert result.event.what_we_saw["delivery"] == "liumd"
+    assert result.event.what_we_saw["liumd_fallback_refused"] == "not_supported"
+    assert runner.calls == []
