@@ -596,13 +596,15 @@ _PROBE_FAILURES: list[Any] = [
 ]
 
 
-def _run_failing_probe(tmp_path: Path, overrides: dict[str, Any], **state: Any) -> subprocess.CompletedProcess:
+def _run_failing_probe(
+    tmp_path: Path, overrides: dict[str, Any], lock_held_seconds: float = 0, **state: Any
+) -> subprocess.CompletedProcess:
     overrides = dict(overrides)
     probe_seconds = overrides.pop("probe_seconds", None)
     arguments = _setup_arguments(tmp_path, {"installed": True, "enabled": True, **overrides, **state})
     if probe_seconds:
         arguments[2] = _SETUP_SCRIPT.replace("PROBE_SECONDS = 60", f"PROBE_SECONDS = {probe_seconds}")
-    return _run_on_a_virtual_clock(arguments)
+    return _run_on_a_virtual_clock(arguments, lock_held_seconds=lock_held_seconds)
 
 
 @pytest.mark.parametrize(
@@ -674,30 +676,35 @@ def test_a_leftover_probe_beside_real_volumes_never_disables_the_plugin(tmp_path
     # Assert
     assert result.returncode == 1
     assert "an earlier probe left volume lium-loopback-probe-v3" in result.stderr
-    assert "kept enabled: the plugin owns 2 volume(s)" in result.stderr
+    assert "kept enabled: the plugin owns 3 volume(s)" in result.stderr
     assert not any(call[1] == "disable" for call in _plugin_calls(tmp_path))
     assert json.loads((tmp_path / "state.json").read_text())["enabled"] is True
 
 
 @pytest.mark.parametrize(
-    ("leftover", "left"),
+    ("leftover", "kept", "lock_held_seconds"),
     [
         pytest.param({"containers": ["lium-loopback-probe-v3"], "rm_exit": 1},
-                     "container lium-loopback-probe-v3, volume lium-loopback-probe-v3", id="container-and-volume"),
+                     "the probe left container lium-loopback-probe-v3, volume lium-loopback-probe-v3", 0,
+                     id="container-and-volume"),
         pytest.param({"volume_rm_exit": 1, "volumes": {"lium-loopback-probe-v3": "vloopback:v3"}},
-                     "volume lium-loopback-probe-v3", id="volume-the-plugin-calls-in-use"),
+                     "the plugin owns 1 volume(s)", 0, id="volume-the-plugin-calls-in-use"),
+        # lock held 70 s of 150: the probe window (150 - 88 = 62 s) is gone before this run's cleanup, so only
+        # Docker's listing shows the volume an earlier setup left
+        pytest.param({"containers": ["lium-loopback-probe-v3"], "volumes": {"lium-loopback-probe-v3": "vloopback:v3"}},
+                     "the plugin owns 1 volume(s)", 70, id="another-setup-held-the-lock-past-the-probe-window"),
     ],
 )
 def test_a_probe_that_cannot_be_removed_keeps_the_plugin_enabled_with_no_other_volume(
-    tmp_path: Path, leftover: dict[str, Any], left: str
+    tmp_path: Path, leftover: dict[str, Any], kept: str, lock_held_seconds: float
 ) -> None:
     # Arrange: the node's state before any rental: the plugin refuses to remove its probe volume as still in
     # use. Turned off then, the plugin would keep that lease, and every later probe would fail the same way
-    result = _run_failing_probe(tmp_path, leftover)
+    result = _run_failing_probe(tmp_path, leftover, lock_held_seconds)
 
     # Assert: kept on, not handed out, and the reason names what was left
     assert result.returncode == 1
-    assert "kept enabled: the probe left " + left in result.stderr
+    assert "kept enabled: " + kept in result.stderr
     assert not any(call[1] == "disable" for call in _plugin_calls(tmp_path))
     assert json.loads((tmp_path / "state.json").read_text())["enabled"] is True
     assert not (tmp_path / "probe-ok").exists()
@@ -714,12 +721,22 @@ def test_a_failed_probe_keeps_the_plugin_enabled_when_its_volumes_cannot_be_list
     assert not (tmp_path / "probe-ok").exists()
 
 
-def test_setup_keeps_a_disabled_earlier_v3_build_whose_disk_files_are_still_there(tmp_path: Path) -> None:
-    # Arrange: Docker lists no volume of a disabled plugin, but its data directory still holds a disk
-    (tmp_path / "vloopback-v3").mkdir()
-    (tmp_path / "vloopback-v3" / "volume_rental").write_bytes(b"")
+@pytest.mark.parametrize(
+    "earlier_root",
+    [pytest.param(False, id="this-data-root"), pytest.param(True, id="an-earlier-docker-data-root")],
+)
+def test_setup_keeps_a_disabled_earlier_v3_build_whose_disk_files_are_still_there(
+    tmp_path: Path, earlier_root: bool
+) -> None:
+    # Arrange: Docker lists no volume of a disabled plugin, but the data directory it was set up with still
+    # holds a disk, also when Docker has since moved to another data root (the fake's "-wrong" DATA_DIR)
+    data_dir = tmp_path / ("vloopback-v3-wrong" if earlier_root else "vloopback-v3")
+    data_dir.mkdir()
+    (data_dir / "volume_rental").write_bytes(b"")
     arguments = _setup_arguments(
-        tmp_path, {"installed": True, "installed_manifest": "sha256:" + "0" * 64, "marker_before": "old"}
+        tmp_path,
+        {"installed": True, "installed_manifest": "sha256:" + "0" * 64, "marker_before": "old",
+         "root_mismatch": earlier_root},
     )
 
     # Act

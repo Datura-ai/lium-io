@@ -103,7 +103,6 @@ signal.signal(signal.SIGTERM, end_on_validator_deadline)
 data_dir = "/srv" + root + "/vloopback-" + generation
 state_dir = "/srv/run/docker-volume-loopback-" + generation
 plugins_dir = host_root + root + "/plugins"
-host_data_dir = host_root + root + "/vloopback-" + generation
 
 def seconds_before_probe_reserve():
     return validator_deadline - PROBE_RESERVE_SECONDS - time.monotonic()
@@ -220,19 +219,29 @@ def disable_plugin(plugin_id):
             pass
     raise RuntimeError("the plugin could not be disabled")
 
-def volumes_on_plugin(plugin_id):
+def volumes_on_plugin(plugin):
     # Docker hides the volumes of a disabled plugin and does not restore a plugin's refcounts after a
     # daemon restart, so its own refusal to disable a plugin in use cannot be relied on. Every regular
-    # file in DATA_DIR is a volume (the plugin's List reads that folder), whether the plugin is enabled or
-    # not; the daemon's listing names the plugin by alias or ID. The probe volume is setup's own
+    # file in the plugin's own DATA_DIR is a volume (the plugin's List reads that folder), whether the plugin
+    # is enabled or not; an earlier build may keep them under an earlier Docker data root. The daemon's
+    # listing names the plugin by alias or ID
     global step
     step = "the listing of the plugin's data directory"
+    plugin_id = plugin["Id"]
+    data_dirs = [entry[len("DATA_DIR="):] for entry in plugin.get("Settings", {}).get("Env", [])
+                 if entry.startswith("DATA_DIR=")]
+    if len(data_dirs) != 1 or not data_dirs[0].startswith("/srv/") or ".." in data_dirs[0].split("/"):
+        raise RuntimeError("cannot tell where the plugin keeps its volumes")
     try:
-        names = {entry.name for entry in os.scandir(host_data_dir) if entry.is_file(follow_symlinks=False)}
+        names = {entry.name for entry in os.scandir(host_root + data_dirs[0][len("/srv"):])
+                 if entry.is_file(follow_symlinks=False)}
     except FileNotFoundError:
         names = set()
     except OSError:
         raise RuntimeError("cannot list the plugin's data directory") from None
+    # the probe's disk file is setup's own; a probe volume Docker still lists is not, as long as no cleanup
+    # in this run removed it: it holds the plugin's lease
+    names.discard(probe_volume)
     listed = run_docker("volume", "ls", "--format", "{{.Name}} {{.Driver}}", timeout=CLEANUP_SECONDS)
     if listed.returncode:
         raise RuntimeError("cannot list the volumes" + stderr_of(listed))
@@ -240,21 +249,20 @@ def volumes_on_plugin(plugin_id):
         fields = line.split()
         if len(fields) == 2 and fields[1] in (alias, plugin_id, plugin_id[:12]):
             names.add(fields[0])
-    names.discard(probe_volume)
     return names
 
-def disable_unless_it_owns_volumes(plugin_id):
+def disable_unless_it_owns_volumes(plugin):
     # a disabled plugin hides its volumes, so a rental on it loses its disk at the next restart or create:
     # one that holds any stays enabled and is only not handed out (no marker) for new volumes
     try:
-        owned = volumes_on_plugin(plugin_id)
+        owned = volumes_on_plugin(plugin)
     except RuntimeError as error:
         raise RuntimeError("kept enabled, " + str(error)) from None
     if owned:
         raise RuntimeError("kept enabled: the plugin owns " + str(len(owned)) + " volume(s)")
     if probe_left:
         raise RuntimeError("kept enabled: the probe left " + ", ".join(probe_left))
-    disable_plugin(plugin_id)
+    disable_plugin(plugin["Id"])
 
 def read_saved_config(plugin_id):
     global step
@@ -271,7 +279,7 @@ def remove_plugin_of_another_build(plugin):
     leftovers = remove_probe_leftovers()
     if leftovers:
         raise RuntimeError("an earlier probe left " + ", ".join(leftovers))
-    if volumes_on_plugin(plugin["Id"]):
+    if volumes_on_plugin(plugin):
         raise RuntimeError("an earlier build of the plugin still owns volumes")
     if plugin["Enabled"]:
         disable_plugin(plugin["Id"])
@@ -353,7 +361,7 @@ try:
             except BaseException as error:
                 reason = str(error) if isinstance(error, RuntimeError) else "probe volume failed: " + type(error).__name__
                 try:
-                    disable_unless_it_owns_volumes(plugin_id)
+                    disable_unless_it_owns_volumes(plugin)
                 except RuntimeError as disable_error:
                     reason += "; " + str(disable_error)
                 raise RuntimeError(reason) from None
