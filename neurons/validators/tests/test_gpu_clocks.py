@@ -426,6 +426,7 @@ async def test_an_application_or_memory_reset_that_gave_no_answer_refuses_the_cr
     logged = [r.getMessage() for r in caplog.records if "reset_no_answer_unrecorded" in r.getMessage()]
     assert len(logged) == (1 if recorded else 2)
     assert logged[-1].startswith(f"gpu_clock_action=reset_no_answer_unrecorded purpose=create node=node7 pod=pod9 gpu={U[1]} ")
+    assert f"gpu_clock_action=rgc_failed node=node7 pod=pod9 gpu={U[1]} recorded=false" in caplog.text
 
 
 @pytest.mark.asyncio
@@ -703,7 +704,7 @@ async def test_a_create_reset_answers_every_gpu_it_could_not_reset_unless_it_has
     with caplog.at_level(logging.WARNING):
         assert await reset_leftover_clock_locks(host, redis, [U[0], U[1]]) == expected
     assert f"gpu_clock_lock:{U[0]}" in redis.store, "kept for the next try"
-    assert f"gpu_clock_action=rgc_failed gpu={U[1]} recorded=false" in caplog.text, "every unrecorded failure is logged"
+    assert f"gpu_clock_action=rgc_failed node=- pod=- gpu={U[1]} recorded=false" in caplog.text, "every unrecorded failure is logged"
 
 
 @pytest.mark.asyncio

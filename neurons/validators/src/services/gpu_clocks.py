@@ -573,8 +573,8 @@ async def _reset_leftovers(
         )
     for uuid in (u for u in gpu_uuids if failures[u] is not None):
         logger.warning(
-            "gpu_clock_action=rgc_failed gpu=%s recorded=%s failure=%s",
-            uuid, str(uuid in recorded).lower(), failures[uuid],
+            "gpu_clock_action=rgc_failed node=%s pod=%s gpu=%s recorded=%s failure=%s",
+            node_id or "-", keep_pod_id or "-", uuid, str(uuid in recorded).lower(), failures[uuid],
         )
     return refused
 
