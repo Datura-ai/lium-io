@@ -206,8 +206,6 @@ class AuthenticationError(Exception):
 
 class ComputeClient:
     HEARTBEAT_PERIOD = 60
-    # after a rollout's SIGTERM: no new command starts, the drain only finishes what was running
-    draining = False
     # a reply popped from the queue whose send has not ended
     reply_in_send = False
 
@@ -842,10 +840,6 @@ class ComputeClient:
 
     async def handle_message(self, raw_msg: str | bytes):
         """handle message received from facilitator"""
-        if self.draining:
-            # the exit would cut it; unanswered, the backend treats it as it would a command to a stopped connector
-            logger.warning(_m("SIGTERM: not starting a command received after it", extra=self.logging_extra))
-            return
         try:
             response = Response.model_validate_json(raw_msg)
         except pydantic.ValidationError:
@@ -1476,7 +1470,6 @@ class ComputeClient:
         extra = get_extra_info(self.logging_extra)
         logger.info(_m("SIGTERM: releasing the connector lead, then finishing in-flight work", extra=extra))
         deadline = asyncio.get_running_loop().time() + SIGTERM_DRAIN_SECONDS
-        self.draining = True
         mark_connector_unready()
         redis_client = self.miner_service.redis_service.redis
         try:
@@ -1507,7 +1500,9 @@ class ComputeClient:
         """The drivers, their steps after the reply and the replies still queued, until the deadline; what is left
         then is cut as the SIGKILL would cut it, and the new leader's restart sweep resends a cut create (DAH-5437)."""
         loop = asyncio.get_running_loop()
-        if self.in_flight_drivers:
+        # the socket stays the backend's only route until the new leader connects after this drain, so commands keep
+        # arriving and starting here; the wait covers the drivers they add too, not just those seen at SIGTERM
+        while self.in_flight_drivers and loop.time() < deadline:
             await asyncio.wait(set(self.in_flight_drivers), timeout=max(0.0, deadline - loop.time()))
         with suppress(asyncio.TimeoutError):
             await asyncio.wait_for(

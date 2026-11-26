@@ -225,17 +225,28 @@ async def test_the_drain_marker_expires_when_the_old_pod_is_killed(tmp_path, mon
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("draining", [False, True])
-async def test_a_command_after_sigterm_is_not_started(draining) -> None:
-    """The drain waits only for the work it saw at SIGTERM, so a later command would be cut by the exit."""
+async def test_a_command_received_during_the_drain_is_run_and_waited_for() -> None:
+    """The backend's only socket is this pod's until the new leader connects after the drain, so a command dropped
+    here would stay unanswered (a create's rent PENDING for 30 min). It runs, and the drain waits for it."""
     client = _client(FakeServer())
-    client.draining = draining
     client.miner_drivers = asyncio.Queue()
     client.resumed_creates_report = None
     client.accepted_request_type = lambda: SimpleNamespace(parse=lambda raw: SimpleNamespace())
-    client.miner_driver = lambda job_request: asyncio.sleep(0)
-    await client.handle_message('{"command": 1}')
-    assert client.miner_drivers.qsize() == (0 if draining else 1)
+    ran = []
+
+    async def driver() -> None:
+        await asyncio.sleep(0.3)
+        ran.append(1)
+
+    client.miner_driver = lambda job_request: driver()
+    first = asyncio.create_task(asyncio.sleep(0.1))
+    client.track_in_flight_driver(first)  # seen at SIGTERM
+    draining = asyncio.create_task(client._finish_in_flight_work(asyncio.get_running_loop().time() + 3))
+    await asyncio.sleep(0.05)
+    await client.handle_message('{"command": 1}')  # arrives mid-drain
+    await draining
+    assert client.miner_drivers.qsize() == 1
+    assert ran == [1]  # the drain did not end before the later command finished
 
 
 @pytest.mark.asyncio
