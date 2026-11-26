@@ -207,16 +207,6 @@ async def test_a_failed_restore_set_on_a_gpu_already_at_the_recorded_limit_is_a_
 
 
 @pytest.mark.asyncio
-async def test_an_ssh_error_on_the_already_at_read_back_keeps_the_set_failed(monkeypatch):
-    # lio#2094 lets _read_back_power_state raise on an SSH error: the failed -pl stands
-    import services.gpu_power_limit as gpl
-
-    monkeypatch.setattr(gpl, "_read_back_power_state", AsyncMock(side_effect=OSError("ssh reset")))
-    failed = gpl.PowerLimitSetOutcome(failure="nvidia-smi -pl failed", persistence_enabled=None)
-    assert await gpl._accept_if_already_at(AsyncMock(), "GPU-a", 400, failed) is failed
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize("whole_node", [False, True])
 async def test_a_customer_create_restores_and_leaves_record_less_gpus_to_the_floor_raise(whole_node):
     # GPU-b has no record and sits at 80 %: the strict restore does not judge it (the live floor raise does)

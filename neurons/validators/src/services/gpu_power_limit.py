@@ -418,13 +418,7 @@ async def _accept_if_already_at(
 ) -> PowerLimitSetOutcome:
     """A failed ``-pl`` on a GPU that already shows the target is not a failed set: the limit the
     caller wants is in place (a strict restore must not fail the rent over it)."""
-    try:
-        readback = await _read_back_power_state(ssh, uuid)
-    except asyncssh.ChannelOpenError:
-        raise
-    except Exception:
-        # an SSH error on the read-back (#2094 lets it raise) proves nothing: the set stays failed
-        return failed
+    readback = await _read_back_power_state(ssh, uuid)
     if readback.watts == watts:
         return PowerLimitSetOutcome(failure=None, persistence_enabled=readback.persistence_enabled)
     return failed
