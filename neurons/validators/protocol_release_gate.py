@@ -5,7 +5,7 @@ protocol than the backend in prod sends replies the backend drops. backend_proto
 PROTOCOL_VERSION that lium-platform's prod backend vendors; raise it only after that backend is live in prod.
 validator_protocol holds the PROTOCOL_VERSION this validator speaks (a test keeps it equal to lium_protocol's), so the
 check runs inside the image build, whose context is this directory only. The Dockerfile runs it on every build
-unless ALLOW_PROTOCOL_AHEAD=1 is passed, which only docker_build.sh does, for non-latest tags.
+unless ALLOW_PROTOCOL_AHEAD=1 is passed, which docker_build.sh does for non-latest tags and the staging workflow does.
 """
 
 import sys

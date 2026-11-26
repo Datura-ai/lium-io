@@ -40,6 +40,9 @@ jobs:
         uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5.4.0
         with:
           context: ./neurons/validators
+          # staging runs ahead of the prod backend; only the prod (latest) build is held by protocol_release_gate.py
+          build-args: |
+            ALLOW_PROTOCOL_AHEAD=1
           build-contexts: |
             datura=./datura
             executor_setup=./neurons/executor

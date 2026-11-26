@@ -36,3 +36,14 @@ def test_every_image_build_runs_the_check_unless_it_opts_out():
     assert "ARG ALLOW_PROTOCOL_AHEAD=0\n" in dockerfile
     assert 'RUN [ "$ALLOW_PROTOCOL_AHEAD" = 1 ] || python3 protocol_release_gate.py' in dockerfile
     assert "protocol_release_gate.py" not in (_PATH.parent / ".dockerignore").read_text()
+
+
+def test_only_the_prod_build_is_held_by_the_check():
+    """Staging and dev run ahead of the prod backend; prod (latest) passes nothing and is checked."""
+    repo = _PATH.parents[2]
+    staging = (repo / ".github" / "workflows" / "validator_cd_staging.yml").read_text()
+    assert "context: ./neurons/validators" in staging
+    assert "ALLOW_PROTOCOL_AHEAD=1" in staging
+    build = (_PATH.parent / "docker_build.sh").read_text()
+    assert 'if [ "$TAG" != "latest" ]; then\n  ALLOW_PROTOCOL_AHEAD=1' in build
+    assert "ALLOW_PROTOCOL_AHEAD" not in (repo / ".github" / "workflows" / "validator_cd_prod.yml").read_text()

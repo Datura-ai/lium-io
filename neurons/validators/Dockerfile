@@ -27,7 +27,7 @@ COPY --from=executor_setup src/ src/executor_payloads/
 # DAH-6804: SysboxLayerResetCheck runs this script's --install-layer-reset on Sysbox hosts (context: neurons/executor)
 COPY --from=executor_setup nvidia_docker_sysbox_setup.sh /app/executor_setup/
 
-# every build is checked unless it opts out; only docker_build.sh opts out, for non-latest (dev) tags
+# every build is checked unless it opts out: docker_build.sh for non-latest (dev) tags, and the staging workflow
 ARG ALLOW_PROTOCOL_AHEAD=0
 RUN [ "$ALLOW_PROTOCOL_AHEAD" = 1 ] || python3 protocol_release_gate.py
 
