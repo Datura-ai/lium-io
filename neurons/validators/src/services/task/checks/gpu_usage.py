@@ -247,6 +247,8 @@ class GpuUsageCheck:
         # every process belongs to ONE OF the node's fillers, not a single expected container.
         filler_containers = set(rented_data.get_filler_containers(ctx.executor.uuid)) if rented_data else set()
         process_names = {process.get("container_name") for process in gpu_processes}
+        if rented_data:
+            filler_containers |= await _fillers_started_after_the_snapshot(ctx, process_names - filler_containers)
         fillers_only = bool(filler_containers) and all(name in filler_containers for name in process_names)
         # judged at any load, also beside a rental pod: a swapped filler can hold VRAM while staying
         # under the utilization limits
@@ -685,6 +687,23 @@ async def _drop_containers_the_backend_still_owns(
         name for name, is_ours in zip(lium_named_containers, ownership_verdicts) if is_ours
     }
     return [process for process in foreign_processes if process.container_name not in still_ours]
+
+
+async def _fillers_started_after_the_snapshot(ctx: Context, names: set[str | None]) -> set[str]:
+    """The filler-named containers outside this cycle's snapshot that the backend confirms as this node's live runs.
+
+    DAH-2757's late-start race on a busy card: a filler the backend starts after the cycle-start
+    `rented_data` read mines at full load by the time this check runs, so judged by the snapshot
+    alone it failed GPU_USAGE_HIGH. The same backend question the idle-card path asks decides it.
+    """
+    claimed_elsewhere: set[str] = _containers_claimed_by_another_executor(ctx)
+    late: list[str] = sorted(
+        name
+        for name in names
+        if name and name.startswith(FILLER_CONTAINER_PREFIX) and name not in claimed_elsewhere
+    )
+    verdicts: list[bool] = await asyncio.gather(*(the_backend_still_owns(ctx, name) for name in late))
+    return {name for name, is_ours in zip(late, verdicts) if is_ours}
 
 
 async def the_backend_still_owns(ctx: Context, container_name: str) -> bool:

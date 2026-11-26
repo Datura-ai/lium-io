@@ -1418,6 +1418,42 @@ async def test_a_lium_named_container_is_judged_by_the_backend(
     assert result.passed is expected_pass
 
 
+@pytest.mark.parametrize(
+    "filler_run,expected_pass",
+    [
+        (FillerRunActiveResponse(active=True, status="RUNNING"), True),
+        (FillerRunActiveResponse(active=False, status="STARTING"), True),
+        (FillerRunActiveResponse(active=False, status="STOPPED"), False),
+        (FillerRunActiveResponse(active=False), False),
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_filler_started_after_the_snapshot_is_judged_by_the_backend_on_a_busy_card(
+    context_factory, filler_run, expected_pass
+):
+    # Prod 25-26 Nov: PEARL fillers created minutes after the cycle-start rented_data read mined at
+    # 100% by the time this check ran and failed GPU_USAGE_HIGH, though the backend ran them.
+    state = _idle_state(
+        [{"gpu_utilization": 100, "memory_utilization": 0, "memory_used_mb": 9000}],
+        [
+            {
+                "pid": 111,
+                "info": "0::/../docker-a.scope",
+                "container_name": LATE_FILLER,
+                "cmdline": "peakminer --coin pearl",
+            }
+        ],
+    )
+    services = build_services()
+    services.backend.get_filler_run_active.return_value = filler_run
+    ctx = context_factory(services=services, config=build_context_config(), state=state)
+
+    result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is expected_pass
+    assert result.event.reason_code == (Msg.USAGE_OK.reason if expected_pass else Msg.USAGE_HIGH.reason)
+
+
 @pytest.mark.parametrize("gpu_utilization", [0, 5])
 @pytest.mark.parametrize("closed_minutes,expected_pass", [(5, True), (30, False)])
 @pytest.mark.asyncio
