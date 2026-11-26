@@ -1556,23 +1556,27 @@ async def test_create_container_presets_src_valid_mark_only_for_runc_pods(
     assert run_spec.sysctls == sysctls
 
 
-@pytest.mark.asyncio
-async def test_a_reported_host_key_that_builds_no_policy_is_refused(docker_service, executor_info):
-    # asyncssh reads known_hosts=None as "verify nothing": every rental SSH path would connect to any host
-    from services.attestation_service import AttestationError, HostPolicyResult
 
-    docker_service.attestation_service.prepare_host_policy = AsyncMock(return_value=HostPolicyResult(known_hosts=None))
+@pytest.mark.asyncio
+async def test_a_reported_host_key_that_builds_no_policy_is_refused(docker_service, executor_info, monkeypatch):
+    # asyncssh reads known_hosts=None as "verify nothing": every rental SSH path would connect to any host
+    from services.attestation_service import AttestationError, AttestationService
+
+    monkeypatch.setattr("services.attestation_service.settings.TDX_VERIFIER_URL", None)
+    docker_service.attestation_service = AttestationService()
+    executor = executor_info.model_copy(update={"ssh_host_key": f"{executor_info.ssh_host_key}\nx"})
 
     with pytest.raises(AttestationError):
-        await docker_service._prepare_known_hosts_policy(executor_info, None, {})
+        await docker_service._prepare_known_hosts_policy(executor, None, {})
 
 
 @pytest.mark.asyncio
-async def test_a_node_that_reports_no_host_key_keeps_its_policy(docker_service, executor_info):
+async def test_a_node_that_reports_no_host_key_keeps_its_policy(docker_service, executor_info, monkeypatch):
     # backup/restore and Jupyter on a non-attested node without a key keep working; each caller decides
-    from services.attestation_service import HostPolicyResult
+    from services.attestation_service import AttestationService
 
+    monkeypatch.setattr("services.attestation_service.settings.TDX_VERIFIER_URL", None)
+    docker_service.attestation_service = AttestationService()
     executor = executor_info.model_copy(update={"ssh_host_key": None})
-    docker_service.attestation_service.prepare_host_policy = AsyncMock(return_value=HostPolicyResult())
 
     assert await docker_service._prepare_known_hosts_policy(executor, None, {}) is None
