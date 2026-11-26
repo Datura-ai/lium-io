@@ -1657,3 +1657,21 @@ def test_trust_a_staging_build_follows_only_its_own_owner_key_and_never_reads_th
     assert trust.offer(_message(OWNER, NEW_VALIDATOR, 2)) is False
     assert trust.refresh_owner() is False and trust.owner == staging.ss58_address
     assert trust.offer(_message(staging, NEW_VALIDATOR, 2)) is True
+
+
+def test_a_disabled_watchtower_stays_up_idle_and_never_checks():
+    """WATCHTOWER_ENABLED=false: main() must not return (under unless-stopped an exit is restarted every second)."""
+    import watchtower as wt
+
+    class Stop(Exception):
+        pass
+
+    with patch.object(wt.settings, "WATCHTOWER_ENABLED", False), \
+            patch.object(wt.time, "sleep", side_effect=[None, Stop()]) as sleep, \
+            patch.object(wt, "check_and_update") as check, patch.object(wt.validator_trust, "load") as load:
+        with pytest.raises(Stop):
+            wt.main()
+    assert sleep.call_count == 2
+    check.assert_not_called()
+    load.assert_not_called()
+
