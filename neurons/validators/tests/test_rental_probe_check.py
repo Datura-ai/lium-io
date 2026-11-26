@@ -28,6 +28,8 @@ from neurons.validators.src.services.task.checks.rental_probe import (
     RentalProbeCheck,
 )
 from neurons.validators.src.services.task.messages import RentalProbeMessages as Msg
+from neurons.validators.src.services.task.messages import render_message
+from neurons.validators.src.services.task.availability import run_availability_errors
 from neurons.validators.src.services.task.pipeline import (
     Pipeline,
     updates_with_clear_verified_job_evidence,
@@ -184,10 +186,14 @@ class FakeCreateLock:
         self.redis.create_lock_events.append("released")
 
 
+# a node with a pass on record, due for its next probe (the usual idle node); None: no pass on record
+_DUE = object()
+
+
 class FakeRedis:
     def __init__(
         self,
-        last_ok: float | None = None,
+        last_ok: float | None | object = _DUE,
         *,
         renting=False,
         broken: bool = False,
@@ -196,8 +202,11 @@ class FakeRedis:
         create_lock_broken: bool = False,
     ):
         self.store: dict[str, str] = {}
+        if last_ok is _DUE:
+            last_ok = time.time() - 7 * 3600
         if last_ok is not None:
             self.store[f"rental_probe_ok:{EXECUTOR.uuid}"] = str(last_ok)
+        self._stamp_before = self.store.get(f"rental_probe_ok:{EXECUTOR.uuid}")
         if failed_step is not None:
             self.store[f"rental_probe_failed:{EXECUTOR.uuid}"] = f"{failed_step}:"
         self.removed_pending: list[tuple[str, str, str]] = []
@@ -253,7 +262,9 @@ class FakeRedis:
         self.removed_pending.append((miner_hotkey, executor_id, pod_id))
 
     def stamped(self) -> bool:
-        return f"rental_probe_ok:{EXECUTOR.uuid}" in self.store
+        # stamped by this probe: the pass on record a test starts with does not count
+        stamp = self.store.get(f"rental_probe_ok:{EXECUTOR.uuid}")
+        return stamp is not None and stamp != self._stamp_before
 
     def standing_failure(self) -> str | None:
         raw = self.store.get(f"rental_probe_failed:{EXECUTOR.uuid}")
@@ -1442,8 +1453,22 @@ async def test_unreadable_state_rents_nothing():
     ctx, docker, _ = make_probe_context(redis=FakeRedis(broken=True))
     with probe_settings(), renter_path():
         result = await RentalProbeCheck().run(ctx)
-    assert result.event.reason_code == Msg.SKIPPED.reason
-    assert result.event.what_we_saw["reason"] == "interval state unreadable"
+    assert result.event.reason_code == Msg.PROOF_UNREADABLE.reason
+    assert result.event.what_we_saw["no_verdict_this_cycle"] == "skipped: interval state unreadable"
+    assert docker.create_calls == []
+
+
+@pytest.mark.asyncio
+async def test_an_unreadable_pass_record_neither_scores_nor_lists_the_node():
+    """Regression (DAH-7044 review): an unreadable pass record was decided as if a pass were on record,
+    so the cycle skipped with a pass and a node no probe had passed on could be scored and listed."""
+    ctx, docker, _ = make_probe_context(redis=FakeRedis(broken=True))
+    with probe_settings():
+        result = await RentalProbeCheck().run(ctx)
+    assert result.passed is False and result.event.reason_code == Msg.PROOF_UNREADABLE.reason
+    assert result.updates == {"score": 0.0, "job_score": 0.0}
+    # the backend keeps the stored listing state: no hide of a proven node, no listing of an unproven one
+    assert run_availability_errors(False, [result.event]) is None
     assert docker.create_calls == []
 
 
@@ -1927,6 +1952,91 @@ async def test_the_teardown_wait_never_outlasts_the_job():
     assert asyncio.get_running_loop().time() - started < 1
     assert not task.done()
     task.cancel()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "make_ctx, late, no_verdict",
+    [
+        (
+            lambda redis: make_probe_context(redis=redis, image_present=False),
+            0,
+            "skipped: default renter image is not pulled on the node",
+        ),
+        (lambda redis: make_probe_context(redis=redis), 650, "skipped: too little cycle time left"),
+    ],
+)
+async def test_a_node_no_probe_has_passed_on_is_not_listed_by_a_cycle_without_a_verdict(
+    make_ctx, late, no_verdict
+):
+    """Regression: a node no probe had passed on was listed with score 1.0 through cycles that reached
+    no verdict, and renters' pods then failed at create. A node is first listed by a probe that passed."""
+    redis = FakeRedis(last_ok=None)
+    ctx, docker, _ = make_ctx(redis)
+    ctx = ctx.model_copy(update={"started_at_monotonic": time.monotonic() - late})
+    with probe_settings():
+        result = await RentalProbeCheck().run(ctx)
+    assert result.passed is False and result.event.reason_code == Msg.NOT_YET_PROVEN.reason
+    assert result.event.what_we_saw["no_verdict_this_cycle"] == no_verdict
+    # nothing failed: the score is held at 0, the verified job is not cleared, no failure is recorded
+    assert result.updates == {"score": 0.0, "job_score": 0.0}
+    assert redis.standing_failure() is None and not redis.stamped()
+    assert docker.create_calls == []
+    # hidden at once (DAH-7044 review): a zero score alone leaves a node the backend holds listed
+    errors = run_availability_errors(False, [*result.extra_events, result.event])
+    assert [e["reason_code"] for e in errors] == ["VERIFICATION_FAILED"]
+    assert errors[0]["what_we_saw"]["failed_reason"] == Msg.NOT_YET_PROVEN.reason
+    # the hold is the result's own, not inferred from the run's last event: events reported after it (a passing
+    # check, network figures) leave it in place
+    later = render_message(Msg.SKIPPED, ctx=ctx, check_id="executor.validate.later", what={})
+    errors = run_availability_errors(False, [*result.extra_events, result.event, later])
+    assert [e["reason_code"] for e in errors] == ["VERIFICATION_FAILED"]
+
+
+@pytest.mark.asyncio
+async def test_a_node_the_validator_cannot_probe_keeps_its_stored_listing():
+    """Review of lio#2442: the validator has no default renter image for the node's GPU and driver, so the probe
+    never starts. Nothing is wrong with the node: it is not hidden as unproven, its listing stays as stored."""
+    redis = FakeRedis(last_ok=None)
+    ctx, docker, _ = make_probe_context(redis=redis, images=())
+    with probe_settings():
+        result = await RentalProbeCheck().run(ctx)
+    assert result.event.reason_code == Msg.NOT_RUN_ON_VALIDATOR.reason
+    assert result.event.what_we_saw["no_verdict_this_cycle"] == (
+        "inconclusive: no default renter image for this GPU and driver"
+    )
+    assert result.updates == {"score": 0.0, "job_score": 0.0} and result.extra_events == []
+    assert run_availability_errors(False, [result.event]) is None
+    assert redis.standing_failure() is None and not redis.stamped() and docker.create_calls == []
+
+
+@pytest.mark.asyncio
+async def test_a_node_with_a_pass_on_record_keeps_a_cycle_without_a_verdict_unpenalised():
+    ctx, _, _ = make_probe_context(redis=FakeRedis(last_ok=time.time() - 7 * 3600), images=())
+    with probe_settings():
+        result = await RentalProbeCheck().run(ctx)
+    assert result.passed is True and result.event.reason_code == Msg.INCONCLUSIVE.reason
+
+
+@pytest.mark.asyncio
+async def test_a_node_no_probe_has_passed_on_is_listed_by_its_first_pass():
+    redis = FakeRedis(last_ok=None)
+    ctx, _, _ = make_probe_context(redis=redis, images=())
+    with probe_settings():
+        assert (await RentalProbeCheck().run(ctx)).passed is False
+    ctx, _, _ = make_probe_context(redis=redis)
+    with probe_settings(), renter_path():
+        result = await RentalProbeCheck().run(ctx)
+    assert result.passed is True and result.event.reason_code == Msg.PROBE_OK.reason
+    assert redis.stamped()
+
+
+@pytest.mark.asyncio
+async def test_a_rented_node_no_probe_has_passed_on_is_left_alone():
+    ctx, _, _ = make_probe_context(redis=FakeRedis(last_ok=None), rented=rented_data(pods=1))
+    with probe_settings():
+        result = await RentalProbeCheck().run(ctx)
+    assert result.passed is True and result.updates == {}
 
 
 def _gpu_step(output: str, gpus: int | None = None, exit_status: int = 0, stderr: str = ""):

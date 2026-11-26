@@ -64,6 +64,7 @@ from .checks import (
     IdleDiskWriteCheck,
     InspectorRentedCheck,
     LocalVerifyCheck,
+    LoginUserCheck,
     MachineSpecScrapeCheck,
     NodeAccountCheck,
     NvlinkFaultCheck,
@@ -97,6 +98,7 @@ from .checks import (
     PidHostRequiredCheck,
     SysboxRequiredCheck,
     TdxHostCheck,
+    RentedMidCycleCheck,
     HalfStartedStopRetryCheck,
     TenantEnforcementCheck,
     UploadFilesCheck,
@@ -273,9 +275,7 @@ class PipelineFactory:
                 pod_recovery=self.pod_recovery,
             ),
             config=ContextConfig(
-                executor_root=executor_info.root_dir,
                 compute_rest_app_url=settings.COMPUTE_REST_API_URL,
-                gpu_monitor_script_relative="src/gpus_utility.py",
                 machine_scrape_filename=encrypted_files.machine_scrape_file_name,
                 # DAH-2794: an executor that can run the source needs no upload at all. The
                 # binary stays built because the miner picks the executor image, and one that
@@ -330,6 +330,8 @@ class PipelineFactory:
                 HalfStartedStopRetryCheck(),
                 # DAH-5729: before any work on the node, the node must be the registering account's
                 NodeAccountCheck(),
+                # the scripts below run from a root-only directory under /root/app: a non-root login is refused first
+                LoginUserCheck(),
                 StartGPUMonitorCheck(),
                 UploadFilesCheck(),
                 MachineSpecScrapeCheck(),
@@ -456,10 +458,14 @@ class PipelineFactory:
                 # DAH-4663: idle nodes only; resets a leftover clock lock or unlists the node
                 GpuClockLockCheck(),
                 GpuUsageCheck(),
+                # A node rented since the cycle started halts here, before the GPU and network tests.
+                RentedMidCycleCheck(),
                 # DAH-5933: before VerifyX, which can take its whole 600 s on a slow download; after it, the
                 # backend's probe was left 1 s and its client timeout read as an API error (ad2382f9, 21 Nov).
                 # Needs only the verified ports, GPU details and rented data, all settled above.
                 RentalVerificationCheck(),
+                # the rental probe can take up to 300 s, and a rent can land meanwhile
+                RentedMidCycleCheck(),
                 # liumd phase 1 (DAH-2834): one signed `POST /verify` runs the VerifyX and matmul
                 # challenges on the executor side by side; the two checks below consume a judged,
                 # passing answer and run over SSH otherwise. Off by default, never fatal.
@@ -467,6 +473,8 @@ class PipelineFactory:
                 VerifyXCheck(),
                 # DAH-4961: the listing's disk floor, judged on the figure VerifyX just published (idle nodes only)
                 DiskSpaceCheck(),
+                # again before the matmul: VerifyX takes minutes, and a rent can land meanwhile
+                RentedMidCycleCheck(),
                 CapabilityCheck(),
                 # DAH-3035: the kernel-fault probe right after the matmul it complements — same idle,
                 # capability-verified population, same filler skip. Flag-gated, shadow-first, off by default.
@@ -548,6 +556,8 @@ class PipelineFactory:
                 HalfStartedStopRetryCheck(),
                 # DAH-5729: before any work on the node, the node must be the registering account's
                 NodeAccountCheck(),
+                # the scripts below run from a root-only directory under /root/app: a non-root login is refused first
+                LoginUserCheck(),
                 StartGPUMonitorCheck(),
                 UploadFilesCheck(),
                 MachineSpecScrapeCheck(),
@@ -618,8 +628,11 @@ class PipelineFactory:
                 PidHostRequiredCheck(),
                 DockerCpuCheck(),
                 RentalVerificationCheck(),
+                # A renter's create since the cycle started halts the run before each GPU workload.
+                RentedMidCycleCheck(),
                 # alone, so no traffic of ours shares the network it measures; ahead of the matmul that consumes it
                 LocalVerifyCheck(),
+                RentedMidCycleCheck(),
                 CapabilityCheck(),
                 # a customer pod CapabilityCheck found started during the run is handled right here, before the next
                 # GPU workload (fault, pinned-memory and NVLink probes, VerifyX) runs beside it (stand check at c795850)
@@ -632,6 +645,7 @@ class PipelineFactory:
                 PostRentalGpuRecheckCheck(),
                 NvlinkFaultCheck(),
                 CachedTemplateVerificationCheck(),
+                RentedMidCycleCheck(),
                 VerifyXCheck(),
                 DiskSpaceCheck(),
                 RentalProbeCheck(),
@@ -661,6 +675,8 @@ class PipelineFactory:
         return cast(
             list[Check],
             [
+                # as in build_checks(): the scrape below runs from a root-only directory, so a non-root login is refused first
+                LoginUserCheck(),
                 # StartGPUMonitorCheck(),  # SKIP: Starts processes on executor
                 UploadFilesCheck(),
                 MachineSpecScrapeCheck(),

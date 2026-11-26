@@ -1,7 +1,6 @@
 import asyncio
 import json
 import logging
-import os
 import shlex
 import time
 from collections.abc import Awaitable, Container, Iterator
@@ -66,6 +65,7 @@ from payload_models.payloads import (
     now_ms,
 )
 
+from services import executor_payload
 from core.config import settings
 from core.utils import _m, _StructuredMessage, get_extra_info
 from protocol.vc_protocol.compute_requests import RentedExecutor, RentedExecutorsResponse
@@ -82,6 +82,7 @@ from services.docker_service import (
 )
 from services.executor_image_policy import ExpectedImageSnapshot
 from services.node_host import (
+    NodeHostError,
     NonPublicAddressError,
     for_payload_miner,
     is_ip_literal,
@@ -113,7 +114,7 @@ from services.storage_operations import (
     start_storage_operation,
     supports_workspace_field,
 )
-from services.storage_operations import upload_secrets_file
+from services.storage_operations import run_job_with_secrets
 from services.upload_nonce import upload_nonce_for_miner
 
 logger = logging.getLogger(__name__)
@@ -139,14 +140,6 @@ MINER_ANSWER_REASON_CODES = frozenset(
 )
 
 
-def _miner_job_script_path(script_name: str) -> str:
-    return os.path.join(os.path.dirname(__file__), "..", "miner_jobs", script_name)
-
-
-def _nohup_command(argv: list[str], log_path: str) -> str:
-    return f"{shlex.join(argv)} > {shlex.quote(log_path)} 2>&1 &"
-
-
 async def _storage_known_hosts(docker_service: DockerService, executor_info: ExecutorSSHInfo, payload):
     """The same pinned host-key policy the rental paths use, for backup/restore/cancel SSH."""
     return await docker_service._prepare_known_hosts_policy(
@@ -167,11 +160,12 @@ def _get_error_details(error: Exception) -> str:
 
 
 def _is_miner_unreachable_error(error: Exception) -> bool:
-    """A timeout or a refused/dropped connection: the miner is offline, not misbehaving (DAH-3593)."""
+    """A timeout, a refused/dropped connection or an axon address we refuse to dial: the miner is not reachable,
+    not misbehaving (DAH-3593). A refused name arrives wrapped in a ClientConnectionError, a refused literal bare."""
     last_attempt = getattr(error, "last_attempt", None)
     if last_attempt is not None and last_attempt.exception() is not None:
         error = last_attempt.exception()
-    return isinstance(error, (asyncio.TimeoutError, aiohttp.ClientConnectionError))
+    return isinstance(error, (asyncio.TimeoutError, aiohttp.ClientConnectionError, NodeHostError))
 
 
 def _storage_repository_spec(
@@ -595,7 +589,8 @@ class MinerService:
             # DAH-6546: a rerun that ran its checks is the latest verdict, failed or not; a pod still on the old GPUs
             # fails it with its own pod_gpus_gone event, and its rented-GPU drop report moves the pod as the first run's
             # did. An errored run (create_task's log_status "error") has no verdict, nor has one whose SSH session died
-            # (its later checks never ran, review 4602277079): the first stands.
+            # (its later checks never ran, review 4602277079), nor has one whose login uid could not be read (it ran no
+            # check): the first stands.
             if (
                 isinstance(rerun, JobResult)
                 and rerun.log_status != "error"
@@ -1810,7 +1805,7 @@ class MinerService:
             if payload.backup_engine == "restic":
                 operation_id = UUID(payload.backup_log_id)
                 if payload.exclude_patterns and not await supports_workspace_field(
-                    ssh_client, executor_info.python_path, "exclude_patterns"
+                    ssh_client, executor_payload.EXECUTOR_PYTHON, "exclude_patterns"
                 ):
                     error = RuntimeError(
                         "executor image cannot skip caches and keys (no workspace.exclude_patterns); "
@@ -1821,15 +1816,16 @@ class MinerService:
                     raise error
                 if payload.volume_encrypted and payload.container_name:
                     await _remount_dropped_gocryptfs(ssh_client, payload, docker_service)
+                spec = self._restic_backup_operation_spec(payload)
                 await note_started_storage_helper(
-                    self.redis_service, executor_info.uuid, operation_id
+                    self.redis_service, executor_info.uuid, operation_id, spec
                 )
                 try:
                     await start_storage_operation(
                         ssh_client,
-                        executor_info.python_path,
+                        executor_payload.EXECUTOR_PYTHON,
                         operation_id,
-                        self._restic_backup_operation_spec(payload),
+                        spec,
                         retain_terminal_artifacts=False,
                     )
                 except Exception:
@@ -1839,38 +1835,23 @@ class MinerService:
                     raise
                 return
 
-            remote_script_path = "/root/app/backup_storage.py"
-            remote_helper_path = "/root/app/workspace_mount.py"
-            local_script_path = _miner_job_script_path("backup_storage.py")
-            local_helper_path = _miner_job_script_path("workspace_mount.py")
-
-            logger.info(
-                _m(
-                    "Uploading backup_storage.py script to the remote server", 
-                    extra=get_extra_info({ "remote_script_path": remote_script_path, "local_script_path": local_script_path })
-                ),
-            )
-
-            async with ssh_client.start_sftp_client() as sftp:
-                await sftp.put(local_script_path, remote_script_path)
-                await sftp.put(local_helper_path, remote_helper_path)
-
-            argv = [
-                executor_info.python_path,
-                "/root/app/backup_storage.py",
-                "--api-url", settings.COMPUTE_REST_API_URL_EXTERNAL,
-                "--source-volume", payload.source_volume,
-                "--backup-path", payload.backup_path,
-                "--secrets-file", await upload_secrets_file(ssh_client, payload.auth_token, payload.backup_volume_info),
-                "--backup-log-id", payload.backup_log_id,
-                "--backup-volume-name", payload.backup_volume_info.name,
-                "--source-volume-path", payload.source_volume_path,
-                "--backup-target-path", payload.backup_target_path,
-            ]
-            await ssh_client.run(
-                _nohup_command(["nohup", *argv], "/root/app/backup_storage.log"),
+            # the validator's backup job and its helper, staged and run in a fresh private directory (run_job), never
+            # beside node-local code it could import
+            logger.info(_m("Starting the backup job on the executor", extra=get_extra_info({"backup_log_id": payload.backup_log_id})))
+            await run_job_with_secrets(
+                ssh_client, "backup", executor_payload.BACKUP_JOB, payload.auth_token, payload.backup_volume_info,
+                lambda secrets_file: [
+                    "--api-url", settings.COMPUTE_REST_API_URL_EXTERNAL,
+                    "--source-volume", payload.source_volume,
+                    "--backup-path", payload.backup_path,
+                    "--secrets-file", secrets_file,
+                    "--backup-log-id", payload.backup_log_id,
+                    "--backup-volume-name", payload.backup_volume_info.name,
+                    "--source-volume-path", payload.source_volume_path,
+                    "--backup-target-path", payload.backup_target_path,
+                ],
+                log="/root/app/backup_storage.log",
                 timeout=50,
-                check=True,
             )
 
     async def handle_restore_container_req(self, executor_info: ExecutorSSHInfo, payload: RestoreContainerRequest, pkey: SSHKey, docker_service: DockerService):
@@ -1886,15 +1867,16 @@ class MinerService:
 
             if payload.backup_engine == "restic":
                 operation_id = UUID(payload.restore_log_id)
+                spec = self._restic_restore_operation_spec(payload)
                 await note_started_storage_helper(
-                    self.redis_service, executor_info.uuid, operation_id
+                    self.redis_service, executor_info.uuid, operation_id, spec
                 )
                 try:
                     await start_storage_operation(
                         ssh_client,
-                        executor_info.python_path,
+                        executor_payload.EXECUTOR_PYTHON,
                         operation_id,
-                        self._restic_restore_operation_spec(payload),
+                        spec,
                         retain_terminal_artifacts=False,
                     )
                 except Exception:
@@ -1904,38 +1886,22 @@ class MinerService:
                     raise
                 return
 
-            remote_script_path = "/root/app/restore_storage.py"
-            remote_helper_path = "/root/app/workspace_mount.py"
-            local_script_path = _miner_job_script_path("restore_storage.py")
-            local_helper_path = _miner_job_script_path("workspace_mount.py")
-
-            logger.info(
-                _m(
-                    "Uploading restore_storage.py script to the remote server for restore operation", 
-                    extra=get_extra_info({ "remote_script_path": remote_script_path, "local_script_path": local_script_path })
-                ),
-            )
-
-            async with ssh_client.start_sftp_client() as sftp:
-                await sftp.put(local_script_path, remote_script_path)
-                await sftp.put(local_helper_path, remote_helper_path)
-
-            argv = [
-                executor_info.python_path,
-                "/root/app/restore_storage.py",
-                "--api-url", settings.COMPUTE_REST_API_URL_EXTERNAL,
-                "--target-volume", payload.target_volume,
-                "--restore-path", payload.restore_path,
-                "--backup-source-path", payload.backup_source_path,
-                "--secrets-file", await upload_secrets_file(ssh_client, payload.auth_token, payload.backup_volume_info),
-                "--restore-log-id", payload.restore_log_id,
-                "--backup-volume-name", payload.backup_volume_info.name,
-                "--target-volume-path", payload.target_volume_path,
-            ]
-            await ssh_client.run(
-                _nohup_command(["nohup", *argv], "/root/app/restore_storage.log"),
+            # the validator's restore job and its helper, staged and run in a fresh private directory (run_job)
+            logger.info(_m("Starting the restore job on the executor", extra=get_extra_info({"restore_log_id": payload.restore_log_id})))
+            await run_job_with_secrets(
+                ssh_client, "restore", executor_payload.RESTORE_JOB, payload.auth_token, payload.backup_volume_info,
+                lambda secrets_file: [
+                    "--api-url", settings.COMPUTE_REST_API_URL_EXTERNAL,
+                    "--target-volume", payload.target_volume,
+                    "--restore-path", payload.restore_path,
+                    "--backup-source-path", payload.backup_source_path,
+                    "--secrets-file", secrets_file,
+                    "--restore-log-id", payload.restore_log_id,
+                    "--backup-volume-name", payload.backup_volume_info.name,
+                    "--target-volume-path", payload.target_volume_path,
+                ],
+                log="/root/app/restore_storage.log",
                 timeout=50,
-                check=True,
             )
 
     async def handle_cancel_storage_operation_req(
@@ -1953,7 +1919,7 @@ class MinerService:
             client_keys=[pkey],
             known_hosts=await _storage_known_hosts(docker_service, executor_info, payload),
         ) as ssh_client:
-            await cancel_storage_operation(ssh_client, UUID(payload.operation_id))
+            await cancel_storage_operation(ssh_client, self.redis_service, UUID(payload.operation_id))
             await forget_storage_helper(
                 self.redis_service, executor_info.uuid, payload.operation_id
             )
@@ -2137,7 +2103,8 @@ class MinerService:
                 ),
             )
             raise
-        except aiohttp.ClientError as e:
+        # a refused literal address is the same outcome as the connector's refusal of a name (a ClientError)
+        except (aiohttp.ClientError, NodeHostError) as e:
             logger.debug(
                 _m(
                     f"REST API {operation_name} client error",

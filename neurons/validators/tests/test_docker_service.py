@@ -2500,7 +2500,8 @@ def test_docker_read_timeout_detection_matches_the_wrapped_sdk_error_and_the_pro
 
 @pytest.mark.asyncio
 async def test_inspector_lifecycle_command_quotes_executor_paths(docker_service):
-    executor_info = ExecutorSSHInfo(
+    # the model refuses such a path from a node; the command quotes it all the same
+    executor_info = ExecutorSSHInfo.model_construct(
         uuid="exec-1",
         address="127.0.0.1",
         port=8080,
@@ -2519,12 +2520,14 @@ async def test_inspector_lifecycle_command_quotes_executor_paths(docker_service)
         "stop",
     )
 
-    assert start_command == (
-        "nohup /usr/bin/python3 '/root/app dir/src/inspector_executor.py'"
-        " --start-collector >/dev/null 2>&1 &"
+    # the validator's own script and interpreter run; the executor's reported paths select nothing
+    for command in (start_command, stop_command):
+        assert "/usr/bin/python3" not in command and "/root/app dir" not in command
+    assert start_command.endswith(
+        "nohup /root/app/.venv/bin/python -E -s \"$d\"/inspector_executor.py --start-collector >/dev/null 2>&1 &"
     )
-    assert stop_command == (
-        "/usr/bin/python3 '/root/app dir/src/inspector_executor.py' --stop-collector"
+    assert stop_command.endswith(
+        '/root/app/.venv/bin/python -E -s "$d"/inspector_executor.py --stop-collector'
     )
 
 
@@ -6942,7 +6945,7 @@ async def test_failed_create_removes_the_pods_volume_only_when_no_other_create_i
     async with _another_create_live("test", live_creates == 2):
         with registry.track("test", ("miner", "exec")):
             await docker_service.cleanup_failed_container_creation(
-                ssh_client=Mock(), default_extra={}, container_name="pod_test", volume_name="volume_test",
+                ssh_client=AsyncMock(), default_extra={}, container_name="pod_test", volume_name="volume_test",
                 remove_volume=True, container_id="cid", pod_id="test",
             )
     assert any("volume rm volume_test" in str(call) for call in ssh_commands.call_args_list) is removed

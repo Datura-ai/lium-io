@@ -737,6 +737,17 @@ class NvmlDigestMessages:
         impact="Score set to 0; previous verification cleared",
         remediation="Reinstall the NVIDIA driver matching this version and ensure libnvidia-ml is not tampered.",
     )
+    DIGEST_UNREAD = MessageTemplate(
+        event="NVML library digest mismatch not confirmed",
+        reason="NVML_DIGEST_UNREAD",
+        severity="warning",
+        category="env",
+        impact="Score set to 0 for this cycle; verification kept",
+        remediation=(
+            "No action needed if the next check passes. "
+            "If it repeats, reinstall the NVIDIA driver matching this version."
+        ),
+    )
     DRIVER_UNKNOWN = MessageTemplate(
         event="Unknown NVIDIA driver version",
         reason="NVML_DRIVER_UNKNOWN",
@@ -919,7 +930,15 @@ class ExecutorImageMessages:
         reason="EXECUTOR_IMAGE_OUTDATED",
         severity="error",
         category="policy",
-        impact="Score set to 0 until the image is current",
+        impact="Free node: validation failed, off the rent list until the image is current",
+    )
+    # DAH-6845: a rented node on an OUTDATED image passes and keeps its incentive, so the event is a warning
+    RENTED_OUTDATED = MessageTemplate(
+        event="Executor image is outdated",
+        reason="EXECUTOR_IMAGE_OUTDATED",
+        severity="warning",
+        category="policy",
+        impact="Rental and incentive continue; update the image before the rental ends",
     )
     UNOFFICIAL = MessageTemplate(
         event="Executor is not an official build",
@@ -927,14 +946,6 @@ class ExecutorImageMessages:
         severity="error",
         category="policy",
         impact="Score set to 0 until the node runs the official executor image",
-    )
-    # Same reason code as OUTDATED so log queries keep matching; severity says it is not scored.
-    OUTDATED_WARNING = MessageTemplate(
-        event="Executor image is outdated",
-        reason="EXECUTOR_IMAGE_OUTDATED",
-        severity="warning",
-        category="policy",
-        impact="Warning only until EXECUTOR_IMAGE_CHECK_ENFORCE is on: score and incentive unchanged",
     )
 
 
@@ -1260,6 +1271,24 @@ class CollateralStatusMessages:
         severity="info",
         category="policy",
         impact="None; the last known collateral status is reported, or none deposited when there is none",
+    )
+
+
+class LoginUserMessages:
+    ROOT = MessageTemplate(
+        event="Validator logged in as root",
+        reason="LOGIN_USER_ROOT",
+        severity="info",
+        category="policy",
+        impact="Proceed",
+    )
+    NOT_ROOT = MessageTemplate(
+        event="Executor SSH user must be root",
+        reason="LOGIN_USER_NOT_ROOT",
+        severity="error",
+        category="policy",
+        impact="Verification failed; the node is not validated while its SSH login is not root",
+        remediation="Run the executor from the standard image, which logs the validator in as root.",
     )
 
 
@@ -1620,6 +1649,14 @@ class TenantEnforcementMessages:
         severity="info",
         category="policy",
         impact="Proceed",
+    )
+    # the run gives no verdict and its kept result is dropped: the cycle saw the rental state change
+    RENTED_SINCE_CYCLE_START = MessageTemplate(
+        event="Executor rented since the cycle started",
+        reason="RENTED_SINCE_CYCLE_START",
+        severity="info",
+        category="policy",
+        impact="Validation halted — no verdict this cycle",
     )
 
 
@@ -2854,6 +2891,33 @@ class RentalProbeMessages:
         category="runtime",
         impact="Score set to 0 and the verified job cleared until a probe passes; the node is probed again next cycle while it stays idle",
     )
+    NOT_YET_PROVEN = MessageTemplate(
+        event="Not listed yet: no rental probe has passed on this node",
+        reason="RENTAL_PROBE_NOT_YET_PROVEN",
+        severity="warning",
+        category="runtime",
+        impact="Score set to 0 until a rental probe passes; the probe runs on the node while it is idle",
+        remediation=(
+            "Keep the node idle with the default renter image for its GPU and driver pulled; "
+            "it is listed after the first rental probe that passes."
+        ),
+    )
+    NOT_RUN_ON_VALIDATOR = MessageTemplate(
+        event="Rental probe could not run: the validator lacks what it needs for this node",
+        reason="RENTAL_PROBE_NOT_RUN_ON_VALIDATOR",
+        severity="warning",
+        category="runtime",
+        impact="No score this cycle; the listing stays as the last cycle left it",
+        remediation="Nothing to do on the node; the probe runs once the validator has what it needs.",
+    )
+    PROOF_UNREADABLE = MessageTemplate(
+        event="Rental probe record could not be read",
+        reason="RENTAL_PROBE_PROOF_UNREADABLE",
+        severity="warning",
+        category="runtime",
+        impact="No score this cycle; the listing stays as the last cycle that could read the record left it",
+        remediation="Nothing to do on the node; the record is read again next cycle.",
+    )
     INCONCLUSIVE = MessageTemplate(
         event="Rental probe could not reach a verdict",
         reason="RENTAL_PROBE_INCONCLUSIVE",
@@ -3447,7 +3511,13 @@ class SshdAuthLogMessages:
 NO_TASK_TIME_REASONS = (RentalVerificationMessages.NO_TASK_TIME.reason, VerifyXMessages.NO_TASK_TIME.reason)
 # results the cycle's snapshot cannot score, held for the cycle-end rented read: a budget stop (above), or a node the
 # backend found rented after the snapshot listed it idle (its GPU count and pool come from that read, never the snapshot)
-CYCLE_END_READ_REASONS = (*NO_TASK_TIME_REASONS, RentalVerificationMessages.RENTED_SINCE_THE_SNAPSHOT.reason)
+# a rental that started after the cycle-start snapshot: one the backend found during the check, or a renter's create
+# the run stopped for (DAH-5750). The cycle saw the rental state change, so its kept result never stands in for it
+RENTED_AFTER_START_REASONS = (
+    RentalVerificationMessages.RENTED_SINCE_THE_SNAPSHOT.reason,
+    TenantEnforcementMessages.RENTED_SINCE_CYCLE_START.reason,
+)
+CYCLE_END_READ_REASONS = (*NO_TASK_TIME_REASONS, *RENTED_AFTER_START_REASONS)
 # DAH-5933 review at ea74f37: a budget stop after a check that already zeroed the cycle's score. Its own code, since
 # the last event before the stop can be one a rollout withholds (a warn-only EXECUTOR_IMAGE_OUTDATED): no rule withholds
 # or carries this one, so the zero is published as it is

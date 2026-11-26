@@ -341,13 +341,12 @@ class Settings(BaseSettings):
     # measurements are still taken and published; only the amount of RAM/disk written shrinks.
     FIRST_PASS_VERIFYX_MEMORY_MAX_TEST_GB: int = Field(env="FIRST_PASS_VERIFYX_MEMORY_MAX_TEST_GB", default=16)
     FIRST_PASS_VERIFYX_STORAGE_TEST_GB: int = Field(env="FIRST_PASS_VERIFYX_STORAGE_TEST_GB", default=1)
-    # The first pass's shortest VerifyX network wait (package try, each speed-test direction). The
-    # library sizes each wait from its transfer at the acceptance floor plus a margin, between this and
-    # VERIFYX NETWORK_TIMEOUT_SECONDS, and gives a failed package one sized try plus a 10 s retry: a slow
-    # mirror cost a new node 4 min at two 120 s tries, while a healthy node at the floor still has time
-    # for a 500 MiB package. Cycle challenges send no floor and keep the full wait. A library without
-    # sizing ignores the keys and waits the full time.
-    FIRST_PASS_VERIFYX_NETWORK_TIMEOUT_SECONDS: int = Field(env="FIRST_PASS_VERIFYX_NETWORK_TIMEOUT_SECONDS", default=45)
+    # The shortest VerifyX network wait (package try, each speed-test direction), sent in every challenge,
+    # first pass and cycle alike. The library sizes each wait from its transfer at the acceptance floor plus a
+    # margin, between this and VERIFYX NETWORK_TIMEOUT_SECONDS, and gives a failed package one sized try plus
+    # a 10 s retry: a slow mirror cost a new node 4 min at two 120 s tries, while a healthy node at the floor
+    # still has time for a 500 MiB package. A library without sizing ignores the keys and waits the full time.
+    VERIFYX_NETWORK_MIN_TIMEOUT_SECONDS: int = Field(env="VERIFYX_NETWORK_MIN_TIMEOUT_SECONDS", default=45)
     # liumd phase 1 (DAH-2834): for an executor whose `/version` advertises `local_verify/1`, run the
     # capability matmul and VerifyX with ONE signed `POST /verify` instead of the SSH commands, and
     # judge the answer with the same unseal/verify code. The POST travels through a direct-tcpip
@@ -642,12 +641,6 @@ class Settings(BaseSettings):
         env="EXECUTOR_IMAGE_REF",
         default="daturaai/compute-subnet-executor:latest",
     )
-    # DAH-2701 compares the executor container's image digest with EXECUTOR_IMAGE_REF's.
-    # False (default): an OUTDATED verdict is logged with both digests and the score, the
-    # incentive and the validation result are unchanged. True: an idle OUTDATED executor fails
-    # validation and every OUTDATED executor earns 0. Off until nodes auto-update again
-    # (DAH-3419): with Watchtower stalled, 99 executors earned 0 for it in one hour on 11 Sep.
-    EXECUTOR_IMAGE_CHECK_ENFORCE: bool = Field(env="EXECUTOR_IMAGE_CHECK_ENFORCE", default=False)
     # DAH-3405: for this many validation cycles, counting the one in which the registry digest of
     # EXECUTOR_IMAGE_REF was seen to change, an executor that fails the way a watchtower restart
     # makes it fail (SSH gone, scrape failed, ports missing, image not yet the new one) gets no
