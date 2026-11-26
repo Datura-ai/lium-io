@@ -40,9 +40,10 @@ class FakeSshClient:
 
     async def run(self, command: str, *args, **kwargs):
         self.commands.append(command)
-        if "docker info" in command:
-            stdout = self.docker_root
-        elif "df -P -B1" in command:
+        if "docker info" in command and "df -P -B1" in command:
+            # one call: the host reads its docker root, then measures it (DAH-7109)
+            command = command.replace('"$root"', self.docker_root.strip() or "/var/lib/docker")
+        if "df -P -B1" in command:
             # Only answer for the real data root: a node with docker on a dedicated disk would
             # otherwise be judged by the root filesystem, which says nothing about docker's space.
             avail = self._free_bytes if self.docker_root.strip() in command else "999999999999"
