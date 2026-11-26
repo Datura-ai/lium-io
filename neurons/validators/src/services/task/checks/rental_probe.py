@@ -129,7 +129,8 @@ _NO_LIBCUDA = "libcuda.so.1 not found"
 # A device count proves nothing about the devices: every CUDA device must report its UUID, name and memory,
 # take a context and a 64 MiB write that reads back, and, where the image has PyTorch (what renters run),
 # run a kernel there too. Prints `error <why>` when libcuda.so.1 cannot be loaded or the driver refuses,
-# else `<source>\tcount\t<n>` and one `<source>\t<i>\tok\t<uuid>\t<MiB>\t<name>` or
+# else `<source>\tcount\t<n>` and one `<source>\t<i>\tok\t<uuid>\t<MiB>\t<name>`,
+# `<source>\t<i>\tbusy\t<uuid>\t<MiB>\t<name>` (identity read, but no memory free for the work) or
 # `<source>\t<i>\terror\t<what>` line per device, source `cuda` (driver API) or `torch`.
 _CUDA_DEVICES_PY = (
     "import ctypes\n"
@@ -145,17 +146,20 @@ _CUDA_DEVICES_PY = (
     "    raise SystemExit(0)\n"
     "print(f'cuda\\tcount\\t{n.value}', flush=True)\n"
     "class Fail(Exception):\n"
-    "    pass\n"
+    "    rc = 0\n"
     "def call(fn, *args):\n"
     "    rc = getattr(cuda, fn)(*args)\n"
     "    if rc:\n"
-    "        raise Fail(f'{fn} {rc}')\n"
+    "        exc = Fail(f'{fn} {rc}')\n"
+    "        exc.rc = rc\n"
+    "        raise exc\n"
     "def uuid_text(raw):\n"
     "    h = bytes(raw).hex()\n"
     "    return f'GPU-{h[:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:32]}'\n"
     "SIZE = 1 << 26\n"
     "for i in range(n.value):\n"
     "    ctx = ctypes.c_void_p(0)\n"
+    "    ident = None\n"
     "    try:\n"
     "        dev = ctypes.c_int(0)\n"
     "        call('cuDeviceGet', ctypes.byref(dev), i)\n"
@@ -165,6 +169,7 @@ _CUDA_DEVICES_PY = (
     "        call('cuDeviceTotalMem_v2', ctypes.byref(mem), dev)\n"
     "        uid = (ctypes.c_ubyte * 16)()\n"
     "        call('cuDeviceGetUuid', uid, dev)\n"
+    "        ident = (uuid_text(uid), str(mem.value >> 20), name.value.decode(errors='replace').strip())\n"
     "        call('cuCtxCreate_v2', ctypes.byref(ctx), 0, dev)\n"
     "        ptr = ctypes.c_uint64(0)\n"
     "        call('cuMemAlloc_v2', ctypes.byref(ptr), ctypes.c_size_t(SIZE))\n"
@@ -175,10 +180,13 @@ _CUDA_DEVICES_PY = (
     "        call('cuCtxSynchronize')\n"
     "        if any(v != pattern for v in back):\n"
     "            raise Fail('device memory did not read back what was written')\n"
-    "        print('\\t'.join(('cuda', str(i), 'ok', uuid_text(uid), str(mem.value >> 20),\n"
-    "                         name.value.decode(errors='replace').strip())), flush=True)\n"
+    "        print('\\t'.join(('cuda', str(i), 'ok') + ident), flush=True)\n"
     "    except Fail as exc:\n"
-    "        print(f'cuda\\t{i}\\terror\\t{exc}', flush=True)\n"
+    # CUDA_ERROR_OUT_OF_MEMORY on the context or the write: the device is who it says, its memory is taken
+    "        if exc.rc == 2 and ident:\n"
+    "            print('\\t'.join(('cuda', str(i), 'busy') + ident), flush=True)\n"
+    "        else:\n"
+    "            print(f'cuda\\t{i}\\terror\\t{exc}', flush=True)\n"
     "    finally:\n"
     "        if ctx.value:\n"
     "            cuda.cuCtxDestroy_v2(ctx)\n"
@@ -192,16 +200,21 @@ _CUDA_DEVICES_PY = (
     "k = torch.cuda.device_count()\n"
     "print(f'torch\\tcount\\t{k}', flush=True)\n"
     "for i in range(k):\n"
+    "    ident = None\n"
     "    try:\n"
     "        p = torch.cuda.get_device_properties(i)\n"
     "        raw = getattr(p.uuid, 'bytes', None)\n"
     "        u = uuid_text(raw) if raw else str(p.uuid)\n"
     "        u = u if u.startswith('GPU-') else f'GPU-{u}'\n"
+    "        ident = (u, str(p.total_memory >> 20), p.name.strip())\n"
     "        x = torch.arange(1 << 20, device=f'cuda:{i}', dtype=torch.int64)\n"
     "        if int((x * 2).sum().item()) != (1 << 20) * ((1 << 20) - 1):\n"
     "            raise RuntimeError('a kernel returned a wrong result')\n"
-    "        print('\\t'.join(('torch', str(i), 'ok', u, str(p.total_memory >> 20), p.name.strip())), flush=True)\n"
+    "        print('\\t'.join(('torch', str(i), 'ok') + ident), flush=True)\n"
     "    except Exception as exc:\n"
+    "        if ident and 'out of memory' in str(exc).lower():\n"
+    "            print('\\t'.join(('torch', str(i), 'busy') + ident), flush=True)\n"
+    "            continue\n"
     "        print(f'torch\\t{i}\\terror\\t{type(exc).__name__}: {str(exc)[:60]}'.replace('\\n', ' '), flush=True)\n"
 )
 GPU_LIST_COMMAND = (
@@ -1101,7 +1114,7 @@ async def _probe(
         login = await _step_ssh_login(ctx, outcome, private_key, ssh_port, deadline_at=deadline_at)
         if login is None:
             return outcome
-        _step_gpu_count(ctx, outcome, login)
+        _step_gpu_count(ctx, outcome, login, beside_fillers)
         if outcome.failed_step is None:
             _step_egress(ctx, outcome, login)
         if outcome.failed_step is None and outcome.inconclusive_reason is None:
@@ -1256,7 +1269,7 @@ async def _step_ssh_login(
     return login
 
 
-def _step_gpu_count(ctx: Context, outcome: _ProbeOutcome, login: _Login) -> None:
+def _step_gpu_count(ctx: Context, outcome: _ProbeOutcome, login: _Login, beside_fillers: bool = False) -> None:
     """Step 4: `nvidia-smi -L` inside the container must list the GPUs this node advertises, and the
     container must be able to open each of them (_usable_gpus)."""
     expected = _expected_gpu_count(ctx)
@@ -1267,7 +1280,7 @@ def _step_gpu_count(ctx: Context, outcome: _ProbeOutcome, login: _Login) -> None
         smi = login.result
         smi_out = (smi.stdout or "").partition(_DEVICE_NODES_MARK)[0]
         seen = _count_gpus(smi_out)
-        short = _usable_gpus(smi.stdout or "", _gpu_details(ctx)).short_of(expected)
+        short = _usable_gpus(smi.stdout or "", _gpu_details(ctx), beside_fillers).short_of(expected)
         gpu_ok = smi.exit_status == 0 and seen == expected and short is None
         if gpu_ok:
             detail = None
@@ -1778,7 +1791,7 @@ def _listed_gpus(smi_text: str, details: list[dict] | None) -> dict[str, tuple[s
 
 
 def _confirm_cuda_devices(
-    lines: list[str], listed: dict[str, tuple[str | None, float | None]]
+    lines: list[str], listed: dict[str, tuple[str | None, float | None]], beside_fillers: bool = False
 ) -> tuple[int, tuple[str, ...]]:
     """How many listed GPUs every CUDA source (the driver API, and PyTorch when the image has it) confirmed
     as a distinct working device of the listed model, and why the others were not."""
@@ -1793,7 +1806,7 @@ def _confirm_cuda_devices(
         for row in rows:
             if len(row) >= 4 and row[2] == "error":
                 problems.append(f"{label} device {row[1]} failed: {row[3][:80]}")
-            elif len(row) >= 6 and row[2] == "ok":
+            elif len(row) >= 6 and row[2] in ("ok", "busy"):
                 uuid, memory, name = row[3], row[4], row[5]
                 seen[uuid] = seen.get(uuid, 0) + 1
                 if uuid not in listed:
@@ -1808,7 +1821,10 @@ def _confirm_cuda_devices(
                     problems.append(
                         f"{label} device {row[1]} ({uuid}) has {memory} MiB, listed with {want_memory:.0f} MiB"
                     )
+                elif row[2] == "busy" and not beside_fillers:
+                    problems.append(f"{label} device {row[1]} ({uuid}) has no free memory and no filler runs beside")
                 else:
+                    # busy beside a filler: the filler holds that memory; the device's identity still had to match
                     matched.add(uuid)
         twice = {uuid for uuid, n in seen.items() if n > 1}
         if twice:
@@ -1822,7 +1838,7 @@ def _confirm_cuda_devices(
     return len(confirmed), tuple(problems)
 
 
-def _usable_gpus(output: str, details: list[dict] | None = None) -> _UsableGpus:
+def _usable_gpus(output: str, details: list[dict] | None = None, beside_fillers: bool = False) -> _UsableGpus:
     """Parse GPU_LIST_COMMAND's sections against the listed GPUs (`details`; none: the container's
     nvidia-smi listing). A missing section reads as nothing usable: the command always prints its marks,
     so output without them did not come from it."""
@@ -1860,7 +1876,7 @@ def _usable_gpus(output: str, details: list[dict] | None = None) -> _UsableGpus:
         return _UsableGpus(usable, None, None, unknown)
     if not lines[0].startswith("cuda\tcount\t"):
         return _UsableGpus(usable, None, lines[0][:80], unknown)
-    confirmed, problems = _confirm_cuda_devices(lines, _listed_gpus(smi_text, details))
+    confirmed, problems = _confirm_cuda_devices(lines, _listed_gpus(smi_text, details), beside_fillers)
     return _UsableGpus(usable, confirmed, None, unknown, cuda_problems=problems)
 
 

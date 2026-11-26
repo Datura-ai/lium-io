@@ -2201,7 +2201,7 @@ SHAPE_LISTING = "".join(
 SHAPE_DETAILS = [{"uuid": u, "name": "NVIDIA GeForce RTX 4090", "capacity": "24564"} for u in SHAPE_UUIDS]
 
 
-def _shape_step(cuda: str):
+def _shape_step(cuda: str, beside_fillers: bool = False):
     ctx = make_probe_context()[0]
     state = replace(ctx.state, gpu_count=8, gpu_details=SHAPE_DETAILS)
     ctx = ctx.model_copy(update={"state": state})
@@ -2213,7 +2213,9 @@ def _shape_step(cuda: str):
         mig=("Disabled",) * 8,
     )
     outcome = module._ProbeOutcome()
-    module._step_gpu_count(ctx, outcome, module._Login(result=MagicMock(stdout=output, stderr="", exit_status=0)))
+    module._step_gpu_count(
+        ctx, outcome, module._Login(result=MagicMock(stdout=output, stderr="", exit_status=0)), beside_fillers
+    )
     return outcome
 
 
@@ -2280,8 +2282,12 @@ class _Fake:
         raw[:] = list(bytes.fromhex(UUIDS[dev.value][4:].replace('-', ''))); return 0
     def cuCtxCreate_v2(self, ref, flags, dev):
         if dev.value in BROKEN: return 101
+        self.dev = dev.value
         ref._obj.value = 1; return 0
-    def cuMemAlloc_v2(self, ref, size): ref._obj.value = 1 << 20; return 0
+    def cuMemAlloc_v2(self, ref, size):
+        # a device whose memory another process holds: CUDA_ERROR_OUT_OF_MEMORY
+        if self.dev in globals().get('FULL', ()): return 2
+        ref._obj.value = 1 << 20; return 0
     def cuMemsetD32_v2(self, ptr, value, n): self.value = value.value; return 0
     def cuMemcpyDtoH_v2(self, dst, src, n):
         for j in range(len(dst)): dst[j] = self.value
@@ -2326,7 +2332,11 @@ torch.cuda = types.SimpleNamespace(
         bytes.fromhex(_SEEN[i][0][4:].replace('-', '')), _SEEN[i][1], _SEEN[i][2]
     ),
 )
-torch.arange = lambda n, device, dtype: _Tensor(n * (n - 1) // 2)
+def _arange(n, device, dtype):
+    if int(device.split(':')[1]) in globals().get('FULL', ()):
+        raise RuntimeError('CUDA out of memory. Tried to allocate 8.00 MiB')
+    return _Tensor(n * (n - 1) // 2)
+torch.arange = _arange
 sys.modules['torch'] = torch
 """
 
@@ -2346,3 +2356,28 @@ def test_the_cuda_script_checks_each_device_pytorch_sees():
         outcome = _shape_step(printed)
         assert outcome.failed_step == verdict, outcome.steps[-1].detail
     assert "PyTorch device 0" in outcome.steps[-1].detail
+
+
+def test_a_device_whose_memory_a_filler_holds_passes_on_its_identity_only_beside_a_filler():
+    """A Lium filler beside the probe can hold nearly all of a card's memory: the work there runs out of
+    memory, so that device is judged on its identity alone, and only when the probe runs beside a filler."""
+    as_listed = [(u, "NVIDIA GeForce RTX 4090", 24217) for u in SHAPE_UUIDS]
+    script = (
+        "FULL = [2, 6]\n"
+        + _FAKE_LIBCUDA.format(uuids=list(SHAPE_UUIDS), broken=[])
+        + _FAKE_TORCH.format(seen=as_listed)
+        + module._CUDA_DEVICES_PY
+    )
+    printed = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, check=True).stdout
+    assert f"cuda\t2\tbusy\t{SHAPE_UUIDS[2]}\t" in printed and f"torch\t6\tbusy\t{SHAPE_UUIDS[6]}\t" in printed
+    assert _shape_step(printed, beside_fillers=True).failed_step is None
+    detail = _shape_step(printed).steps[-1].detail
+    assert "6 of 8 GPU(s) confirmed usable" in detail and "no filler runs beside" in detail
+    # the identity still has to match: a busy device of another model fails beside a filler too
+    other = printed.replace(
+        f"cuda\t2\tbusy\t{SHAPE_UUIDS[2]}\t24217\tNVIDIA GeForce RTX 4090",
+        f"cuda\t2\tbusy\t{SHAPE_UUIDS[2]}\t48541\tNVIDIA RTX A6000",
+    )
+    assert other != printed
+    detail = _shape_step(other, beside_fillers=True).steps[-1].detail
+    assert "7 of 8 GPU(s) confirmed usable" in detail and "is a 'NVIDIA RTX A6000'" in detail
