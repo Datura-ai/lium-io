@@ -710,6 +710,25 @@ def test_a_probe_that_cannot_be_removed_keeps_the_plugin_enabled_with_no_other_v
     assert not (tmp_path / "probe-ok").exists()
 
 
+def test_a_probe_disk_file_no_cleanup_removed_keeps_the_plugin_enabled_when_docker_does_not_list_it(
+    tmp_path: Path,
+) -> None:
+    # Arrange: another setup held the lock past the probe window, so this run never reaches its cleanup.
+    # The probe's disk file an earlier setup left is still in the plugin's folder, but Docker does not list
+    # the probe volume: the file alone may hold the plugin's lease
+    (tmp_path / "vloopback-v3").mkdir()
+    (tmp_path / "vloopback-v3" / "lium-loopback-probe-v3").write_bytes(b"")
+
+    # Act
+    result = _run_failing_probe(tmp_path, {}, lock_held_seconds=70)
+
+    # Assert: counted as an owned volume, so the plugin is not turned off
+    assert result.returncode == 1
+    assert "kept enabled: the plugin owns 1 volume(s)" in result.stderr
+    assert not any(call[1] == "disable" for call in _plugin_calls(tmp_path))
+    assert json.loads((tmp_path / "state.json").read_text())["enabled"] is True
+
+
 def test_a_failed_probe_keeps_the_plugin_enabled_when_its_volumes_cannot_be_listed(tmp_path: Path) -> None:
     # Arrange: the daemon refuses the listing, so setup cannot tell whether a rental's disk is on the plugin
     result = _run_failing_probe(tmp_path, {"run_exit": 1, "volume_ls_exit": 1})

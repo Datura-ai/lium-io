@@ -157,11 +157,14 @@ probe_container = probe_volume
 # reaches it, and a plugin turned off before that keeps the lease for good, so no later probe can remove
 # its volume (DAH-7237)
 probe_left = []
+# set only once a cleanup in this run removed the probe: until then its disk file may hold the lease
+probe_removed = []
 
 def remove_probe_leftovers():
     # the container first: a `docker run` cut off by its timeout leaves it running with the volume
     # attached. Returns what stayed behind
     probe_left[:] = ["the probe cleanup"]  # stays if a call below is cut off
+    probe_removed[:] = []
     leftovers = []
     removed = run_docker("rm", "-f", probe_container, timeout=CLEANUP_SECONDS)
     if removed.returncode and "no such container" not in removed.stderr.lower():
@@ -169,6 +172,7 @@ def remove_probe_leftovers():
     if run_docker("volume", "rm", "-f", probe_volume, timeout=CLEANUP_SECONDS).returncode:
         leftovers.append("volume " + probe_volume)
     probe_left[:] = leftovers
+    probe_removed[:] = [] if leftovers else [True]
     return leftovers
 
 def mount_probe_volume():
@@ -239,9 +243,10 @@ def volumes_on_plugin(plugin):
         names = set()
     except OSError:
         raise RuntimeError("cannot list the plugin's data directory") from None
-    # the probe's disk file is setup's own; a probe volume Docker still lists is not, as long as no cleanup
-    # in this run removed it: it holds the plugin's lease
-    names.discard(probe_volume)
+    # the probe's disk file is setup's own only once a cleanup in this run removed the probe; before that
+    # (a run out of time before its cleanup) it may hold the plugin's lease, whatever Docker lists
+    if probe_removed:
+        names.discard(probe_volume)
     listed = run_docker("volume", "ls", "--format", "{{.Name}} {{.Driver}}", timeout=CLEANUP_SECONDS)
     if listed.returncode:
         raise RuntimeError("cannot list the volumes" + stderr_of(listed))
