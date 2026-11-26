@@ -2,7 +2,7 @@
 
 If the executor dies while its containerd shim is still alive (a host IO stall can leave the shim blocked
 for minutes), every restart fails with `failed to create task for container: AlreadyExists: task <id>:
-already exists`. Docker's restart policy then stops retrying and autoheal only restarts running containers,
+already exists`. Docker's restart policy then stops retrying and the API watcher (api_watcher.py) only restarts running containers,
 so the node stays offline until someone kills the shim by hand. The monitor container (pid: host, docker
 socket) runs this check every minute: it kills only the shim that carries this container's own id, and its
 children, then starts the container. A tree with a process in uninterruptible IO (D state) is left for the

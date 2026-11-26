@@ -29,6 +29,7 @@ from workspace_mount import (
 )
 
 from services import docker_service as docker_service_module
+from services import executor_payload
 from services import miner_service as miner_service_module
 
 
@@ -309,6 +310,8 @@ async def test_cancel_storage_operation_pins_the_host_key(monkeypatch):
 @pytest.mark.asyncio
 async def test_legacy_bootstrap_restore_keeps_secrets_off_the_command_line():
     ssh_client = AsyncMock()
+    # the staging command prints the job's fresh directory
+    ssh_client.run.return_value = SimpleNamespace(stdout=executor_payload.service_dir_glob("restore") + "AbCd1234")
     sftp_context = _FakeSftpContext()
     ssh_client.start_sftp_client = Mock(return_value=sftp_context)
     payload = _restore_payload()
@@ -450,7 +453,6 @@ async def test_encrypted_bootstrap_restore_spec_never_carries_the_passphrase(mon
     assert spec["workspace"]["requested_path"] == "/root"
     # create-time: the entrypoint may have touched the fresh mount already; the backup wins
     assert spec["workspace"]["bootstrap"] is True
-
 
 
 

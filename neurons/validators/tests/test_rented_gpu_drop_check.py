@@ -91,10 +91,11 @@ def _ctx(
     scrape_error: str | None = None,
     rented=True,
     anchor: list[str] = UUIDS,
+    host: dict | None = None,
     **rented_kwargs,
 ):
     executor = default_executor()
-    specs: dict = {"gpu": {"count": count, "details": _details(listed)}}
+    specs: dict = {"gpu": {"count": count, "details": _details(listed)}, **(host or {})}
     if scrape_error is not None:
         specs["gpu_scrape_error"] = scrape_error
     state = build_state(
@@ -356,6 +357,33 @@ async def test_a_pod_whose_reboot_failed_still_posts_the_new_cards(context_facto
     assert FAULT_ANCHORED_MISSING in call.kwargs["faults"]
     assert call.kwargs["missing_uuids"] == sorted(UUIDS)
     assert call.kwargs["gpu_details"] == _details(new)
+
+
+@pytest.mark.asyncio
+async def test_a_whole_set_of_other_cards_is_posted_with_the_hosts_cpu_and_ram_counts(context_factory):
+    # DAH-7143: the swap can be a move to a host with fewer cores; the backend recreates the pod with these
+    services = _services()
+    new = [f"GPU-b0b{i}-0000-0000-0000-00000000000{i}" for i in range(8)]
+    host = {"cpu": {"count": 64}, "ram": {"total": 528_000_000.0}}
+    ctx = _ctx(context_factory, services, listed=new, host=host).model_copy(
+        update={"runner": FakeRunner(_report("ok"))}
+    )
+
+    await RentedGpuDropCheck().run(ctx)
+
+    call = services.backend.report_rented_gpu_drop.await_args
+    assert (call.kwargs["cpu_count"], call.kwargs["ram_total"]) == (64, 528_000_000)
+
+
+@pytest.mark.asyncio
+async def test_a_fault_with_every_anchored_card_listed_posts_no_host_counts(context_factory):
+    services = _services()
+    flags = [f"gpu 3 ({UUIDS[3]}): 1 uncorrected ECC error(s) since the driver loaded"]
+
+    await _run_with_memory_read(context_factory, services, _report("flagged", flags=flags))
+
+    call = services.backend.report_rented_gpu_drop.await_args
+    assert (call.kwargs["cpu_count"], call.kwargs["ram_total"]) == (None, None)
 
 
 @pytest.mark.asyncio

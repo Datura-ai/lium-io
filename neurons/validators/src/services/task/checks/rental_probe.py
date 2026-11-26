@@ -33,6 +33,7 @@ from services.redis_service import (
 
 from ...const import MIN_POD_PORT_COUNT, POD_CONTAINER_PREFIX
 from ...node_host import open_public_connection, public_host_sock
+from ..availability import failed_check_event
 from ..messages import NO_OUTBOUND_INTERNET_REMEDIATION, OutboundInternetMessages
 from ..messages import RentalProbeMessages as Msg
 from ..messages import render_message
@@ -270,7 +271,12 @@ class RentalProbeCheck:
     renter holds it, and re-reads the node's idleness from the backend and this validator's pending-pod
     marks under the lock, not from the cycle-start snapshot; the lock is released as soon as the
     create returns. Anything the probe cannot read (backend, Redis) makes it skip or reach no verdict;
-    it never penalises on missing data alone.
+    it never penalises on missing data alone. A node with no passed probe on record is the exception:
+    a cycle without a verdict hides it (RENTAL_PROBE_NOT_YET_PROVEN, score 0, nothing cleared), so a node
+    is first listed by a probe that passed, never by a skip. A record that cannot be read scores nothing
+    and leaves the listing as stored (RENTAL_PROBE_PROOF_UNREADABLE), as does a probe the validator cannot
+    run for a reason on its own side (RENTAL_PROBE_NOT_RUN_ON_VALIDATOR: no default renter image for the
+    GPU and driver, no input, no create lock).
 
     An idle node running a Lium filler is probed too, beside the filler rather than in its place:
     create_container is told `beside_fillers`, so it
@@ -412,8 +418,10 @@ class RentalProbeCheck:
         with the lock held; every refusal after the lock was taken releases it first.
         """
         # the last probe's failed step, standing until a probe passes; None when there is none or
-        # Redis could not be read (then this cycle behaves as if there were none, and logs why)
-        standing = await _standing_failure(ctx)
+        # Redis could not be read (then this cycle behaves as if there were none, and logs why). A node
+        # no probe has passed on yet stands the same way: it is first listed by a pass, not by a skip;
+        # so does one whose pass record cannot be read (an unknown record is not a pass).
+        standing = await _standing_failure(ctx) or await _never_passed(ctx)
 
         skip_reason, skip_what = await _skip_reason(ctx, standing)
         if skip_reason == "rented":
@@ -424,13 +432,13 @@ class RentalProbeCheck:
         missing = _missing_inputs(ctx)
         if missing:
             return self._inconclusive(
-                ctx, f"validator has no {missing} for this executor", steps=[], standing=standing
+                ctx, f"validator has no {missing} for this executor", steps=[], standing=standing, validator_side=True
             )
 
         image_ref = await _default_renter_image(ctx)
         if image_ref is None:
             return self._inconclusive(
-                ctx, "no default renter image for this GPU and driver", steps=[], standing=standing
+                ctx, "no default renter image for this GPU and driver", steps=[], standing=standing, validator_side=True
             )
         image_present = await _image_present_on_host(ctx, image_ref)
         if image_present is None:
@@ -461,7 +469,7 @@ class RentalProbeCheck:
         create_lock = await _take_create_lock(ctx)
         if create_lock is None:
             return self._inconclusive(
-                ctx, "could not take the node's create lock", steps=[], standing=standing
+                ctx, "could not take the node's create lock", steps=[], standing=standing, validator_side=True
             )
         if not create_lock.held:
             # a renter's create: rented, as far as the standing failure is concerned
@@ -545,9 +553,42 @@ class RentalProbeCheck:
             },
         )
 
-    def _carried(self, ctx: Context, standing: _Failure, *, no_verdict: str) -> CheckResult:
+    def _carried(
+        self, ctx: Context, standing: _Failure, *, no_verdict: str, validator_side: bool = False
+    ) -> CheckResult:
         """This cycle reached no verdict of its own and the last probe failed: fail the node again with
         that step (review). `no_verdict` is what this cycle would otherwise have reported."""
+        if standing is _NEVER_PASSED and validator_side:
+            # the probe could not start for a reason on the validator's side (no default renter image for the
+            # GPU and driver, no input, no create lock): that says nothing about the node, so it is not hidden as
+            # unproven; like an unreadable record, no score and the stored listing stays (review of lio#2442)
+            event = render_message(
+                Msg.NOT_RUN_ON_VALIDATOR,
+                ctx=ctx,
+                check_id=self.check_id,
+                what={"executor_uuid": ctx.executor.uuid, "no_verdict_this_cycle": no_verdict},
+            )
+            return CheckResult(passed=False, event=event, updates={"score": 0.0, "job_score": 0.0})
+        if standing is _NEVER_PASSED or standing is _PROOF_UNREADABLE:
+            # nothing failed, so nothing is recorded or cleared. Never passed: the reason hides the node
+            # (REASONS_THAT_HIDE_AT_ONCE) until its first pass. Unreadable: no score, and the backend keeps
+            # the node's stored listing state (REASONS_THAT_KEEP_STORED), so an unproven node is not listed
+            # by it and a proven one is not hidden by a Redis read failure.
+            event = render_message(
+                Msg.NOT_YET_PROVEN if standing is _NEVER_PASSED else Msg.PROOF_UNREADABLE,
+                ctx=ctx,
+                check_id=self.check_id,
+                what={"executor_uuid": ctx.executor.uuid, "no_verdict_this_cycle": no_verdict},
+            )
+            # the hold travels with this result, not with where the run happens to end: an unproven node stays
+            # hidden whatever the run reports after it (network figures included)
+            hold = failed_check_event(False, [event]) if standing is _NEVER_PASSED else None
+            return CheckResult(
+                passed=False,
+                event=event,
+                updates={"score": 0.0, "job_score": 0.0},
+                extra_events=[hold] if hold else [],
+            )
         what: dict[str, Any] = {
             "executor_uuid": ctx.executor.uuid,
             "failed_step": standing.step,
@@ -584,9 +625,12 @@ class RentalProbeCheck:
         steps: list[_Step],
         what: dict[str, Any] | None = None,
         standing: _Failure | None = None,
+        validator_side: bool = False,
     ) -> CheckResult:
         if standing is not None:
-            return self._carried(ctx, standing, no_verdict=f"inconclusive: {reason}")
+            return self._carried(
+                ctx, standing, no_verdict=f"inconclusive: {reason}", validator_side=validator_side
+            )
         event = render_message(
             Msg.INCONCLUSIVE,
             ctx=ctx,
@@ -808,6 +852,23 @@ async def _clear_last_ok(ctx: Context) -> None:
 class _Failure:
     step: str
     create_step: str | None = None
+
+
+# The standing state of a node with no passed probe on record (DAH-7044): a node is first listed by a
+# probe that passed, not by cycles that reached no verdict. Never written to Redis; the first pass's
+# stamp ends it.
+_NEVER_PASSED = _Failure("never_passed")
+# The stamp could not be read: whether a pass is on record is unknown, so the node is not scored on it.
+_PROOF_UNREADABLE = _Failure("proof_unreadable")
+
+
+async def _never_passed(ctx: Context) -> _Failure | None:
+    try:
+        last_ok = await _last_ok_at(ctx)
+    except Exception:
+        _read_failed(ctx, "its interval stamp in Redis")
+        return _PROOF_UNREADABLE
+    return _NEVER_PASSED if last_ok is None else None
 
 
 async def _standing_failure(ctx: Context) -> _Failure | None:

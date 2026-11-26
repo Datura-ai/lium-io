@@ -325,7 +325,7 @@ class MinerLogLine(BaseModel):
         return MinerLogLine._no_payout(
             result,
             reason=ZeroIncentiveReason.OUTDATED_EXECUTOR_IMAGE,
-            message=outdated_image_remediation(str(expected_ref), enforced=True),
+            message=outdated_image_remediation(str(expected_ref), report.get("status")),
             extra_fields={
                 "executor_image_status": report.get("status"),
                 "observed_digest": report.get("observed_digest"),
