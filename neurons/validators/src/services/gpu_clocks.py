@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import secrets
 import shlex
 import time
 from contextlib import AsyncExitStack, asynccontextmanager
@@ -133,7 +134,7 @@ def build_clock_command(
     return f"nvidia-smi -i {shlex.quote(uuid)} -lgc {int(min_mhz)},{int(max_mhz)}"
 
 
-def _reset_command(uuids: list[str], pod_gpu_uuids: set[str] | None) -> str:
+def _reset_command(uuids: list[str], pod_gpu_uuids: set[str] | None, results: str) -> str:
     """One job per GPU, all GPUs at once: -rgc, then -rac (application clocks: -ac, or any process once the host ran
     -acp UNRESTRICTED), then -rmc (locked memory clocks: -lmc), each echoing "<uuid> <exit>" (-rgc) or
     "<uuid> <flag> <exit>", so a create never hands a renter clocks the host or the last pod lowered. Every nvidia-smi
@@ -142,17 +143,22 @@ def _reset_command(uuids: list[str], pod_gpu_uuids: set[str] | None) -> str:
     -rac/-rmc batch outlasted the runner's budget, so the call gave no answer at all and no GPU had a verdict (prod
     25 Nov). The kill is per nvidia-smi and nothing wraps the batch: uutils timeout (Ubuntu 26.04) signals only its
     direct child and GNU timeout gives each inner timeout its own process group, so an outer kill left resets running
-    (lio#2362). `wait` returns only once every reset has exited. A killed reset echoes 137."""
+    (lio#2362). `wait` returns only once every reset has exited. A killed reset echoes 137. Each line is appended to
+    the host file `results` the moment its reset ends and the file is printed at the end, so if the call overruns the
+    runner's budget (its answer lost), the GPUs that answered are read back from it and only the others are unknown;
+    the file stays unless the print reached the caller."""
     per_reset = f"timeout -s KILL {PER_RESET_TIMEOUT_SECONDS:g}"
+    quoted = shlex.quote(results)
     jobs = []
     for uuid in uuids:
         rgc = build_clock_command("reset", uuid, pod_gpu_uuids=pod_gpu_uuids)
-        steps = [f"{per_reset} {rgc} >/dev/null 2>&1; echo {shlex.quote(uuid)} $?"] + [
-            f"{per_reset} nvidia-smi -i {shlex.quote(uuid)} {flag} >/dev/null 2>&1; echo {shlex.quote(uuid)} {flag} $?"
+        steps = [f"{per_reset} {rgc} >/dev/null 2>&1; echo {shlex.quote(uuid)} $? >> {quoted}"] + [
+            f"{per_reset} nvidia-smi -i {shlex.quote(uuid)} {flag} >/dev/null 2>&1; "
+            f"echo {shlex.quote(uuid)} {flag} $? >> {quoted}"
             for flag in _APP_MEM_FLAGS
         ]
         jobs.append("( " + "; ".join(steps) + " ) &")
-    return f"sh -c {shlex.quote(' '.join(jobs) + ' wait')}"
+    return f"sh -c {shlex.quote(' '.join(jobs) + f' wait; cat {quoted} && rm -f {quoted}')}"
 
 
 def _app_mem_outcome(code: str, rgc_exit: str | None) -> str:
@@ -272,8 +278,14 @@ async def _reset_gpu_clocks(
     if not uuids:
         _log_reset_outcome(purpose, pod_id, [], [], {}, None)
         return {}
-    result = await _run(runner, _reset_command(uuids, pod_gpu_uuids), timeout=_RESET_CALL_TIMEOUT_SECONDS)
-    lines = [line.split() for line in (result.stdout or "").splitlines()]
+    results = f"/tmp/lium-gpu-clock-reset-{secrets.token_hex(8)}"
+    result = await _run(runner, _reset_command(uuids, pod_gpu_uuids, results), timeout=_RESET_CALL_TIMEOUT_SECONDS)
+    stdout = result.stdout or ""
+    if result.exit_code != 0:
+        # the answer was lost (budget overrun, channel closed): what the GPUs wrote so far; a reset still running
+        # after this read writes a line nobody reads (a few bytes left in /tmp), its GPU counted as no answer
+        stdout = (await _run(runner, f"cat {results} 2>/dev/null; rm -f {results}")).stdout or ""
+    lines = [line.split() for line in stdout.splitlines()]
     # the -rgc lines (a -rac/-rmc line has 3 fields); a killed -rgc gave no verdict, as a lost answer
     exits = {p[0]: p[1] for p in lines if len(p) == 2 and p[1] != _KILLED_EXIT}
     failures: dict[str, str | None] = {
@@ -484,8 +496,8 @@ async def reset_leftover_clock_locks(
 ) -> list[str]:
     """Safety net before a create: `-rgc` every GPU of the new pod (None/empty = every host GPU), with or
     without a lock record, so neither a lost record nor a lock set outside Lium hands a renter locked clocks (as
-    raise_low_power_limits_to_default does for power). Answers the GPUs whose reset failed (records stay): the
-    create must not start on them. A GPU with no record that refuses -rgc as having no clock control here (exit 3
+    raise_low_power_limits_to_default does for power). Answers the GPUs whose reset failed or gave no answer (records
+    stay): the create must not start on them, so a GPU whose clocks cannot be confirmed reset fails closed. A GPU with no record that refuses -rgc as having no clock control here (exit 3
     or 4: nobody locked it from here) is not counted; any other failure is, record or not. While Redis cannot say
     which GPUs have a record, every failed reset counts. A GPU whose record names `keep_pod_id` (the pod's own edit or reboot) keeps its lock and
     record (review). `expected` (uuid -> the record read before the GPU lock) resets only a GPU whose record is
@@ -514,26 +526,26 @@ async def _reset_leftovers(
     except Exception:
         recorded, own = set(gpu_uuids), set()  # unknown (review): every failed reset counts, never a silent pass
     gpu_uuids = [uuid for uuid in gpu_uuids if uuid not in own]
-    ran = True
     try:
         failures = await _reset_gpu_clocks(runner, redis, gpu_uuids, purpose=purpose, pod_id=keep_pod_id, forget=False)
     except Exception:
-        if not recorded:
-            raise
-        # the SSH call failed: no verdict on any GPU, so only the recorded ones count, as when nothing is recorded
-        ran, failures = False, dict.fromkeys(gpu_uuids, "the reset did not run")
+        failures = dict.fromkeys(gpu_uuids, _NO_ANSWER)  # the SSH call failed: no GPU answered
     try:
         await _forget(redis, [uuid for uuid, failure in failures.items() if failure is None])
     except Exception:
         pass  # the GPUs are reset; a record left over costs the next create one more -rgc (review)
-    # a GPU whose -rgc gave no answer (killed on the host, or the call's answer lost) has no verdict, as above
-    unrecorded = [u for u in gpu_uuids if ran and failures[u] not in (None, _NO_ANSWER) and u not in recorded]
-    for uuid in unrecorded:
-        logger.warning("gpu_clock_action=rgc_failed gpu=%s recorded=false failure=%s", uuid, failures[uuid])
-    return [
+    # fail closed: a GPU with no verdict (its -rgc killed on the host, or its line lost) may still hold lowered clocks,
+    # record or not; only a completed exit 3/4 on an unrecorded GPU (no clock control from here) is not counted
+    refused = [
         uuid for uuid in gpu_uuids
-        if failures[uuid] is not None and (uuid in recorded or (uuid in unrecorded and failures[uuid] not in _NO_CLOCK_CONTROL))
+        if failures[uuid] is not None and (uuid in recorded or failures[uuid] not in _NO_CLOCK_CONTROL)
     ]
+    for uuid in (u for u in gpu_uuids if failures[u] is not None):
+        logger.warning(
+            "gpu_clock_action=rgc_failed gpu=%s recorded=%s failure=%s",
+            uuid, str(uuid in recorded).lower(), failures[uuid],
+        )
+    return refused
 
 
 async def clock_locked_gpu_uuids(redis: RedisService, gpu_uuids: list[str]) -> set[str]:

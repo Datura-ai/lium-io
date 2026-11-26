@@ -15287,7 +15287,10 @@ class DockerService:
                 return
         if still_locked:
             # never hand a renter locked clocks, whoever locked them
-            raise RuntimeError(f"GPU clocks could not be reset to default: {', '.join(still_locked)}")
+            raise RuntimeError(
+                f"GPU clocks could not be confirmed reset to default (the reset failed or gave no answer): "
+                f"{', '.join(still_locked)}"
+            )
 
     async def delete_container(
         self,
