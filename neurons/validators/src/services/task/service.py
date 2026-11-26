@@ -304,10 +304,6 @@ class TaskService:
                 # event list is read, so a new reachability check needs no change here.
                 # DAH-5395: a run ended by a failure in REASONS_THAT_HIDE_AT_ONCE hides the node too
                 result.availability_errors = run_availability_errors(ok, events)
-                # DAH-7229: a run that ended before the rental probe still holds a node no probe has passed on
-                result.availability_errors = await with_the_unproven_hold(
-                    last_context, checks, events, result.availability_errors
-                )
                 if not ok and last_event.reason_code == TenantEnforcementMessages.EXECUTOR_TRANSPORT_UNREACHABLE.reason:
                     # DAH-5718: the checks after the one whose session died never ran, so [] would clear holds only
                     # they re-read (a GPU-loss hold the scrape cleared waits for its recheck); None leaves the stored ones
@@ -336,6 +332,11 @@ class TaskService:
                             error.model_dump(mode="json") for error in availability_errors([waiting])
                         ]
                     result.availability_errors = result.availability_errors or None
+                # DAH-7229: a run that ended before the rental probe still holds a node no probe has passed on. After
+                # DAH-5718, so a lost session's None (keep what is stored) stays None
+                result.availability_errors = await with_the_unproven_hold(
+                    last_context, checks, events, result.availability_errors
+                )
                 # DAH-3405: the last event is the one that ended the run — the failed fatal check,
                 # the finalize event of a run that completed without a score, or the rented halt
                 # (success=True, score 0 when the image is OUTDATED).

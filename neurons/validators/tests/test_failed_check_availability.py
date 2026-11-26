@@ -314,3 +314,30 @@ def test_any_other_run_still_sends_an_empty_list() -> None:
 
     assert run_availability_errors(False, events) == []
     assert run_availability_errors(True, events[:1]) == []
+
+
+@pytest.mark.asyncio
+async def test_a_lost_session_before_the_rental_probe_keeps_the_stored_restrictions(monkeypatch) -> None:
+    """lio#2496 review: the unproven-node hold was added before the DAH-5718 lost-session rule, so a run whose
+    session died before the probe sent [hold] (replacing the stored restrictions) instead of None."""
+    from services.task.checks import rental_probe
+    from services.task.checks.rental_probe import RentalProbeCheck
+    from services.task.messages import TenantEnforcementMessages
+
+    async def never_passed(ctx):
+        return rental_probe._NEVER_PASSED
+
+    monkeypatch.setattr(rental_probe, "_never_passed", never_passed)
+    monkeypatch.setattr(rental_probe, "rental_of_this_node", lambda ctx: None)
+    lost = _event("executor.validate.port", TenantEnforcementMessages.EXECUTOR_TRANSPORT_UNREACHABLE.reason)
+    node = MagicMock(success=False, pipeline_id="p", default_extra={})
+    node.executor.uuid = "node"
+    service = _service(pipeline_run=(False, [lost], node))
+    service.pipeline_factory.build_checks.return_value = [RentalProbeCheck()]
+
+    result = await _create_task(service)
+
+    assert result.availability_errors is None
+    # the same run with an empty list (any other early end) does get the hold
+    held = await rental_probe.with_the_unproven_hold(node, [RentalProbeCheck()], [lost], [])
+    assert [e["reason_code"] for e in held] == ["VERIFICATION_FAILED"]

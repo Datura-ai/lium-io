@@ -448,6 +448,11 @@ class RentalProbeCheck:
 
         image_ref = await _default_renter_image(ctx)
         if image_ref is None:
+            # the backend did not answer (timeout, error, bad body): the validator's side, the stored listing stays
+            return self._inconclusive(
+                ctx, "could not read the default renter image", steps=[], standing=standing, validator_side=True
+            )
+        if not image_ref:
             # the lookup key (GPU and driver) is the node's own report, so an unproven node stays held
             return self._inconclusive(
                 ctx, "no default renter image for this GPU and driver", steps=[], standing=standing
@@ -764,18 +769,21 @@ def _expected_gpu_count(ctx: Context) -> int:
 
 
 async def _default_renter_image(ctx: Context) -> str | None:
+    """The default renter image for the node's GPU and driver; "" when there is none for them (or the node reports
+    neither), None when the backend did not answer (the client returns None on a timeout, error or bad body)."""
     gpu_model = ctx.state.gpu_model
     driver_version = str((ctx.state.specs or {}).get("gpu", {}).get("driver") or "")
     if not gpu_model or not driver_version:
-        return None
+        return ""
     try:
         images = await ctx.services.backend.get_default_docker_image(gpu_model, driver_version)
     except Exception:
         _read_failed(ctx, "the default renter image from the backend")
         return None
-    if not images:
+    if images is None:
+        _read_failed(ctx, "the default renter image from the backend")
         return None
-    return images[0].image_ref
+    return images[0].image_ref if images else ""
 
 
 async def _image_present_on_host(ctx: Context, image_ref: str) -> bool | None:

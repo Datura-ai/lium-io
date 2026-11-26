@@ -314,7 +314,8 @@ def make_probe_context(
     docker = docker or FakeDocker()
     redis = redis or FakeRedis()
     backend = AsyncMock()
-    backend.get_default_docker_image.return_value = list(images) if images else None
+    # () is the backend answering that no image exists; None is no answer (timeout, error, bad body)
+    backend.get_default_docker_image.return_value = list(images) if images is not None else None
     # the fresh backend reads: before the probe (is the node idle now?) and, on a failed verdict, after
     # it (was it rented meanwhile?). A list gives one answer per call.
     if isinstance(rented_now, list):
@@ -2022,16 +2023,25 @@ async def test_an_unproven_node_with_no_default_image_for_its_driver_stays_held(
 
 
 @pytest.mark.asyncio
-async def test_an_unreadable_image_list_keeps_an_unproven_nodes_stored_listing():
-    """Follow-up of lio#2442: the validator's own image-list read got no answer (an SSH outage of ours times it
-    out on every node). That says nothing about the node: no node-proven hold, the listing stays as stored."""
+@pytest.mark.parametrize(
+    ("unread", "reason"),
+    [
+        ("default image lookup", "inconclusive: could not read the default renter image"),
+        ("image list", "inconclusive: could not read the node's image list"),
+    ],
+)
+async def test_a_validator_side_unread_input_keeps_an_unproven_nodes_stored_listing(unread, reason):
+    """Follow-up of lio#2442: the backend client returns None on a timeout, error or bad body (lio#2496 review), and
+    the validator's own image-list read can get no answer (an SSH outage of ours times it out on every node). Neither
+    says anything about the node: no node-proven hold, the listing stays as stored."""
     redis = FakeRedis(last_ok=None)
-    ctx, docker, _ = make_probe_context(redis=redis)
-    ctx.ssh.run.side_effect = asyncssh.ConnectionLost("lost")
+    ctx, docker, _ = make_probe_context(redis=redis, images=None if unread == "default image lookup" else (IMAGE,))
+    if unread == "image list":
+        ctx.ssh.run.side_effect = asyncssh.ConnectionLost("lost")
     with probe_settings():
         result = await RentalProbeCheck().run(ctx)
     assert result.event.reason_code == Msg.NOT_RUN_ON_VALIDATOR.reason
-    assert result.event.what_we_saw["no_verdict_this_cycle"] == "inconclusive: could not read the node's image list"
+    assert result.event.what_we_saw["no_verdict_this_cycle"] == reason
     assert result.updates == {"score": 0.0, "job_score": 0.0} and result.extra_events == []
     assert run_availability_errors(False, [result.event]) is None
     assert docker.create_calls == []
@@ -2363,31 +2373,26 @@ def test_the_gpu_check_has_time_for_all_its_calls():
 
 
 @pytest.mark.asyncio
-async def test_too_little_cycle_time_keeps_an_unproven_nodes_stored_listing():
-    """Follow-up of lio#2442: the cycle's time is the validator's to budget, so running short says nothing about
-    the node: no listing hold, the stored listing stays (as for an unreadable image list)."""
+@pytest.mark.parametrize(
+    ("short_of", "reason"),
+    [
+        ("the probe", "skipped: too little cycle time left"),
+        ("the create", "inconclusive: too little cycle time left for the create"),
+    ],
+)
+async def test_too_little_cycle_time_keeps_an_unproven_nodes_stored_listing(monkeypatch, short_of, reason):
+    """Follow-up of lio#2442: the cycle's time is the validator's to budget, so running short (before the probe or
+    before its create) says nothing about the node: no listing hold, the stored listing stays."""
     redis = FakeRedis(last_ok=None)
     ctx, docker, _ = make_probe_context(redis=redis)
-    ctx = ctx.model_copy(update={"started_at_monotonic": time.monotonic() - 650})
+    if short_of == "the probe":
+        ctx = ctx.model_copy(update={"started_at_monotonic": time.monotonic() - 650})
+    else:
+        monkeypatch.setattr(module, "_create_deadline_seconds", lambda ctx: module._MIN_CREATE_DEADLINE_SECONDS - 1)
     with probe_settings():
         result = await RentalProbeCheck().run(ctx)
     assert result.event.reason_code == Msg.NOT_RUN_ON_VALIDATOR.reason
-    assert result.event.what_we_saw["no_verdict_this_cycle"] == "skipped: too little cycle time left"
-    assert result.extra_events == [] and run_availability_errors(False, [result.event]) is None
-    assert docker.create_calls == []
-
-
-@pytest.mark.asyncio
-async def test_too_little_time_for_the_create_keeps_an_unproven_nodes_stored_listing(monkeypatch):
-    redis = FakeRedis(last_ok=None)
-    ctx, docker, _ = make_probe_context(redis=redis)
-    monkeypatch.setattr(module, "_create_deadline_seconds", lambda ctx: module._MIN_CREATE_DEADLINE_SECONDS - 1)
-    with probe_settings():
-        result = await RentalProbeCheck().run(ctx)
-    assert result.event.reason_code == Msg.NOT_RUN_ON_VALIDATOR.reason
-    assert result.event.what_we_saw["no_verdict_this_cycle"] == (
-        "inconclusive: too little cycle time left for the create"
-    )
+    assert result.event.what_we_saw["no_verdict_this_cycle"] == reason
     assert result.extra_events == [] and run_availability_errors(False, [result.event]) is None
     assert docker.create_calls == []
 
