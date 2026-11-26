@@ -1617,6 +1617,10 @@ class ComputeClient:
             response: (
                 ContainerDeleted | FailedContainerRequest
             ) = await self.miner_service.handle_container(job_request)
+            if isinstance(response, FailedContainerRequest):
+                # the backend matches a failure to the delete send it answers (a duplicated or late reply must not
+                # answer a later send, DAH-7216)
+                response.command_id = job_request.command_id
 
             logger.info(
                 _m(
