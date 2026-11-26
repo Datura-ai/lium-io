@@ -580,3 +580,22 @@ def test_a_start_request_failing_before_docker_is_reported_as_a_start_failure(mi
 
     assert isinstance(result, FailedContainerRequest)
     assert result.error_type == FailedContainerErrorTypes.ContainerStartFailed
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        miner_service_module.NonPublicAddressError("0.0.0.0 is not a public address"),
+        aiohttp.ClientConnectorDNSError(
+            Mock(host="miner.example.net", port=8000, ssl=None),
+            miner_service_module.NonPublicAddressError("miner.example.net resolves to a non-public address"),
+        ),
+    ],
+    ids=["refused-literal", "refused-name"],
+)
+def test_a_refused_axon_address_is_an_unreachable_miner_whether_literal_or_name(error):
+    assert miner_service_module._is_miner_unreachable_error(error)
+
+
+def test_a_bug_in_the_validator_is_not_an_unreachable_miner():
+    assert not miner_service_module._is_miner_unreachable_error(KeyError("results"))
