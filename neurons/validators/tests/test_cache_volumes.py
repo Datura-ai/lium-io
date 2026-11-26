@@ -1,11 +1,11 @@
 import asyncio
+import math
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
 
 from payload_models.payloads import CacheVolume, ContainerCreateRequest, WorkloadKind
-import math
 
 from services.const import (
     DPHN_CACHE_FREE_MARGIN_GB,
@@ -1084,13 +1084,15 @@ class RefusingDuHostSshClient(DuHostSshClient):
 
 
 @pytest.mark.asyncio
-async def test_a_job_cache_over_its_size_that_docker_cannot_remove_stays_mounted(docker_service):
-    ssh_client = RefusingDuHostSshClient([_JOB_CACHE], free_gb=10, du_stdout=_kb(250))
+@pytest.mark.parametrize("free_gb", [10, 5000])
+async def test_a_job_cache_over_its_size_that_docker_cannot_remove_is_not_mounted(docker_service, free_gb):
+    # taiberium (lio#2249): mounted as is, it is charged nothing and keeps growing; the run goes without it
+    ssh_client = RefusingDuHostSshClient([_JOB_CACHE], free_gb=free_gb, du_stdout=_kb(250))
 
     affordable = await docker_service.select_affordable_cache_volumes(ssh_client, _job_with_cache(), {})
 
     assert any("volume rm" in command and _JOB_CACHE in command for command in ssh_client.commands)
-    assert [volume.name for volume in affordable] == [_JOB_CACHE]
+    assert affordable == []
 
 
 class CacheDuHostSshClient(RemovingHostSshClient):

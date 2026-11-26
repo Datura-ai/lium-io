@@ -7193,16 +7193,16 @@ class DockerService:
             case CacheCharge.REST_OF_SIZE:
                 if held_gb <= size_gb:
                     return size_gb - held_gb
-                # over its size: removed so the run starts it empty, and charged whole like a new one; kept as is
-                # (nothing charged) when docker cannot remove it
+                # over its size: removed so the run starts it empty, and charged whole like a new one; when docker
+                # cannot remove it, never afforded (math.inf), so the run goes without it instead of growing it further
                 try:
                     removed = await ssh_client.run(DockerCommand.volume_remove_strict(volume_name))
                 except asyncio.CancelledError:
                     raise
                 except Exception:
-                    return 0
+                    return math.inf
                 if removed.exit_status != 0:
-                    return 0
+                    return math.inf
                 logger.info(
                     _m("Cache was over its size; removed so the run starts it empty", extra=get_extra_info(extra))
                 )
