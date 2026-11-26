@@ -105,6 +105,7 @@ def _rented_data(executor_uuid: str, pods: list[str]):
     resp.executors = {executor_uuid: executor_mock}
     resp.filler_containers_by_executor = {}
     resp.all_filler_containers_by_executor = {}
+    resp.read_at = None
     return resp
 
 
@@ -1691,9 +1692,17 @@ async def test_an_unlisted_filler_older_than_the_rented_list_goes_at_once_and_a_
     rented_data = _real_rented_data(EXECUTOR_UUID, [LIVE_POD])
     rented_data.read_at = time.time() - read_minutes_ago * 60
 
+    reserve = MagicMock(return_value=True)
+
     _, removed_names, _ = await ContainerCleanup().cleanup(
-        ssh_client=ssh, rented_data=rented_data, executor_uuid=EXECUTOR_UUID, lium_workload_ended=ended
+        ssh_client=ssh,
+        rented_data=rented_data,
+        executor_uuid=EXECUTOR_UUID,
+        lium_workload_ended=ended,
+        reserve_removal=reserve,
     )
 
     assert removed_names == [before_read]
     assert not any(name in c for c in rm_calls for name in (after_read, young_pod, late_callback))
+    # the early path's backend lookup is the removal's lookup: no second slot is reserved for it
+    assert before_read not in [call.args[0] for call in reserve.call_args_list]

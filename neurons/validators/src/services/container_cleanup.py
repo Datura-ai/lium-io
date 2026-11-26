@@ -490,19 +490,17 @@ class ContainerCleanup:
                 if age_minutes and age_minutes > removal_age:
                     if legacy and not await self._legacy_ended(lium_workload_ended, stripped_name):
                         continue
-                    if (
+                    if not legacy and removal_age < self.stale_threshold_minutes:
+                        # a filler whose create callback comes late is missing from the list while it runs:
+                        # before the fixed grace, only the backend's record that it ended lets it go, and
+                        # that one lookup also confirms the removal, so it reserves no second one
+                        if not await self._legacy_ended(lium_workload_ended, stripped_name):
+                            continue
+                    elif (
                         not legacy
                         and reserve_removal is not None
                         and stripped_name.startswith((POD_CONTAINER_PREFIX, FILLER_CONTAINER_PREFIX))
                         and not reserve_removal(stripped_name)
-                    ):
-                        continue
-                    # a filler whose create callback comes late is missing from the list while it runs:
-                    # before the fixed grace, only the backend's record that it ended lets it go
-                    if (
-                        not legacy
-                        and removal_age < self.stale_threshold_minutes
-                        and not await self._legacy_ended(lium_workload_ended, stripped_name)
                     ):
                         continue
                     if self.dry_run:
@@ -573,7 +571,7 @@ class ContainerCleanup:
         it goes once its age (host clock) passes the validator's time since the list was read, plus a
         margin. pod_ and health_check_ containers, and a list with no read time, keep the fixed grace.
         """
-        read_at = rented_data.read_at if isinstance(rented_data, RentedExecutorsResponse) else None
+        read_at = rented_data.read_at if rented_data is not None else None
         if not name.startswith(FILLER_CONTAINER_PREFIX) or read_at is None:
             return self.stale_threshold_minutes
         return (time.time() - read_at) / 60 + FILLER_LIST_READ_MARGIN_MINUTES
