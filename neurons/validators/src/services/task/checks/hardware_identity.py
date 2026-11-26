@@ -100,30 +100,51 @@ def gpu_identity_kernel_findings(
     kernel: list[str] | None,
     minors: dict[str, int] | None,
     pcis: dict[str, str] | None,
-) -> list[str]:
+) -> tuple[list[str], list[str]]:
     """The scrape's per-card identity against the validator's own container kernel read.
 
     Both reads are in the executor container, so this is a consistency check, not a host proof.
     A mismatch means the scrape's sources and the validator's procfs read do not describe the
-    same cards.
+    same cards. Returns the stable reason codes and the operator-only detail lines.
     """
     found: list[str] = []
-    for card in cards:
+    details: list[str] = []
+
+    def add(reason: str, detail: str) -> None:
+        if reason not in found:
+            found.append(reason)
+        detail = detail[:240]
+        if detail not in details:
+            details.append(detail)
+
+    for index, card in enumerate(cards):
         uuid = card.get("uuid")
+        pci = card.get("pci")
+        label = f"card {index} {uuid or '<no uuid>'} {pci or '<no pci>'}"
         if not isinstance(uuid, str) or not uuid:
-            found.append("identity_uuid_missing")
+            add("identity_uuid_missing", f"{label}: no uuid")
             continue
         if kernel is not None and uuid not in kernel:
-            found.append("identity_uuid_not_in_container_kernel")
+            add(
+                "identity_uuid_not_in_container_kernel",
+                f"{label}: not in kernel {kernel}",
+            )
             continue
-        if minors is not None and minors.get(uuid) != card.get("minor"):
-            found.append("identity_minor_mismatch")
-        pci = card.get("pci")
-        if pcis is not None and isinstance(pci, str) and pci and pcis.get(uuid, "") != pci.lower():
-            found.append("identity_pci_mismatch")
+        kernel_minor = minors.get(uuid) if minors is not None else None
+        if minors is not None and kernel_minor != card.get("minor"):
+            add(
+                "identity_minor_mismatch",
+                f"{label}: block minor {card.get('minor')}, kernel minor {kernel_minor}",
+            )
+        kernel_pci = pcis.get(uuid) if pcis is not None else None
+        if pcis is not None and isinstance(pci, str) and pci and kernel_pci != pci.lower():
+            add(
+                "identity_pci_mismatch",
+                f"{label}: block pci {pci}, kernel pci {kernel_pci}",
+            )
         if card.get("dev_node_present") is False:
-            found.append("identity_dev_node_missing")
-    return list(dict.fromkeys(found))
+            add("identity_dev_node_missing", f"{label}: /dev/nvidia{card.get('minor')} missing")
+    return found, details[:32]
 
 
 def digest(values: list[str]) -> str:
@@ -256,18 +277,18 @@ class HardwareIdentityCheck:
             findings.append("dmi_overlaid")
         if gpu_sources_disagree(reported, host_kernel or kernel):
             findings.append("gpu_sources_disagree")
-        identity_findings = gpu_identity_kernel_findings(
+        identity_findings, identity_details = gpu_identity_kernel_findings(
             identity_cards, kernel, view.minors, view.pcis
         )
         if identity_findings:
+            logger.warning(
+                "liumd gpu_identity container kernel cross-check: reasons=%s details=%s",
+                identity_findings,
+                identity_details,
+                extra=ctx.default_extra,
+            )
             if settings.VALIDATOR_LIUMD_EVIDENCE_MODE == "enforce":
                 findings.extend(identity_findings)
-            else:
-                logger.warning(
-                    "liumd gpu_identity container kernel cross-check: %s",
-                    identity_findings,
-                    extra=ctx.default_extra,
-                )
         if dmi_identity_drifted(previous, gpus, dmi_identity, boot_id):
             findings.append("dmi_changed_under_same_gpus")
 

@@ -388,15 +388,20 @@ async def test_identity_block_matches_the_container_kernel(context_factory):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("field", "value", "reason"),
+    ("field", "value", "reason", "detail"),
     [
-        ("minor", 7, "identity_minor_mismatch"),
-        ("pci", "0000:00:2f.0", "identity_pci_mismatch"),
-        ("dev_node_present", False, "identity_dev_node_missing"),
+        ("minor", 7, "identity_minor_mismatch", "block minor 7, kernel minor 0"),
+        (
+            "pci",
+            "0000:00:2f.0",
+            "identity_pci_mismatch",
+            "block pci 0000:00:2f.0, kernel pci 0000:00:1b.0",
+        ),
+        ("dev_node_present", False, "identity_dev_node_missing", "/dev/nvidia0 missing"),
     ],
 )
 async def test_identity_mismatch_follows_shadow_and_enforce(
-    context_factory, monkeypatch, caplog, field, value, reason
+    context_factory, monkeypatch, caplog, field, value, reason, detail
 ):
     kwargs = dict(
         stdout=_stdout(),
@@ -411,6 +416,8 @@ async def test_identity_mismatch_follows_shadow_and_enforce(
     assert shadow.passed is True
     assert shadow.event.what_we_saw["identity_findings"] == [reason]
     assert any(reason in record.getMessage() for record in caplog.records)
+    assert any(detail in record.getMessage() for record in caplog.records)
+    assert detail not in str(shadow.event.what_we_saw)
 
     monkeypatch.setattr(hardware_identity.settings, "VALIDATOR_LIUMD_EVIDENCE_MODE", "enforce")
     enforced = await _run(_ctx(context_factory, **kwargs))

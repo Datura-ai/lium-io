@@ -400,6 +400,7 @@ async def test_shadow_logs_a_mismatch_and_passes(monkeypatch, caplog):
     extra = line.msg.extra
     assert extra["mode"] == "shadow" and extra["would_fail"] is True
     assert "duplicate_uuid" in extra["reasons"]
+    assert any("duplicate uuid" in d for d in extra["details"])
     assert extra["claimed_count"] == extra["evidence_count"] == 2
 
 

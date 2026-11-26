@@ -62,6 +62,9 @@ async def test_captured_specs_in_both_modes(monkeypatch, caplog):
                 reasons = set(line.msg.extra["reasons"])
                 assert line.msg.extra["mode"] == "shadow", case["name"]
                 assert line.msg.extra["would_fail"] is bool(reasons), case["name"]
+                assert "details" in line.msg.extra, case["name"]
+                if expected:
+                    assert line.msg.extra["details"], case["name"]
                 assert expected <= reasons, (case["name"], expected, reasons)
             elif expected:
                 assert result.passed is False, case["name"]

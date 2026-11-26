@@ -57,6 +57,27 @@ def _has_duplicates(values: list[str | None]) -> bool:
     return len(present) != len(set(present))
 
 
+DETAIL_MAX = 32
+DETAIL_CHARS = 240
+
+
+def _card_label(index: int, card: dict[str, Any]) -> str:
+    uuid = _as_text(card.get("uuid")) or "<no uuid>"
+    pci = _as_text(card.get("pci")) or "<no pci>"
+    return f"card {index} {uuid} {pci}"
+
+
+def _duplicate_groups(cards: list[dict[str, Any]], field: str) -> list[tuple[str, list[int]]]:
+    groups: dict[str, tuple[str, list[int]]] = {}
+    for index, card in enumerate(cards):
+        value = _as_text(card.get(field))
+        if not value:
+            continue
+        _original, indexes = groups.setdefault(value.lower(), (value, []))
+        indexes.append(index)
+    return [(value, indexes) for value, indexes in groups.values() if len(indexes) > 1]
+
+
 def evaluate_gpu_identity(
     identity: Any,
     claimed_count: Any,
@@ -64,7 +85,12 @@ def evaluate_gpu_identity(
     claimed_model: str | None = None,
 ) -> dict[str, Any]:
     """The validator's own verdict on the scrape's identity block. Defensive: junk is a mismatch,
-    never an exception."""
+    never an exception.
+
+    `reasons` is the stable code set used by the check and the event. `details` is the
+    operator log: card index, UUID, PCI and the two values that disagreed. It is never put in
+    the event, so a miner cannot read our internals from the backend.
+    """
     block = _as_dict(identity)
     cards_value = block.get("cards")
     claimed = _as_int(claimed_count)
@@ -75,66 +101,84 @@ def evaluate_gpu_identity(
         "nvidia_module_present": block.get("nvidia_module_present") is True,
         "proc_driver_present": block.get("proc_driver_present") is True,
         "reasons": [],
+        "details": [],
         "would_fail": False,
     }
     if not isinstance(cards_value, list):
         judged["reasons"] = ["identity_missing"]
+        judged["details"] = ["identity block missing or cards is not a list"]
         judged["would_fail"] = True
         return judged
 
     cards = [_as_dict(card) for card in cards_value if isinstance(card, dict)]
     judged["evidence_count"] = len(cards)
     reasons: list[str] = []
+    details: list[str] = []
 
-    def add(reason: str) -> None:
+    def add(reason: str, detail: str) -> None:
         if reason not in reasons:
             reasons.append(reason)
+        detail = detail[:DETAIL_CHARS]
+        if detail not in details:
+            details.append(detail)
 
     if not judged["nvidia_module_present"]:
-        add("nvidia_module_missing")
+        add("nvidia_module_missing", "nvidia kernel module is not present")
     if not judged["proc_driver_present"]:
-        add("proc_driver_missing")
+        add("proc_driver_missing", "/proc/driver/nvidia/gpus is not readable")
     if claimed is not None and len(cards) < claimed:
-        add("missing_card")
+        add("missing_card", f"claimed {claimed} cards, evidence has {len(cards)}")
     if claimed is not None and len(cards) > claimed:
-        add("extra_card")
-    if _has_duplicates([_as_text(card.get("uuid")) for card in cards]):
-        add("duplicate_uuid")
-    if _has_duplicates([_as_text(card.get("pci")) for card in cards]):
-        add("duplicate_pci")
-    for card in cards:
+        add("extra_card", f"claimed {claimed} cards, evidence has {len(cards)}")
+    for value, indexes in _duplicate_groups(cards, "uuid"):
+        add("duplicate_uuid", f"duplicate uuid {value} on cards {indexes}")
+    for value, indexes in _duplicate_groups(cards, "pci"):
+        add("duplicate_pci", f"duplicate pci {value} on cards {indexes}")
+    for index, card in enumerate(cards):
+        label = _card_label(index, card)
         if not _as_text(card.get("uuid")):
-            add("uuid_missing")
+            add("uuid_missing", f"{label}: no uuid")
         if not _as_text(card.get("pci")):
-            add("pci_missing")
+            add("pci_missing", f"{label}: no pci")
         sources = _as_dict(card.get("sources"))
         nvml = _as_dict(sources.get("nvml"))
         proc = _as_dict(sources.get("proc"))
         sysfs = _as_dict(sources.get("sysfs"))
         if not nvml:
-            add("nvml_source_missing")
+            add("nvml_source_missing", f"{label}: nvml source missing")
         if not proc:
-            add("proc_source_missing")
+            add("proc_source_missing", f"{label}: proc source missing")
         if not sysfs:
-            add("sysfs_source_missing")
+            add("sysfs_source_missing", f"{label}: sysfs source missing")
         for name, fields in SOURCE_FIELDS.items():
             source = _as_dict(sources.get(name))
             if not source:
                 continue
             for field in fields:
-                if not _field_agrees(field, card.get(field), source.get(field)):
-                    label = "vram" if field == "vram_mb" else field
-                    add(f"{name}_{label}_mismatch")
+                declared, reported = card.get(field), source.get(field)
+                if not _field_agrees(field, declared, reported):
+                    label_field = "vram" if field == "vram_mb" else field
+                    add(
+                        f"{name}_{label_field}_mismatch",
+                        f"{label}: {name} {field} {reported!r}, card says {declared!r}",
+                    )
         vendor = _as_text(sysfs.get("vendor"))
         if vendor is not None and vendor.lower() != SYSFS_VENDOR:
-            add("sysfs_vendor_mismatch")
+            add("sysfs_vendor_mismatch", f"{label}: sysfs vendor {vendor}, expected {SYSFS_VENDOR}")
         if card.get("dev_node_present") is False:
-            add("dev_node_missing")
+            minor = card.get("minor")
+            add(
+                "dev_node_missing",
+                f"{label}: /dev/nvidia{minor if minor is not None else '<minor>'} missing",
+            )
         model = _as_text(card.get("model"))
         if claimed_model and model and model.lower() != claimed_model.strip().lower():
-            add("claimed_model_mismatch")
+            add("claimed_model_mismatch", f"{label}: model {model!r}, claimed {claimed_model!r}")
 
     judged["reasons"] = reasons
+    judged["details"] = details[:DETAIL_MAX]
+    if len(details) > DETAIL_MAX:
+        judged["details"].append(f"... {len(details) - DETAIL_MAX} more")
     judged["would_fail"] = bool(reasons)
     return judged
 
@@ -153,6 +197,7 @@ def log_gpu_identity(ctx: Context, judged: dict[str, Any], mode: str) -> None:
         "nvidia_module_present": judged["nvidia_module_present"],
         "proc_driver_present": judged["proc_driver_present"],
         "reasons": judged["reasons"],
+        "details": judged.get("details", []),
         "would_fail": judged["would_fail"],
     }
     try:

@@ -162,3 +162,19 @@ def test_timing_and_benchmark_fields_are_measurements_not_reasons():
     report["first_result_spread_ms"] = 999_999
 
     assert _reasons(report) == []
+
+
+def test_details_name_the_card_and_the_two_values():
+    judged = evaluate_gpu_identity(
+        _report(_card(0, uuid="GPU-1"), _card(1, uuid="GPU-1")), 2
+    )
+    assert any("duplicate uuid" in detail and "cards [0, 1]" in detail for detail in judged["details"])
+
+    card = _card()
+    card["sources"]["nvml"]["uuid"] = "GPU-OTHER"
+    judged = evaluate_gpu_identity(_report(card), 1)
+    assert any("card 0" in detail and "nvml uuid" in detail and "GPU-OTHER" in detail for detail in judged["details"])
+
+
+def test_clean_details_are_empty():
+    assert evaluate_gpu_identity(_report(_card()), 1)["details"] == []
