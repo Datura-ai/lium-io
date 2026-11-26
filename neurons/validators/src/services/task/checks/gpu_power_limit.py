@@ -105,8 +105,8 @@ def _limit_below_default_event(
     measurements: list[GpuPowerMeasurement],
     incomplete: list[GpuPowerMeasurement],
     host_limit_rejected: bool,
-):
-    measured = "; ".join(
+) -> ValidationEvent:
+    measured ="; ".join(
         f"GPU {m.index}: {shown(m.power_limit, 0, failed_below=True)} W limit, "
         f"default {m.power_default_limit:.0f} W "
         f"({shown(m.power_limit / m.power_default_limit * 100, 0, failed_below=True)}%)"
