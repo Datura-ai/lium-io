@@ -48,11 +48,12 @@ async def test_captured_specs_in_both_modes(monkeypatch, caplog):
             _start_reading(monkeypatch, _answer(case["specs"]))
             runner = DummySSHCommandRunner(result=make_command_result(success=False))
 
-            with caplog.at_level(logging.WARNING, logger=gpu_identity.__name__):
+            with caplog.at_level(logging.INFO, logger=gpu_identity.__name__):
                 result = await MachineSpecScrapeCheck().run(_ctx(runner))
 
             if mode == "shadow":
-                assert result.passed is True, case["name"]
+                assert result.passed is True, (case["name"], result.event.what_we_saw)
+                assert result.event.what_we_saw.get("delivery") == "liumd", (case["name"], result.event.what_we_saw)
                 [line] = [
                     r
                     for r in caplog.records
