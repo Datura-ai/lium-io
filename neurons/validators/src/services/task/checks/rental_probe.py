@@ -260,6 +260,7 @@ _WIPE_TEARDOWN_EXTRA_SECONDS = 120
 _SHELL_COMMAND_TIMEOUT_SECONDS = 60
 # every string copied out of the host into the event is bounded (PR_PROCESS §5)
 _TAIL_CHARS = 600
+_OUTPUT_SEP = " | output: "
 _REDIS_LAST_OK_PREFIX = RENTAL_PROBE_OK_PREFIX
 # the failed step of the last probe, standing until a probe passes (review: a skipped or inconclusive
 # next cycle must not relist the node without a clean probe). It has no lifetime: a broken node relisted
@@ -1288,14 +1289,13 @@ def _step_gpu_count(ctx: Context, outcome: _ProbeOutcome, login: _Login, beside_
             summary = (
                 f"expected {expected} GPU(s), nvidia-smi -L listed {seen} (exit {smi.exit_status})"
                 + (f", {short}" if short else "")
-                + " | output: "
-            )
-            # the record keeps the last _TAIL_CHARS of a detail: the output gets only the room the summary
-            # leaves, so the usable count is never cut off
-            room = max(_TAIL_CHARS - len(summary), 0)
+            )[: _TAIL_CHARS - len(_OUTPUT_SEP)] + _OUTPUT_SEP
+            # the record keeps the last _TAIL_CHARS of a detail: the summary is cut at its end and the output
+            # gets only the room it leaves, so the usable count at its start is never cut off
+            room = _TAIL_CHARS - len(summary)
             detail = summary + ((smi.stderr or smi_out or "")[-room:] if room else "")
         else:
-            detail = f"expected {expected} GPU(s), nvidia-smi -L listed {seen} but {short}"
+            detail = f"expected {expected} GPU(s), nvidia-smi -L listed {seen} but {short}"[:_TAIL_CHARS]
     outcome.steps.append(_Step(STEP_GPU_COUNT, login.command_seconds, gpu_ok, detail))
     if not gpu_ok:
         outcome.failed_step = STEP_GPU_COUNT
@@ -1828,9 +1828,8 @@ def _confirm_cuda_devices(
                     matched.add(uuid)
         twice = {uuid for uuid, n in seen.items() if n > 1}
         if twice:
-            # two devices behind one UUID are one card
+            # two devices behind one UUID are one card: it counts once, the listed cards it hides are missing
             problems.append(f"{label} reports {len(twice)} GPU UUID(s) on more than one device")
-            matched -= twice
         missing = len(set(listed) - set(seen))
         if missing:
             problems.append(f"{missing} listed GPU(s) are no {label} device")

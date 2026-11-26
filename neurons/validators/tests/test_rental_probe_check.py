@@ -2256,9 +2256,22 @@ def test_gpu_count_fails_cuda_devices_with_the_wrong_memory_or_one_uuid_twice():
     detail = _shape_step(one_uuid).steps[-1].detail
     unreadable = cuda_devices(SHAPE_LISTING, 8).replace(f"{SHAPE_UUIDS[2]}\t24000", f"{SHAPE_UUIDS[2]}\tlots")
     assert "reported no readable memory size" in _shape_step(unreadable).steps[-1].detail
-    assert "0 of 8 GPU(s) confirmed usable" in detail
+    # one card behind eight devices counts once
+    assert "1 of 8 GPU(s) confirmed usable" in detail
     assert "CUDA reports 1 GPU UUID(s) on more than one device" in detail
     assert "7 listed GPU(s) are no CUDA device" in detail
+
+
+def test_gpu_count_keeps_the_confirmed_count_in_a_long_failure_record():
+    """The record keeps a detail's last _TAIL_CHARS: a long diagnostic is cut at its end, not its count."""
+    long_name = "NVIDIA " + "X" * 400
+    devices = cuda_devices(SHAPE_LISTING, 8)
+    for uuid in SHAPE_UUIDS[:4]:
+        devices = devices.replace(f"{uuid}\t24000\tNVIDIA GeForce RTX 4090", f"{uuid}\t24000\t{long_name}")
+    outcome = _shape_step(devices)
+    assert outcome.failed_step == STEP_GPU_COUNT
+    detail = outcome.steps[-1].as_record()["detail"]
+    assert detail.startswith("expected 8 GPU(s), nvidia-smi -L listed 8 but 4 of 8 GPU(s) confirmed usable")
 
 
 def test_gpu_count_keeps_the_usable_count_when_every_cuda_device_fails():
