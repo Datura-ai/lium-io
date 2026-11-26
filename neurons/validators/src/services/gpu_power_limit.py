@@ -1001,17 +1001,17 @@ async def restore_tracked_gpu_power_limits(
     host_probe: PrerunHostProbe | None = None,
     concurrency: int = POWER_LIMIT_SET_CONCURRENCY,
     require_complete: bool = False,
-    require_restored: bool = False,
+    require_recorded_gpus_restored: bool = False,
 ) -> int:
     """Restore the frozen pre-cap limit of every tracked GPU among ``gpu_uuids``.
 
     Best-effort by default; returns the number of records restored and cleared.
     ``require_complete`` raises on unreadable records or any restore not confirmed and cleared, and
     on a GPU without a record that the host does not show at 80 % of its default limit or more.
-    ``require_restored`` (a customer create) raises on unreadable records or any restore not confirmed
+    ``require_recorded_gpus_restored`` (a customer create) raises on unreadable records or any restore not confirmed
     and cleared, but leaves a record-less GPU to the caller's live floor raise.
     """
-    strict = require_complete or require_restored
+    strict = require_complete or require_recorded_gpus_restored
     read_result = await read_gpu_power_restore_records(redis, gpu_uuids, log_extra, require_complete=strict)
     # A GPU of the index whose record is gone was restored already, e.g. by the customer create's own
     # restore before its `docker run`; strict callers confirm that on the GPU itself.
@@ -1052,29 +1052,29 @@ async def restore_all_host_gpu_power_limits(
     *,
     host_probe: PrerunHostProbe | None = None,
     concurrency: int = POWER_LIMIT_SET_CONCURRENCY,
-    require_restored: bool = False,
+    require_recorded_gpus_restored: bool = False,
 ) -> int:
     """Enumerate the host's GPUs over SSH and restore every tracked one — for whole-node containers
-    whose payload names no gpu_uuids. Best-effort unless ``require_restored`` (a customer create), which
+    whose payload names no gpu_uuids. Best-effort unless ``require_recorded_gpus_restored`` (a customer create), which
     raises when the GPUs or their records cannot be read or a restore is not confirmed and cleared;
     returns the restored count."""
     try:
         state_by_uuid = await _query_power_state(ssh, host_probe=host_probe)
     except Exception as exc:
-        if require_restored:
+        if require_recorded_gpus_restored:
             # the host's nvidia-smi: the create fails as the node's and the renter is moved
             raise RuntimeError(f"GPU power state could not be read to restore before a rental: {exc!r}") from exc
         _log(logging.ERROR, f"gpu power restore: state query failed: {exc}; will retry later", {}, log_extra)
         return 0
     read_result = await read_gpu_power_restore_records(
-        redis, list(state_by_uuid), log_extra, require_complete=require_restored
+        redis, list(state_by_uuid), log_extra, require_complete=require_recorded_gpus_restored
     )
     if not read_result.records:
         return 0
     restored = await _restore_records(
-        ssh, redis, read_result.records, state_by_uuid, log_extra, concurrency, require_complete=require_restored
+        ssh, redis, read_result.records, state_by_uuid, log_extra, concurrency, require_complete=require_recorded_gpus_restored
     )
-    if require_restored and restored != len(read_result.records):
+    if require_recorded_gpus_restored and restored != len(read_result.records):
         raise RuntimeError("GPU power restoration incomplete")
     return restored
 

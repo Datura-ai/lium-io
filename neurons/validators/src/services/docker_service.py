@@ -10421,7 +10421,7 @@ class DockerService:
                 log_extra=default_extra,
                 host_probe=host_probe,
                 concurrency=concurrency,
-                require_restored=record_rental_start,
+                require_recorded_gpus_restored=record_rental_start,
             )
         else:
             # empty gpu_uuids = whole-node container (--gpus all) → check every host GPU
@@ -10431,7 +10431,7 @@ class DockerService:
                 log_extra=default_extra,
                 host_probe=host_probe,
                 concurrency=concurrency,
-                require_restored=record_rental_start,
+                require_recorded_gpus_restored=record_rental_start,
             )
         # State-free last-resort net: if a pre-cap record was lost, the record-based
         # restore above did nothing — lift anything still below the check's floor back

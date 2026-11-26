@@ -172,8 +172,8 @@ async def test_a_customer_create_never_starts_on_a_cap_whose_restore_failed(whol
 
     async def restore():
         if whole_node:
-            return await restore_all_host_gpu_power_limits(ssh, redis, require_restored=strict)
-        return await restore_tracked_gpu_power_limits(ssh, redis, ["GPU-a", "GPU-b"], require_restored=strict)
+            return await restore_all_host_gpu_power_limits(ssh, redis, require_recorded_gpus_restored=strict)
+        return await restore_tracked_gpu_power_limits(ssh, redis, ["GPU-a", "GPU-b"], require_recorded_gpus_restored=strict)
 
     if strict:
         # the host's fault: the create fails and the renter is moved; the record stays for the retry
@@ -202,7 +202,7 @@ async def test_a_failed_restore_set_on_a_gpu_already_at_the_recorded_limit_is_a_
 
     ssh = AsyncMock(run=AsyncMock(side_effect=run))
     # Act / Assert: the strict restore succeeds and clears the record instead of failing the rent.
-    assert await restore_tracked_gpu_power_limits(ssh, redis, ["GPU-a"], require_restored=True) == 1
+    assert await restore_tracked_gpu_power_limits(ssh, redis, ["GPU-a"], require_recorded_gpus_restored=True) == 1
     assert _restore_key("GPU-a") not in redis.store
 
 
@@ -219,9 +219,9 @@ async def test_a_customer_create_restores_and_leaves_record_less_gpus_to_the_flo
 
     ssh = AsyncMock(run=AsyncMock(side_effect=run))
     if whole_node:
-        restored = await restore_all_host_gpu_power_limits(ssh, redis, require_restored=True)
+        restored = await restore_all_host_gpu_power_limits(ssh, redis, require_recorded_gpus_restored=True)
     else:
-        restored = await restore_tracked_gpu_power_limits(ssh, redis, ["GPU-a", "GPU-b"], require_restored=True)
+        restored = await restore_tracked_gpu_power_limits(ssh, redis, ["GPU-a", "GPU-b"], require_recorded_gpus_restored=True)
     assert restored == 1
     assert not redis.store
 
@@ -231,7 +231,7 @@ async def test_a_whole_node_customer_create_with_an_unreadable_host_fails_as_the
     redis = FakeRedis({_restore_key("GPU-a"): _record("GPU-a", 400)})
     ssh = AsyncMock(run=AsyncMock(side_effect=TimeoutError()))
     with pytest.raises(RuntimeError) as caught:
-        await restore_all_host_gpu_power_limits(ssh, redis, require_restored=True)
+        await restore_all_host_gpu_power_limits(ssh, redis, require_recorded_gpus_restored=True)
     assert type(caught.value) is RuntimeError
     assert await restore_all_host_gpu_power_limits(ssh, redis) == 0
 
@@ -252,7 +252,7 @@ async def test_only_the_customer_creates_last_restore_is_strict(monkeypatch, gpu
         SimpleNamespace(redis_service=object()), AsyncMock(), payload, None, {}, record_rental_start=record_rental_start
     )
     restore_mock = tracked if gpu_uuids else whole
-    assert restore_mock.await_args.kwargs["require_restored"] is record_rental_start
+    assert restore_mock.await_args.kwargs["require_recorded_gpus_restored"] is record_rental_start
 
 
 @pytest.mark.asyncio
