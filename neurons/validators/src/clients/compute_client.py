@@ -1130,6 +1130,10 @@ class ComputeClient:
                 ))
                 await self._run_miner_job(job_request)
                 return
+            for reply in replies:
+                if isinstance(reply, FailedContainerRequest):
+                    # the cache key is the send it answers; a reply cached before the echo has none (DAH-7216)
+                    reply.command_id = command_id
             async with self.lock:
                 for reply in replies:
                     self.message_queue.append(reply)
