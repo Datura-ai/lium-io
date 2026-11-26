@@ -1415,8 +1415,9 @@ def _last_attempt_exception(exc: Exception) -> BaseException:
     return exc
 
 
-class _CreateCancelledByDelete(Exception):
-    """Raised at a create checkpoint when this pod's delete has already reported it gone."""
+class _CreateCancelledByDelete(ContainerCreateRefused):
+    """Raised at a create checkpoint when this pod's delete has already reported it gone; also by the run spec's
+    `before_start_call`, so the container is never started."""
 
 
 class _SameNameContainerKept(Exception):
@@ -2506,7 +2507,16 @@ class _InflightCreate:
     # entry outlives any single one of them and only the last to leave clears it.
     running: int = 0
     cancelled_by_delete: bool = False
+    # attempts in their run step, which removes its own container after a delete (`removes_own_container`)
+    removing_own: int = 0
+    # set once a delete need not wait for this create: every attempt left, or each is in its run step
     done: asyncio.Event = field(default_factory=asyncio.Event)
+
+    def settle(self) -> None:
+        if self.running <= 0 or self.removing_own >= self.running:
+            self.done.set()
+        else:
+            self.done.clear()
     cancelled: asyncio.Event = field(default_factory=asyncio.Event)
 
 
@@ -2550,6 +2560,7 @@ class _InflightCreateRegistry:
         key = (pod_id, executor)
         create = self._creates.setdefault(key, _InflightCreate())
         create.running += 1
+        create.settle()
         try:
             yield
         finally:
@@ -2557,7 +2568,22 @@ class _InflightCreateRegistry:
             create.running -= 1
             if create.running <= 0:
                 self._creates.pop(key, None)
-                create.done.set()
+            create.settle()
+
+    @contextlib.contextmanager
+    def removes_own_container(self, pod_id: str, executor: ExecutorKey) -> Iterator[None]:
+        """The create's run step: dockerd's `containers/create` cannot be cancelled, and the create removes the
+        container itself (never started) after a delete, so a delete need not wait for it and answers at once."""
+        creates = self._matching(pod_id, executor)
+        for create in creates:
+            create.removing_own += 1
+            create.settle()
+        try:
+            yield
+        finally:
+            for create in creates:
+                create.removing_own -= 1
+                create.settle()
 
     def _matching(self, pod_id: str, executor: ExecutorKey | None) -> list[_InflightCreate]:
         executor = executor or self._held.get().get(pod_id)
@@ -2590,7 +2616,8 @@ class _InflightCreateRegistry:
         return sum(create.running for create in self._matching(pod_id, executor)) == 1
 
     async def wait_until_done(self, pod_id: str, timeout: float, executor: ExecutorKey | None = None) -> bool:
-        """Wait for the create(s) on this pod to leave. False when the wait ran out."""
+        """Wait for the create(s) on this pod to leave, or to be in the run step that removes its own container
+        (`removes_own_container`). False when the wait ran out."""
         creates = self._matching(pod_id, executor)
         if not creates:
             return True
@@ -2750,6 +2777,13 @@ def _is_filler_create_beside_customer_create(payload: ContainerCreateRequest) ->
         payload.workload_kind == WorkloadKind.FILLER
         and customer_creates.ran_since_filler_started(payload)
     )
+
+
+def _refuse_start_after_delete(payload: ContainerCreateRequest) -> None:
+    """In the Docker thread, right before the start: a delete that overtook dockerd's create leaves the container
+    unstarted for the create's own removal. The executor is named: the thread does not carry the create's context."""
+    if inflight_creates.is_cancelled(payload.pod_id, executor_key(payload)):
+        raise _CreateCancelledByDelete(f"delete for pod {payload.pod_id} arrived before its container started")
 
 
 def _refuse_filler_during_customer_create(payload: ContainerCreateRequest) -> None:
@@ -4704,6 +4738,7 @@ class DockerService:
                 if payload.workload_kind == WorkloadKind.FILLER
                 else None
             ),
+            before_start_call=lambda: _refuse_start_after_delete(payload),
         )
 
     async def _ensure_pod_quote_socket(
@@ -11986,43 +12021,47 @@ class DockerService:
                     # again right before the create: a customer create may register while the run
                     # waits for a thread.
                     _refuse_filler_during_customer_create(payload)
-                    container_id = await self._run_rental_docker_create_with_port_retry(
-                        docker_client=docker_client,
-                        ssh_client=ssh_client,
-                        run_spec=run_spec,
-                        container_name=container_name,
-                        default_extra=default_extra,
-                        local_volume=local_volume,
-                        log_tag=log_tag,
-                        port_maps=port_maps,
-                        spare_port_pairs=_spare_port_pairs(payload.available_ports, port_maps),
-                        pod_id=payload.pod_id,
-                        # a filler removes no probe, so it has no live re-removal to run on a bind refusal
-                        remove_port_checks_listed_live=(
-                            None
-                            if probed_port_check_names is None or payload.workload_kind == WorkloadKind.FILLER
-                            else lambda: self.wait_for_port_check_containers(
-                                executor_info=executor_info,
-                                miner_hotkey=payload.miner_hotkey,
-                                keypair=keypair,
-                                private_key=private_key,
-                                ssh_client=ssh_client,
-                            )
-                        ),
-                        # fillers keep no RepoDigests on a flattened copy, so their image check would be skipped
-                        flatten_reserved_bytes=(
-                            _flatten_reserved_bytes(
-                                effective_storage_limit_gb, effective_volume_limit_gb, payload.disk_share
-                            )
-                            if payload.workload_kind == WorkloadKind.CUSTOMER_RENTAL
-                            else None
-                        ),
-                        before_flatten_retry=lambda: self._abort_if_cancelled_by_delete(
-                            ssh_client, payload, default_extra, settle_early_probes
-                        ),
-                        flatten_beside_other_create=lambda: customer_creates.others_running(payload),
-                    )
+                    with inflight_creates.removes_own_container(payload.pod_id, executor_key(payload)):
+                        container_id = await self._run_rental_docker_create_with_port_retry(
+                            docker_client=docker_client,
+                            ssh_client=ssh_client,
+                            run_spec=run_spec,
+                            container_name=container_name,
+                            default_extra=default_extra,
+                            local_volume=local_volume,
+                            log_tag=log_tag,
+                            port_maps=port_maps,
+                            spare_port_pairs=_spare_port_pairs(payload.available_ports, port_maps),
+                            pod_id=payload.pod_id,
+                            # a filler removes no probe, so it has no live re-removal to run on a bind refusal
+                            remove_port_checks_listed_live=(
+                                None
+                                if probed_port_check_names is None or payload.workload_kind == WorkloadKind.FILLER
+                                else lambda: self.wait_for_port_check_containers(
+                                    executor_info=executor_info,
+                                    miner_hotkey=payload.miner_hotkey,
+                                    keypair=keypair,
+                                    private_key=private_key,
+                                    ssh_client=ssh_client,
+                                )
+                            ),
+                            # fillers keep no RepoDigests on a flattened copy, so their image check would be skipped
+                            flatten_reserved_bytes=(
+                                _flatten_reserved_bytes(
+                                    effective_storage_limit_gb, effective_volume_limit_gb, payload.disk_share
+                                )
+                                if payload.workload_kind == WorkloadKind.CUSTOMER_RENTAL
+                                else None
+                            ),
+                            before_flatten_retry=lambda: self._abort_if_cancelled_by_delete(
+                                ssh_client, payload, default_extra, settle_early_probes
+                            ),
+                            flatten_beside_other_create=lambda: customer_creates.others_running(payload),
+                        )
                     edit_swap.replacement_id = container_id
+                    # the run waited for dockerd's outcome, which a delete may have overtaken: the handler
+                    # below removes the container and its volume
+                    await self._abort_if_cancelled_by_delete(ssh_client, payload, default_extra, settle_early_probes)
                     # A customer create that ran while the daemon created this container may have
                     # swept the host before it was listed: remove it by its ID (handler below).
                     _refuse_filler_during_customer_create(payload)
@@ -12126,7 +12165,7 @@ class DockerService:
                             default_extra=default_extra,
                         )
                     if isinstance(
-                        docker_run_error, _FillerRefusedForCustomerCreate
+                        docker_run_error, (_FillerRefusedForCustomerCreate, _CreateCancelledByDelete)
                     ) or _is_filler_create_beside_customer_create(payload):
                         # DAH-2356: the PEARL cap applied above must not stay on the GPUs the customer
                         # is about to get; lifted only after the container is removed.
