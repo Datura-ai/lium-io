@@ -436,7 +436,7 @@ class RunningOutageTally:
 # DAH-5395: the failure reasons that hide the node at once. Any other failed run keeps the backend's usual rule.
 # RENTAL_PROBE_NOT_YET_PROVEN (DAH-7044): a node is first listed by a rental probe that passed.
 REASONS_THAT_HIDE_AT_ONCE = frozenset(
-    {"GPU_DETAILS_MISMATCH", "GPU_UUID_CHANGED", "NVLINK_FAULT", "RENTAL_PROBE_NOT_YET_PROVEN"}
+    {"GPU_DETAILS_MISMATCH", "GPU_UUID_CHANGED", "LOGIN_USER_NOT_ROOT", "NVLINK_FAULT", "RENTAL_PROBE_NOT_YET_PROVEN"}
 )
 
 

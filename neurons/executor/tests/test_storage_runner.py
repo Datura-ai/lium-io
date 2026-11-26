@@ -64,6 +64,8 @@ POD_ID = UUID("22222222-2222-4222-8222-222222222222")
 SNAPSHOT_ID = "a" * 64
 CONTAINER_ID = "b" * 64
 
+RUNNER = str(Path(storage_runner.__file__).resolve())
+
 
 def _operation_payload(
     *,
@@ -998,7 +1000,7 @@ def test_a_helper_whose_start_fails_is_removed(monkeypatch: pytest.MonkeyPatch) 
 
     monkeypatch.setattr("storage.restic.subprocess.run", fake_run)
     with pytest.raises(ResticOperationError):
-        runner.launch_wrapper_helper("/usr/bin/python3", "/root/app/src/storage_runner.py", json.dumps(payload))
+        runner.launch_wrapper_helper("/usr/bin/python3", RUNNER, json.dumps(payload))
 
     assert calls[-1][1:] == ["rm", "--force", runner._helper_container_name()]
 
@@ -1015,7 +1017,7 @@ def _launched_helper(
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr("storage.restic.subprocess.run", fake_run)
-    runner.launch_wrapper_helper("/usr/bin/python3", "/root/app/src/storage_runner.py", spec_json)
+    runner.launch_wrapper_helper("/usr/bin/python3", RUNNER, spec_json)
     return launched[0]
 
 
@@ -2128,7 +2130,7 @@ def test_executor_only_launches_the_helper_detached_with_the_runner_as_its_entry
 
     def fake_run(command: list[str], *args: object, **kwargs: object) -> SimpleNamespace:
         calls.append((command, kwargs.get("env") or {}))  # type: ignore[arg-type]
-        if command[1] == "exec":
+        if command[1] == "exec" and command[-1] == restic.HELPER_SPEC_PATH:
             spec_inputs.append(kwargs["input"])  # type: ignore[arg-type]
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
@@ -2141,14 +2143,19 @@ def test_executor_only_launches_the_helper_detached_with_the_runner_as_its_entry
     assert "--detach" in command and "--rm" not in command
     assert f"{restic.HELPER_SPEC_DIR}:rw,nosuid,nodev,noexec,size=1m,mode=0700" in command
     entrypoint = command.index("--entrypoint")
-    assert command[entrypoint + 1 : entrypoint + 4] == [sys.executable, IMAGE, str(Path(storage_runner.__file__).resolve())]
-    assert command[entrypoint + 4] == "--in-helper"
+    # the helper waits for the launching runner's own files, then runs them: its image need not hold that runner
+    assert command[entrypoint + 1 : entrypoint + 7] == [
+        sys.executable, IMAGE, "-I", "-c", restic._AWAIT_HELPER_RUNNER, f"{restic.HELPER_RUNNER_DIR}/storage_runner.py"
+    ]
+    assert command[entrypoint + 7] == "--in-helper"
+    sent = next(c for c, _ in calls if c[1] == "exec" and c[-1] == restic.HELPER_RUNNER_DIR)
+    assert sent[-2] == restic._UNPACK_HELPER_RUNNER
     assert ("--namespace-pid" in command and "--privileged" in command and "host" in command) is encrypted
     assert ("customer-volume:/workspace:ro" in command) is not encrypted
     # review, Pixel: the helper's config (what docker inspect shows after it ends) holds no secret at all
     for secret in ("access-key", "secret-key", "session-token", "repository-password"):
         assert secret not in " ".join(command) + " ".join(env.values())
-    exec_command, _ = next((c, e) for c, e in calls if c[1] == "exec")
+    exec_command, _ = next((c, e) for c, e in calls if c[1] == "exec" and c[-1] == restic.HELPER_SPEC_PATH)
     assert exec_command[:4] == ["/usr/bin/docker", "exec", "-i", command[command.index("--name") + 1]]
     assert exec_command[-1] == restic.HELPER_SPEC_PATH
     assert json.loads(spec_inputs[0])["repository"]["password"] == "repository-password"
@@ -2492,7 +2499,7 @@ def test_without_detach_the_executor_returns_only_when_the_helper_ends(
     monkeypatch.setattr("storage.restic.subprocess.run", fake_run)
 
     assert storage_runner.main() == 3
-    assert calls[-5:] == ["run", "exec", "logs", "wait", "rm"]
+    assert calls[-6:] == ["run", "exec", "exec", "logs", "wait", "rm"]
 
 
 def test_the_helper_spec_write_is_atomic_and_private(tmp_path: Path) -> None:
@@ -2504,7 +2511,29 @@ def test_the_helper_spec_write_is_atomic_and_private(tmp_path: Path) -> None:
     assert not (tmp_path / "spec.json.part").exists()
 
 
-def test_a_failed_spec_hand_off_removes_the_started_helper(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_the_helper_gets_the_files_of_the_runner_that_launched_it(tmp_path: Path) -> None:
+    # the exact scripts the launch runs in the helper: a runner staged outside the image arrives whole and is started
+    staged = tmp_path / "staged"
+    (staged / "storage").mkdir(parents=True)
+    (staged / "storage_runner.py").write_text("import sys\nfrom storage import marker\nprint(marker.NAME, *sys.argv[1:])\n")
+    # a regular package, as the real one: it must win over an installed `storage` further down sys.path
+    (staged / "storage" / "__init__.py").write_text("")
+    (staged / "storage" / "marker.py").write_text("NAME = 'staged'\n")
+    target = tmp_path / "in-helper"
+    waiting = subprocess.Popen(
+        [sys.executable, "-I", "-c", restic._AWAIT_HELPER_RUNNER, str(target / "storage_runner.py"), "--in-helper"],
+        stdout=subprocess.PIPE, text=True,
+    )
+    subprocess.run(
+        [sys.executable, "-I", "-c", restic._UNPACK_HELPER_RUNNER, str(target)],
+        input=restic._runner_archive(staged / "storage_runner.py"), text=True, check=True,
+    )
+    assert waiting.communicate(timeout=30)[0] == "staged --in-helper\n"
+    assert not (tmp_path / "in-helper.part").exists()
+
+
+@pytest.mark.parametrize("failing", [restic.HELPER_RUNNER_DIR, restic.HELPER_SPEC_PATH])
+def test_a_failed_hand_off_removes_the_started_helper(monkeypatch: pytest.MonkeyPatch, failing: str) -> None:
     runner = ResticStorageRunner(
         StorageOperationSpec.from_mapping(_operation_payload()),
         DockerVolumeWorkspace(IMAGE, "customer-volume", PurePosixPath("/workspace"), True),
@@ -2513,9 +2542,27 @@ def test_a_failed_spec_hand_off_removes_the_started_helper(monkeypatch: pytest.M
 
     def fake_run(command: list[str], *args: object, **kwargs: object) -> SimpleNamespace:
         calls.append(command)
-        return SimpleNamespace(returncode=1 if command[1] == "exec" else 0, stdout="", stderr="exec failed")
+        failed = command[1] == "exec" and command[-1] == failing
+        return SimpleNamespace(returncode=1 if failed else 0, stdout="", stderr="exec failed")
 
     monkeypatch.setattr("storage.restic.subprocess.run", fake_run)
     with pytest.raises(ResticOperationError, match="did not start"):
-        runner.launch_wrapper_helper("/usr/bin/python3", "/root/app/src/storage_runner.py", "{}")
+        runner.launch_wrapper_helper("/usr/bin/python3", RUNNER, "{}")
     assert calls[-1][1:3] == ["rm", "--force"]
+
+
+def test_an_unreadable_runner_starts_no_helper(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    runner = ResticStorageRunner(
+        StorageOperationSpec.from_mapping(_operation_payload()),
+        DockerVolumeWorkspace(IMAGE, "customer-volume", PurePosixPath("/workspace"), True),
+    )
+    monkeypatch.setattr("storage.restic.subprocess.run", lambda *a, **k: pytest.fail("docker ran"))
+    with pytest.raises(OSError):
+        runner.launch_wrapper_helper("/usr/bin/python3", str(tmp_path / "storage_runner.py"), "{}")
+
+
+def test_a_cancel_during_the_wait_for_the_runner_ends_the_helper(tmp_path: Path) -> None:
+    waiting = subprocess.Popen([sys.executable, "-I", "-c", restic._AWAIT_HELPER_RUNNER, str(tmp_path / "never.py")])
+    time.sleep(0.5)
+    waiting.terminate()
+    assert waiting.wait(timeout=10) == 130
