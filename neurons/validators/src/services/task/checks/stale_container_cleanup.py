@@ -16,7 +16,7 @@ from protocol.vc_protocol.compute_requests import (
     PodRentalActiveResponse,
 )
 from protocol.vc_protocol.validator_requests import ContainerState, PodContainerState
-from services.container_cleanup import rented_list_unknown_reason
+from services.container_cleanup import SnapshotSSH, rented_list_unknown_reason
 from services.redis_service import CLEANUP_SEEN_EXECUTORS_SET
 
 from ...const import (
@@ -181,6 +181,8 @@ class StaleContainerCleanupCheck:
             reserved.add(name)
             return True
 
+        # DAH-7109: the always-run reads below are answered from this one SSH call until a command changes the host
+        ssh_client = await SnapshotSSH.take(ctx.ssh)
         if first_sight:
             removed_count, removed_names, unremovable_names = 0, [], []
         else:
@@ -189,7 +191,7 @@ class StaleContainerCleanupCheck:
                 removed_names,
                 unremovable_names,
             ) = await ctx.services.container_cleanup.cleanup(
-                ssh_client=ctx.ssh,
+                ssh_client=ssh_client,
                 rented_data=ctx.state.rented_data,
                 executor_uuid=ctx.executor.uuid,
                 on_before_remove=queue.add,
@@ -213,14 +215,14 @@ class StaleContainerCleanupCheck:
             # stamped first: a sweep cut by the step's budget must not run again next cycle ahead of the reclaim
             self._last_sweep_at[ctx.executor.uuid] = now
             swept_download_temporaries = await ctx.services.container_cleanup.sweep_abandoned_download_temporaries(
-                ssh_client=ctx.ssh,
+                ssh_client=ssh_client,
                 executor_uuid=ctx.executor.uuid,
             )
             # A volume_<uuid> whose container is gone and whose pod or filler run is over is never read
             # again; same hourly throttle, since each candidate costs backend lookups. Before the
             # reclaim below, which measures free disk itself: the renter's leftovers go first.
             removed_orphan_volumes = await ctx.services.container_cleanup.remove_orphan_rental_volumes(
-                ssh_client=ctx.ssh,
+                ssh_client=ssh_client,
                 rented_data=ctx.state.rented_data,
                 executor_uuid=ctx.executor.uuid,
                 is_orphan=lambda volume_id, age: _is_orphan_volume(ctx, volume_id, age),
@@ -232,7 +234,7 @@ class StaleContainerCleanupCheck:
         # ~37 GB forever), so a node that has fallen under the rental listing floor is rescued from
         # here, where the decision is made on real free space and outside any launch.
         reclaimed_cache_volumes = await ctx.services.container_cleanup.reclaim_dphn_cache_when_disk_is_tight(
-            ssh_client=ctx.ssh,
+            ssh_client=ssh_client,
             executor_uuid=ctx.executor.uuid,
         )
 
