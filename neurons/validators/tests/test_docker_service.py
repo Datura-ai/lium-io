@@ -8884,6 +8884,56 @@ async def test_recreated_sysbox_pod_on_existing_volume_still_caps_var_lib_docker
 
 
 @pytest.mark.asyncio
+async def test_a_restart_whose_kept_volume_is_gone_reports_its_own_step(
+    docker_service,
+    monkeypatch,
+):
+    # the backend's REBOOT_FAILED retry reads the step: a gone disk is not retried every hour
+    _patch_create_container_happy_path(docker_service, monkeypatch)
+    driver_of = AsyncMock(side_effect=docker_service_module.WorkspaceVolumeMissingError("volume_existing gone"))
+    monkeypatch.setattr(docker_service, "_vloopback_driver_of_volume", driver_of)
+    payload = ContainerCreateRequest(
+        miner_hotkey="miner",
+        executor_id=str(uuid4()),
+        pod_id=str(uuid4()),
+        workload_kind=WorkloadKind.CUSTOMER_RENTAL,
+        docker_image="daturaai/dind:test",
+        user_public_keys=["ssh-ed25519 test-key"],
+        gpu_uuids=["GPU-test"],
+        cpu_count=1,
+        memory_gb=1,
+        volume_limit_gb=80,
+        storage_limit_gb=40,
+        is_sysbox=True,
+        local_volume="volume_existing",
+        available_ports=[PayloadPortMapping(internal_port=20020, external_port=20020)],
+        pod_mapping=[],
+        active_container_names=[],
+        active_volume_names=[],
+    )
+    executor_info = ExecutorSSHInfo(
+        uuid=payload.executor_id,
+        address="127.0.0.1",
+        port=8080,
+        ssh_username="root",
+        ssh_port=2200,
+        python_path="/usr/bin/python",
+        root_dir="/root/app",
+        ssh_host_key=FAKE_SSH_HOST_KEY,
+    )
+
+    result = await docker_service.create_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    assert isinstance(result, FailedContainerRequest), result
+    assert result.failure_step == "workspace_volume_missing"
+
+
+@pytest.mark.asyncio
 async def test_create_container_encrypted_local_volume_docker_run_flags(
     docker_service,
     monkeypatch,

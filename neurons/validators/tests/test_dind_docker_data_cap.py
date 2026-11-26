@@ -5,7 +5,11 @@ from unittest.mock import AsyncMock
 
 import pytest
 from payload_models.payloads import ContainerCreateRequest, CustomOptions
-from services.docker_service import _parse_volume_host_probe, _parse_volume_size_to_bytes
+from services.docker_service import (
+    WorkspaceVolumeMissingError,
+    _parse_volume_host_probe,
+    _parse_volume_size_to_bytes,
+)
 from services.rental_docker_sdk import GpuDockerConfig, _build_host_config_kwargs
 
 from tests.test_deploy_optimizations import svc  # noqa: F401  (pytest fixture)
@@ -123,8 +127,18 @@ async def test_reused_volume_driver(svc, exit_status, stdout, expected):  # noqa
 async def test_missing_reused_volume_fails_the_create(svc):  # noqa: F811
     # a vanished workspace would be recreated by Docker as an uncapped local volume
     ssh = AsyncMock()
-    ssh.run = AsyncMock(return_value=AsyncMock(exit_status=1, stdout=""))
-    with pytest.raises(RuntimeError, match="could not be inspected"):
+    ssh.run = AsyncMock(return_value=AsyncMock(exit_status=1, stdout="", stderr="permission denied"))
+    with pytest.raises(RuntimeError, match="could not be inspected") as raised:
+        await svc._vloopback_driver_of_volume(ssh, "volume_pod", {})
+    assert not isinstance(raised.value, WorkspaceVolumeMissingError)  # a read fault is not a gone disk
+
+
+@pytest.mark.asyncio
+async def test_a_kept_volume_docker_does_not_have_is_answered_as_gone(svc):  # noqa: F811
+    ssh = AsyncMock()
+    answer = "Error response from daemon: get volume_pod: no such volume"
+    ssh.run = AsyncMock(return_value=AsyncMock(exit_status=1, stdout="", stderr=answer))
+    with pytest.raises(WorkspaceVolumeMissingError, match="kept disk is gone"):
         await svc._vloopback_driver_of_volume(ssh, "volume_pod", {})
 
 

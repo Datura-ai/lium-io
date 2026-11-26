@@ -846,6 +846,14 @@ def _current_loopback_plugin_state_command() -> str:
     return _loopback_plugin_state_command(current_loopback_plugin_alias())
 
 
+# the failure_step of a restart whose kept workspace volume Docker no longer has: retrying cannot bring it back
+WORKSPACE_VOLUME_MISSING_STEP = "workspace_volume_missing"
+
+
+class WorkspaceVolumeMissingError(RuntimeError):
+    """Docker answered that the pod's kept workspace volume does not exist on the host."""
+
+
 class NoUsableLoopbackPluginError(Exception):
     """The current plugin cannot be used and no fallback plugin can be: the validator never installs
     or enables the legacy plugin, so the rent fails naming the fallbacks' states."""
@@ -5084,7 +5092,12 @@ class DockerService:
             timeout=_VLOOPBACK_REPAIR_COMMAND_TIMEOUT_SEC,
         )
         if getattr(result, "exit_status", 0) != 0:
-            # the recorded workspace is gone: Docker would recreate it as an uncapped local volume
+            # Docker's own answer for a volume it does not have; a plugin or SSH fault reads differently
+            if "no such volume" in f"{result.stderr or ''}{result.stdout or ''}".lower():
+                raise WorkspaceVolumeMissingError(
+                    f"workspace volume {local_volume} is no longer on the host; the pod's kept disk is gone"
+                )
+            # the recorded workspace could not be read: Docker would recreate it as an uncapped local volume
             raise RuntimeError(
                 f"workspace volume {local_volume} could not be inspected; refusing an uncapped recreate"
             )
@@ -12016,9 +12029,13 @@ class DockerService:
                     # restart/edit reuses the workspace volume: inner Docker goes on the same
                     # loopback plugin, read from the volume itself
                     current_step = "docker_data_volume_driver"
-                    local_volume_driver = await self._vloopback_driver_of_volume(
-                        ssh_client, local_volume, default_extra
-                    )
+                    try:
+                        local_volume_driver = await self._vloopback_driver_of_volume(
+                            ssh_client, local_volume, default_extra
+                        )
+                    except WorkspaceVolumeMissingError:
+                        current_step = WORKSPACE_VOLUME_MISSING_STEP
+                        raise
                 # host_pid_max was read and validated fail-closed before any host side-effect above
                 # (review finding on PR #1531); here it only sizes the container's pids.max.
                 run_spec = self._build_rental_container_run_spec(
