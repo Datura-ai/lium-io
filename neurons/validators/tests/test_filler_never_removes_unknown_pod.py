@@ -91,7 +91,7 @@ def _removed_names(ssh_client) -> list[str]:
 
 @pytest.fixture
 def svc() -> ds_module.DockerService:
-    return ds_module.DockerService(ssh_service=Mock(), redis_service=Mock(mget=AsyncMock(side_effect=lambda keys: [None] * len(keys)), set=AsyncMock(), write_atomically=AsyncMock(), get_rented_machine=AsyncMock(return_value=None), rented_machines_synced=AsyncMock(return_value=True)), attestation_service=Mock(prepare_host_policy=AsyncMock(return_value=HostPolicyResult(known_hosts=Mock()))))
+    return ds_module.DockerService(ssh_service=Mock(), redis_service=Mock(mget=AsyncMock(side_effect=lambda keys: [None] * len(keys)), set=AsyncMock(), write_atomically=AsyncMock(), get_rented_machine=AsyncMock(return_value=None), rented_machines_synced=AsyncMock(return_value=True)), attestation_service=Mock(prepare_host_policy=AsyncMock(return_value=HostPolicyResult())))
 
 
 @pytest.mark.parametrize(
