@@ -8,7 +8,7 @@ jobs:
     runs-on: ubuntu-latest
     # Branch test builds only, from any ref, main included: `dockerhub-push-dev` (no branch policy), whose Docker Hub
     # ruleset covers only the `-dev` repositories (.github/rulesets/README.md). The release repositories' `dev` tag, which
-    # the dev and staging stacks pull, is written only by lium-io-deployment's staging executor publish (staging liumd);
+    # the dev and staging stacks pull, is written only by the deployment repository's staging executor publish (staging liumd);
     # this workflow wrote it too, with the release liumd, so the staging stacks fell back to baked keys (DAH-6670).
     environment: dockerhub-push-dev
     env:

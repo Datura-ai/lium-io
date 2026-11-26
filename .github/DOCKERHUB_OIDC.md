@@ -57,7 +57,7 @@ could then edit its workflow and push `:latest`. Create the two `-dev` repositor
 `daturaai` → Create repository) before the ruleset. A dev stack tests a branch image by pointing
 `EXECUTOR_IMAGE_REF` at `daturaai/compute-subnet-executor-dev:dev` (and its updater's
 `WATCHTOWER_IMAGE` at `daturaai/compute-subnet-executor-runner-dev`). The `dev` tag of the release
-repositories, which the dev and staging stacks pull, comes only from lium-io-deployment's staging
+repositories, which the dev and staging stacks pull, comes only from the deployment repository's staging
 executor publish, which bakes the staging liumd (DAH-6670); `executor_cd_dev` no longer writes it.
 `miner_cd_dev` and `validator_cd_dev` stay `main`-only (no branch run since April).
 

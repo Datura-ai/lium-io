@@ -16,7 +16,7 @@ Docker trusts that subject only for `daturaai/compute-subnet-executor-dev` and
 `…-executor-runner-dev` (ruleset `lium-io-dev`, `../DOCKERHUB_OIDC.md`), so a branch build
 gets a token that cannot push a release image, whatever its workflow file says. A dispatch from
 `main` takes the same path: the release repositories' `dev` tag, which the dev and staging stacks
-pull, is written only by lium-io-deployment's staging executor publish (DAH-6670). `miner_cd_dev.yml` and
+pull, is written only by the deployment repository's staging executor publish (DAH-6670). `miner_cd_dev.yml` and
 `validator_cd_dev.yml` are dispatched from `main` only.
 
 The tag ruleset `release-tags` (`release-tags.json`) restricts who may create, move or delete
