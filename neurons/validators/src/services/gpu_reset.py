@@ -432,8 +432,6 @@ class _Plan:
     # the reset runs in the host unit, which also stops host GPU holders the validator does not list (a pod that owns
     # every host GPU, unless its host is proven without systemd with nothing to stop)
     owns_host: bool = False
-    # the pod owns every host GPU (container and backend alike), in the host unit or not
-    whole_host: bool = False
     # host PCI bus id of each host GPU
     bus_by_uuid: dict[str, str] = field(default_factory=dict)
 
@@ -529,7 +527,7 @@ async def _plan_running_pod(
     host_services: list[str] = list(fabric_services)
     holder_containers: list[str] = []
     # both ownership sources: a `--gpus all` container may see more GPUs than the backend gave the pod
-    whole_host = owns_host = set(ordered) == set(host_by_uuid) == set(pod_gpu_uuids)
+    owns_host = set(ordered) == set(host_by_uuid) == set(pod_gpu_uuids)
     if owns_host:
         holders = await plan_host_holders(runner, fabric_services, container_id)
         host_services, holder_containers, owns_host = holders.host_services, holders.holder_containers, holders.owns_host
@@ -542,7 +540,6 @@ async def _plan_running_pod(
         host_services=host_services,
         holder_containers=holder_containers,
         owns_host=owns_host,
-        whole_host=whole_host,
         bus_by_uuid={gpu.uuid: gpu.bus_id for gpu in host_gpus},
     )
 
@@ -968,9 +965,9 @@ async def reset_pod_gpus(
 
     if plan.widened:
         notes.append("NVLink peers inside the pod were reset together")
-    if not plan.whole_host:
-        # nothing on the host is stopped for a pod that owns only some GPUs, and the driver refuses the reset while
-        # any process outside the pod holds a target GPU open: refuse before the pod is stopped
+    if not plan.owns_host:
+        # no host unit stops anything (a pod that owns only some GPUs, or a whole host without systemd), and the
+        # driver refuses the reset while any process outside the pod holds a target GPU open: refuse before the stop
         try:
             held = await _holders_outside(runner, plan, settle_seconds)
         except GpuResetRefused as refused:
