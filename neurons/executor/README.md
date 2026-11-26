@@ -230,10 +230,9 @@ The same commands by hand:
 root=$(docker info --format '{{.DockerRootDir}}')
 docker plugin install ashald/docker-volume-loopback@sha256:caafc80c60c3630812433c6e5ebb4df5ca514333cbec4af6a3a5164c150fd170 --alias vloopback --grant-all-permissions DATA_DIR=$root/loopback   # when the plugin is missing
 docker plugin disable vloopback && docker plugin set vloopback DATA_DIR=$root/loopback && docker plugin enable vloopback   # when DATA_DIR is not absolute; stop rentals first
-docker volume create -d vloopback -o size=10G t && docker volume inspect t --format '{{.Mountpoint}}'   # must start with /
-docker run --rm --name t --runtime=sysbox-runc -v t:/lium-vol daturaai/compute-subnet-executor:latest sh -c 'echo ok > /lium-vol/probe && cat /lium-vol/probe'   # prints ok
-docker rm -f t; docker volume rm t
 ```
+
+For the mount test (step 3), run `sudo bash nvidia_docker_sysbox_setup.sh --check`. It uses a test volume with its own name and removes only that one. Do not test with a volume you create by hand: `docker volume create` reuses an existing volume of the same name, and removing it afterwards deletes that volume's data.
 
 Causes the installer names:
 
