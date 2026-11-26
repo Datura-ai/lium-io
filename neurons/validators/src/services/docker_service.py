@@ -15278,7 +15278,7 @@ class DockerService:
                 # the pod's own lock survives its edit or reboot (review)
                 still_locked = await reset_leftover_clock_locks(
                     SSHCommandRunner(ssh_client, max_retries=0), self.redis_service, payload.gpu_uuids,
-                    keep_pod_id=payload.pod_id,
+                    keep_pod_id=payload.pod_id, purpose="create",
                 )
             except Exception as exc:
                 logger.warning(

@@ -221,9 +221,9 @@ async def test_a_successful_edit_runs_the_same_host_commands(svc, monkeypatch):
         "nvidia-smi --query-gpu=uuid,power.limit,power.default_limit,power.min_limit,power.max_limit"
         " --format=csv,noheader,nounits",
         # DAH-4663: the clock-lock safety net resets the pod's GPUs, inside the failed-create cleanup, before docker run
-        # then, in the same call, each reset under its own SIGKILL timeout: application and memory clocks back to default
-        "nvidia-smi -i GPU-test -rgc >/dev/null 2>&1; echo GPU-test $?; sh -c "
-        "'( timeout -s KILL 15 nvidia-smi -i GPU-test -rac >/dev/null 2>&1; echo GPU-test -rac $?; "
+        # with application and memory clocks, every GPU in parallel, each reset under its own SIGKILL timeout
+        "sh -c '( timeout -s KILL 15 nvidia-smi -i GPU-test -rgc >/dev/null 2>&1; echo GPU-test $?; "
+        "timeout -s KILL 15 nvidia-smi -i GPU-test -rac >/dev/null 2>&1; echo GPU-test -rac $?; "
         "timeout -s KILL 15 nvidia-smi -i GPU-test -rmc >/dev/null 2>&1; echo GPU-test -rmc $? ) & wait'",
         host_key,
         # the validator's own collector starter (services.executor_payload), not the executor's reported paths
