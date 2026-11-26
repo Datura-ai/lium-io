@@ -741,6 +741,29 @@ async def test_a_create_reset_that_overruns_keeps_the_answered_gpus_and_refuses_
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("call_exit", [0, 1])
+async def test_a_partial_answer_counts_its_lines_whatever_the_calls_exit_code(call_exit):
+    """Review (lio#2499): GPU A answered all three resets, GPU B none for -rmc, and no results file is left. The lines
+    that came back count with exit 1 as with exit 0: only B refuses the create, and A's lock record goes."""
+    host, redis = FakeHost(), FakeRedis()
+    for uuid in (U[0], U[1]):
+        redis.store[f"gpu_clock_lock:{uuid}"] = json.dumps({"pod_id": "old"})
+    stdout = f"{U[0]} 0\n{U[0]} -rac 0\n{U[0]} -rmc 0\n{U[1]} 0\n{U[1]} -rac 0"
+    fake_run = host.run
+
+    async def run(cmd, **kw):
+        if " -rgc " in cmd and not cmd.startswith("cat "):
+            host.commands.append(cmd)
+            return make_command_result(call_exit == 0, stdout, exit_code=call_exit)
+        return await fake_run(cmd, **kw)
+
+    host.run = run
+    assert await reset_leftover_clock_locks(host, redis, [U[0], U[1]]) == [U[1]]
+    assert f"gpu_clock_lock:{U[0]}" not in redis.store
+    assert f"gpu_clock_lock:{U[1]}" in redis.store
+
+
+@pytest.mark.asyncio
 async def test_a_create_reset_that_overruns_with_no_line_refuses_every_gpu_without_a_lock_record():
     host, redis = FakeHost(rgc_exit=None), FakeRedis()
     assert await reset_leftover_clock_locks(host, redis, [U[0], U[1]]) == [U[0], U[1]]

@@ -288,10 +288,11 @@ async def _reset_gpu_clocks(
     result = await _run(runner, _reset_command(uuids, pod_gpu_uuids, results), timeout=_RESET_CALL_TIMEOUT_SECONDS)
     stdout = result.stdout or ""
     if result.exit_code != 0:
-        # the answer was lost (budget overrun, channel closed): what the GPUs wrote so far; a reset still running
+        # the answer may be lost or partial (budget overrun, channel closed, a non-zero exit): every line that did
+        # come back counts whatever the exit code (review), plus what the GPUs wrote to the file; a reset still running
         # after this read writes a line nobody reads (a few bytes left in /tmp), its GPU counted as no answer
         # 10 s (review): the create's wait stays under the budget it had before the read-back
-        stdout = (await _run(runner, f"cat {results} 2>/dev/null; rm -f {results}", timeout=10)).stdout or ""
+        stdout += "\n" + ((await _run(runner, f"cat {results} 2>/dev/null; rm -f {results}", timeout=10)).stdout or "")
     lines = [line.split() for line in stdout.splitlines()]
     # the -rgc lines (a -rac/-rmc line has 3 fields); a killed -rgc gave no verdict, as a lost answer
     exits = {p[0]: p[1] for p in lines if len(p) == 2 and p[1] != _KILLED_EXIT}
