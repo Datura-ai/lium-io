@@ -434,12 +434,20 @@ class RunningOutageTally:
 
 
 # DAH-5395: the failure reasons that hide the node at once. Any other failed run keeps the backend's usual rule.
-REASONS_THAT_HIDE_AT_ONCE = frozenset({"GPU_DETAILS_MISMATCH", "GPU_UUID_CHANGED", "LOGIN_USER_NOT_ROOT", "NVLINK_FAULT"})
+# RENTAL_PROBE_NOT_YET_PROVEN (DAH-7044): a node is first listed by a rental probe that passed.
+REASONS_THAT_HIDE_AT_ONCE = frozenset(
+    {"GPU_DETAILS_MISMATCH", "GPU_UUID_CHANGED", "LOGIN_USER_NOT_ROOT", "NVLINK_FAULT", "RENTAL_PROBE_NOT_YET_PROVEN"}
+)
 
 
 # runs that stop before the checks that re-read the stored restrictions: [] would clear what those checks keep
-# (DAH-6546: a pod left unread after a GPU-set move stops the run, and its rerun looks again)
-REASONS_THAT_KEEP_STORED = frozenset({"GPU_LOST_POD_UNREAD"})
+# (DAH-6546: a pod left unread after a GPU-set move stops the run, and its rerun looks again; DAH-7050: a library
+# mismatch not confirmed)
+# (DAH-7044: an unreadable rental-probe record, or a probe the validator cannot run for a reason on its own side,
+# neither lists an unproven node nor hides a proven one)
+REASONS_THAT_KEEP_STORED = frozenset(
+    {"GPU_LOST_POD_UNREAD", "NVML_DIGEST_UNREAD", "RENTAL_PROBE_PROOF_UNREADABLE", "RENTAL_PROBE_NOT_RUN_ON_VALIDATOR"}
+)
 
 
 def run_availability_errors(ok: bool, events: list[ValidationEvent]) -> list[dict] | None:

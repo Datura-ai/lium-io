@@ -1415,8 +1415,9 @@ def _last_attempt_exception(exc: Exception) -> BaseException:
     return exc
 
 
-class _CreateCancelledByDelete(Exception):
-    """Raised at a create checkpoint when this pod's delete has already reported it gone."""
+class _CreateCancelledByDelete(ContainerCreateRefused):
+    """Raised at a create checkpoint when this pod's delete has already reported it gone; also by the run spec's
+    `before_start_call`, so the container is never started."""
 
 
 class _SameNameContainerKept(Exception):
@@ -1892,6 +1893,11 @@ _RESTORE_BRING_UP_TIMEOUT_SECONDS = 300
 _KEPT_COPY_TIMEOUT_SECONDS = 900
 
 
+def _seconds_left(deadline: float) -> int:
+    # a host-side `timeout 0` means no limit, so never below one second
+    return max(1, math.floor(deadline - time.monotonic()))
+
+
 class KeptContainersNotRemoved(RuntimeError):
     """The pod's kept containers were found but `docker rm -fv` failed: they stay until a delete removes them."""
 
@@ -1917,9 +1923,22 @@ async def _remove_kept_containers(ssh_client: asyncssh.SSHClientConnection, cont
         if len(fields) == 2 and fields[0].startswith(prefix)
     ]
     if ids:
-        removed = await _run_with_host_timeout(
-            ssh_client, f"/usr/bin/docker rm -fv {' '.join(map(shlex.quote, ids))}", _PARK_COMMAND_TIMEOUT_SECONDS
-        )
+        rm = f"/usr/bin/docker rm -fv {' '.join(map(shlex.quote, ids))}"
+        # once kept containers are found, only an rm that answered 0 removed them: a step that timed out or failed
+        # leaves them in place, and nothing but a re-asked delete ever removes them
+        try:
+            removed = await _run_with_host_timeout(ssh_client, rm, _PARK_COMMAND_TIMEOUT_SECONDS)
+            if removed.exit_status != 0:
+                # a parked container whose exit event dockerd lost (an edit's direct kill cut off by this delete)
+                # fails `rm -f` forever: kill its init and shim directly and try once more, as container_cleanup
+                # does (DAH-2991)
+                for container_id in ids:
+                    await _run_with_host_timeout(
+                        ssh_client, DockerCommand.kill_container_processes(container_id), _PARK_COMMAND_TIMEOUT_SECONDS
+                    )
+                removed = await _run_with_host_timeout(ssh_client, rm, _PARK_COMMAND_TIMEOUT_SECONDS)
+        except Exception as exc:
+            raise KeptContainersNotRemoved(f"docker rm did not answer: {exc!r}") from exc
         if removed.exit_status != 0:
             raise KeptContainersNotRemoved(f"docker rm exited {removed.exit_status}: {(removed.stderr or '').strip()}")
     return ids
@@ -2071,8 +2090,15 @@ class _EditSwap:
         docker_client=None,
         redis: RedisService | None = None,
         executor_id: str | None = None,
+        deleted: Callable[[], Awaitable[None]] | None = None,
     ):
         self.ssh_client = ssh_client
+        # returns once the pod's delete cancels this edit: a wait on dockerd gives way to it (DAH-7025 review)
+        self.deleted = deleted
+        # the delete arrived while the parked container was being stopped: it removes the pod's kept containers itself
+        self.left_to_delete = False
+        # the wait after `docker kill` ended with Docker answering that the container still runs
+        self.running_after_kill = False
         # the create's Docker SDK connection, independent of the SSH session: stops a renamed pod a dead SSH lost track of
         self.docker_client = docker_client
         self.container_name = container_name
@@ -2114,10 +2140,10 @@ class _EditSwap:
     async def __aenter__(self) -> "_EditSwap":
         return self
 
-    async def _run(self, command: str) -> asyncssh.SSHCompletedProcess:
+    async def _run(self, command: str, timeout: float | None = None) -> asyncssh.SSHCompletedProcess:
         # a wedged dockerd can hang `docker stop`/`kill`/`inspect` forever (a reboot hung until the
         # connector pod was replaced): the host ends each command (exit 124), the validator bounds the rest
-        return await _run_with_host_timeout(self.ssh_client, command, _PARK_COMMAND_TIMEOUT_SECONDS)
+        return await _run_with_host_timeout(self.ssh_client, command, timeout or _PARK_COMMAND_TIMEOUT_SECONDS)
 
     async def park(self) -> str | None:
         """Rename the running container aside and stop it. None when there is nothing to park."""
@@ -2239,9 +2265,10 @@ class _EditSwap:
             # after a destructive `docker rm -fv`. If even the rename back fails, parked_name
             # stays set so __aexit__ tries the full restore once more. The kill can still land after
             # the wait, so rename back only while Docker still says it runs; a stopped or unreadable
-            # container stays parked for __aexit__ to restore.
-            running = await self._run(f"/usr/bin/docker inspect -f '{{{{.State.Running}}}}' {shlex.quote(parked)}")
-            if running.exit_status == 0 and (running.stdout or "").strip() == "true":
+            # container stays parked for __aexit__ to restore. The wait's own last read decides: no new read, so the
+            # park ends inside the budget a cancelling delete waits for.
+            if self.running_after_kill:
+                # a write keeps the full timeout: cut short after dockerd applied it, the restore would remove the pod
                 renamed_back = await self._run(
                     f"/usr/bin/docker rename {shlex.quote(parked)} {shlex.quote(self.container_name)}"
                 )
@@ -2344,18 +2371,14 @@ class _EditSwap:
         """DinD (sysbox) pods often fail the first `docker stop` while a retry seconds later works (prod 15-21 Oct
         2026: 12 park failures on 10 hosts, all on dind-lium1). Kill it once; True when Docker reports it stopped within _PARK_KILL_WAIT_SECONDS."""
         killed = await self._run(f"/usr/bin/docker kill {shlex.quote(parked)}")
-        for _ in range(max(1, _PARK_KILL_WAIT_SECONDS // max(_PARK_KILL_SETTLE_SECONDS, 1))):
-            await asyncio.sleep(_PARK_KILL_SETTLE_SECONDS)
-            running = await self._run(f"/usr/bin/docker inspect -f '{{{{.State.Running}}}}' {shlex.quote(parked)}")
-            is_stopped = running.exit_status == 0 and (running.stdout or "").strip() == "false"
-            if is_stopped:
-                break
-        if not is_stopped and _DOCKER_COULD_NOT_KILL_PHRASES[1] in (killed.stderr or "").lower():
-            # dockerd lost the exit event (F-1633): kill init + shim directly, as the delete path does (DAH-2991)
-            await self._run(DockerCommand.kill_container_processes(parked))
-            running = await self._run(f"/usr/bin/docker inspect -f '{{{{.State.Running}}}}' {shlex.quote(parked)}")
-            is_stopped = running.exit_status == 0 and (running.stdout or "").strip() == "false"
-            self.unkillable = not is_stopped
+        # every wait after the kill shares one budget: a delete waits CANCELLED_CREATE_ABORT_TIMEOUT_SECONDS for
+        # the edit it cancels, so a slow dockerd must not stretch the park past it (DAH-7025 review)
+        deadline = time.monotonic() + _PARK_KILL_WAIT_SECONDS
+        direct, is_stopped = await self._unless_deleted(self._wait_after_kill(parked, killed, deadline))
+        if direct is not None:
+            # the host's fault (counted against the node) only when Docker still reports it running and the process
+            # was not seen gone: a teardown dockerd has not finished yet is not a wedge, and its retry parks (DAH-7025)
+            self.unkillable = not is_stopped and "init=gone" not in direct
         logger.warning(
             _m(
                 "docker stop failed while parking the current container; tried docker kill",
@@ -2366,11 +2389,66 @@ class _EditSwap:
                         "stop_stderr": (stopped.stderr or "").strip(),
                         "kill_stderr": (killed.stderr or "").strip(),
                         "stopped_after_kill": is_stopped,
+                        "direct_kill": direct.strip() if direct is not None else None,
                     }
                 ),
             )
         )
         return is_stopped
+
+    async def _wait_after_kill(self, parked: str, killed, deadline: float) -> tuple[str | None, bool]:
+        direct = None
+        if _DOCKER_COULD_NOT_KILL_PHRASES[1] in (killed.stderr or "").lower():
+            # dockerd lost the exit event (F-1633), so waiting for it to report one first waits for nothing:
+            # kill init + shim directly now, as the delete path does (DAH-2991)
+            direct = (await self._run(DockerCommand.kill_container_processes(parked), _seconds_left(deadline))).stdout or ""
+        # init=alive waits too: a pid-namespace init still reaping its dying children reads alive for a moment,
+        # so init is re-read with each State.Running read and the verdict uses the last reading (DAH-7025 review)
+        probe = DockerCommand.init_state(direct) if direct else None
+        stopped, init_gone = await self._docker_reports_stopped(parked, deadline, probe)
+        if init_gone:
+            direct = re.sub(r"init=\w+", "init=gone", direct)
+        return direct, stopped
+
+    async def _unless_deleted(self, work: Awaitable):
+        """The work's result, unless the pod's delete cancels this edit first: a delete waits
+        CANCELLED_CREATE_ABORT_TIMEOUT_SECONDS for it, so the edit then ends at once and leaves the parked container
+        to the delete, which removes the pod's kept containers (DAH-5773)."""
+        if self.deleted is None:
+            return await work
+        working, deleted = asyncio.ensure_future(work), asyncio.ensure_future(self.deleted())
+        try:
+            done, _ = await asyncio.wait({working, deleted}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for pending in (working, deleted):
+                if not pending.done():
+                    pending.cancel()
+        if working in done:
+            return working.result()
+        self.left_to_delete = True
+        raise _CreateCancelledByDelete("the pod's delete arrived while its container was being stopped for the edit")
+
+    async def _docker_reports_stopped(self, parked: str, deadline: float, init_probe: str | None = None) -> tuple[bool, bool]:
+        """Re-read the container's state every _PARK_KILL_SETTLE_SECONDS until the deadline; each read ends by it.
+        Leaves running_after_kill set when the last read answered that the container still runs. With init_probe,
+        init is re-read after each read that still finds it running; returns (stopped, init seen gone)."""
+        self.running_after_kill = False
+        init_gone = False
+        for _ in range(max(1, _PARK_KILL_WAIT_SECONDS // max(_PARK_KILL_SETTLE_SECONDS, 1))):
+            await asyncio.sleep(_PARK_KILL_SETTLE_SECONDS)
+            if time.monotonic() >= deadline:
+                break
+            running = await self._run(
+                f"/usr/bin/docker inspect -f '{{{{.State.Running}}}}' {shlex.quote(parked)}", _seconds_left(deadline)
+            )
+            answered = (running.stdout or "").strip() if running.exit_status == 0 else None
+            if answered == "false":
+                return True, init_gone
+            self.running_after_kill = answered == "true"
+            if init_probe is not None and not init_gone and time.monotonic() < deadline:
+                read = await self._run(init_probe, _seconds_left(deadline))
+                init_gone = (read.stdout or "").strip() == "init=gone"
+        return False, init_gone
 
     async def _record_parked(self, parked: bool) -> None:
         """Best effort: unrecorded, a parked container's GPU load counts as the provider's."""
@@ -2404,6 +2482,9 @@ class _EditSwap:
         if self.parked_name is None:
             return False
         try:
+            if self.left_to_delete:
+                # a wedged `docker rm` here would hold the delete that is waiting for this edit
+                return False
             if exc is None or self.replacement_is_up or isinstance(exc, _CreateCancelledByDelete):
                 # Replacement is up (or the pod was deleted meanwhile): the old container is now the
                 # stale one. Best effort — a wedged remove is left to the next edit's clean-leftover removal.
@@ -2506,7 +2587,16 @@ class _InflightCreate:
     # entry outlives any single one of them and only the last to leave clears it.
     running: int = 0
     cancelled_by_delete: bool = False
+    # attempts in their run step, which removes its own container after a delete (`removes_own_container`)
+    removing_own: int = 0
+    # set once a delete need not wait for this create: every attempt left, or each is in its run step
     done: asyncio.Event = field(default_factory=asyncio.Event)
+
+    def settle(self) -> None:
+        if self.running <= 0 or self.removing_own >= self.running:
+            self.done.set()
+        else:
+            self.done.clear()
     cancelled: asyncio.Event = field(default_factory=asyncio.Event)
 
 
@@ -2550,6 +2640,7 @@ class _InflightCreateRegistry:
         key = (pod_id, executor)
         create = self._creates.setdefault(key, _InflightCreate())
         create.running += 1
+        create.settle()
         try:
             yield
         finally:
@@ -2557,7 +2648,22 @@ class _InflightCreateRegistry:
             create.running -= 1
             if create.running <= 0:
                 self._creates.pop(key, None)
-                create.done.set()
+            create.settle()
+
+    @contextlib.contextmanager
+    def removes_own_container(self, pod_id: str, executor: ExecutorKey) -> Iterator[None]:
+        """The create's run step: dockerd's `containers/create` cannot be cancelled, and the create removes the
+        container itself (never started) after a delete, so a delete need not wait for it and answers at once."""
+        creates = self._matching(pod_id, executor)
+        for create in creates:
+            create.removing_own += 1
+            create.settle()
+        try:
+            yield
+        finally:
+            for create in creates:
+                create.removing_own -= 1
+                create.settle()
 
     def _matching(self, pod_id: str, executor: ExecutorKey | None) -> list[_InflightCreate]:
         executor = executor or self._held.get().get(pod_id)
@@ -2590,7 +2696,8 @@ class _InflightCreateRegistry:
         return sum(create.running for create in self._matching(pod_id, executor)) == 1
 
     async def wait_until_done(self, pod_id: str, timeout: float, executor: ExecutorKey | None = None) -> bool:
-        """Wait for the create(s) on this pod to leave. False when the wait ran out."""
+        """Wait for the create(s) on this pod to leave, or to be in the run step that removes its own container
+        (`removes_own_container`). False when the wait ran out."""
         creates = self._matching(pod_id, executor)
         if not creates:
             return True
@@ -2750,6 +2857,13 @@ def _is_filler_create_beside_customer_create(payload: ContainerCreateRequest) ->
         payload.workload_kind == WorkloadKind.FILLER
         and customer_creates.ran_since_filler_started(payload)
     )
+
+
+def _refuse_start_after_delete(payload: ContainerCreateRequest) -> None:
+    """In the Docker thread, right before the start: a delete that overtook dockerd's create leaves the container
+    unstarted for the create's own removal. The executor is named: the thread does not carry the create's context."""
+    if inflight_creates.is_cancelled(payload.pod_id, executor_key(payload)):
+        raise _CreateCancelledByDelete(f"delete for pod {payload.pod_id} arrived before its container started")
 
 
 def _refuse_filler_during_customer_create(payload: ContainerCreateRequest) -> None:
@@ -4702,6 +4816,7 @@ class DockerService:
                 if payload.workload_kind == WorkloadKind.FILLER
                 else None
             ),
+            before_start_call=lambda: _refuse_start_after_delete(payload),
         )
 
     async def _ensure_pod_quote_socket(
@@ -10891,6 +11006,7 @@ class DockerService:
                         docker_client=docker_client,
                         redis=self.redis_service,
                         executor_id=str(executor_info.uuid),
+                        deleted=lambda: inflight_creates.wait_cancelled(payload.pod_id, executor_key(payload)),
                     )
                 )
                 # Add profiler for ssh connection
@@ -11984,43 +12100,47 @@ class DockerService:
                     # again right before the create: a customer create may register while the run
                     # waits for a thread.
                     _refuse_filler_during_customer_create(payload)
-                    container_id = await self._run_rental_docker_create_with_port_retry(
-                        docker_client=docker_client,
-                        ssh_client=ssh_client,
-                        run_spec=run_spec,
-                        container_name=container_name,
-                        default_extra=default_extra,
-                        local_volume=local_volume,
-                        log_tag=log_tag,
-                        port_maps=port_maps,
-                        spare_port_pairs=_spare_port_pairs(payload.available_ports, port_maps),
-                        pod_id=payload.pod_id,
-                        # a filler removes no probe, so it has no live re-removal to run on a bind refusal
-                        remove_port_checks_listed_live=(
-                            None
-                            if probed_port_check_names is None or payload.workload_kind == WorkloadKind.FILLER
-                            else lambda: self.wait_for_port_check_containers(
-                                executor_info=executor_info,
-                                miner_hotkey=payload.miner_hotkey,
-                                keypair=keypair,
-                                private_key=private_key,
-                                ssh_client=ssh_client,
-                            )
-                        ),
-                        # fillers keep no RepoDigests on a flattened copy, so their image check would be skipped
-                        flatten_reserved_bytes=(
-                            _flatten_reserved_bytes(
-                                effective_storage_limit_gb, effective_volume_limit_gb, payload.disk_share
-                            )
-                            if payload.workload_kind == WorkloadKind.CUSTOMER_RENTAL
-                            else None
-                        ),
-                        before_flatten_retry=lambda: self._abort_if_cancelled_by_delete(
-                            ssh_client, payload, default_extra, settle_early_probes
-                        ),
-                        flatten_beside_other_create=lambda: customer_creates.others_running(payload),
-                    )
+                    with inflight_creates.removes_own_container(payload.pod_id, executor_key(payload)):
+                        container_id = await self._run_rental_docker_create_with_port_retry(
+                            docker_client=docker_client,
+                            ssh_client=ssh_client,
+                            run_spec=run_spec,
+                            container_name=container_name,
+                            default_extra=default_extra,
+                            local_volume=local_volume,
+                            log_tag=log_tag,
+                            port_maps=port_maps,
+                            spare_port_pairs=_spare_port_pairs(payload.available_ports, port_maps),
+                            pod_id=payload.pod_id,
+                            # a filler removes no probe, so it has no live re-removal to run on a bind refusal
+                            remove_port_checks_listed_live=(
+                                None
+                                if probed_port_check_names is None or payload.workload_kind == WorkloadKind.FILLER
+                                else lambda: self.wait_for_port_check_containers(
+                                    executor_info=executor_info,
+                                    miner_hotkey=payload.miner_hotkey,
+                                    keypair=keypair,
+                                    private_key=private_key,
+                                    ssh_client=ssh_client,
+                                )
+                            ),
+                            # fillers keep no RepoDigests on a flattened copy, so their image check would be skipped
+                            flatten_reserved_bytes=(
+                                _flatten_reserved_bytes(
+                                    effective_storage_limit_gb, effective_volume_limit_gb, payload.disk_share
+                                )
+                                if payload.workload_kind == WorkloadKind.CUSTOMER_RENTAL
+                                else None
+                            ),
+                            before_flatten_retry=lambda: self._abort_if_cancelled_by_delete(
+                                ssh_client, payload, default_extra, settle_early_probes
+                            ),
+                            flatten_beside_other_create=lambda: customer_creates.others_running(payload),
+                        )
                     edit_swap.replacement_id = container_id
+                    # the run waited for dockerd's outcome, which a delete may have overtaken: the handler
+                    # below removes the container and its volume
+                    await self._abort_if_cancelled_by_delete(ssh_client, payload, default_extra, settle_early_probes)
                     # A customer create that ran while the daemon created this container may have
                     # swept the host before it was listed: remove it by its ID (handler below).
                     _refuse_filler_during_customer_create(payload)
@@ -12124,7 +12244,7 @@ class DockerService:
                             default_extra=default_extra,
                         )
                     if isinstance(
-                        docker_run_error, _FillerRefusedForCustomerCreate
+                        docker_run_error, (_FillerRefusedForCustomerCreate, _CreateCancelledByDelete)
                     ) or _is_filler_create_beside_customer_create(payload):
                         # DAH-2356: the PEARL cap applied above must not stay on the GPUs the customer
                         # is about to get; lifted only after the container is removed.

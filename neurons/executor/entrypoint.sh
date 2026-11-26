@@ -154,6 +154,20 @@ fi
 
 docker compose up --pull "$pull" --detach --wait --force-recreate
 
+# DAH-7125: the executor has no Docker healthcheck any more (the monitor's API watcher restarts it), so --wait only
+# waits for the start. Readiness is the API answering; a node still starting is logged, never recreated again here.
+# This stack's old autoheal container is removed by the monitor (services/api_watcher.py), which retries until it is gone.
+tries=0
+until docker compose exec -T executor sh -c 'curl -fsS --max-time 5 "http://127.0.0.1:$INTERNAL_PORT/version"' >/dev/null 2>&1; do
+    tries=$((tries + 1))
+    if [ "$tries" -ge "${RUNNER_READY_MAX_TRIES:-36}" ]; then
+        echo "The executor API did not answer yet; the monitor restarts it if it stays down."
+        break
+    fi
+    sleep 5
+done
+if [ "$tries" -lt "${RUNNER_READY_MAX_TRIES:-36}" ]; then echo "Executor API ready."; fi
+
 # The executor is pulled by digest, so its old images are not dangling and `image prune` keeps them
 # (2-5 GB per release, every past release too). Remove every executor image but the one now running;
 # Docker refuses to remove an image a container still uses.

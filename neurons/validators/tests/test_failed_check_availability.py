@@ -39,6 +39,7 @@ HIDES_AT_ONCE = [
     ("gpu.validate.model", "GPU_DETAILS_MISMATCH"),
     ("gpu.validate.fingerprint", "GPU_UUID_CHANGED"),
     ("gpu.validate.nvlink_fault", "NVLINK_FAULT"),
+    ("executor.validate.rental_probe", "RENTAL_PROBE_NOT_YET_PROVEN"),
     ("executor.validate.login_user", "LOGIN_USER_NOT_ROOT"),
 ]
 
@@ -288,6 +289,13 @@ async def test_create_task_says_nothing_against_the_node_for_our_own_errors(erro
 
 def test_a_run_stopped_on_an_unread_pod_with_no_errors_sends_none_so_stored_restrictions_stay() -> None:
     events = [_event("gpu.scrape.machine_spec", "OK", "info"), _event("gpu.validate.loss_hold", "GPU_LOST_POD_UNREAD", "warning")]
+
+    assert run_availability_errors(False, events) is None
+
+
+def test_a_run_ended_on_an_unconfirmed_library_mismatch_sends_none_so_stored_restrictions_stay() -> None:
+    # DAH-7050: the run stops before the checks that re-read the stored restrictions
+    events = [_event("gpu.scrape.machine_spec", "OK", "info"), _event("gpu.validate.nvml_digest", "NVML_DIGEST_UNREAD", "warning")]
 
     assert run_availability_errors(False, events) is None
 

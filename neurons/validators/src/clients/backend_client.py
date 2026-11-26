@@ -447,6 +447,8 @@ class BackendClient:
         nvml_gpu_count: int,
         gpu_details: list[dict] | None = None,
         observed_at: str | None = None,
+        cpu_count: int | None = None,
+        ram_total: int | None = None,
     ) -> RentedGpuDropResponse | None:
         """Tell the backend a rented pod's node lost a GPU (``state="fault"``) or has all of them back
         (``state="recovered"``).
@@ -456,7 +458,9 @@ class BackendClient:
         next cycle. ``expected_gpu_count``, ``visible_gpu_count``, ``rented_gpu_count`` (every pod's
         ``gpu_count`` summed, None when one is unknown) and ``nvml_gpu_count`` are executor-wide;
         ``pod_gpu_count`` is this pod's own share, so a split node's renters can be told apart.
-        ``gpu_details``: the scrape's card list, sent when the anchored cards are gone.
+        ``gpu_details``: the scrape's card list, sent when the anchored cards are gone. ``cpu_count`` and
+        ``ram_total`` (KiB): the same scrape's counts, sent with it: the swap can be a move to another host, and the
+        backend recreates the pod with that host's share (DAH-7143).
         ``observed_at``: when the check saw the fault or the clean result (a retried recovery keeps it).
         """
         return await self._signed_request(
@@ -477,6 +481,8 @@ class BackendClient:
                 "rented_gpu_count": rented_gpu_count,
                 "nvml_gpu_count": nvml_gpu_count,
                 **({"gpu_details": gpu_details} if gpu_details else {}),
+                **({"cpu_count": cpu_count} if gpu_details and cpu_count else {}),
+                **({"ram_total": ram_total} if gpu_details and ram_total else {}),
                 **({"observed_at": observed_at} if observed_at else {}),
             },
             timeout=10,
