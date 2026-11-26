@@ -164,10 +164,10 @@ def test_scrape_keys_are_mapped_for_the_backend() -> None:
     assert "'data_egress_ip': \"\"" in service
 
 
-def test_liumd_echo_answers_reach_the_backend_under_their_name() -> None:
+def test_liumd_region_handshakes_reach_the_backend_under_their_name() -> None:
     from services.task.checks.machine_spec_scrape import _normalize_liumd_document
 
-    answers = {"www.cloudflare.com": "192.0.2.1", "checkip.amazonaws.com": "198.51.100.1", "api.ipify.org": ""}
-    document = _normalize_liumd_document({"data_egress_ip": "", "data_egress_ips": answers})
+    rtts = {"us-west-1": 600.0, "ap-east-1": 75.0, "eu-central-1": None}
+    document = _normalize_liumd_document({"data_egress_ip": "", "data_region_rtts": rtts})
 
-    assert document == {"egress_ip": "", "egress_ips": answers}
+    assert document == {"egress_ip": "", "region_rtts": rtts}

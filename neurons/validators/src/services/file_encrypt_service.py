@@ -189,8 +189,8 @@ ORIGINAL_KEYS = {
     'ib_driver': "driver",
     'data_boot_id': "boot_id",
     'data_egress_ip': "egress_ip",
-    # liumd only: each IP echo service's answer, so the backend can tell answers that disagree from no answer
-    'data_egress_ips': "egress_ips",
+    # liumd only: the lowest TLS handshake time in ms to each of a fixed set of cloud regions
+    'data_region_rtts': "region_rtts",
     'data_container_cap_eff': "container_cap_eff",
     'data_executor_pid_mode_scrape_error': "executor_pid_mode_scrape_error",
     'data_executor_pid_mode': "executor_pid_mode",
@@ -439,9 +439,8 @@ class FileEncryptService:
             'ib_gids': "",
             'ib_driver': "",
             'data_boot_id': "",
-            # longer key before the key it extends (prefix rule above)
-            'data_egress_ips': "",
             'data_egress_ip': "",
+            'data_region_rtts': "",
             'data_container_cap_eff': "",
             'data_executor_pid_mode_scrape_error': "",
             'data_executor_pid_mode': "",

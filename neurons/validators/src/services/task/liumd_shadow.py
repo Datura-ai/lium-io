@@ -614,8 +614,8 @@ NOT_COMPARABLE_SPEC_PATHS = frozenset(
         "host_memory.mapped_kb",
         "host_memory.mapped_outside_workloads_kb",
         "egress_ip",
-        # liumd only (machine_scrape reports one answer)
-        "egress_ips",
+        # liumd only
+        "region_rtts",
         "infiniband_ports",
     }
 )
