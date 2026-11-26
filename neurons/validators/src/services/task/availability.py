@@ -265,6 +265,9 @@ def build_rented_executor_not_listed_event(
 
 # The executor's answer to an upload signed more than UPLOAD_NONCE_MAX_AGE_SECONDS (600) away from its own clock.
 STALE_UPLOAD_NONCE = "Stale upload nonce"
+# The miner writes a node's answer as "HTTP <status>: <text>". The executor serves POST /upload_ssh_key at its root
+# and never answers it 404, so a 404 comes from some other server on that address and port, not from the executor.
+NO_EXECUTOR_API_ANSWER = "HTTP 404:"
 
 
 def build_executor_unreachable_by_miner_event(
@@ -278,9 +281,25 @@ def build_executor_unreachable_by_miner_event(
 
     ``refusal`` is the node's own answer when it did answer and turned the key down
     (``refused_executors``): the node is reachable, so the event names the answer, and for a stale
-    nonce the node's clock (22 Nov: 14 refusals were read as "could not reach"). Same
+    nonce the node's clock (22 Nov: 14 refusals were read as "could not reach"). A 404 is no refusal: no
+    executor served the request, so the event says so instead of pointing at the executor's log. Same
     code and score: the node still took no key.
     """
+    if refusal is not None and refusal.startswith(NO_EXECUTOR_API_ANSWER):
+        return build_availability_event(
+            code=AvailabilityErrorCode.EXECUTOR_UNREACHABLE_BY_MINER,
+            reach_source=ReachSource.MINER,
+            reach_target=ReachTarget.EXECUTOR_API,
+            event_text="Miner reached this node's address, but no executor answered there",
+            impact="Score 0 for this cycle; the node is hidden from the market until a cycle installs the key.",
+            remediation=(
+                "Something other than the executor answers on the node's executor port (HTTP 404 to "
+                "/upload_ssh_key), so the request never reached the executor and its log shows nothing. Check "
+                "that the executor container is running (`docker ps`) and that it is what listens on the executor "
+                "port (`ss -ltnp`), and that the miner's address and port for this node point at it."
+            ),
+            what_we_saw={"executor_uuid": executor_uuid, "miner_hotkey": miner_hotkey, "node_answer": refusal},
+        )
     if refusal is not None:
         if STALE_UPLOAD_NONCE in refusal:
             remediation = (
