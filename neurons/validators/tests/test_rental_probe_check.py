@@ -7,6 +7,7 @@ so most regressions here are of the "rents when it must not" or "penalises when 
 from __future__ import annotations
 
 import asyncio
+import re
 import subprocess
 import sys
 import time
@@ -78,7 +79,10 @@ def gpu_list_output(
     cuda: str = "2",
     mig: tuple[str, ...] = ("Disabled", "Disabled"),
 ) -> str:
-    """What the probe's GPU_LIST_COMMAND prints inside the renter container."""
+    """What the probe's GPU_LIST_COMMAND prints inside the renter container. A digit `cuda` is how many of
+    the listed cards CUDA brings up, each as itself; any other `cuda` is printed as given."""
+    if cuda.isdigit():
+        cuda = cuda_devices(listing, int(cuda))
     return (
         listing
         + "--gpu-device-nodes--\n"
@@ -89,8 +93,16 @@ def gpu_list_output(
         + "".join(f"{u}, {m}\n" for u, m in minors)
         + "--gpu-mig-mode--\n"
         + "".join(f"{mode}\n" for mode in mig)
-        + "--cuda-device-count--\n"
-        + (f"{cuda}\n" if cuda else "")
+        + "--cuda-devices--\n"
+        + (f"{cuda.rstrip()}\n" if cuda else "")
+    )
+
+
+def cuda_devices(listing: str, n: int, source: str = "cuda", memory: int = 24000) -> str:
+    """The CUDA script's lines for the first n cards of an nvidia-smi listing, each working as listed."""
+    cards = re.findall(r"^GPU \d+: (.+?) \(UUID: (GPU-[0-9a-fA-F-]+)\)", listing, re.MULTILINE)[:n]
+    return f"{source}\tcount\t{n}\n" + "".join(
+        f"{source}\t{i}\tok\t{uuid}\t{memory}\t{name}\n" for i, (name, uuid) in enumerate(cards)
     )
 
 
@@ -1226,7 +1238,7 @@ async def test_gpu_count_mismatch_fails_at_gpu_count():
         result = await RentalProbeCheck().run(ctx)
     assert result.passed is False and result.event.what_we_saw["failed_step"] == STEP_GPU_COUNT
     detail = result.event.what_we_saw["probe_steps"][-2]["detail"]
-    assert detail == "the GPU check in the container did not finish within 60 s" and "nvidia-smi -L" not in detail
+    assert detail == "the GPU check in the container did not finish within 120 s" and "nvidia-smi -L" not in detail
 
 
 @pytest.mark.asyncio
@@ -1932,7 +1944,9 @@ async def test_the_teardown_wait_never_outlasts_the_job():
 def _gpu_step(output: str, gpus: int | None = None, exit_status: int = 0, stderr: str = ""):
     ctx, _, _ = make_probe_context()
     if gpus is not None:
-        ctx = ctx.model_copy(update={"state": replace(ctx.state, gpu_count=gpus)})
+        # the listing is the container's nvidia-smi one, as on a real node
+        details = [{"uuid": u} for u in re.findall(r"\(UUID: (GPU-[0-9a-fA-F-]+)\)", output)]
+        ctx = ctx.model_copy(update={"state": replace(ctx.state, gpu_count=gpus, gpu_details=details)})
     outcome = module._ProbeOutcome()
     smi = MagicMock(stdout=output, stderr=stderr, exit_status=exit_status)
     module._step_gpu_count(ctx, outcome, module._Login(result=smi, command_seconds=0.5))
@@ -1953,7 +1967,9 @@ def test_gpu_count_step_fails_listed_gpus_the_container_has_no_device_node_for()
 def test_gpu_count_step_fails_when_cuda_sees_fewer_gpus_than_listed():
     outcome = _gpu_step(gpu_list_output(cuda="1"))
     assert outcome.failed_step == STEP_GPU_COUNT
-    assert "CUDA sees 1 device(s)" in outcome.steps[-1].detail
+    assert "CUDA confirmed 1 as working devices of the listed model (1 listed GPU(s) are no CUDA device)" in (
+        outcome.steps[-1].detail
+    )
     outcome = _gpu_step(gpu_list_output(cuda="error 100"))
     assert outcome.failed_step == STEP_GPU_COUNT
     assert "CUDA failed to start (error 100)" in outcome.steps[-1].detail
@@ -2005,7 +2021,7 @@ def test_gpu_count_without_a_cuda_reading_is_decided_by_the_device_nodes():
     one_node = module._usable_gpus(
         gpu_list_output(listing, nodes=(0,), minors=eight, cuda="", mig=("Disabled",) * 8)
     )
-    assert one_node.cuda_count is None and one_node.cuda_error is None
+    assert one_node.cuda_confirmed is None and one_node.cuda_error is None
     assert one_node.short_of(8) == (
         "1 of 8 GPU(s) confirmed usable: the container has 1 usable GPU device node(s) (/dev/nvidiaN)"
     )
@@ -2075,8 +2091,8 @@ def test_gpu_count_fails_nvidia_smi_uuids_the_kernel_does_not_list():
     assert shape.unknown_uuids == 8
     assert shape.short_of(8) == (
         "0 of 8 GPU(s) confirmed usable: the container has 8 nvidia-smi GPU UUID(s) the kernel driver "
-        "does not know; the container has 0 usable GPU device node(s) (/dev/nvidiaN); CUDA sees 1 "
-        "device(s)"
+        "does not know; the container has 0 usable GPU device node(s) (/dev/nvidiaN); CUDA confirmed 1 as "
+        "working devices of the listed model (7 listed GPU(s) are no CUDA device)"
     )
 
 
@@ -2126,7 +2142,7 @@ def test_gpu_count_fails_output_cut_short_before_the_cuda_section():
     without python3), where the device nodes decide."""
     full = gpu_list_output()
     assert _gpu_step(full).failed_step is None
-    truncated = full.partition("--cuda-device-count--")[0]
+    truncated = full.partition("--cuda-devices--")[0]
     outcome = _gpu_step(truncated)
     assert outcome.failed_step == STEP_GPU_COUNT
     detail = outcome.steps[-1].detail
@@ -2140,7 +2156,7 @@ def test_gpu_count_fails_output_cut_short_before_the_cuda_section():
 def test_gpu_count_fails_when_libcuda_cannot_be_loaded():
     """The CUDA script itself, run with libcuda.so.1 unloadable, must print a reading that fails the step,
     MIG or not: no renter process can use a GPU without it."""
-    script = "import ctypes\ndef refuse(*a, **k):\n    raise OSError\nctypes.CDLL = refuse\n" + module._CUDA_COUNT_PY
+    script = "import ctypes\ndef refuse(*a, **k):\n    raise OSError\nctypes.CDLL = refuse\n" + module._CUDA_DEVICES_PY
     printed = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, check=True).stdout
     for mig in (("Disabled", "Disabled"), ("Enabled", "Enabled")):
         outcome = _gpu_step(gpu_list_output(cuda=printed.strip(), mig=mig))
@@ -2166,10 +2182,167 @@ def test_gpu_count_reads_cuda_with_the_image_cuda_visible_devices_unset():
     read it as a missing card."""
     assert "env -u CUDA_VISIBLE_DEVICES python3 -c" in module.GPU_LIST_COMMAND
     assert module.GPU_LIST_COMMAND.index("--gpu-mig-mode--") < module.GPU_LIST_COMMAND.index(
-        "--cuda-device-count--"
+        "--cuda-devices--"
     )
 
 
 def test_the_gpu_check_has_time_for_all_its_calls():
-    # review: the step runs two nvidia-smi calls, the device-node listing and cuInit over every card under one limit
-    assert module._GPU_CHECK_TIMEOUT_SECONDS == 60
+    # review: the step runs two nvidia-smi calls, the device-node listing, a context and a write on every CUDA
+    # device and PyTorch's import and a kernel on every device under one limit
+    assert module._GPU_CHECK_TIMEOUT_SECONDS == 120
+
+
+# 7be61cf6 shape (26 Nov): 8 listed cards, every device node and kernel minor in place, but CUDA cannot use
+# them as listed
+SHAPE_UUIDS = tuple(f"GPU-{i}{i}{i}{i}{i}{i}{i}{i}-1111-2222-3333-444444444444" for i in range(8))
+SHAPE_LISTING = "".join(
+    f"GPU {i}: NVIDIA GeForce RTX 4090 (UUID: {u})\n" for i, u in enumerate(SHAPE_UUIDS)
+)
+SHAPE_DETAILS = [{"uuid": u, "name": "NVIDIA GeForce RTX 4090", "capacity": "24564"} for u in SHAPE_UUIDS]
+
+
+def _shape_step(cuda: str):
+    ctx = make_probe_context()[0]
+    state = replace(ctx.state, gpu_count=8, gpu_details=SHAPE_DETAILS)
+    ctx = ctx.model_copy(update={"state": state})
+    output = gpu_list_output(
+        SHAPE_LISTING,
+        nodes=tuple(range(8)),
+        minors=tuple(zip(SHAPE_UUIDS, range(8))),
+        cuda=cuda,
+        mig=("Disabled",) * 8,
+    )
+    outcome = module._ProbeOutcome()
+    module._step_gpu_count(ctx, outcome, module._Login(result=MagicMock(stdout=output, stderr="", exit_status=0)))
+    return outcome
+
+
+def test_gpu_count_passes_every_listed_card_working_as_itself_under_cuda_and_pytorch():
+    cuda = cuda_devices(SHAPE_LISTING, 8) + cuda_devices(SHAPE_LISTING, 8, source="torch")
+    outcome = _shape_step(cuda)
+    assert outcome.failed_step is None and outcome.steps[-1].ok is True
+
+
+def test_gpu_count_fails_a_node_whose_cuda_devices_are_not_its_listed_gpus():
+    """Regression (7be61cf6, 26 Nov): nvidia-smi, the device nodes and the CUDA device count all said 8, the
+    probe passed, and a renter's PyTorch saw one device of another model."""
+    other = "cuda\t0\tok\t" + SHAPE_UUIDS[0] + "\t48541\tNVIDIA RTX A6000\n"
+    # the driver API: one device of another model, the others take no context
+    driver = "cuda\tcount\t8\n" + other + "".join(f"cuda\t{i}\terror\tcuCtxCreate_v2 101\n" for i in range(1, 8))
+    detail = _shape_step(driver).steps[-1].detail
+    assert "0 of 8 GPU(s) confirmed usable" in detail
+    assert f"CUDA device 0 ({SHAPE_UUIDS[0]}) is a 'NVIDIA RTX A6000', listed as 'NVIDIA GeForce RTX 4090'" in detail
+    assert "CUDA device 1 failed: cuCtxCreate_v2 101" in detail
+    # the driver API brings up all eight as listed, PyTorch (what a renter runs) sees one device of another model
+    torch_one = "torch\tcount\t1\n" + other.replace("cuda\t", "torch\t", 1)
+    outcome = _shape_step(cuda_devices(SHAPE_LISTING, 8) + torch_one)
+    assert outcome.failed_step == STEP_GPU_COUNT
+    detail = outcome.steps[-1].detail
+    assert "0 of 8 GPU(s) confirmed usable" in detail
+    assert "PyTorch device 0" in detail and "7 listed GPU(s) are no PyTorch device" in detail
+
+
+def test_gpu_count_fails_cuda_devices_with_the_wrong_memory_or_one_uuid_twice():
+    wrong_memory = cuda_devices(SHAPE_LISTING, 8).replace(f"{SHAPE_UUIDS[3]}\t24000", f"{SHAPE_UUIDS[3]}\t48541")
+    detail = _shape_step(wrong_memory).steps[-1].detail
+    assert "7 of 8 GPU(s) confirmed usable" in detail
+    assert f"CUDA device 3 ({SHAPE_UUIDS[3]}) has 48541 MiB, listed with 24564 MiB" in detail
+    # every device reports the first card's UUID: one card, not eight
+    one_uuid = "cuda\tcount\t8\n" + "".join(
+        f"cuda\t{i}\tok\t{SHAPE_UUIDS[0]}\t24000\tNVIDIA GeForce RTX 4090\n" for i in range(8)
+    )
+    detail = _shape_step(one_uuid).steps[-1].detail
+    unreadable = cuda_devices(SHAPE_LISTING, 8).replace(f"{SHAPE_UUIDS[2]}\t24000", f"{SHAPE_UUIDS[2]}\tlots")
+    assert "reported no readable memory size" in _shape_step(unreadable).steps[-1].detail
+    assert "0 of 8 GPU(s) confirmed usable" in detail
+    assert "CUDA reports 1 GPU UUID(s) on more than one device" in detail
+    assert "7 listed GPU(s) are no CUDA device" in detail
+
+
+def test_gpu_count_keeps_the_usable_count_when_every_cuda_device_fails():
+    failing = "cuda\tcount\t8\n" + "".join(f"cuda\t{i}\terror\tcuCtxCreate_v2 101\n" for i in range(8))
+    detail = _shape_step(failing).steps[-1].as_record()["detail"]
+    assert "0 of 8 GPU(s) confirmed usable" in detail and "; 6 more)" in detail
+
+
+_FAKE_LIBCUDA = """
+import ctypes, sys
+sys.modules['torch'] = None
+UUIDS = {uuids!r}
+BROKEN = {broken!r}
+class _Fake:
+    def cuInit(self, flags): return 0
+    def cuDeviceGetCount(self, ref): ref._obj.value = len(UUIDS); return 0
+    def cuDeviceGet(self, ref, i): ref._obj.value = i; return 0
+    def cuDeviceGetName(self, buf, size, dev): buf.value = b'NVIDIA GeForce RTX 4090'; return 0
+    def cuDeviceTotalMem_v2(self, ref, dev): ref._obj.value = 24217 << 20; return 0
+    def cuDeviceGetUuid(self, raw, dev):
+        raw[:] = list(bytes.fromhex(UUIDS[dev.value][4:].replace('-', ''))); return 0
+    def cuCtxCreate_v2(self, ref, flags, dev):
+        if dev.value in BROKEN: return 101
+        ref._obj.value = 1; return 0
+    def cuMemAlloc_v2(self, ref, size): ref._obj.value = 1 << 20; return 0
+    def cuMemsetD32_v2(self, ptr, value, n): self.value = value.value; return 0
+    def cuMemcpyDtoH_v2(self, dst, src, n):
+        for j in range(len(dst)): dst[j] = self.value
+        return 0
+    def cuCtxSynchronize(self): return 0
+    def cuCtxDestroy_v2(self, ctx): return 0
+ctypes.CDLL = lambda name: _Fake()
+"""
+
+
+def test_the_cuda_script_brings_up_each_device_and_prints_what_the_step_reads():
+    """The script itself, over a stand-in libcuda: eight working cards pass, a card that takes no context
+    is named."""
+    for broken, verdict in (((), None), ((5,), STEP_GPU_COUNT)):
+        script = _FAKE_LIBCUDA.format(uuids=list(SHAPE_UUIDS), broken=list(broken)) + module._CUDA_DEVICES_PY
+        printed = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, check=True).stdout
+        outcome = _shape_step(printed)
+        assert outcome.failed_step == verdict, outcome.steps[-1].detail
+    assert "CUDA device 5 failed: cuCtxCreate_v2 101" in outcome.steps[-1].detail
+
+
+_FAKE_TORCH = """
+import types
+class _Props:
+    def __init__(self, raw, name, mib):
+        self.uuid = types.SimpleNamespace(bytes=raw)
+        self.name = name
+        self.total_memory = mib << 20
+class _Tensor:
+    def __init__(self, value): self.value = value
+    def __mul__(self, k): return _Tensor(self.value * k)
+    def sum(self): return self
+    def item(self): return self.value
+_SEEN = {seen!r}
+torch = types.ModuleType('torch')
+torch.version = types.SimpleNamespace(cuda='12.8')
+torch._C = types.SimpleNamespace(_CudaDeviceProperties=types.SimpleNamespace(uuid=None))
+torch.int64 = 'int64'
+torch.cuda = types.SimpleNamespace(
+    device_count=lambda: len(_SEEN),
+    get_device_properties=lambda i: _Props(
+        bytes.fromhex(_SEEN[i][0][4:].replace('-', '')), _SEEN[i][1], _SEEN[i][2]
+    ),
+)
+torch.arange = lambda n, device, dtype: _Tensor(n * (n - 1) // 2)
+sys.modules['torch'] = torch
+"""
+
+
+def test_the_cuda_script_checks_each_device_pytorch_sees():
+    """The script's PyTorch half, over a stand-in torch: all eight cards as listed pass; one device of
+    another model fails."""
+    as_listed = [(u, "NVIDIA GeForce RTX 4090", 24217) for u in SHAPE_UUIDS]
+    for seen, verdict in ((as_listed, None), ([(SHAPE_UUIDS[0], "NVIDIA RTX A6000", 48541)], STEP_GPU_COUNT)):
+        script = (
+            _FAKE_LIBCUDA.format(uuids=list(SHAPE_UUIDS), broken=[])
+            + _FAKE_TORCH.format(seen=seen)
+            + module._CUDA_DEVICES_PY
+        )
+        printed = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, check=True).stdout
+        assert "torch\tcount\t" in printed
+        outcome = _shape_step(printed)
+        assert outcome.failed_step == verdict, outcome.steps[-1].detail
+    assert "PyTorch device 0" in outcome.steps[-1].detail
