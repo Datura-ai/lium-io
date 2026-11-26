@@ -188,6 +188,9 @@ _REDIS_FAILED_PREFIX = RENTAL_PROBE_FAILED_PREFIX
 # the OK stamp expires: a deregistered executor's stamp ages out, and an expired stamp only makes the
 # probe run again on the next idle cycle
 _REDIS_STAMP_TTL_SECONDS = 30 * 24 * 3600
+# that a probe has ever passed on the node (DAH-7044): kept apart from the interval stamp, which expires
+# while a node stays rented and is cleared to re-run the probe; no lifetime, like the standing failure
+_REDIS_PROVEN_PREFIX = "rental_probe_proven"
 # A node whose probe has not passed for this many probe intervals and is skipped for a state of its own
 # Docker is logged as RENTAL_PROBE_LONG_UNPROBED.
 _LONG_UNPROBED_INTERVALS = 4
@@ -275,8 +278,9 @@ class RentalProbeCheck:
     a cycle without a verdict hides it (RENTAL_PROBE_NOT_YET_PROVEN, score 0, nothing cleared), so a node
     is first listed by a probe that passed, never by a skip. A record that cannot be read scores nothing
     and leaves the listing as stored (RENTAL_PROBE_PROOF_UNREADABLE), as does a probe the validator cannot
-    run for a reason on its own side (RENTAL_PROBE_NOT_RUN_ON_VALIDATOR: no default renter image for the
-    GPU and driver, no input, no create lock).
+    run for a reason on its own side (RENTAL_PROBE_NOT_RUN_ON_VALIDATOR: no input, no create lock, the node's
+    image list unreadable). No default renter image for the node's GPU and driver is not one: that lookup
+    key is the node's own report.
 
     An idle node running a Lium filler is probed too, beside the filler rather than in its place:
     create_container is told `beside_fillers`, so it
@@ -437,19 +441,23 @@ class RentalProbeCheck:
 
         image_ref = await _default_renter_image(ctx)
         if image_ref is None:
+            # the lookup key (GPU and driver) is the node's own report, so an unproven node stays held
             return self._inconclusive(
-                ctx, "no default renter image for this GPU and driver", steps=[], standing=standing, validator_side=True
+                ctx, "no default renter image for this GPU and driver", steps=[], standing=standing
             )
         image_present = await _image_present_on_host(ctx, image_ref)
         if image_present is None:
             if standing is None:
                 await _log_if_long_unprobed(ctx, "could not read the node's image list")
+            # the validator's own read got no answer (fleet-wide during our SSH outage): an unproven node keeps
+            # its stored listing rather than a node-proven hold the outage silencer leaves in place
             return self._inconclusive(
                 ctx,
                 "could not read the node's image list",
                 steps=[],
                 what={"image": image_ref},
                 standing=standing,
+                validator_side=True,
             )
         if not image_present:
             # a pull would put minutes of Docker Hub traffic inside the validation cycle; the
@@ -559,8 +567,8 @@ class RentalProbeCheck:
         """This cycle reached no verdict of its own and the last probe failed: fail the node again with
         that step (review). `no_verdict` is what this cycle would otherwise have reported."""
         if standing is _NEVER_PASSED and validator_side:
-            # the probe could not start for a reason on the validator's side (no default renter image for the
-            # GPU and driver, no input, no create lock): that says nothing about the node, so it is not hidden as
+            # the probe could not start for a reason on the validator's side (no input, no create lock, the node's
+            # image list unreadable): that says nothing about the node, so it is not hidden as
             # unproven; like an unreadable record, no score and the stored listing stays (review of lio#2442)
             event = render_message(
                 Msg.NOT_RUN_ON_VALIDATOR,
@@ -819,12 +827,14 @@ async def _last_ok_at(ctx: Context) -> float | None:
 
 
 async def _stamp_last_ok(ctx: Context) -> None:
+    _PROVEN_SEEN[ctx.executor.uuid] = True
     try:
         await ctx.services.redis.set(
             f"{_REDIS_LAST_OK_PREFIX}:{ctx.executor.uuid}",
             str(time.time()),
             ex=_REDIS_STAMP_TTL_SECONDS,
         )
+        await ctx.services.redis.set(f"{_REDIS_PROVEN_PREFIX}:{ctx.executor.uuid}", "1")
     except Exception:
         logger.warning(
             _m(
@@ -862,13 +872,34 @@ _NEVER_PASSED = _Failure("never_passed")
 _PROOF_UNREADABLE = _Failure("proof_unreadable")
 
 
+# What this process last read of each node's proof (executor uuid -> passed). When Redis cannot be read, a node
+# read as unproven stays held and one read as proven keeps its listing; only a node not read since start is unknown.
+# shortcut: in-process only, so the first cycle after a validator restart during a Redis outage is still unknown.
+_PROVEN_SEEN: dict[str, bool] = {}
+
+
+async def _proven(ctx: Context) -> bool:
+    """Has a probe ever passed on the node? Raises when Redis cannot be read."""
+    if await ctx.services.redis.get(f"{_REDIS_PROVEN_PREFIX}:{ctx.executor.uuid}") is not None:
+        return True
+    if await _last_ok_at(ctx) is None:
+        return False
+    # a pass stamped before the proof key existed
+    await ctx.services.redis.set(f"{_REDIS_PROVEN_PREFIX}:{ctx.executor.uuid}", "1")
+    return True
+
+
 async def _never_passed(ctx: Context) -> _Failure | None:
     try:
-        last_ok = await _last_ok_at(ctx)
+        proven = await _proven(ctx)
     except Exception:
-        _read_failed(ctx, "its interval stamp in Redis")
-        return _PROOF_UNREADABLE
-    return _NEVER_PASSED if last_ok is None else None
+        _read_failed(ctx, "its rental probe proof in Redis")
+        seen = _PROVEN_SEEN.get(ctx.executor.uuid)
+        if seen is None:
+            return _PROOF_UNREADABLE
+        return None if seen else _NEVER_PASSED
+    _PROVEN_SEEN[ctx.executor.uuid] = proven
+    return None if proven else _NEVER_PASSED
 
 
 async def _standing_failure(ctx: Context) -> _Failure | None:

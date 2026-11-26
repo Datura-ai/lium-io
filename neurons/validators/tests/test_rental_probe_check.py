@@ -59,6 +59,14 @@ from tests.helpers import (
     make_context,
 )
 
+
+@pytest.fixture(autouse=True)
+def _fresh_proof_memo():
+    module._PROVEN_SEEN.clear()
+    yield
+    module._PROVEN_SEEN.clear()
+
+
 EXECUTOR = default_executor()
 MINER = "miner-hotkey"
 IMAGE = DefaultDockerImage(docker_image="daturaai/pytorch", docker_image_tag="2.7.0-cuda12.8")
@@ -1450,6 +1458,7 @@ async def test_unreadable_state_rents_nothing():
     assert result.event.what_we_saw["reason"] == "could not confirm the node is idle"
     assert docker.create_calls == []
 
+    module._PROVEN_SEEN.clear()  # a node this process has not read before
     ctx, docker, _ = make_probe_context(redis=FakeRedis(broken=True))
     with probe_settings(), renter_path():
         result = await RentalProbeCheck().run(ctx)
@@ -1994,20 +2003,86 @@ async def test_a_node_no_probe_has_passed_on_is_not_listed_by_a_cycle_without_a_
 
 
 @pytest.mark.asyncio
-async def test_a_node_the_validator_cannot_probe_keeps_its_stored_listing():
-    """Review of lio#2442: the validator has no default renter image for the node's GPU and driver, so the probe
-    never starts. Nothing is wrong with the node: it is not hidden as unproven, its listing stays as stored."""
+async def test_an_unproven_node_with_no_default_image_for_its_driver_stays_held():
+    """Follow-up of lio#2442: the default image is looked up by the GPU and driver the node reports, so no image
+    for them is not the validator's side: a node no probe has passed on stays held until one passes."""
     redis = FakeRedis(last_ok=None)
     ctx, docker, _ = make_probe_context(redis=redis, images=())
     with probe_settings():
         result = await RentalProbeCheck().run(ctx)
-    assert result.event.reason_code == Msg.NOT_RUN_ON_VALIDATOR.reason
+    assert result.event.reason_code == Msg.NOT_YET_PROVEN.reason
     assert result.event.what_we_saw["no_verdict_this_cycle"] == (
         "inconclusive: no default renter image for this GPU and driver"
     )
+    errors = run_availability_errors(False, [*result.extra_events, result.event])
+    assert [e["reason_code"] for e in errors] == ["VERIFICATION_FAILED"]
+    assert redis.standing_failure() is None and not redis.stamped() and docker.create_calls == []
+
+
+@pytest.mark.asyncio
+async def test_an_unreadable_image_list_keeps_an_unproven_nodes_stored_listing():
+    """Follow-up of lio#2442: the validator's own image-list read got no answer (an SSH outage of ours times it
+    out on every node). That says nothing about the node: no node-proven hold, the listing stays as stored."""
+    redis = FakeRedis(last_ok=None)
+    ctx, docker, _ = make_probe_context(redis=redis)
+    ctx.ssh.run.side_effect = asyncssh.ConnectionLost("lost")
+    with probe_settings():
+        result = await RentalProbeCheck().run(ctx)
+    assert result.event.reason_code == Msg.NOT_RUN_ON_VALIDATOR.reason
+    assert result.event.what_we_saw["no_verdict_this_cycle"] == "inconclusive: could not read the node's image list"
     assert result.updates == {"score": 0.0, "job_score": 0.0} and result.extra_events == []
     assert run_availability_errors(False, [result.event]) is None
-    assert redis.standing_failure() is None and not redis.stamped() and docker.create_calls == []
+    assert docker.create_calls == []
+
+
+@pytest.mark.asyncio
+async def test_a_pass_outlives_the_interval_stamp():
+    """Follow-up of lio#2442: the interval stamp expires after 30 days and is not refreshed while the node is
+    rented; a node that passed must not read as never proven when a long rental ends."""
+    redis = FakeRedis(last_ok=None)
+    ctx, _, _ = make_probe_context(redis=redis)
+    with probe_settings(), renter_path():
+        assert (await RentalProbeCheck().run(ctx)).event.reason_code == Msg.PROBE_OK.reason
+    redis.age_past_every_lifetime()
+    module._PROVEN_SEEN.clear()
+    assert f"rental_probe_ok:{EXECUTOR.uuid}" not in redis.store
+    ctx, _, _ = make_probe_context(redis=redis, images=())
+    with probe_settings():
+        result = await RentalProbeCheck().run(ctx)
+    assert result.passed is True and result.event.reason_code == Msg.INCONCLUSIVE.reason
+
+
+@pytest.mark.asyncio
+async def test_a_pass_stamped_before_the_proof_key_counts_and_is_kept():
+    redis = FakeRedis(last_ok=time.time() - 7 * 3600)
+    ctx, _, _ = make_probe_context(redis=redis, images=())
+    with probe_settings():
+        result = await RentalProbeCheck().run(ctx)
+    assert result.passed is True and result.event.reason_code == Msg.INCONCLUSIVE.reason
+    assert redis.store[f"rental_probe_proven:{EXECUTOR.uuid}"] == "1"
+    assert redis.expiries[f"rental_probe_proven:{EXECUTOR.uuid}"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("passed_before", [False, True])
+async def test_a_proof_read_failure_keeps_what_was_last_read(passed_before):
+    """Follow-up of lio#2442: an unreadable proof kept the stored listing, so a listed node no probe had passed on
+    stayed rentable through a Redis outage. A node last read as unproven stays held; one read as proven is not."""
+    redis = FakeRedis(last_ok=time.time() - 7 * 3600 if passed_before else None)
+    ctx, _, _ = make_probe_context(redis=redis, images=())
+    with probe_settings():
+        await RentalProbeCheck().run(ctx)
+    redis.broken = True
+    ctx, docker, _ = make_probe_context(redis=redis, images=())
+    with probe_settings():
+        result = await RentalProbeCheck().run(ctx)
+    errors = run_availability_errors(False, [*result.extra_events, result.event])
+    if passed_before:
+        assert result.event.reason_code != Msg.NOT_YET_PROVEN.reason and not errors
+    else:
+        assert result.event.reason_code == Msg.NOT_YET_PROVEN.reason
+        assert [e["reason_code"] for e in errors] == ["VERIFICATION_FAILED"]
+    assert docker.create_calls == []
 
 
 @pytest.mark.asyncio
