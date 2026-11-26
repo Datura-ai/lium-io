@@ -1,7 +1,7 @@
 # Release guards: the `dockerhub-push` environment and the `release-tags` ruleset
 
 Every job in this repository that logs in to Docker Hub runs in the GitHub environment
-`dockerhub-push` (`executor_cd_prod.yml`, `executor_cd_dev.yml`, `miner_cd_prod.yml`,
+`dockerhub-push` (`executor_cd_prod.yml`, `miner_cd_prod.yml`,
 `miner_cd_dev.yml`, `validator_cd_prod.yml`, `validator_cd_dev.yml`, `watchtower_image.yml`).
 The login is Docker Hub OIDC (`../DOCKERHUB_OIDC.md`): Docker trusts the subject
 `repo:Datura-ai/lium-io:environment:dockerhub-push`, and the environment holds no secret. Its
@@ -10,12 +10,13 @@ deployment policy names the only refs allowed to log in: `main` and the release 
 branch stops before the job's first step with "Branch … is not allowed to deploy to
 dockerhub-push" and never gets a Docker Hub token.
 
-The one exception is `executor_cd_dev.yml`, the dev build developers dispatch from feature
-branches: off `main` it runs in a second environment, `dockerhub-push-dev`, with no branch policy.
+The one exception is `executor_cd_dev.yml`, the test build developers dispatch from feature
+branches: it runs in a second environment, `dockerhub-push-dev`, with no branch policy.
 Docker trusts that subject only for `daturaai/compute-subnet-executor-dev` and
 `…-executor-runner-dev` (ruleset `lium-io-dev`, `../DOCKERHUB_OIDC.md`), so a branch build
-gets a token that cannot push a release image, whatever its workflow file says. From `main` it
-keeps `dockerhub-push` and the release repositories' `dev` tag. `miner_cd_dev.yml` and
+gets a token that cannot push a release image, whatever its workflow file says. A dispatch from
+`main` takes the same path: the release repositories' `dev` tag, which the dev and staging stacks
+pull, is written only by lium-io-deployment's staging executor publish (DAH-6670). `miner_cd_dev.yml` and
 `validator_cd_dev.yml` are dispatched from `main` only.
 
 The tag ruleset `release-tags` (`release-tags.json`) restricts who may create, move or delete

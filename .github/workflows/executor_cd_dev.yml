@@ -1,4 +1,4 @@
-name: "CD: Deploying Executor (dev) with Manual Trigger"
+name: "CD: Executor branch test build (-dev repositories) with Manual Trigger"
 
 on:
   workflow_dispatch:
@@ -6,16 +6,17 @@ on:
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    # From main: the release repositories' `dev` tag, which the dev and staging stacks pull. From any
-    # other branch: `dockerhub-push-dev` (no branch policy), whose Docker Hub ruleset covers only the
-    # `-dev` repositories, so a branch never gets a token for a release image (.github/rulesets/README.md).
-    environment: ${{ github.ref == 'refs/heads/main' && 'dockerhub-push' || 'dockerhub-push-dev' }}
+    # Branch test builds only, from any ref, main included: `dockerhub-push-dev` (no branch policy), whose Docker Hub
+    # ruleset covers only the `-dev` repositories (.github/rulesets/README.md). The release repositories' `dev` tag, which
+    # the dev and staging stacks pull, is written only by lium-io-deployment's staging executor publish (staging liumd);
+    # this workflow wrote it too, with the release liumd, so the staging stacks fell back to baked keys (DAH-6670).
+    environment: dockerhub-push-dev
     env:
-      IMAGE_REPO_SUFFIX: ${{ github.ref != 'refs/heads/main' && '-dev' || '' }}
+      IMAGE_REPO_SUFFIX: "-dev"
       TAG: "dev" 
       VALIDATOR_HOTKEY_SS58: "5DHgdomxxHSQf7neJWcagvGhTMKpqvKWwuprEaFF8C653qty"
-      # the staging owner key (staging only, not on chain) and the message it signed: the `dev` executor, which the
-      # staging stack runs, follows validator messages that key signs (scripts/staging_trust_override.sh), as the
+      # the staging owner key (staging only, not on chain) and the message it signed: a `-dev` branch executor, which a
+      # dev or staging stack may point at, follows validator messages that key signs (scripts/staging_trust_override.sh), as the
       # staging watchtower and miner do (watchtower_image.yml, miner_cd_staging.yml), read from the staging backend
       STAGING_TRUST_OWNER_SS58: "5EeYEmUGfAJeTmVvYSmkpsUmVhiySd2Zch5nyt4tE1HygFX8"
       STAGING_TRUST_MESSAGE: "lium-validator:5DHgdomxxHSQf7neJWcagvGhTMKpqvKWwuprEaFF8C653qty:1"
