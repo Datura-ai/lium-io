@@ -26,6 +26,7 @@ from services.ssh_service import SSHService
 
 from .checks.port_connectivity import PortConnectivityCheck
 from .checks.post_rental_gpu_recheck import PostRentalGpuRecheckCheck
+from .checks.rental_probe import with_the_unproven_hold
 from .availability import (
     MAX_PEER_TEXT_LENGTH,
     ReachSource,
@@ -303,6 +304,10 @@ class TaskService:
                 # event list is read, so a new reachability check needs no change here.
                 # DAH-5395: a run ended by a failure in REASONS_THAT_HIDE_AT_ONCE hides the node too
                 result.availability_errors = run_availability_errors(ok, events)
+                # DAH-7229: a run that ended before the rental probe still holds a node no probe has passed on
+                result.availability_errors = await with_the_unproven_hold(
+                    last_context, checks, events, result.availability_errors
+                )
                 if not ok and last_event.reason_code == TenantEnforcementMessages.EXECUTOR_TRANSPORT_UNREACHABLE.reason:
                     # DAH-5718: the checks after the one whose session died never ran, so [] would clear holds only
                     # they re-read (a GPU-loss hold the scrape cleared waits for its recheck); None leaves the stored ones

@@ -1203,6 +1203,32 @@ async def test_verifyx_skips_while_a_standing_rental_probe_failure_fails_the_cyc
 
 
 @pytest.mark.asyncio
+@pytest.mark.real_rental_probe_proof
+async def test_verifyx_skips_on_a_node_no_rental_probe_has_passed_on(context_factory):
+    """Follow-up of lio#2442: earlier checks reserved cycle time only for a recorded probe failure, so a node no probe
+    had passed on could be left too little time for its first probe on every cycle and stay hidden for good."""
+    verifyx_service = DummyVerifyXService(
+        success=True, updated_specs={"network": {"download_speed": 500.0, "upload_speed": 100.0}}
+    )
+    services = build_services(verifyx=verifyx_service)
+    state = build_state(
+        specs={"gpu": {"count": 8}},
+        rented_data=RentedExecutorsResponse(
+            executors={},
+            banned_guids=[],
+            network_ema={"executor-123": NetworkEMA(ema_verifyx_download_speed=500.0, ema_verifyx_upload_speed=70.0)},
+        ),
+    )
+    ctx = context_factory(services=services, config=build_context_config(), state=state)
+
+    result = await VerifyXCheck().run(ctx)
+
+    assert result.event.reason_code == Msg.STANDING_PROBE_FAILURE_SKIPPED.reason
+    assert verifyx_service.called_with is None
+    assert result.updates["state"].verifyx_skipped_for_standing_probe_failure is True
+
+
+@pytest.mark.asyncio
 async def test_verifyx_skip_uses_the_kept_ema_once_the_backend_stops_sending_it(context_factory):
     """The backend sends the EMA for active and filler nodes only; the failed cycles make the node inactive."""
     verifyx_service = DummyVerifyXService(

@@ -414,3 +414,28 @@ def port_mapping_dao(mock_async_session_maker):
     from daos.port_mapping_dao import PortMappingDao
 
     return PortMappingDao()
+
+
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers", "real_rental_probe_proof: read the rental-probe proof from Redis instead of assuming a pass on record"
+    )
+
+
+@pytest.fixture(autouse=True)
+def _a_rental_probe_pass_on_record(request, monkeypatch):
+    """Every node has a rental-probe pass on record unless a test asks for the real read (DAH-7229): VerifyX and the
+    all-cards run defer on a node no probe has passed on, which tests of those checks are not about."""
+    if request.node.get_closest_marker("real_rental_probe_proof"):
+        return
+    import importlib
+
+    async def proven(ctx):
+        return None
+
+    for name in ("services.task.checks.rental_probe", "neurons.validators.src.services.task.checks.rental_probe"):
+        try:
+            module = importlib.import_module(name)
+        except ImportError:
+            continue
+        monkeypatch.setattr(module, "_never_passed", proven)

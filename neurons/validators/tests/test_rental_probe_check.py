@@ -60,6 +60,9 @@ from tests.helpers import (
 )
 
 
+pytestmark = pytest.mark.real_rental_probe_proof
+
+
 @pytest.fixture(autouse=True)
 def _fresh_proof_memo():
     module._PROVEN_SEEN.clear()
@@ -1972,7 +1975,6 @@ async def test_the_teardown_wait_never_outlasts_the_job():
             0,
             "skipped: default renter image is not pulled on the node",
         ),
-        (lambda redis: make_probe_context(redis=redis), 650, "skipped: too little cycle time left"),
     ],
 )
 async def test_a_node_no_probe_has_passed_on_is_not_listed_by_a_cycle_without_a_verdict(
@@ -2358,3 +2360,89 @@ def test_gpu_count_reads_cuda_with_the_image_cuda_visible_devices_unset():
 def test_the_gpu_check_has_time_for_all_its_calls():
     # review: the step runs two nvidia-smi calls, the device-node listing and cuInit over every card under one limit
     assert module._GPU_CHECK_TIMEOUT_SECONDS == 60
+
+
+@pytest.mark.asyncio
+async def test_too_little_cycle_time_keeps_an_unproven_nodes_stored_listing():
+    """Follow-up of lio#2442: the cycle's time is the validator's to budget, so running short says nothing about
+    the node: no listing hold, the stored listing stays (as for an unreadable image list)."""
+    redis = FakeRedis(last_ok=None)
+    ctx, docker, _ = make_probe_context(redis=redis)
+    ctx = ctx.model_copy(update={"started_at_monotonic": time.monotonic() - 650})
+    with probe_settings():
+        result = await RentalProbeCheck().run(ctx)
+    assert result.event.reason_code == Msg.NOT_RUN_ON_VALIDATOR.reason
+    assert result.event.what_we_saw["no_verdict_this_cycle"] == "skipped: too little cycle time left"
+    assert result.extra_events == [] and run_availability_errors(False, [result.event]) is None
+    assert docker.create_calls == []
+
+
+@pytest.mark.asyncio
+async def test_too_little_time_for_the_create_keeps_an_unproven_nodes_stored_listing(monkeypatch):
+    redis = FakeRedis(last_ok=None)
+    ctx, docker, _ = make_probe_context(redis=redis)
+    monkeypatch.setattr(module, "_create_deadline_seconds", lambda ctx: module._MIN_CREATE_DEADLINE_SECONDS - 1)
+    with probe_settings():
+        result = await RentalProbeCheck().run(ctx)
+    assert result.event.reason_code == Msg.NOT_RUN_ON_VALIDATOR.reason
+    assert result.event.what_we_saw["no_verdict_this_cycle"] == (
+        "inconclusive: too little cycle time left for the create"
+    )
+    assert result.extra_events == [] and run_availability_errors(False, [result.event]) is None
+    assert docker.create_calls == []
+
+
+@pytest.mark.asyncio
+async def test_an_unproven_nodes_first_probe_gets_the_cycle_time_and_relists_after_the_deferred_checks():
+    """Follow-up of lio#2442: VerifyX and the all-cards run defer on a node no probe has passed on, so its first probe
+    has the time. That cycle does not relist the node; its pass is kept, so the next cycle runs every check in full
+    and lists it."""
+    redis = FakeRedis(last_ok=None)
+    ctx, _, _ = make_probe_context(redis=redis)
+    assert await module.has_standing_failure(ctx) is True
+    ctx = ctx.model_copy(update={"state": replace(ctx.state, verifyx_skipped_for_standing_probe_failure=True)})
+    with probe_settings(), renter_path():
+        result = await RentalProbeCheck().run(ctx)
+    assert result.passed is False and result.event.reason_code == Msg.CYCLE_WITHOUT_VERIFYX.reason
+    # the pass is on record, the interval stamp is not, so the deferral ends and the next probe runs in full
+    assert redis.store[f"rental_probe_proven:{EXECUTOR.uuid}"] == "1" and not redis.stamped()
+    ctx, _, _ = make_probe_context(redis=redis)
+    assert await module.has_standing_failure(ctx) is False
+    with probe_settings(), renter_path():
+        result = await RentalProbeCheck().run(ctx)
+    assert result.passed is True and result.event.reason_code == Msg.PROBE_OK.reason and redis.stamped()
+
+
+def _early_failure_run(ctx):
+    from neurons.validators.src.services.task.messages import DiskSpaceMessages
+
+    network = render_message(Msg.SKIPPED, ctx=ctx, check_id="executor.validate.verifyx", what={})
+    disk = render_message(DiskSpaceMessages.NOT_REPORTED, ctx=ctx, check_id="executor.validate.disk_space", what={})
+    return [network, disk]
+
+
+@pytest.mark.asyncio
+async def test_a_run_that_ends_before_the_probe_keeps_an_unproven_nodes_hold():
+    """Follow-up of lio#2442: the hold travelled with the probe's result only. A later run that ended at an earlier
+    check (after healthy network figures) sent no availability error, which lifts the hold with no pass."""
+    redis = FakeRedis(last_ok=None)
+    ctx, _, _ = make_probe_context(redis=redis)
+    events = _early_failure_run(ctx)
+    assert run_availability_errors(False, events) == []
+    errors = await module.with_the_unproven_hold(ctx, [RentalProbeCheck()], events, [])
+    assert [e["reason_code"] for e in errors] == ["VERIFICATION_FAILED"]
+    assert errors[0]["what_we_saw"]["failed_reason"] == Msg.NOT_YET_PROVEN.reason
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["proven", "probe_ran", "no_probe_in_pipeline", "kept_stored", "rented"])
+async def test_the_unproven_hold_is_added_only_to_a_run_that_skipped_the_probe_of_an_unproven_node(case):
+    redis = FakeRedis(last_ok=time.time() - 7 * 3600 if case == "proven" else None)
+    ctx, _, _ = make_probe_context(redis=redis, rented=rented_data(pods=1) if case == "rented" else None)
+    events = _early_failure_run(ctx)
+    if case == "probe_ran":
+        events.append(render_message(Msg.SKIPPED, ctx=ctx, check_id=RentalProbeCheck.check_id, what={}))
+    checks = [] if case == "no_probe_in_pipeline" else [RentalProbeCheck()]
+    errors = None if case == "kept_stored" else []
+    assert await module.with_the_unproven_hold(ctx, checks, events, errors) == errors
+

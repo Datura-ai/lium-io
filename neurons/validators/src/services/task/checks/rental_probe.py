@@ -279,7 +279,7 @@ class RentalProbeCheck:
     is first listed by a probe that passed, never by a skip. A record that cannot be read scores nothing
     and leaves the listing as stored (RENTAL_PROBE_PROOF_UNREADABLE), as does a probe the validator cannot
     run for a reason on its own side (RENTAL_PROBE_NOT_RUN_ON_VALIDATOR: no input, no create lock, the node's
-    image list unreadable). No default renter image for the node's GPU and driver is not one: that lookup
+    image list unreadable, too little cycle time left). No default renter image for the node's GPU and driver is not one: that lookup
     key is the node's own report.
 
     An idle node running a Lium filler is probed too, beside the filler rather than in its place:
@@ -337,6 +337,7 @@ class RentalProbeCheck:
                 steps=[],
                 what={"create_deadline_seconds": int(create_deadline)},
                 standing=standing,
+                validator_side=True,
             )
         try:
             outcome = await _probe(
@@ -368,6 +369,8 @@ class RentalProbeCheck:
             try:
                 # run() drops this pass when VerifyX or the all-cards proof skipped the cycle; a stamp then would hold
                 # the next full probe back a whole interval, so only a pass the cycle keeps is stamped
+                # the proof is the pass itself: written either way, so a deferral does not repeat on the next cycle
+                await _stamp_proven(ctx)
                 if not _cycle_skipped_a_work_proof(ctx):
                     await _stamp_last_ok(ctx)
                 await _clear_failure(ctx)
@@ -431,7 +434,11 @@ class RentalProbeCheck:
         if skip_reason == "rented":
             return self._skipped(ctx, skip_reason, skip_what)
         if skip_reason:
-            return self._skipped(ctx, skip_reason, skip_what, standing=standing)
+            # the cycle's time is the validator's to budget (earlier checks leave room for an unproven node's probe,
+            # has_standing_failure): a shortage says nothing about the node, so its stored listing stays
+            return self._skipped(
+                ctx, skip_reason, skip_what, standing=standing, validator_side=skip_reason == _TOO_LITTLE_TIME
+            )
 
         missing = _missing_inputs(ctx)
         if missing:
@@ -568,7 +575,7 @@ class RentalProbeCheck:
         that step (review). `no_verdict` is what this cycle would otherwise have reported."""
         if standing is _NEVER_PASSED and validator_side:
             # the probe could not start for a reason on the validator's side (no input, no create lock, the node's
-            # image list unreadable): that says nothing about the node, so it is not hidden as
+            # image list unreadable, too little cycle time): that says nothing about the node, so it is not hidden as
             # unproven; like an unreadable record, no score and the stored listing stays (review of lio#2442)
             event = render_message(
                 Msg.NOT_RUN_ON_VALIDATOR,
@@ -614,9 +621,10 @@ class RentalProbeCheck:
         what: dict[str, Any] | None = None,
         *,
         standing: _Failure | None = None,
+        validator_side: bool = False,
     ) -> CheckResult:
         if standing is not None:
-            return self._carried(ctx, standing, no_verdict=f"skipped: {reason}")
+            return self._carried(ctx, standing, no_verdict=f"skipped: {reason}", validator_side=validator_side)
         event = render_message(
             Msg.SKIPPED,
             ctx=ctx,
@@ -669,7 +677,7 @@ async def _skip_reason(ctx: Context, standing: _Failure | None = None) -> tuple[
         return "port check deferred for disk pressure", {}
     seconds_left = task_seconds_left(ctx)
     if seconds_left < (_MIN_TASK_SECONDS_LEFT_STANDING if standing else _MIN_TASK_SECONDS_LEFT):
-        return "too little cycle time left", {"task_seconds_left": int(seconds_left)}
+        return _TOO_LITTLE_TIME, {"task_seconds_left": int(seconds_left)}
 
     try:
         last_ok = await _last_ok_at(ctx)
@@ -694,6 +702,7 @@ def _read_failed(ctx: Context, what: str) -> None:
     )
 
 
+_TOO_LITTLE_TIME = "too little cycle time left"
 _RENTED_SINCE_CYCLE_START = "rented since the cycle started"
 _RENT_IN_PROGRESS = "a rent is being created on the node"
 # the busy reasons that mean a renter has the node: a standing failure is not applied on these
@@ -826,15 +835,23 @@ async def _last_ok_at(ctx: Context) -> float | None:
         return None
 
 
-async def _stamp_last_ok(ctx: Context) -> None:
+async def _stamp_proven(ctx: Context) -> None:
     _PROVEN_SEEN[ctx.executor.uuid] = True
+    try:
+        await ctx.services.redis.set(f"{_REDIS_PROVEN_PREFIX}:{ctx.executor.uuid}", "1")
+    except Exception:
+        logger.warning(
+            _m("Rental probe's proof could not be written", extra=get_extra_info(ctx.default_extra)), exc_info=True
+        )
+
+
+async def _stamp_last_ok(ctx: Context) -> None:
     try:
         await ctx.services.redis.set(
             f"{_REDIS_LAST_OK_PREFIX}:{ctx.executor.uuid}",
             str(time.time()),
             ex=_REDIS_STAMP_TTL_SECONDS,
         )
-        await ctx.services.redis.set(f"{_REDIS_PROVEN_PREFIX}:{ctx.executor.uuid}", "1")
     except Exception:
         logger.warning(
             _m(
@@ -925,11 +942,37 @@ async def _standing_failure(ctx: Context) -> _Failure | None:
 
 
 async def has_standing_failure(ctx: Context) -> bool:
-    """Does a standing probe failure fail this cycle? Not on a node a renter has (_may_probe skips it there)."""
+    """Does a standing probe failure, or no pass on record, fail this cycle? Not on a node a renter has (_may_probe
+    skips it there). VerifyX and the all-cards proof defer on it, leaving the cycle's time to the probe."""
     rented = rental_of_this_node(ctx)
     if rented and rented.pods:
         return False
-    return await _standing_failure(ctx) is not None
+    return await _standing_failure(ctx) is not None or await _never_passed(ctx) is _NEVER_PASSED
+
+
+async def with_the_unproven_hold(
+    ctx: Context, checks: list, events: list, errors: list[dict] | None
+) -> list[dict] | None:
+    """A run's availability errors, with the listing hold of a node no probe has passed on when the run ended before
+    the probe (an earlier check failed): its list would otherwise be [], which lifts the hold with no pass. Unchanged
+    for any other node, a rented one, an unreadable record, a pipeline without the probe, or None (the stored
+    listing, and the hold the last run left, are kept)."""
+    if errors is None or not any(isinstance(check, RentalProbeCheck) for check in checks):
+        return errors
+    if any(event.check_id == RentalProbeCheck.check_id for event in events):
+        return errors
+    rented = rental_of_this_node(ctx)
+    if rented and rented.pods:
+        return errors
+    if await _never_passed(ctx) is not _NEVER_PASSED:
+        return errors
+    event = render_message(
+        Msg.NOT_YET_PROVEN,
+        ctx=ctx,
+        check_id=RentalProbeCheck.check_id,
+        what={"executor_uuid": ctx.executor.uuid, "no_verdict_this_cycle": "the run ended before the probe"},
+    )
+    return [*errors, failed_check_event(False, [event]).model_dump(mode="json")]
 
 
 async def _stamp_failure(ctx: Context, failure: _Failure) -> None:
