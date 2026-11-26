@@ -314,8 +314,7 @@ def make_probe_context(
     docker = docker or FakeDocker()
     redis = redis or FakeRedis()
     backend = AsyncMock()
-    # () is the backend answering that no image exists; None is no answer (timeout, error, bad body)
-    backend.get_default_docker_image.return_value = list(images) if images is not None else None
+    backend.get_default_docker_image.return_value = list(images) if images else None
     # the fresh backend reads: before the probe (is the node idle now?) and, on a failed verdict, after
     # it (was it rented meanwhile?). A list gives one answer per call.
     if isinstance(rented_now, list):
@@ -2006,42 +2005,33 @@ async def test_a_node_no_probe_has_passed_on_is_not_listed_by_a_cycle_without_a_
 
 
 @pytest.mark.asyncio
-async def test_an_unproven_node_with_no_default_image_for_its_driver_stays_held():
-    """Follow-up of lio#2442: the default image is looked up by the GPU and driver the node reports, so no image
-    for them is not the validator's side: a node no probe has passed on stays held until one passes."""
+async def test_a_node_the_validator_cannot_probe_keeps_its_stored_listing():
+    """Review of lio#2442: the validator has no default renter image for the node's GPU and driver, so the probe
+    never starts. Nothing is wrong with the node: it is not hidden as unproven, its listing stays as stored."""
     redis = FakeRedis(last_ok=None)
     ctx, docker, _ = make_probe_context(redis=redis, images=())
     with probe_settings():
         result = await RentalProbeCheck().run(ctx)
-    assert result.event.reason_code == Msg.NOT_YET_PROVEN.reason
+    assert result.event.reason_code == Msg.NOT_RUN_ON_VALIDATOR.reason
     assert result.event.what_we_saw["no_verdict_this_cycle"] == (
         "inconclusive: no default renter image for this GPU and driver"
     )
-    errors = run_availability_errors(False, [*result.extra_events, result.event])
-    assert [e["reason_code"] for e in errors] == ["VERIFICATION_FAILED"]
+    assert result.updates == {"score": 0.0, "job_score": 0.0} and result.extra_events == []
+    assert run_availability_errors(False, [result.event]) is None
     assert redis.standing_failure() is None and not redis.stamped() and docker.create_calls == []
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("unread", "reason"),
-    [
-        ("default image lookup", "inconclusive: could not read the default renter image"),
-        ("image list", "inconclusive: could not read the node's image list"),
-    ],
-)
-async def test_a_validator_side_unread_input_keeps_an_unproven_nodes_stored_listing(unread, reason):
-    """Follow-up of lio#2442: the backend client returns None on a timeout, error or bad body (lio#2496 review), and
-    the validator's own image-list read can get no answer (an SSH outage of ours times it out on every node). Neither
-    says anything about the node: no node-proven hold, the listing stays as stored."""
+async def test_an_unread_image_list_keeps_an_unproven_nodes_stored_listing():
+    """Follow-up of lio#2442: the validator's own image-list read can get no answer (an SSH outage of ours times it
+    out on every node). That says nothing about the node: no node-proven hold, the listing stays as stored."""
     redis = FakeRedis(last_ok=None)
-    ctx, docker, _ = make_probe_context(redis=redis, images=None if unread == "default image lookup" else (IMAGE,))
-    if unread == "image list":
-        ctx.ssh.run.side_effect = asyncssh.ConnectionLost("lost")
+    ctx, docker, _ = make_probe_context(redis=redis, images=(IMAGE,))
+    ctx.ssh.run.side_effect = asyncssh.ConnectionLost("lost")
     with probe_settings():
         result = await RentalProbeCheck().run(ctx)
     assert result.event.reason_code == Msg.NOT_RUN_ON_VALIDATOR.reason
-    assert result.event.what_we_saw["no_verdict_this_cycle"] == reason
+    assert result.event.what_we_saw["no_verdict_this_cycle"] == "inconclusive: could not read the node's image list"
     assert result.updates == {"score": 0.0, "job_score": 0.0} and result.extra_events == []
     assert run_availability_errors(False, [result.event]) is None
     assert docker.create_calls == []

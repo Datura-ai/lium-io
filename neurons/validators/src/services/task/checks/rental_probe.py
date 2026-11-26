@@ -278,9 +278,8 @@ class RentalProbeCheck:
     a cycle without a verdict hides it (RENTAL_PROBE_NOT_YET_PROVEN, score 0, nothing cleared), so a node
     is first listed by a probe that passed, never by a skip. A record that cannot be read scores nothing
     and leaves the listing as stored (RENTAL_PROBE_PROOF_UNREADABLE), as does a probe the validator cannot
-    run for a reason on its own side (RENTAL_PROBE_NOT_RUN_ON_VALIDATOR: no input, no create lock, the node's
-    image list unreadable, too little cycle time left). No default renter image for the node's GPU and driver is not one: that lookup
-    key is the node's own report.
+    run for a reason on its own side (RENTAL_PROBE_NOT_RUN_ON_VALIDATOR: no default renter image for the
+    GPU and driver, no input, no create lock, the node's image list unreadable, too little cycle time left).
 
     An idle node running a Lium filler is probed too, beside the filler rather than in its place:
     create_container is told `beside_fillers`, so it
@@ -448,14 +447,8 @@ class RentalProbeCheck:
 
         image_ref = await _default_renter_image(ctx)
         if image_ref is None:
-            # the backend did not answer (timeout, error, bad body): the validator's side, the stored listing stays
             return self._inconclusive(
-                ctx, "could not read the default renter image", steps=[], standing=standing, validator_side=True
-            )
-        if not image_ref:
-            # the lookup key (GPU and driver) is the node's own report, so an unproven node stays held
-            return self._inconclusive(
-                ctx, "no default renter image for this GPU and driver", steps=[], standing=standing
+                ctx, "no default renter image for this GPU and driver", steps=[], standing=standing, validator_side=True
             )
         image_present = await _image_present_on_host(ctx, image_ref)
         if image_present is None:
@@ -579,8 +572,9 @@ class RentalProbeCheck:
         """This cycle reached no verdict of its own and the last probe failed: fail the node again with
         that step (review). `no_verdict` is what this cycle would otherwise have reported."""
         if standing is _NEVER_PASSED and validator_side:
-            # the probe could not start for a reason on the validator's side (no input, no create lock, the node's
-            # image list unreadable, too little cycle time): that says nothing about the node, so it is not hidden as
+            # the probe could not start for a reason on the validator's side (no default renter image for the
+            # GPU and driver, no input, no create lock, the node's image list unreadable, too little cycle time):
+            # that says nothing about the node, so it is not hidden as
             # unproven; like an unreadable record, no score and the stored listing stays (review of lio#2442)
             event = render_message(
                 Msg.NOT_RUN_ON_VALIDATOR,
@@ -769,21 +763,18 @@ def _expected_gpu_count(ctx: Context) -> int:
 
 
 async def _default_renter_image(ctx: Context) -> str | None:
-    """The default renter image for the node's GPU and driver; "" when there is none for them (or the node reports
-    neither), None when the backend did not answer (the client returns None on a timeout, error or bad body)."""
     gpu_model = ctx.state.gpu_model
     driver_version = str((ctx.state.specs or {}).get("gpu", {}).get("driver") or "")
     if not gpu_model or not driver_version:
-        return ""
+        return None
     try:
         images = await ctx.services.backend.get_default_docker_image(gpu_model, driver_version)
     except Exception:
         _read_failed(ctx, "the default renter image from the backend")
         return None
-    if images is None:
-        _read_failed(ctx, "the default renter image from the backend")
+    if not images:
         return None
-    return images[0].image_ref if images else ""
+    return images[0].image_ref
 
 
 async def _image_present_on_host(ctx: Context, image_ref: str) -> bool | None:
