@@ -5253,7 +5253,6 @@ class DockerService:
             host_policy = await self.attestation_service.prepare_host_policy(
                 executor,
             )
-            return host_policy.known_hosts
         except AttestationError:
             raise
         except Exception as exc:
@@ -5267,6 +5266,13 @@ class DockerService:
                 f"Unable to prepare host-key policy for executor "
                 f"{executor.address}:{executor.port}; refusing unpinned rental SSH"
             ) from exc
+        if host_policy.known_hosts is None and (executor.ssh_host_key or "").strip():
+            # a reported key that built no policy would connect unchecked (asyncssh reads None as "verify nothing");
+            # a node that reports no key keeps its behaviour, decided by each caller
+            raise AttestationError(
+                f"No host-key policy for executor {executor.address}:{executor.port}; refusing unpinned rental SSH"
+            )
+        return host_policy.known_hosts
 
     async def _skip_probe_held_ports(self, executor_id: str, available_ports: dict, required_port_count: int) -> dict:
         """The backend's free ports less those a running port check holds, unless too few would be left."""
