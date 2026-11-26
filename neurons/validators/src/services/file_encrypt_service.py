@@ -439,6 +439,8 @@ class FileEncryptService:
             'ib_gids': "",
             'ib_driver': "",
             'data_boot_id': "",
+            # longer key before the key it extends (prefix rule above)
+            'data_egress_ips': "",
             'data_egress_ip': "",
             'data_container_cap_eff': "",
             'data_executor_pid_mode_scrape_error': "",
