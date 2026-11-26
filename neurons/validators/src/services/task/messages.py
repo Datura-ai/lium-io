@@ -2891,6 +2891,33 @@ class RentalProbeMessages:
         category="runtime",
         impact="Score set to 0 and the verified job cleared until a probe passes; the node is probed again next cycle while it stays idle",
     )
+    NOT_YET_PROVEN = MessageTemplate(
+        event="Not listed yet: no rental probe has passed on this node",
+        reason="RENTAL_PROBE_NOT_YET_PROVEN",
+        severity="warning",
+        category="runtime",
+        impact="Score set to 0 until a rental probe passes; the probe runs on the node while it is idle",
+        remediation=(
+            "Keep the node idle with the default renter image for its GPU and driver pulled; "
+            "it is listed after the first rental probe that passes."
+        ),
+    )
+    NOT_RUN_ON_VALIDATOR = MessageTemplate(
+        event="Rental probe could not run: the validator lacks what it needs for this node",
+        reason="RENTAL_PROBE_NOT_RUN_ON_VALIDATOR",
+        severity="warning",
+        category="runtime",
+        impact="No score this cycle; the listing stays as the last cycle left it",
+        remediation="Nothing to do on the node; the probe runs once the validator has what it needs.",
+    )
+    PROOF_UNREADABLE = MessageTemplate(
+        event="Rental probe record could not be read",
+        reason="RENTAL_PROBE_PROOF_UNREADABLE",
+        severity="warning",
+        category="runtime",
+        impact="No score this cycle; the listing stays as the last cycle that could read the record left it",
+        remediation="Nothing to do on the node; the record is read again next cycle.",
+    )
     INCONCLUSIVE = MessageTemplate(
         event="Rental probe could not reach a verdict",
         reason="RENTAL_PROBE_INCONCLUSIVE",
