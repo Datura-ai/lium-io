@@ -1893,6 +1893,11 @@ _RESTORE_BRING_UP_TIMEOUT_SECONDS = 300
 _KEPT_COPY_TIMEOUT_SECONDS = 900
 
 
+def _seconds_left(deadline: float) -> int:
+    # a host-side `timeout 0` means no limit, so never below one second
+    return max(1, math.floor(deadline - time.monotonic()))
+
+
 class KeptContainersNotRemoved(RuntimeError):
     """The pod's kept containers were found but `docker rm -fv` failed: they stay until a delete removes them."""
 
@@ -1918,9 +1923,22 @@ async def _remove_kept_containers(ssh_client: asyncssh.SSHClientConnection, cont
         if len(fields) == 2 and fields[0].startswith(prefix)
     ]
     if ids:
-        removed = await _run_with_host_timeout(
-            ssh_client, f"/usr/bin/docker rm -fv {' '.join(map(shlex.quote, ids))}", _PARK_COMMAND_TIMEOUT_SECONDS
-        )
+        rm = f"/usr/bin/docker rm -fv {' '.join(map(shlex.quote, ids))}"
+        # once kept containers are found, only an rm that answered 0 removed them: a step that timed out or failed
+        # leaves them in place, and nothing but a re-asked delete ever removes them
+        try:
+            removed = await _run_with_host_timeout(ssh_client, rm, _PARK_COMMAND_TIMEOUT_SECONDS)
+            if removed.exit_status != 0:
+                # a parked container whose exit event dockerd lost (an edit's direct kill cut off by this delete)
+                # fails `rm -f` forever: kill its init and shim directly and try once more, as container_cleanup
+                # does (DAH-2991)
+                for container_id in ids:
+                    await _run_with_host_timeout(
+                        ssh_client, DockerCommand.kill_container_processes(container_id), _PARK_COMMAND_TIMEOUT_SECONDS
+                    )
+                removed = await _run_with_host_timeout(ssh_client, rm, _PARK_COMMAND_TIMEOUT_SECONDS)
+        except Exception as exc:
+            raise KeptContainersNotRemoved(f"docker rm did not answer: {exc!r}") from exc
         if removed.exit_status != 0:
             raise KeptContainersNotRemoved(f"docker rm exited {removed.exit_status}: {(removed.stderr or '').strip()}")
     return ids
@@ -2072,8 +2090,15 @@ class _EditSwap:
         docker_client=None,
         redis: RedisService | None = None,
         executor_id: str | None = None,
+        deleted: Callable[[], Awaitable[None]] | None = None,
     ):
         self.ssh_client = ssh_client
+        # returns once the pod's delete cancels this edit: a wait on dockerd gives way to it (DAH-7025 review)
+        self.deleted = deleted
+        # the delete arrived while the parked container was being stopped: it removes the pod's kept containers itself
+        self.left_to_delete = False
+        # the wait after `docker kill` ended with Docker answering that the container still runs
+        self.running_after_kill = False
         # the create's Docker SDK connection, independent of the SSH session: stops a renamed pod a dead SSH lost track of
         self.docker_client = docker_client
         self.container_name = container_name
@@ -2115,10 +2140,10 @@ class _EditSwap:
     async def __aenter__(self) -> "_EditSwap":
         return self
 
-    async def _run(self, command: str) -> asyncssh.SSHCompletedProcess:
+    async def _run(self, command: str, timeout: float | None = None) -> asyncssh.SSHCompletedProcess:
         # a wedged dockerd can hang `docker stop`/`kill`/`inspect` forever (a reboot hung until the
         # connector pod was replaced): the host ends each command (exit 124), the validator bounds the rest
-        return await _run_with_host_timeout(self.ssh_client, command, _PARK_COMMAND_TIMEOUT_SECONDS)
+        return await _run_with_host_timeout(self.ssh_client, command, timeout or _PARK_COMMAND_TIMEOUT_SECONDS)
 
     async def park(self) -> str | None:
         """Rename the running container aside and stop it. None when there is nothing to park."""
@@ -2240,9 +2265,10 @@ class _EditSwap:
             # after a destructive `docker rm -fv`. If even the rename back fails, parked_name
             # stays set so __aexit__ tries the full restore once more. The kill can still land after
             # the wait, so rename back only while Docker still says it runs; a stopped or unreadable
-            # container stays parked for __aexit__ to restore.
-            running = await self._run(f"/usr/bin/docker inspect -f '{{{{.State.Running}}}}' {shlex.quote(parked)}")
-            if running.exit_status == 0 and (running.stdout or "").strip() == "true":
+            # container stays parked for __aexit__ to restore. The wait's own last read decides: no new read, so the
+            # park ends inside the budget a cancelling delete waits for.
+            if self.running_after_kill:
+                # a write keeps the full timeout: cut short after dockerd applied it, the restore would remove the pod
                 renamed_back = await self._run(
                     f"/usr/bin/docker rename {shlex.quote(parked)} {shlex.quote(self.container_name)}"
                 )
@@ -2345,18 +2371,14 @@ class _EditSwap:
         """DinD (sysbox) pods often fail the first `docker stop` while a retry seconds later works (prod 15-21 Oct
         2026: 12 park failures on 10 hosts, all on dind-lium1). Kill it once; True when Docker reports it stopped within _PARK_KILL_WAIT_SECONDS."""
         killed = await self._run(f"/usr/bin/docker kill {shlex.quote(parked)}")
-        for _ in range(max(1, _PARK_KILL_WAIT_SECONDS // max(_PARK_KILL_SETTLE_SECONDS, 1))):
-            await asyncio.sleep(_PARK_KILL_SETTLE_SECONDS)
-            running = await self._run(f"/usr/bin/docker inspect -f '{{{{.State.Running}}}}' {shlex.quote(parked)}")
-            is_stopped = running.exit_status == 0 and (running.stdout or "").strip() == "false"
-            if is_stopped:
-                break
-        if not is_stopped and _DOCKER_COULD_NOT_KILL_PHRASES[1] in (killed.stderr or "").lower():
-            # dockerd lost the exit event (F-1633): kill init + shim directly, as the delete path does (DAH-2991)
-            await self._run(DockerCommand.kill_container_processes(parked))
-            running = await self._run(f"/usr/bin/docker inspect -f '{{{{.State.Running}}}}' {shlex.quote(parked)}")
-            is_stopped = running.exit_status == 0 and (running.stdout or "").strip() == "false"
-            self.unkillable = not is_stopped
+        # every wait after the kill shares one budget: a delete waits CANCELLED_CREATE_ABORT_TIMEOUT_SECONDS for
+        # the edit it cancels, so a slow dockerd must not stretch the park past it (DAH-7025 review)
+        deadline = time.monotonic() + _PARK_KILL_WAIT_SECONDS
+        direct, is_stopped = await self._unless_deleted(self._wait_after_kill(parked, killed, deadline))
+        if direct is not None:
+            # the host's fault (counted against the node) only when Docker still reports it running and the process
+            # was not seen gone: a teardown dockerd has not finished yet is not a wedge, and its retry parks (DAH-7025)
+            self.unkillable = not is_stopped and "init=gone" not in direct
         logger.warning(
             _m(
                 "docker stop failed while parking the current container; tried docker kill",
@@ -2367,11 +2389,66 @@ class _EditSwap:
                         "stop_stderr": (stopped.stderr or "").strip(),
                         "kill_stderr": (killed.stderr or "").strip(),
                         "stopped_after_kill": is_stopped,
+                        "direct_kill": direct.strip() if direct is not None else None,
                     }
                 ),
             )
         )
         return is_stopped
+
+    async def _wait_after_kill(self, parked: str, killed, deadline: float) -> tuple[str | None, bool]:
+        direct = None
+        if _DOCKER_COULD_NOT_KILL_PHRASES[1] in (killed.stderr or "").lower():
+            # dockerd lost the exit event (F-1633), so waiting for it to report one first waits for nothing:
+            # kill init + shim directly now, as the delete path does (DAH-2991)
+            direct = (await self._run(DockerCommand.kill_container_processes(parked), _seconds_left(deadline))).stdout or ""
+        # init=alive waits too: a pid-namespace init still reaping its dying children reads alive for a moment,
+        # so init is re-read with each State.Running read and the verdict uses the last reading (DAH-7025 review)
+        probe = DockerCommand.init_state(direct) if direct else None
+        stopped, init_gone = await self._docker_reports_stopped(parked, deadline, probe)
+        if init_gone:
+            direct = re.sub(r"init=\w+", "init=gone", direct)
+        return direct, stopped
+
+    async def _unless_deleted(self, work: Awaitable):
+        """The work's result, unless the pod's delete cancels this edit first: a delete waits
+        CANCELLED_CREATE_ABORT_TIMEOUT_SECONDS for it, so the edit then ends at once and leaves the parked container
+        to the delete, which removes the pod's kept containers (DAH-5773)."""
+        if self.deleted is None:
+            return await work
+        working, deleted = asyncio.ensure_future(work), asyncio.ensure_future(self.deleted())
+        try:
+            done, _ = await asyncio.wait({working, deleted}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for pending in (working, deleted):
+                if not pending.done():
+                    pending.cancel()
+        if working in done:
+            return working.result()
+        self.left_to_delete = True
+        raise _CreateCancelledByDelete("the pod's delete arrived while its container was being stopped for the edit")
+
+    async def _docker_reports_stopped(self, parked: str, deadline: float, init_probe: str | None = None) -> tuple[bool, bool]:
+        """Re-read the container's state every _PARK_KILL_SETTLE_SECONDS until the deadline; each read ends by it.
+        Leaves running_after_kill set when the last read answered that the container still runs. With init_probe,
+        init is re-read after each read that still finds it running; returns (stopped, init seen gone)."""
+        self.running_after_kill = False
+        init_gone = False
+        for _ in range(max(1, _PARK_KILL_WAIT_SECONDS // max(_PARK_KILL_SETTLE_SECONDS, 1))):
+            await asyncio.sleep(_PARK_KILL_SETTLE_SECONDS)
+            if time.monotonic() >= deadline:
+                break
+            running = await self._run(
+                f"/usr/bin/docker inspect -f '{{{{.State.Running}}}}' {shlex.quote(parked)}", _seconds_left(deadline)
+            )
+            answered = (running.stdout or "").strip() if running.exit_status == 0 else None
+            if answered == "false":
+                return True, init_gone
+            self.running_after_kill = answered == "true"
+            if init_probe is not None and not init_gone and time.monotonic() < deadline:
+                read = await self._run(init_probe, _seconds_left(deadline))
+                init_gone = (read.stdout or "").strip() == "init=gone"
+        return False, init_gone
 
     async def _record_parked(self, parked: bool) -> None:
         """Best effort: unrecorded, a parked container's GPU load counts as the provider's."""
@@ -2405,6 +2482,9 @@ class _EditSwap:
         if self.parked_name is None:
             return False
         try:
+            if self.left_to_delete:
+                # a wedged `docker rm` here would hold the delete that is waiting for this edit
+                return False
             if exc is None or self.replacement_is_up or isinstance(exc, _CreateCancelledByDelete):
                 # Replacement is up (or the pod was deleted meanwhile): the old container is now the
                 # stale one. Best effort — a wedged remove is left to the next edit's clean-leftover removal.
@@ -10928,6 +11008,7 @@ class DockerService:
                         docker_client=docker_client,
                         redis=self.redis_service,
                         executor_id=str(executor_info.uuid),
+                        deleted=lambda: inflight_creates.wait_cancelled(payload.pod_id, executor_key(payload)),
                     )
                 )
                 # Add profiler for ssh connection
