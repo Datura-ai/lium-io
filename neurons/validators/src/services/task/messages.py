@@ -930,7 +930,15 @@ class ExecutorImageMessages:
         reason="EXECUTOR_IMAGE_OUTDATED",
         severity="error",
         category="policy",
-        impact="Score set to 0 until the image is current",
+        impact="Free node: validation failed, off the rent list until the image is current",
+    )
+    # DAH-6845: a rented node on an OUTDATED image passes and keeps its incentive, so the event is a warning
+    RENTED_OUTDATED = MessageTemplate(
+        event="Executor image is outdated",
+        reason="EXECUTOR_IMAGE_OUTDATED",
+        severity="warning",
+        category="policy",
+        impact="Rental and incentive continue; update the image before the rental ends",
     )
     UNOFFICIAL = MessageTemplate(
         event="Executor is not an official build",
@@ -938,14 +946,6 @@ class ExecutorImageMessages:
         severity="error",
         category="policy",
         impact="Score set to 0 until the node runs the official executor image",
-    )
-    # Same reason code as OUTDATED so log queries keep matching; severity says it is not scored.
-    OUTDATED_WARNING = MessageTemplate(
-        event="Executor image is outdated",
-        reason="EXECUTOR_IMAGE_OUTDATED",
-        severity="warning",
-        category="policy",
-        impact="Warning only until EXECUTOR_IMAGE_CHECK_ENFORCE is on: score and incentive unchanged",
     )
 
 
