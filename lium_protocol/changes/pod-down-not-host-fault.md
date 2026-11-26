@@ -1,0 +1,2 @@
+minor
+`FailedContainerErrorCodes.PodDownNotHostFault`: a failed edit or reboot whose undo's own egress guard refused left no container of the pod running, as Docker reports it. The backend stops billing the pod and charges nothing to the host (no provider fault). A lost pod bridge is not this code: it reports `ExecutorUnreachable`, a host fault. A backend older than the release that adds it cannot parse it, so a validator release that sends it waits until a backend that parses that version is in production.

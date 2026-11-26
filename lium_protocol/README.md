@@ -6,7 +6,7 @@ The validator↔backend wire, once. Pydantic v2 models for:
 - `lium_protocol.backend_to_validator` — every message the backend sends down that socket (`BackendMessageType`, 19 types: container lifecycle, ssh keys, backups, Jupyter, the estimate request, the staging-only forced cycle, the one-node recheck), plus the three typeless replies it sends there (`SOCKET_REPLIES`: `Response`, `RentedMachineResponse`, `RevenuePerGpuTypeResponse` — no `message_type`, told apart by the request the validator is waiting for).
 - `lium_protocol.http` — the bodies of the backend HTTP API the validator reads between cycles (`HTTP_MODELS`, 10 bodies).
 
-No application code: nothing here imports the validator or the backend. `PROTOCOL_VERSION` (`2.18.0`) is semver over the wire.
+No application code: nothing here imports the validator or the backend. `PROTOCOL_VERSION` (`2.17.0`) is semver over the wire.
 
 ## Using it
 
@@ -87,7 +87,6 @@ To undo a wire change that is not released yet, `git revert` alone is not enough
 - `2.13.0` — `ContainerCreated.command_id` (optional, default empty): the `ContainerCreateRequest`'s `command_id`, echoed. `ExecutorRentFinishedRequest.create_command_id` (optional, default empty): the backend names in it the `ContainerCreated.command_id` the receipt answers. It is not `command_id`, which the validator dedupes requests on. The backend applies a success only for the pod's current create; an older one gets its receipt alone. The validator clears only the pending state of the dispatch a receipt names, and the `ResumedCreatesReport` goes once every success replayed ahead of it has its receipt. Empty on either side: as before.
 - `2.15.0` — `SshPubKeyRemoved.command_id` (optional, default empty): the `RemoveSshPublicKeysRequest`'s `command_id`, echoed, as `SshPubKeyAdded` does since 1.14.0; a removal's `FailedContainerRequest` echoes it too. The backend confirms a removal only on the answer to that send, so a delayed answer to an earlier send cannot confirm a later one. Empty from an older validator.
 - `2.17.0` — `ExecutorSpecRequest.rented_pod_faults` (optional): the rented pods this cycle's pod checks judged, by pod id, each with the host-side fault codes found on it (`RENTED_POD_PROC_FUSE_DISCONNECTED`: sysbox-fs died or restarted under the pod and its `/proc` answers "Transport endpoint is not connected"); `[]` = judged and clean, a pod not listed was not judged. None from an older validator and for a cycle that judged no pod.
-- `2.18.0` — `FailedContainerErrorCodes.PodDownNotHostFault`: a failed edit or reboot whose undo's own egress guard refused left no container of the pod running, as Docker reports it. The backend stops billing the pod and charges nothing to the host (no provider fault). A lost pod bridge is not this code: it reports `ExecutorUnreachable`, a host fault. A backend older than 2.18.0 cannot parse it, so a validator release that sends it waits until a backend that parses 2.18.0 is in production.
 - `2.16.0` — `GpuResetErrorCode.GpusLostOnHost`: a renter's GPU reset found the GPUs gone from the host driver (the host GPU listing failed, timed out or came back empty); the provider has to reboot the host. The validator sends it once the backend accepts it; a validator released before that sends `ResetNotSupported` with the same detail for this case.
 - `1.0.0` — first release.
 
