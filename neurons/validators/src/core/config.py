@@ -367,10 +367,11 @@ class Settings(BaseSettings):
     # it finds is scored or stored: the result is built before it starts. Off: nothing new runs.
     VALIDATOR_LIUMD_SHADOW: bool = Field(env="VALIDATOR_LIUMD_SHADOW", default=False)
     # DAH-2834: hardware identity from the machine scrape's `gpu_identity` block (NVML, driver
-    # procfs, PCI sysfs). `shadow` logs one `[liumd_evidence]` line per node and never scores;
-    # `enforce` fails the scrape check on a mismatch, or when liumd cannot produce the scrape at
-    # all (fail-closed; the Python fallback would bypass the gate), which ends the run at score 0.
-    # Timing, clocks, TFLOPS and bandwidth stay measurements on the run and are never judged here.
+    # procfs, PCI sysfs). Requires VALIDATOR_LIUMD_SPECS. `shadow` logs one `[liumd_evidence]`
+    # line per node and never scores; `enforce` fails the scrape check on a mismatch, or when
+    # liumd cannot produce the scrape at all (fail-closed; the Python fallback would bypass the
+    # gate), which ends the run at score 0. Timing, clocks, TFLOPS and bandwidth stay
+    # measurements on the run and are never judged here.
     VALIDATOR_LIUMD_EVIDENCE_MODE: Literal["shadow", "enforce"] = Field(
         env="VALIDATOR_LIUMD_EVIDENCE_MODE", default="shadow"
     )
