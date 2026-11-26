@@ -109,6 +109,8 @@ services:
 WATCHTOWER_ENABLED=false
 ```
 
+A disabled watchtower stays running and does nothing until it is stopped. It checks no image and restarts no container.
+
 ## Development
 
 ```bash
