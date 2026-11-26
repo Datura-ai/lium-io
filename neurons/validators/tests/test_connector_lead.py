@@ -140,7 +140,7 @@ async def test_sigterm_releases_the_lead_and_exits_0(tmp_path, monkeypatch) -> N
 
 
 @pytest.mark.asyncio
-async def test_sigterm_lets_in_flight_work_finish_after_releasing_the_lead(tmp_path, monkeypatch) -> None:
+async def test_sigterm_lets_in_flight_work_finish_while_still_leading(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(compute_client, "CONNECTOR_READY_FILE", str(tmp_path / "ready"))
     _no_lua_release(monkeypatch)
     exited, codes = _fake_exit(monkeypatch)
@@ -163,8 +163,9 @@ async def test_sigterm_lets_in_flight_work_finish_after_releasing_the_lead(tmp_p
     await _sigterm(client, exited, 5)
 
     assert codes == [0]
-    assert lead_held_while_working == [0]  # the lead went first, the create still finished
+    assert lead_held_while_working == [1]  # the new pod's restart sweep cannot resume this create while it runs
     assert not client.in_flight_drivers and not client.message_queue  # the create and its reply both done
+    assert not await FakeRedis(server=server).exists(compute_client.CONNECTOR_LEAD_LOCK_KEY)  # released after
 
 
 @pytest.mark.asyncio
@@ -186,9 +187,9 @@ async def test_sigterm_exits_at_the_drain_bound_when_work_hangs(tmp_path, monkey
 
 
 @pytest.mark.asyncio
-async def test_the_new_leader_holds_its_restart_sweep_until_the_old_pods_drain_ends(tmp_path, monkeypatch) -> None:
+async def test_the_new_pod_leads_only_once_the_old_pods_drain_ends(tmp_path, monkeypatch) -> None:
     """The new leader's restart sweep resumes every recorded create; one the old pod still drives would then run
-    twice, so taking the lead waits until the old pod's drain ends."""
+    twice, so the old pod keeps the lead until its drain ends."""
     monkeypatch.setattr(compute_client, "CONNECTOR_READY_FILE", str(tmp_path / "ready"))
     _no_lua_release(monkeypatch)
     exited, codes = _fake_exit(monkeypatch)
@@ -200,7 +201,7 @@ async def test_the_new_leader_holds_its_restart_sweep_until_the_old_pods_drain_e
     old.exit_on_sigterm(asyncio.get_running_loop())
     try:
         os.kill(os.getpid(), signal.SIGTERM)
-        await asyncio.sleep(0.3)  # the old pod released the lead and drains
+        await asyncio.sleep(0.3)  # the old pod drains, still leading
         taking = asyncio.create_task(new.take_connector_lead())
         await asyncio.sleep(1)
         assert not taking.done()  # leads only once the old pod's create is done
@@ -211,17 +212,6 @@ async def test_the_new_leader_holds_its_restart_sweep_until_the_old_pods_drain_e
         asyncio.get_running_loop().remove_signal_handler(signal.SIGTERM)
     new._lead_task.cancel()
     assert codes == [0]
-
-
-@pytest.mark.asyncio
-async def test_the_drain_marker_expires_when_the_old_pod_is_killed(tmp_path, monkeypatch) -> None:
-    monkeypatch.setattr(compute_client, "CONNECTOR_READY_FILE", str(tmp_path / "ready"))
-    monkeypatch.setattr(compute_client, "SIGTERM_DRAIN_SECONDS", 0.5)
-    server = FakeServer()
-    await FakeRedis(server=server).set(compute_client.CONNECTOR_DRAIN_KEY, "1", px=500)  # its pod SIGKILLed mid-drain
-    new = _client(server)
-    await asyncio.wait_for(new.take_connector_lead(), 3)
-    new._lead_task.cancel()
 
 
 @pytest.mark.asyncio
@@ -269,6 +259,28 @@ async def test_the_drain_waits_for_a_reply_being_sent(tmp_path, monkeypatch) -> 
     await client._finish_in_flight_work(asyncio.get_running_loop().time() + 3)
     sender.cancel()
     assert len(sent) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_driver_started_while_a_reply_is_sent_is_waited_for() -> None:
+    """The drain checks the drivers again after the replies: one a command starts during a reply's send runs too."""
+    client = _client(FakeServer())
+    client.reply_in_send = True
+    ran = []
+
+    async def driver() -> None:
+        await asyncio.sleep(0.3)
+        ran.append(1)
+
+    def reply_sent_and_command_arrived() -> None:
+        client.track_in_flight_driver(asyncio.create_task(driver()))
+        client.reply_in_send = False
+
+    asyncio.get_running_loop().call_later(0.2, reply_sent_and_command_arrived)
+
+    await client._finish_in_flight_work(asyncio.get_running_loop().time() + 3)
+
+    assert ran == [1]
 
 
 def test_run_sh_execs_the_connector() -> None:

@@ -143,9 +143,6 @@ LEAD_RELEASE_TIMEOUT_SECONDS = CONNECTOR_LEAD_LOCK_TTL_SECONDS / 3
 # after a rollout's SIGTERM, in-flight creates, deletes and GPU resets and their replies finish up to this, inside
 # the deployment's 30 s termination grace
 SIGTERM_DRAIN_SECONDS = 25
-# set by a pod that drains after a SIGTERM, before it releases the lead: the new leader's restart sweep would resume
-# the creates it still drives, so the new leader waits until the drain ends (or the key expires with a killed pod)
-CONNECTOR_DRAIN_KEY = "connector-draining"
 # the SIGTERM handler's task, held so it is not collected before it exits
 _sigterm_exits: set[asyncio.Task] = set()
 
@@ -1407,7 +1404,7 @@ class ComputeClient:
         )
 
     async def take_connector_lead(self) -> None:
-        """Wait until no other connector leads and the old pod's drain ended, then lead while this process lives.
+        """Wait until no other connector leads, then lead while this process lives (DAH-5177).
 
         Ready (the deployment lets the old pod go) only while waiting on the lock or leading: a Redis error retries
         here, unready, instead of unwinding into start_process's full restart with the probe still passing."""
@@ -1431,33 +1428,16 @@ class ComputeClient:
                 logger.warning(_m("Could not take the connector lead", extra={**extra, "error": str(exc)}))
                 await asyncio.sleep(1)
         self._lead_lock = lock
-        self._lead_task = asyncio.create_task(self._keep_connector_lead(lock))
-        await self._wait_for_the_old_pods_drain(extra)
         logger.info(_m("Leading the backend connection", extra=extra))
-
-    async def _wait_for_the_old_pods_drain(self, extra: dict) -> None:
-        """The restart sweep resumes every recorded create, so it runs only once the pod that led before has finished
-        the work it still drives after its SIGTERM; the mark expires with a pod killed mid-drain."""
-        redis_client = self.miner_service.redis_service.redis
-        logged = False
-        while True:
-            try:
-                if not await redis_client.exists(CONNECTOR_DRAIN_KEY):
-                    return
-            except redis.exceptions.RedisError as exc:
-                logger.warning(_m("Could not read the old pod's drain mark", extra={**extra, "error": str(exc)}))
-            if not logged:
-                logger.info(_m("Waiting for the old pod's in-flight work to finish", extra=extra))
-                logged = True
-            await asyncio.sleep(0.5)
+        self._lead_task = asyncio.create_task(self._keep_connector_lead(lock))
 
     def track_in_flight_driver(self, task: asyncio.Task) -> None:
         self.in_flight_drivers.add(task)
         task.add_done_callback(self.in_flight_drivers.discard)
 
     def exit_on_sigterm(self, loop: asyncio.AbstractEventLoop) -> None:
-        """A rollout's SIGTERM hands the lead to the new pod at once, lets the in-flight work finish and exits 0,
-        instead of being SIGKILLed at the end of the grace holding the lock."""
+        """A rollout's SIGTERM lets the in-flight work finish while this pod still leads, then hands the lead to the
+        new pod and exits 0, instead of being SIGKILLed at the end of the grace holding the lock."""
 
         def on_sigterm() -> None:
             task = loop.create_task(self._release_lead_and_exit())
@@ -1468,18 +1448,11 @@ class ComputeClient:
 
     async def _release_lead_and_exit(self) -> None:
         extra = get_extra_info(self.logging_extra)
-        logger.info(_m("SIGTERM: releasing the connector lead, then finishing in-flight work", extra=extra))
-        deadline = asyncio.get_running_loop().time() + SIGTERM_DRAIN_SECONDS
+        logger.info(_m("SIGTERM: finishing in-flight work, then releasing the connector lead", extra=extra))
         mark_connector_unready()
-        redis_client = self.miner_service.redis_service.redis
-        try:
-            # first: the new leader must find it the moment the lead is free
-            await asyncio.wait_for(
-                redis_client.set(CONNECTOR_DRAIN_KEY, "1", px=int(SIGTERM_DRAIN_SECONDS * 1000) + 1000),
-                LEAD_RELEASE_TIMEOUT_SECONDS,
-            )
-        except Exception as exc:
-            logger.warning(_m("Could not mark the drain for the new leader", extra={**extra, "error": str(exc)}))
+        # the lead is kept through the drain: the new pod's restart sweep, which resumes every recorded create, starts
+        # only once this pod no longer drives one
+        await self._finish_in_flight_work(asyncio.get_running_loop().time() + SIGTERM_DRAIN_SECONDS)
         if (lead_task := getattr(self, "_lead_task", None)) is not None:
             lead_task.cancel()
         if (lock := getattr(self, "_lead_lock", None)) is not None:
@@ -1489,38 +1462,32 @@ class ComputeClient:
                 logger.warning(
                     _m("Could not release the connector lead; it expires", extra={**extra, "error": str(exc)})
                 )
-        await self._finish_in_flight_work(deadline)
-        try:
-            await asyncio.wait_for(redis_client.delete(CONNECTOR_DRAIN_KEY), LEAD_RELEASE_TIMEOUT_SECONDS)
-        except Exception as exc:
-            logger.warning(_m("Could not end the drain mark; it expires", extra={**extra, "error": str(exc)}))
         os._exit(0)
 
     async def _finish_in_flight_work(self, deadline: float) -> None:
         """The drivers, their steps after the reply and the replies still queued, until the deadline; what is left
         then is cut as the SIGKILL would cut it, and the new leader's restart sweep resends a cut create (DAH-5437)."""
         loop = asyncio.get_running_loop()
-        # the socket stays the backend's only route until the new leader connects after this drain, so commands keep
-        # arriving and starting here; the wait covers the drivers they add too, not just those seen at SIGTERM
-        while self.in_flight_drivers and loop.time() < deadline:
-            await asyncio.wait(set(self.in_flight_drivers), timeout=max(0.0, deadline - loop.time()))
-        with suppress(asyncio.TimeoutError):
-            await asyncio.wait_for(
-                create_steps_after_reply.wait_until_all_done(), max(0.0, deadline - loop.time())
+        # one loop over all three: commands keep arriving on the socket during the drain, and a driver or after-reply
+        # step started by any of them, or a reply it queues, is waited for too
+        while loop.time() < deadline:
+            work = self.in_flight_drivers | create_steps_after_reply.pending()
+            if work:
+                await asyncio.wait(work, timeout=deadline - loop.time(), return_when=asyncio.FIRST_COMPLETED)
+            elif self.message_queue or self.reply_in_send:
+                await asyncio.sleep(min(0.1, deadline - loop.time()))
+            else:
+                return
+        logger.warning(
+            _m(
+                "SIGTERM: exiting with work still in flight",
+                extra={
+                    **get_extra_info(self.logging_extra),
+                    "drivers": len(self.in_flight_drivers),
+                    "unsent": len(self.message_queue),
+                },
             )
-        while (self.message_queue or self.reply_in_send) and loop.time() < deadline:
-            await asyncio.sleep(0.1)
-        if self.in_flight_drivers or self.message_queue:
-            logger.warning(
-                _m(
-                    "SIGTERM: exiting with work still in flight",
-                    extra={
-                        **get_extra_info(self.logging_extra),
-                        "drivers": len(self.in_flight_drivers),
-                        "unsent": len(self.message_queue),
-                    },
-                )
-            )
+        )
 
     async def _keep_connector_lead(self, lock: aioredis.lock.Lock) -> None:
         extra = get_extra_info(self.logging_extra)
