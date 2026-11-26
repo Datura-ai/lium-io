@@ -42,7 +42,6 @@ LIUMD_SPECS = {
                 "vram_mb": 24576,
                 "driver": "595.112.07",
                 "dev_node_present": True,
-                "char_dev_present": True,
                 "minor": 0,
                 "sources": {
                     "nvml": {
@@ -81,7 +80,6 @@ LIUMD_SPECS = {
                 "vram_mb": 24576,
                 "driver": "595.112.07",
                 "dev_node_present": True,
-                "char_dev_present": True,
                 "minor": 1,
                 "sources": {
                     "nvml": {

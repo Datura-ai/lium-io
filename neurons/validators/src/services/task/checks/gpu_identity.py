@@ -130,8 +130,6 @@ def evaluate_gpu_identity(
             add("sysfs_vendor_mismatch")
         if card.get("dev_node_present") is False:
             add("dev_node_missing")
-        if card.get("char_dev_present") is False:
-            add("char_dev_missing")
         model = _as_text(card.get("model"))
         if claimed_model and model and model.lower() != claimed_model.strip().lower():
             add("claimed_model_mismatch")

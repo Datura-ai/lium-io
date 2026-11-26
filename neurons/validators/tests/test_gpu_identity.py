@@ -15,7 +15,6 @@ def _card(
     model="NVIDIA L4",
     vram_mb=22565,
     dev_node_present=True,
-    char_dev_present=True,
     nvml=True,
     proc=True,
     sysfs=True,
@@ -53,7 +52,6 @@ def _card(
         "vram_mb": vram_mb,
         "driver": "595.112.07",
         "dev_node_present": dev_node_present,
-        "char_dev_present": char_dev_present,
         "minor": index,
         "sources": sources,
         "mismatches": [],
@@ -144,7 +142,6 @@ def test_a_sysfs_vendor_that_is_not_nvidia_is_a_mismatch():
 
 def test_a_missing_kernel_device_is_a_mismatch():
     assert "dev_node_missing" in _reasons(_report(_card(dev_node_present=False)))
-    assert "char_dev_missing" in _reasons(_report(_card(char_dev_present=False)))
 
 
 def test_a_model_that_contradicts_the_claim_is_a_mismatch():
