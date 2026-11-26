@@ -448,26 +448,6 @@ def test_answer_must_echo_the_intent():
         assert exc.value.reason == reason
 
 
-def test_answer_evidence_is_kept_and_optional():
-    intent = {"nonce": "n1", "executor_uuid": "e"}
-    evidence = {"schema": "lium.evidence/1", "gpus": [], "timing": {"wall_clock_ms": 2377}}
-    good = {
-        "schema": SCHEMA,
-        "nonce": "n1",
-        "executor_uuid": "e",
-        "steps": {},
-        "evidence": evidence,
-    }
-    assert parse_answer(good, intent=intent, round_trip_ms=5).evidence == evidence
-    # A result with no evidence parses as before, and a value that is not an object is dropped
-    # rather than rejecting the answer.
-    assert parse_answer({**good, "evidence": None}, intent=intent, round_trip_ms=5).evidence == {}
-    without = {key: value for key, value in good.items() if key != "evidence"}
-    assert parse_answer(without, intent=intent, round_trip_ms=5).evidence == {}
-    assert parse_answer({**good, "evidence": "junk"}, intent=intent, round_trip_ms=5).evidence == {}
-    assert parse_answer({**good, "evidence": []}, intent=intent, round_trip_ms=5).evidence == {}
-
-
 def test_wire_contract_with_the_executor_side(keypair):
     """The intent this client builds is what the executor's own wire types accept, the signed bytes
     are the same function on both ends (datura), and the executor's result document parses here.

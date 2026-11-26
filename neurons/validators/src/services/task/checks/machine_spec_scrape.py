@@ -25,6 +25,7 @@ from ..runner import SSHCommandResult
 from .container_download_speed import SPECS_KEY as IN_POD_DOWNLOAD_KEY
 from .container_download_speed import SPECS_MEASURED_AT_KEY as IN_POD_DOWNLOAD_AT_KEY
 from .gpu_loss_hold import GpuLossHoldCheck
+from .gpu_identity import enforced, evaluate_gpu_identity, event_fields, log_gpu_identity
 from .rented_gpu_drop import RentedGpuDropCheck, missing_gpus_under_reset
 from .task_time import task_seconds_left
 from .upload_files import UPLOAD_TIMEOUT, UploadFailed, upload_validation_files_to_fresh_remote_dir
@@ -511,6 +512,15 @@ class MachineSpecScrapeCheck:
             return result, self._liumd_reason(result)
         if not raw_gpu_details:
             return await self._fail_without_gpus(ctx, answer, specs), None
+        identity = evaluate_gpu_identity(
+            specs.get("gpu_identity"),
+            len(raw_gpu_details),
+            claimed_model=raw_gpu_details[0].get("name"),
+        )
+        mode = settings.VALIDATOR_LIUMD_EVIDENCE_MODE
+        log_gpu_identity(ctx, identity, mode)
+        if enforced(mode, identity):
+            return self._fail_gpu_identity(ctx, identity, answer), None
         return self._result_from_specs(ctx, specs, delivery="liumd", task=task, snapshot=False), None
 
     @staticmethod
@@ -546,6 +556,21 @@ class MachineSpecScrapeCheck:
         )
         return CheckResult(passed=False, event=event, updates=reset, extra_events=gpu_lost_events)
 
+    def _fail_gpu_identity(
+        self, ctx: Context, judged: dict[str, Any], answer: Any
+    ) -> CheckResult:
+        event = render_message(
+            Msg.GPU_IDENTITY_MISMATCH,
+            ctx=ctx,
+            check_id=self.check_id,
+            what={
+                "delivery": "liumd",
+                "round_trip_ms": answer.round_trip_ms,
+                **event_fields(judged),
+            },
+        )
+        return CheckResult(passed=False, event=event)
+
     def _result_from_specs(
         self,
         ctx: Context,
@@ -561,6 +586,7 @@ class MachineSpecScrapeCheck:
         # the in-pod download figure is the validator's own reading (ContainerDownloadSpeedCheck), never the node's
         specs.pop(IN_POD_DOWNLOAD_KEY, None)
         specs.pop(IN_POD_DOWNLOAD_AT_KEY, None)
+        specs.pop("gpu_identity", None)
         vloopback = specs.pop("vloopback_check", None)
         gpu_info = specs.get("gpu", {}) or {}
         gpu_count = gpu_info.get("count", 0) or 0

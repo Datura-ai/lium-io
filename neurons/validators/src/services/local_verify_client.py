@@ -216,9 +216,6 @@ class LocalVerifyAnswer:
     steps: dict[str, StepEvidence]
     round_trip_ms: int
     specs: dict[str, Any] = field(default_factory=dict)
-    # The executor's liumd GPU evidence document (`lium.evidence/1`); empty when it sent none or
-    # sent something that is not an object. Never read by a check's verdict.
-    evidence: dict[str, Any] = field(default_factory=dict)
     build_sha: str = ""
     target: str = ""
 
@@ -248,7 +245,6 @@ def parse_answer(raw: Any, *, intent: dict[str, Any], round_trip_ms: int) -> Loc
         steps={name: StepEvidence.from_wire(steps[name]) for name in STEP_NAMES if name in steps},
         round_trip_ms=round_trip_ms,
         specs=raw.get("specs") if isinstance(raw.get("specs"), dict) else {},
-        evidence=raw.get("evidence") if isinstance(raw.get("evidence"), dict) else {},
         build_sha=str(raw.get("build_sha") or "")[:EXECUTOR_VERSION_MAX_CHARS],
         target=str(raw.get("target") or "")[:EXECUTOR_VERSION_MAX_CHARS],
     )
