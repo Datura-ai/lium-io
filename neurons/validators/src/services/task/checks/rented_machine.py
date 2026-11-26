@@ -1474,11 +1474,10 @@ class PodRunningAndAuthorizedKeys(NamedTuple):
     running: bool
     # None: dockerd refused the exec (a restarting or paused container), so the keys are unknown.
     authorized_keys: list[str] | None
-    # dockerd refused the exec because the container is restarting: `docker ps` still lists it as running
+    # Docker's own state says restarting (dockerd refused the keys read): `docker ps` still lists it as running
     restarting: bool = False
 
 
-_DOCKER_RESTARTING = "is restarting, wait until the container is running"
 # The per-pod verdict for a rented container caught in a restart loop. Reported only: the check's verdict on the
 # node, penalties, scoring and billing do not read it.
 RENTED_POD_RESTARTING = "RENTED_POD_RESTARTING"
@@ -1508,7 +1507,6 @@ async def _check_pod_running_and_read_authorized_keys(
         # refusal reads as unknown.
         if keys_result.exit_status != 0 and _DOCKER_DAEMON_ERROR in str(keys_result.stderr):
             ssh_keys = None
-            restarting = _DOCKER_RESTARTING in str(keys_result.stderr)
         else:
             ssh_keys = keys_result.stdout.strip().split("\n") if keys_result.stdout else []
     except (asyncssh.Error, OSError):
@@ -1516,10 +1514,22 @@ async def _check_pod_running_and_read_authorized_keys(
     except Exception:
         ssh_keys = []
 
+    if pod_running and ssh_keys is None:
+        # Docker's own state, not the refusal text: a running container whose read failed is not restarting
+        try:
+            state = await ssh_client.run(
+                f"/usr/bin/docker inspect -f '{{{{.State.Restarting}}}}' {shlex.quote(container_name)}"
+            )
+            restarting = state.exit_status == 0 and state.stdout.strip() == "true"
+        except (asyncssh.Error, OSError):
+            raise
+        except Exception:
+            restarting = False
+
     if ssh_keys and any(body in line for line in ssh_keys for body in FOREIGN_POD_KEY_BODIES):
         ssh_keys = await _strip_foreign_pod_keys(ssh_client, container_name, ssh_keys, log_extra)
 
-    return PodRunningAndAuthorizedKeys(running=pod_running, authorized_keys=ssh_keys, restarting=pod_running and restarting)
+    return PodRunningAndAuthorizedKeys(running=pod_running, authorized_keys=ssh_keys, restarting=restarting)
 
 
 # I-78: keys no renter, platform service or team member owns; removed from a rented pod on every read.

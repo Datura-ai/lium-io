@@ -1,4 +1,4 @@
-"""A rented container dockerd reports restarting is named in its per-pod verdict; the node's verdict is not changed."""
+"""A rented container Docker reports restarting is named in its per-pod verdict; the node's verdict is not changed."""
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -17,23 +17,35 @@ PAUSED = "Error response from daemon: Container abc123 is paused, unpause the co
 
 
 class FakeSSH:
-    def __init__(self, exec_stderr, listed="cid"):
-        self.exec_stderr, self.listed = exec_stderr, listed
+    def __init__(self, exec_stderr, listed="cid", restarting="false"):
+        self.exec_stderr, self.listed, self.restarting = exec_stderr, listed, restarting
 
     async def run(self, command):
         if "docker ps" in command:
             return SimpleNamespace(stdout=self.listed, stderr="", exit_status=0)
+        if "docker inspect" in command:
+            return SimpleNamespace(stdout=self.restarting + "\n", stderr="", exit_status=0)
         return SimpleNamespace(stdout="", stderr=self.exec_stderr, exit_status=1)
 
 
 @pytest.mark.asyncio
 async def test_a_restarting_container_is_read_as_listed_and_restarting():
-    result = await _check_pod_running_and_read_authorized_keys(FakeSSH(RESTARTING), "pod_x")
+    result = await _check_pod_running_and_read_authorized_keys(FakeSSH(RESTARTING, restarting="true"), "pod_x")
     assert (result.running, result.authorized_keys, result.restarting) == (True, None, True)
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("ssh", [FakeSSH(PAUSED), FakeSSH(RESTARTING, listed=""), FakeSSH("")])
+async def test_a_running_container_whose_read_fails_is_not_restarting():
+    # the refusal text alone does not decide it: Docker's own state reads running, not restarting
+    result = await _check_pod_running_and_read_authorized_keys(FakeSSH(RESTARTING), "pod_x")
+    assert (result.running, result.authorized_keys, result.restarting) == (True, None, False)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "ssh",
+    [FakeSSH(PAUSED), FakeSSH(RESTARTING, listed="", restarting="true"), FakeSSH("", restarting="true")],
+)
 async def test_paused_unlisted_or_readable_is_not_restarting(ssh):
     assert (await _check_pod_running_and_read_authorized_keys(ssh, "pod_x")).restarting is False
 
