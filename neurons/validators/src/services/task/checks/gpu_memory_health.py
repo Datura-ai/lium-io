@@ -9,6 +9,7 @@ from typing import Any
 
 import redis.exceptions
 
+from services import executor_payload
 from core.config import settings
 from core.utils import _m, get_extra_info
 
@@ -248,7 +249,7 @@ async def read_memory_health(ctx: Context) -> MemoryHealthRead:
     if ctx.state.memory_health is not None:
         return ctx.state.memory_health
     before = await _load_card_health(ctx)
-    command = f"{shlex.quote(ctx.executor.python_path)} -I - --nvml-only"
+    command = f"{shlex.quote(executor_payload.EXECUTOR_PYTHON)} -I - --nvml-only"
     if before is not None and before.xid_after is not None:
         command += f" --xid-after {before.xid_after}"
         if before.boot_id is not None:

@@ -117,6 +117,10 @@ def plugin():
     identity = "b" * 64 if state.get("enable_switch_id") and state.get("enabled") else plugin_id
     return {"Id": identity, "Enabled": state.get("enabled", False), "Settings": {"Env": env}}
 
+if state.get(action + "_stderr"):
+    print(state[action + "_stderr"], file=sys.stderr)
+if action == "install" and state.get("install_leaves_nothing"):
+    sys.exit(1)
 if action == "install":
     if state.get("install_waits_for_release"):
         wait_for_release()
@@ -469,7 +473,7 @@ def test_setup_removes_a_probe_container_its_timeout_cut_off_before_its_volume(t
     state = json.loads((tmp_path / "state.json").read_text())
     for result in results:
         assert result.returncode == 1
-        assert "probe volume failed: TimeoutExpired" in result.stderr
+        assert "docker run --rm timed out" in result.stderr
         assert "could not be disabled" not in result.stderr
     assert state["containers"] == []
     assert state["enabled"] is False
@@ -602,7 +606,7 @@ def test_setup_whose_install_took_most_of_the_deadline_reports_a_hung_disable_in
     assert result.elapsed < deadline_seconds
     assert "cut short" not in result.stderr
     assert result.returncode == 1
-    assert "probe volume failed: TimeoutExpired" in result.stderr
+    assert "docker run --rm timed out" in result.stderr
     assert "could not be disabled" in result.stderr
     assert sum(call[1] == "disable" for call in _plugin_calls(tmp_path)) == 3
     assert not (tmp_path / "probe-ok").exists()
@@ -666,7 +670,7 @@ def test_setup_reports_a_probe_that_ran_out_of_its_budget_and_a_disable_that_hun
 
     # Assert
     assert result.returncode == 1
-    assert "probe volume failed: TimeoutExpired" in result.stderr
+    assert "docker run --rm timed out" in result.stderr
     assert "could not be disabled" in result.stderr
     assert not (tmp_path / "probe-ok").exists()
 
@@ -685,8 +689,59 @@ def test_setup_cut_short_by_the_validators_deadline_says_so_on_stderr(tmp_path: 
 
     # Assert
     assert process.returncode == 1
-    assert "setup cut short by the validator's deadline" in stderr
+    assert "setup cut short by the validator's deadline during docker run --rm" in stderr
     assert not (tmp_path / "probe-ok").exists()
+
+
+
+def test_setup_cut_short_while_reading_the_plugins_saved_config_names_that_read(tmp_path: Path) -> None:
+    # Arrange: plugin inspect answers, then the read of the plugin's saved config blocks (a named pipe) until the
+    # validator's `timeout` sends SIGTERM; the reason must not name the inspect that already returned
+    arguments = _setup_arguments(tmp_path, {"installed": True, "enabled": True})
+    config = tmp_path / "plugins" / ("a" * 64) / "config.json"
+    config.unlink()
+    os.mkfifo(config)
+    process = subprocess.Popen(arguments, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    writer = None
+    while writer is None:  # a non-blocking writer opens only once the setup waits on the pipe as its reader
+        assert process.poll() is None, process.communicate()
+        try:
+            writer = os.open(config, os.O_WRONLY | os.O_NONBLOCK)
+        except OSError:
+            time.sleep(0.01)
+
+    # Act: the setup now waits in the read, with the writer held open and nothing written
+    try:
+        process.send_signal(signal.SIGTERM)
+        _, stderr = process.communicate(timeout=20)
+    finally:
+        os.close(writer)
+
+    # Assert
+    assert process.returncode == 1
+    assert any(call[1] == "inspect" for call in _plugin_calls(tmp_path))
+    assert "setup cut short by the validator's deadline during the read of the plugin's saved config" in stderr
+
+@pytest.mark.skipif(not Path("/proc/locks").exists(), reason="reads blocked lock waiters from /proc/locks")
+def test_setup_cut_short_while_waiting_for_the_setup_lock_names_the_wait(tmp_path: Path) -> None:
+    # Arrange: another setup holds the lock when the validator's `timeout` sends SIGTERM
+    arguments = _setup_arguments(tmp_path, {}, alias="vloopback:v3")
+    with open(tmp_path / "setup.lock", "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        process = subprocess.Popen(arguments, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        while not _blocked_on(tmp_path / "setup.lock"):  # the setup is waiting for the lock, not still starting
+            assert process.poll() is None, "the setup ended before it waited for the lock"
+            time.sleep(0.01)
+
+        # Act
+        process.send_signal(signal.SIGTERM)
+        _, stderr = process.communicate(timeout=20)
+
+    # Assert: the reason names the lock wait, and no docker command ran
+    assert process.returncode == 1
+    assert "setup cut short by the validator's deadline during the wait for the setup lock" in stderr
+    assert json.loads((tmp_path / "state.json").read_text())["calls"] == []
+
 
 def _blocked_on(lock_path: Path) -> bool:
     """True while some process waits for the flock on lock_path (Linux lists blocked waiters with `->`)."""
@@ -747,3 +802,49 @@ async def test_setup_command_quotes_the_root_and_never_installs_a_digest(alias, 
     assert args[4:8] == [alias, tag, digest, generation]
     assert args[8] == ("" if generation == "v2" else "docker.io/library/alpine:3.19")
     assert "sha256" not in tag
+
+
+@pytest.mark.parametrize(
+    "overrides, reason",
+    [
+        (
+            {"install_leaves_nothing": True,
+             "install_stderr": "Error response from daemon: Get https://bot:hunter2@registry.example/v2/:\n  unauthorized"},
+            "installation did not produce a plugin: Error response from daemon: "
+            "Get https://registry.example/v2/: unauthorized",
+        ),
+        (
+            {"enable_exit": 1, "enable_stderr": "Error response from daemon: dial unix plugin.sock: connect refused"},
+            "verified plugin remains disabled: Error response from daemon: dial unix plugin.sock: connect refused",
+        ),
+        (
+            {"install_leaves_nothing": True,
+             "install_stderr": 'Get "https://blobs.example/b/l?X-Amz-Signature=hunter2&X-Amz-Expires=60": EOF'},
+            'installation did not produce a plugin: Get "https://blobs.example/b/l": EOF',
+        ),
+        (
+            {"enable_exit": 1, "enable_stderr": "pull https://u:hunter2@blobs.example/b/l?sig=hunter2#hunter2 failed"},
+            "verified plugin remains disabled: pull https://blobs.example/b/l failed",
+        ),
+        (
+            {"install_leaves_nothing": True,
+             "install_stderr": "Get https://bot:hun@ter2@registry.example/v2/: unauthorized"},
+            "installation did not produce a plugin: Get https://registry.example/v2/: unauthorized",
+        ),
+        (
+            {"enable_exit": 1, "enable_stderr": "pull https://u:hun/ter2@blobs.example/b/l failed"},
+            "verified plugin remains disabled: pull https://blobs.example/b/l failed",
+        ),
+    ],
+)
+def test_setup_failure_carries_docker_s_own_reason_without_credentials(tmp_path: Path, overrides, reason) -> None:
+    # Arrange
+    arguments = _setup_arguments(tmp_path, overrides)
+
+    # Act
+    result = subprocess.run(arguments, capture_output=True, text=True, timeout=20)
+
+    # Assert
+    assert result.returncode == 1
+    assert result.stderr.strip() == reason
+    assert "hunter2" not in result.stderr and "ter2" not in result.stderr

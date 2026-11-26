@@ -309,7 +309,7 @@ async def test_a_pinned_run_targets_one_card_and_keys_on_it(monkeypatch):
         gpu_uuid="GPU-1",
     )
 
-    assert ssh.run.call_args.args[0].startswith("CUDA_VISIBLE_DEVICES=GPU-1 python ")
+    assert "; CUDA_VISIBLE_DEVICES=GPU-1 " + mvs.executor_payload.run(mvs.executor_payload.MATRIX) + " " in ssh.run.call_args.args[0]
     machine_info = json.loads(wrapper.generateChallenge.call_args.args[2])
     assert machine_info == {"uuids": "GPU-1", "gpu_count": 1, "gpu_model": "NVIDIA H100 80GB HBM3"}
 

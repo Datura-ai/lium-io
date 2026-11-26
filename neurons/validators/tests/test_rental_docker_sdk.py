@@ -1380,7 +1380,8 @@ def test_require_rental_docker_ssh_host_key_strips_present_key():
     ],
 )
 def test_require_rental_docker_ssh_host_key_checks_a_hostnames_registered_key(reported, registered, accepted):
-    executor_info = ExecutorSSHInfo(
+    # the model refuses a multi-line reported key from a node; the check refuses it all the same
+    executor_info = ExecutorSSHInfo.model_construct(
         uuid="executor-id",
         address="node.example",
         port=8000,

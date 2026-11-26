@@ -62,6 +62,7 @@ from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Any
 
+from services import executor_payload
 from services.gpu_clocks import clock_locked_gpu_uuids
 
 from core.config import settings
@@ -368,7 +369,7 @@ class GpuThermalThrottleCheck:
         heat_seconds = LOAD_PROBE_SECONDS + (LOAD_START_SECONDS - PROBE_SECONDS) + scrape_timeout + LOAD_KILL_SECONDS
         load = asyncio.create_task(
             ctx.runner.run(
-                f"{shlex.quote(ctx.executor.python_path)} -I - --seconds {PROBE_SECONDS} --heat-seconds {heat_seconds}",
+                f"{shlex.quote(executor_payload.EXECUTOR_PYTHON)} -I - --seconds {PROBE_SECONDS} --heat-seconds {heat_seconds}",
                 timeout=PROBE_TIMEOUT_SECONDS + heat_seconds,
                 retryable=False,
                 stdin_text=probe_source(),

@@ -131,6 +131,30 @@ async def test_plain_idle_node_earns_only_in_the_unrented_pool(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_an_outdated_image_on_a_partly_rented_node_keeps_the_idle_pay_of_its_free_gpus(monkeypatch):
+    # DAH-6845: a rented node keeps its rewards on an outdated image, its free split GPUs included
+    async def scored(status: str) -> JobResult:
+        job = _make_job(gpu_count=8, rented_gpu_count=1)
+        job.executor_image_report = {
+            "status": status,
+            "expected_ref": "daturaai/compute-subnet-executor:latest",
+            "rented_when_read": True,
+        }
+        incentive = _build_incentive(job)
+        monkeypatch.setattr(incentive, "_calculate_rental_share", AsyncMock(return_value=0.1))
+        await incentive.calculate_mining_scores()
+        return job
+
+    current, outdated = await scored("CURRENT"), await scored("OUTDATED")
+
+    assert outdated.incentive == pytest.approx(current.incentive)
+    assert outdated.mining_score == pytest.approx(current.mining_score)
+    assert "outdated_executor_image" not in [r.reason for r in outdated.zero_incentive_reasons]
+    # an image that was never released still excludes the whole node
+    assert (await scored("UNOFFICIAL")).incentive == 0
+
+
+@pytest.mark.asyncio
 async def test_node_wide_exclusion_reaches_the_backend_once_on_a_partially_rented_split_node(monkeypatch):
     # Arrange — both portions are scored and each records the node-wide Discord exclusion.
     job = _make_job(gpu_count=2, rented_gpu_count=1)

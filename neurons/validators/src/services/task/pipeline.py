@@ -14,6 +14,7 @@ from datura.requests.miner_requests import ExecutorSSHInfo
 from core.utils import _m
 from clients.backend_client import BackendClient
 from services.ssh_service import SSHService
+from services.file_encrypt_service import ScrapeBinaryBuild
 from services.redis_service import RedisService
 from services.matrix_validation_service import ValidationService
 from services.verifyx_validation_service import VerifyXValidationService
@@ -27,7 +28,13 @@ from services.container_cleanup import ContainerCleanup
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from protocol.vc_protocol.validator_requests import PodContainerState
 from .availability import REASONS_THAT_HIDE_AT_ONCE, AvailabilityErrorCode
-from .messages import NodeAccountMessages, RentalVerificationMessages, TenantEnforcementMessages, render_message
+from .messages import (
+    LoginUserMessages,
+    NodeAccountMessages,
+    RentalVerificationMessages,
+    TenantEnforcementMessages,
+    render_message,
+)
 from .models import ValidationEvent
 from .runner import SSHCommandResult, SSHCommandRunner
 
@@ -134,9 +141,7 @@ class ContextServices:
 
 @dataclass(frozen=True)
 class ContextConfig:
-    executor_root: str
     compute_rest_app_url: str
-    gpu_monitor_script_relative: str
     machine_scrape_filename: str
     machine_scrape_timeout: int
     obfuscation_keys: Any
@@ -157,6 +162,8 @@ class ContextConfig:
     # DAH-2794: obfuscated scrape source, piped to the executor's interpreter over stdin.
     # None => the legacy path, where the scrape is a binary uploaded by UploadFilesCheck.
     machine_scrape_source: Optional[str] = None
+    # DAH-5899: builds the cycle's binary on the first stdin failure; None => it is already built
+    machine_scrape_binary_build: ScrapeBinaryBuild | None = None
     # DAH-3011: True only for a never-validated executor's first, unscored verification
     # (set in PipelineFactory.build_context). The capability
     # matmul and VerifyX right-size their probes and the bandwidth gate is deferred to the first
@@ -320,6 +327,14 @@ class Context(BaseModel):
     # carries the evidence (lium-platform DAH-3385). The pipeline fills reason_code/check_id from the event when
     # the check did not set it itself.
     clear_verified_job_evidence: dict[str, Any] | None = None
+    # DAH-6784: the check that cleared the verified job meant it for an idle node only (it leaves rented nodes
+    # alone, judged from rental reads older than the reset). Sent as its own field, not in the evidence the backend
+    # may cut, and applied there only while no customer pod runs on the node. Set afresh by every clearing check.
+    clear_verified_job_unrented_only: bool = False
+    # DAH-6784: the check_ids of the idle-only checks (those that set clear_verified_job_unrented_only on a failure)
+    # that ran in full this cycle and passed. A check says so with updates["idle_check_passed"]=True on its real pass
+    # path only; the backend lifts a hold such a check left on a rented node only when that check is listed here.
+    idle_checks_passed: tuple[str, ...] = ()
     # Set by GpuFingerprintCheck when the node lists a full set of other GPUs (full_set_changed): ResultHandler
     # makes this cycle's set the anchor.
     gpu_reanchor: bool = False
@@ -505,7 +520,9 @@ def _vloopback_outcome(event: ValidationEvent) -> str:
     return f"{vloopback.get('verdict')}:{vloopback.get('reason_code')}"
 
 
-def updates_with_clear_verified_job_evidence(res: CheckResult, check_id: str) -> dict[str, Any]:
+def updates_with_clear_verified_job_evidence(
+    res: CheckResult, check_id: str, idle_checks_passed: tuple[str, ...] = ()
+) -> dict[str, Any]:
     """The check's updates, with ``clear_verified_job_evidence`` filled when the check clears the verified job.
 
     DAH-3386: every check that sets ``clear_verified_job_info`` names itself to the backend — its event's
@@ -514,12 +531,21 @@ def updates_with_clear_verified_job_evidence(res: CheckResult, check_id: str) ->
     rented-machine check adds the container's death diagnostics) keeps it; only the two names are filled in.
     """
     updates = dict(res.updates)
+    # DAH-6784: never a Context field of its own; a passing check's mark becomes its id in the run's list, or the ids
+    # of the parts it proved when it names them (node_account: a hold one part left lifts only on proof of that part)
+    mark = updates.pop("idle_check_passed", False)
+    if res.passed and mark is True:
+        updates["idle_checks_passed"] = (*idle_checks_passed, res.event.check_id or check_id)
+    elif res.passed and isinstance(mark, tuple) and mark and all(isinstance(part, str) for part in mark):
+        updates["idle_checks_passed"] = (*idle_checks_passed, *mark)
     if not updates.get("clear_verified_job_info"):
         return updates
     evidence = dict(updates.get("clear_verified_job_evidence") or {})
     evidence.setdefault("reason_code", res.event.reason_code)
     evidence.setdefault("check_id", res.event.check_id or check_id)
     updates["clear_verified_job_evidence"] = evidence
+    # a later clearing check never inherits an earlier one's idle-only mark
+    updates["clear_verified_job_unrented_only"] = updates.get("clear_verified_job_unrented_only") is True
     return updates
 
 
@@ -731,7 +757,9 @@ class Pipeline:
             if _stops_run(chk, res):
                 return
             if res.updates:
-                current = current.model_copy(update=updates_with_clear_verified_job_evidence(res, chk.check_id))
+                current = current.model_copy(
+                    update=updates_with_clear_verified_job_evidence(res, chk.check_id, current.idle_checks_passed)
+                )
 
     async def _run_stage(self, stage: ParallelStage, ctx: Context) -> list[_RanCheck]:
         """Run the lanes at once; the first lane to stop (fatal, halt or exception) cancels the rest."""
@@ -846,7 +874,7 @@ class Pipeline:
         res = ran.result
         if not res.updates:
             return current_ctx
-        updates = updates_with_clear_verified_job_evidence(res, ran.check.check_id)
+        updates = updates_with_clear_verified_job_evidence(res, ran.check.check_id, current_ctx.idle_checks_passed)
         if parallel and "state" in updates:
             updates["state"] = merge_state(current_ctx.state, ran.before_state, updates["state"])
         return current_ctx.model_copy(update=updates)
@@ -855,7 +883,8 @@ class Pipeline:
         passed, events, end_ctx = await self._run_checks(ctx)
         # another account's machine answered, or the machine could not be confirmed as the account's (a read that
         # still failed after the reconnect, which a relay can cause): no completion step touches it (DAH-6539)
-        if any(event.reason_code in _NOT_THE_ACCOUNTS_MACHINE for event in events):
+        # a non-root login runs nothing on the host either: completion steps need the root login every script uses
+        if any(event.reason_code in _NOT_THE_ACCOUNTS_MACHINE or event.reason_code == LoginUserMessages.NOT_ROOT.reason for event in events):
             return passed, events, end_ctx
         for chk in self.on_completion:
             try:
