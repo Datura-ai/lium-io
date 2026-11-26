@@ -1,3 +1,4 @@
+import functools
 import json
 from collections.abc import Iterable
 
@@ -20,6 +21,12 @@ def declared_ports(executor_info: ExecutorSSHInfo) -> list[PortPair]:
     the backend binds for it (its first mapping in declared order), so a verified port is never
     rented onto a different internal port than the one probed.
     """
+    if not executor_info.port_mappings:
+        return [
+            pair
+            for pair in _unique_port_pairs_of_range(executor_info.port_range)
+            if pair.internal != executor_info.ssh_port
+        ]
     rental_internal: dict[int, int] = {}
     for internal, external in json.loads(executor_info.port_mappings or "[]"):
         rental_internal.setdefault(int(external), int(internal))
@@ -37,6 +44,13 @@ def declared_ports(executor_info: ExecutorSSHInfo) -> list[PortPair]:
         seen_external.add(external)
         pairs.append(PortPair(internal, external))
     return pairs
+
+
+@functools.lru_cache(maxsize=32)
+def _unique_port_pairs_of_range(port_range: str | None) -> tuple[PortPair, ...]:
+    # one entry per range string, shared by every node declaring it; the default range is ~6 MB.
+    # A range pairs each port with itself, so dropping the ssh port after dedup gives the same list.
+    return tuple(dict.fromkeys(PortPair(i, e) for i, e in get_all_ports(port_range, None, ssh_port=-1)))
 
 
 def tally_port_ranges(

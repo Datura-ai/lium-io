@@ -1,7 +1,8 @@
 """The validator this miner trusts, as named by a message the SN51 subnet owner signed.
 
 The message is `lium-validator:<validator hotkey>:<revision>` (datura.validator_trust), the same one the executor
-takes. It comes from `<COMPUTE_REST_API_URL>/watchtower/validator-message` every few minutes, and from the image
+takes. It comes from `<COMPUTE_REST_API_URL>/watchtower/validator-message` (a staging build:
+`<_STAGING_TRUST_API_URL>/...`) every few minutes, and from the image
 (`src/validator_trust_message.json`). A message is taken when the current subnet owner's coldkey signed it and its
 revision is higher than the held one's; on any error the held message stays. There is no expiry.
 
@@ -91,6 +92,7 @@ class ValidatorTrust:
         owner: str | None = None,
         read_chain: bool = True,
         message: SignedTrustMessage | None = None,
+        api_url: str | None = None,
     ):
         self.engine = engine or db_engine
         self.image_message = image_message
@@ -102,6 +104,8 @@ class ValidatorTrust:
         self.read_chain = read_chain
         # the build's own signed message (a staging build), used instead of the image copy
         self.message = message
+        # a staging build reads its owner's messages from the backend that serves them, not this host's backend
+        self.api_url = api_url
         self.owner = self.release_owner
         self.held: TrustedValidator | None = None
         # every validator a message named that this miner took, the held one included
@@ -204,9 +208,10 @@ class ValidatorTrust:
 
     async def refresh_message(self) -> None:
         """A 404 or any failure keeps the message held."""
-        if not self.enabled or not settings.COMPUTE_REST_API_URL:
+        base = self.api_url or settings.COMPUTE_REST_API_URL
+        if not self.enabled or not base:
             return
-        url = settings.COMPUTE_REST_API_URL.rstrip("/") + "/watchtower/validator-message"
+        url = base.rstrip("/") + "/watchtower/validator-message"
         try:
             data = await fetch_json(url)
             if data is not None:

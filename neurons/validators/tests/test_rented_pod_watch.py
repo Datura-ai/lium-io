@@ -351,6 +351,17 @@ async def test_run_bounds_the_whole_tick_and_schedules_from_its_start(monkeypatc
     monkeypatch.setattr(settings, "RENTED_POD_WATCH_INTERVAL_SECONDS", 0.2)
     watch = _watch(FakeBackend(_rented()), FakeProbe())
     loop = asyncio.get_running_loop()
+    # virtual time: the loop jumps to its next timer instead of waiting, so a slow host cannot stretch a gap
+    now = [loop.time()]
+    real_select = loop._selector.select
+
+    def jump_select(timeout=None):
+        if timeout:
+            now[0] += timeout
+        return real_select(0 if timeout is not None else None)
+
+    monkeypatch.setattr(loop, "time", lambda: now[0])
+    monkeypatch.setattr(loop._selector, "select", jump_select)
     starts = []
 
     async def slow_tick():
@@ -361,8 +372,8 @@ async def test_run_bounds_the_whole_tick_and_schedules_from_its_start(monkeypatc
     await asyncio.wait_for(watch.run(lambda: len(starts) >= 3), timeout=2)
 
     assert len(starts) == 3
-    assert starts[1] - starts[0] < 0.3  # 0.2 from the first start, not 0.15 + 0.2 after it
-    assert starts[2] - starts[1] < 0.3  # the hung tick was cut at the interval
+    assert starts[1] - starts[0] == pytest.approx(0.2)  # 0.2 from the first start, not 0.15 + 0.2 after it
+    assert starts[2] - starts[1] == pytest.approx(0.2)  # the hung tick was cut at the interval
 
 
 # review ask 1: the light target list, shaped as the rented list the probe takes

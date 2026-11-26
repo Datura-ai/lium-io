@@ -5,6 +5,9 @@ import shlex
 from datetime import datetime, timezone
 
 import asyncssh
+import redis.exceptions
+from core.config import settings
+from services.redis_service import RedisWrites
 
 from ..messages import RentedPodOwnershipMessages as Msg
 from ..messages import render_message
@@ -39,6 +42,20 @@ PATHS = (
     "/usr/share",
     "/var/lib/dpkg",
 )
+
+
+# Sysbox hands a stopping pod's files back to their host owners from the top of the tree: in 11 of 11 reads taken
+# just before a host reboot (21-22 Nov) these were back at host root, the sudo files still in the range. The two
+# package dirs came back in either order, so they are a set that may follow the top dirs, not a fixed sequence
+REVERTED_FIRST = ("/", "/usr", "/usr/lib")
+MAY_BE_REVERTED_NEXT = ("/usr/share", "/var/lib/dpkg")
+# a container seen mid-revert is remembered until a clean read: any later read still showing the shape, on the same init
+# pid or a new one (a pod restarted into it has finished stopping), is a lasting state, not a stop
+MID_REVERT_KEY_PREFIX = "rented_pod_ownership:mid_revert"
+MID_REVERT_TTL_SECONDS = 24 * 3600
+# the marks' one read and one write together: Redis lets a call wait a minute for a pooled connection, and an
+# observe-only check must not spend the validation deadline on it. A candidate not read back in time is SHIFTED
+MID_REVERT_MARKS_BUDGET_SECONDS = 10
 
 
 def read_command(pids: list[int], proc: str = "/proc") -> str:
@@ -101,12 +118,17 @@ def judge(line: str) -> dict | None:
     # (an image without /root or sudo) are judged from the rest
     if not shifted and read["/"] is None:
         return None
-    return {
-        "pid": pid_num,
-        "uid_map_base": base,
-        "host_owners": owners,
-        "outside_namespace": shifted,
-    }
+    pod = {"pid": pid_num, "uid_map_base": base, "host_owners": owners, "outside_namespace": shifted}
+    # the shape a stopping pod's hand-back leaves: the top dirs (and maybe the package dirs) at host root, everything
+    # else read in the range. It is only a candidate: run() reports it unread once, and SHIFTED on any later read of the
+    # same container before a clean one (a hand-back cut short by a power loss stays like this on a running pod)
+    if (
+        set(REVERTED_FIRST) <= set(shifted) <= set(REVERTED_FIRST + MAY_BE_REVERTED_NEXT)
+        and all(owners[path] == 0 for path in shifted)
+        and len(owners) > len(shifted)
+    ):
+        pod.update(outside_namespace=[], being_reverted=shifted)
+    return pod
 
 
 class RentedPodOwnershipCheck:
@@ -121,6 +143,7 @@ class RentedPodOwnershipCheck:
     """
 
     check_id = "host.observe.rented_pod_ownership"
+    # safe to rerun on a fresh session: a mark carries the run's pipeline id, so a rerun reads its own mark as the same sight
     replays_after_session_drop = True
     fatal = False
 
@@ -143,11 +166,13 @@ class RentedPodOwnershipCheck:
                 timeout=READ_TIMEOUT_SECONDS,
             )
             pid_by_name = {}
-            # docker inspect exits 1 on a missing name but still prints the others
+            # docker inspect exits 1 on a missing name but still prints the others; a name not asked for is ignored
+            # (the provider controls the reply, and each pod read can move a Redis mark)
             for line in (res.stdout or "").splitlines():
                 name, _, pid = line.partition(" ")
-                if (_num(pid) or 0) > 0:
-                    pid_by_name[name.lstrip("/")] = _num(pid)
+                name = name.lstrip("/")
+                if name in names and (_num(pid) or 0) > 0:
+                    pid_by_name[name] = _num(pid)
             if not pid_by_name:
                 return self._event(
                     ctx, Msg.UNREAD, {"reason": "no running rented container", "pods": names}
@@ -180,7 +205,15 @@ class RentedPodOwnershipCheck:
                 what["runtime_restarted_under_pods"] = restarted
                 # when each flagged runtime started: a notice must date the restart, not the day the check first saw it
                 what["runtime_started_at"] = started_at
+        candidates = [p for p in pods.values() if p.get("being_reverted")]
+        first_sights = await self._settle_mid_revert_marks(
+            ctx, candidates, [p for p in pods.values() if not p.get("being_reverted") and not p["outside_namespace"]]
+        )
+        for pod in candidates:
+            if pod["container"] not in first_sights:
+                pod["outside_namespace"] = pod.pop("being_reverted")
         shifted = [p for p in pods.values() if p["outside_namespace"]]
+        reverting = sorted(p["container"] for p in pods.values() if p.get("being_reverted"))
         if shifted:
             template = await self._shift_template(ctx, shifted)
         elif unread:
@@ -188,6 +221,11 @@ class RentedPodOwnershipCheck:
             what.update(reason="pod not read back", unread=unread, exit_status=res.exit_status)
             if empty_reads:
                 what["empty_reads"] = empty_reads
+        elif reverting:
+            # first sight of the hand-back shape a stopping pod leaves (the host going down): unknown until the next
+            # cycle shows whether the pod stopped or keeps it
+            template = Msg.UNREAD
+            what.update(reason="ownership being handed back, as when the pod stops", being_reverted=reverting)
         elif "runtime_restarted_under_pods" in what:
             # own outcome, not OK: a repeated OK is logged at DEBUG, so the restart would never surface
             template = Msg.RUNTIME_RESTARTED
@@ -196,6 +234,45 @@ class RentedPodOwnershipCheck:
         if unread:
             what["unread"] = unread
         return self._event(ctx, template, what)
+
+    async def _settle_mid_revert_marks(self, ctx: Context, candidates: list[dict], clean: list[dict]) -> set[str]:
+        """The candidates read in the hand-back shape for the first time since their last clean read (any init pid).
+        One MGET and one MULTI/EXEC within MID_REVERT_MARKS_BUDGET_SECONDS: each candidate's mark is set to this run's
+        pipeline id (a mark of the same run, left by the check before its session dropped and it ran again, is the same
+        sight; the TTL only ends marks of containers never read again; each sight renews it) and each clean pod's is
+        cleared, as a clean read ends the stop the mark stood for. When Redis cannot say in time, no candidate is a first sight: the shape
+        is reported, never hidden. A dry run shares Redis with the live validator: it reads the marks, never writes."""
+        if not candidates and (not clean or settings.DRY_RUN):
+            return set()
+
+        def key(pod: dict) -> str:
+            return f"{MID_REVERT_KEY_PREFIX}:{ctx.executor.uuid}:{pod['container']}"
+
+        async def settle() -> set[str]:
+            seen = await ctx.services.redis.mget([key(p) for p in candidates])
+            run = ctx.pipeline_id.encode()
+            first = {
+                p["container"]
+                for p, mark in zip(candidates, seen)
+                if mark is None or (mark.encode() if isinstance(mark, str) else mark) == run
+            }
+            if not settings.DRY_RUN:
+                writes = RedisWrites()
+                for pod in candidates:
+                    if pod["container"] in first:
+                        writes.set(key(pod), ctx.pipeline_id, ex=MID_REVERT_TTL_SECONDS)
+                    else:
+                        # a later sight keeps the earlier run's id: a rerun of this run must still read it as later
+                        writes.expire(key(pod), MID_REVERT_TTL_SECONDS)
+                for pod in clean:
+                    writes.delete(key(pod))
+                await ctx.services.redis.write_atomically(writes)
+            return first
+
+        try:
+            return await asyncio.wait_for(settle(), timeout=MID_REVERT_MARKS_BUDGET_SECONDS)
+        except (redis.exceptions.RedisError, OSError, TimeoutError):
+            return set()
 
     async def _shift_template(self, ctx: Context, shifted: list[dict]):
         """A container restarted long after the host booted was not brought back by a host reboot: say so,

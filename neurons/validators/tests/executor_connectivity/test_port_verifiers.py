@@ -34,6 +34,68 @@ async def test_semi_batch_fails_a_chunk_that_does_not_answer_in_time(mocker):
 
 
 @pytest.mark.asyncio
+async def test_semi_batch_publishes_a_mapped_port_on_the_host_port_the_router_forwards_to(mocker):
+    # port_mappings: the router forwards external 40000 to host port 9000, where a rental pod binds
+    ports = [PortPair(9000, 40000)]
+    runner = mocker.Mock()
+    runner.run = mocker.AsyncMock(return_value=CONTAINER_STARTED)
+    runner.cleanup = mocker.AsyncMock()
+    port_tester = mocker.Mock()
+    port_tester.test_many = mocker.AsyncMock(side_effect=lambda _s, _h, chunk, *_a: (chunk, []))
+
+    await SemiBatchVerifier(port_tester, runner).verify(ports, ssh_client=mocker.Mock(), host="1.2.3.4")
+
+    assert runner.run.await_args.args[3] == "-p 9000:9000"
+
+
+
+@pytest.mark.asyncio
+async def test_semi_batch_one_busy_host_port_fails_only_itself(mocker):
+    # review: a rental started after selection holds host port 9003; docker refused its whole chunk and the
+    # cycle kept one verified port of eleven
+    ports = [PortPair(9000 + i, 40000 + i) for i in range(11)]
+
+    async def run(_ssh, _name, _script, publish_flags, _timeout):
+        if "-p 9003:" in publish_flags:
+            return ContainerStartResult(
+                ok=False,
+                container_id=None,
+                status="docker: Error response from daemon: driver failed programming external connectivity on "
+                "endpoint port_test_pub_x: Bind for 0.0.0.0:9003 failed: port is already allocated.",
+            )
+        return CONTAINER_STARTED
+
+    runner = mocker.Mock()
+    runner.run = mocker.AsyncMock(side_effect=run)
+    runner.cleanup = mocker.AsyncMock()
+    port_tester = mocker.Mock()
+    port_tester.test_many = mocker.AsyncMock(side_effect=lambda _s, _h, chunk, *_a: (chunk, []))
+
+    successful, failed = await SemiBatchVerifier(port_tester, runner).verify(
+        ports, ssh_client=mocker.Mock(), host="1.2.3.4"
+    )
+
+    assert failed == [ports[3]]
+    assert set(successful) == set(ports) - {ports[3]} and len(successful) == 10
+
+
+@pytest.mark.asyncio
+async def test_semi_batch_a_start_failure_naming_no_chunk_port_fails_the_chunk(mocker):
+    ports = [PortPair(9000 + i, 9000 + i) for i in range(3)]
+    runner = mocker.Mock()
+    runner.run = mocker.AsyncMock(
+        return_value=ContainerStartResult(ok=False, container_id=None, status="Bind for 0.0.0.0:9500 failed")
+    )
+    port_tester = mocker.Mock()
+
+    successful, failed = await SemiBatchVerifier(port_tester, runner).verify(
+        ports, ssh_client=mocker.Mock(), host="1.2.3.4"
+    )
+
+    assert (successful, failed) == ([], ports)
+    assert runner.run.await_count == 1
+
+@pytest.mark.asyncio
 async def test_fallback_stops_when_a_container_start_hangs(mocker):
     # DAH-5419: a stuck docker daemon held the start until the task was dropped with no result
     ports = [PortPair(9000 + i, 9000 + i) for i in range(10)]

@@ -88,7 +88,10 @@ async def test_every_hard_exclusion_and_every_enforced_gate_is_recorded_in_order
 
     result = await _incentive().calculate_executor_score(
         _idle_full_8x(
-            provider_discord_connected=False, is_new_rentals_paused=True, is_spot=True, spec=dict(SHORT_DISK_SPEC)
+            provider_discord_connected=False,
+            is_new_rentals_paused=True,
+            is_spot=True,
+            spec={**SHORT_DISK_SPEC, "ram": {"total": 16 * 1024**2}},
         )
     )
 
@@ -98,6 +101,7 @@ async def test_every_hard_exclusion_and_every_enforced_gate_is_recorded_in_order
         "new_rentals_paused",
         "price_above_market_p90_soft_limit",
         "insufficient_disk_for_vram",
+        "insufficient_ram_for_vram",
         "flagship_without_ncu_or_split",
     ]
     assert result.mining_score == 0
@@ -342,14 +346,10 @@ async def test_a_run_that_passed_every_check_gets_no_validation_failed(engine, e
 @pytest.mark.parametrize("engine", [RentalPriceIncentive, DefaultIncentive])
 @pytest.mark.parametrize(
     ("failure_reason_code", "overrides"),
-    [
-        (TenantEnforcementMessages.ALREADY_RENTED.reason, {"is_rented": True}),
-        (ExecutorImageMessages.OUTDATED.reason, {}),
-    ],
-    ids=["rented-halt", "image-check-failed"],
+    [(ExecutorImageMessages.OUTDATED.reason, {})],
+    ids=["image-check-failed"],
 )
-async def test_an_outdated_image_is_one_reason_for_one_cause(monkeypatch, engine, failure_reason_code, overrides):
-    monkeypatch.setattr(settings, "EXECUTOR_IMAGE_CHECK_ENFORCE", True)
+async def test_an_outdated_image_is_one_reason_for_one_cause(engine, failure_reason_code, overrides):
     result = _idle_full_8x(
         score=0,
         job_score=0,

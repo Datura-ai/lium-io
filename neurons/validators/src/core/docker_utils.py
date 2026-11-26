@@ -13,6 +13,23 @@ from services.const import DOCKER_DIND_IMAGE, LIUM_POD_ID_LABEL
 _CONTAINER_DEATH_LOG_TAIL_LINES = 100
 _CONTAINER_DEATH_LOG_MAX_CHARS = 4000
 
+# dockerd's two bind refusals name the host address the bind was for:
+#   `failed to bind host port for 0.0.0.0:9101:192.0.2.2:22/tcp: address already in use`
+#   `failed to bind host port 0.0.0.0:9030/tcp: address already in use`
+#   `Bind for 0.0.0.0:9101 failed: port is already allocated`
+_BOUND_HOST_PORT_RE = re.compile(
+    r"(?:Bind for|failed to bind host port(?: for)?) (?:\[[0-9a-fA-F:.]{0,45}\]|[0-9.]{1,15}):(\d{1,5})(?![0-9])"
+)
+
+
+def bound_host_port(text: str) -> int | None:
+    """The host port dockerd could not bind, read from its refusal text; None when the text has none."""
+    match = _BOUND_HOST_PORT_RE.search(text)
+    if match is None:
+        return None
+    port = int(match.group(1))
+    return port if 0 < port <= 65535 else None
+
 
 class DockerCommand:
     """Builds safe docker command strings."""
@@ -93,17 +110,41 @@ class DockerCommand:
         event": the process is wedged, typically in uninterruptible I/O on a dead mount), `docker rm -f`
         fails forever and the container keeps its published ports. The executor runs `pid: host` and
         privileged, so the host pids are visible: killing the shim makes containerd report the task
-        as exited and dockerd then lets `docker rm -f` through. Prints what was killed; exit 0 always.
+        as exited and dockerd then lets `docker rm -f` through. Prints what was killed and
+        ``init=alive`` when the init process outlived the SIGKILL (the same pid and start time, not a
+        zombie: the wedge), ``init=unknown`` when its start time could not be read from a /proc entry that is still there, else ``init=gone``; exit 0 always.
         """
         quoted = shlex.quote(name)
+        # /proc/<pid>/stat after the comm's closing paren: field 1 is the state, field 20 the start time
+        stat = "sed 's/.*) //' /proc/$pid/stat 2>/dev/null"
         return (
             f"pid=$(/usr/bin/docker inspect -f '{{{{.State.Pid}}}}' {quoted} 2>/dev/null); "
             "if [ -n \"$pid\" ] && [ \"$pid\" != 0 ]; then "
+            f"started=$({stat} | cut -d' ' -f20); "
             "shim=$(awk '/^PPid:/{print $2}' /proc/$pid/status 2>/dev/null); "
             "kill -9 $pid 2>/dev/null; "
             "if [ -n \"$shim\" ] && grep -qa containerd-shim /proc/$shim/cmdline 2>/dev/null; "
             "then kill -9 $shim 2>/dev/null; else shim=; fi; "
-            "sleep 3; echo \"killed pid=$pid shim=${shim:-none}\"; fi; true"
+            f"sleep 3; now=$({stat} | cut -d' ' -f1,20); init=gone; "
+            # no /proc entry at all: init exited and was reaped before the lookup, Docker just has not caught up
+            "if [ -z \"$started\" ]; then [ -e /proc/$pid ] && init=unknown; "
+            "elif [ \"${now#* }\" = \"$started\" ] && [ \"${now%% *}\" != Z ]; then init=alive; fi; "
+            "echo \"killed pid=$pid started=$started shim=${shim:-none} init=$init\"; fi; true"
+        )
+
+    @staticmethod
+    def init_state(direct: str) -> str | None:
+        """Re-read the init a direct kill reported alive or unknown (its pid and start time from that output):
+        prints ``init=alive|unknown|gone`` by the same reading. None when the output names none to re-read."""
+        found = re.search(r"pid=(\d+) started=(\d*) .*init=(alive|unknown)\b", direct)
+        if found is None:
+            return None
+        pid, started = found.group(1), found.group(2)
+        return (
+            f"now=$(sed 's/.*) //' /proc/{pid}/stat 2>/dev/null | cut -d' ' -f1,20); init=gone; "
+            f"if [ -z \"{started}\" ]; then [ -e /proc/{pid} ] && init=unknown; "
+            f"elif [ \"${{now#* }}\" = \"{started}\" ] && [ \"${{now%% *}}\" != Z ]; then init=alive; fi; "
+            "echo \"init=$init\""
         )
 
     @staticmethod
@@ -213,15 +254,6 @@ class DockerCommand:
         return "/usr/bin/docker volume ls -qf dangling=true"
 
     @staticmethod
-    def inspect_created_timestamp(container_id: str) -> str:
-        """Build docker inspect command to get creation timestamp in seconds."""
-        return (
-            f"/usr/bin/docker inspect {shlex.quote(container_id)} "
-            "--format '{{json .Created}}' | "
-            "xargs -I {} date -d {} +%s"
-        )
-
-    @staticmethod
     def ps_running(container_name: str) -> str:
         """Build docker ps command to check if container is running.
 
@@ -267,6 +299,9 @@ class ContainerDeathDiagnostics:
     error: str | None = None
     started_at: str | None = None
     finished_at: str | None = None
+    # how often dockerd's restart policy brought it back, and that policy: a crash loop under it shows here
+    restart_count: int | None = None
+    restart_policy: str | None = None
     logs_tail: str | None = None
     host_context: dict[str, str] | None = None
     capture_error: str | None = None
@@ -283,6 +318,8 @@ class ContainerDeathDiagnostics:
             "container_error": self.error,
             "container_started_at": self.started_at,
             "container_finished_at": self.finished_at,
+            "container_restart_count": self.restart_count,
+            "container_restart_policy": self.restart_policy,
             "container_logs_tail": self.logs_tail,
             "container_host_context": self.host_context,
             "diagnostics_capture_error": self.capture_error,
@@ -346,6 +383,7 @@ async def collect_container_death_diagnostics(
     ssh_client: asyncssh.SSHClientConnection,
     container_name: str,
     diagnostics: ContainerDeathDiagnostics | None = None,
+    read_logs: bool = True,
 ) -> ContainerDeathDiagnostics:
     """Read why a container died over an already-open SSH session.
 
@@ -362,9 +400,14 @@ async def collect_container_death_diagnostics(
 
     try:
         inspect_result = await ssh_client.run(
-            f"/usr/bin/docker inspect --format '{{{{json .State}}}}' {quoted_name}"
+            f"/usr/bin/docker inspect --format '{{{{json .State}}}}{{{{println}}}}{{{{.RestartCount}}}} "
+            f"{{{{.HostConfig.RestartPolicy.Name}}}}' {quoted_name}"
         )
-        raw_state = (inspect_result.stdout or "").strip()
+        raw_state, _, restart = (inspect_result.stdout or "").strip().partition("\n")
+        count, _, policy = restart.strip().partition(" ")
+        # the provider controls the host: plain ASCII digits only ("²".isdigit() is True, int() fails)
+        diagnostics.restart_count = int(count) if count.isascii() and count.isdigit() and len(count) <= 10 else None
+        diagnostics.restart_policy = policy.strip() or None
         if raw_state:
             parsed_state = json.loads(raw_state)
             if isinstance(parsed_state, dict):
@@ -386,7 +429,8 @@ async def collect_container_death_diagnostics(
         capture_errors.append(f"inspect: {exc}")
 
     # a removed container's log went with it: `2>&1` would store docker's "No such container" as its output
-    if not diagnostics.container_missing:
+    # read_logs=False: a renter workload still running may print its own secrets; its output stays off our logs
+    if read_logs and not diagnostics.container_missing:
         try:
             logs_result = await ssh_client.run(
                 f"/usr/bin/docker logs --tail {_CONTAINER_DEATH_LOG_TAIL_LINES} {quoted_name} 2>&1 || true"

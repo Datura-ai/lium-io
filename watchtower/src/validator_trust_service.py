@@ -97,6 +97,7 @@ class ValidatorTrust:
         owner: str | None = None,
         read_chain: bool = True,
         message: SignedTrustMessage | None = None,
+        api_url: str | None = None,
     ):
         self.image_message = image_message
         self.enabled = enabled
@@ -105,6 +106,8 @@ class ValidatorTrust:
         self.read_chain = read_chain
         # the build's own signed message (a staging build), used instead of the image copy
         self.message = message
+        # a staging build reads its owner's messages from the backend that serves them, not this host's backend
+        self.api_url = api_url
         self.owner = self.release_owner
         self.held: TrustedValidator | None = None
         self._owner_due = 0.0
@@ -153,16 +156,19 @@ class ValidatorTrust:
             "subnet_owner": self.owner if self.enabled else None,
         }
 
+    def message_url(self) -> str:
+        return self.api_url.rstrip("/") + "/watchtower/validator-message" if self.api_url else VALIDATOR_MESSAGE_URL
+
     def refresh_message(self) -> None:
         """A 404 or any failure keeps the message held."""
         if not self.enabled:
             return
         try:
-            data = fetch_json(VALIDATOR_MESSAGE_URL)
+            data = fetch_json(self.message_url())
             if data is not None:
                 self.offer(_signed(data))
         except Exception as exc:
-            url = VALIDATOR_MESSAGE_URL
+            url = self.message_url()
             logger.warning(f"Validator trust: message not refreshed from {url}: {type(exc).__name__}: {exc}")
 
     def refresh_owner(self) -> bool:
