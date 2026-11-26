@@ -437,6 +437,7 @@ async def test_enforce_passes_a_clean_identity_and_drops_the_block(monkeypatch):
     assert result.passed is True
     assert result.event.reason_code == Msg.SCRAPE_OK.reason
     assert "gpu_identity" not in result.updates["state"].specs
+    assert result.updates["state"].gpu_identity["cards"]
 
 
 @pytest.mark.asyncio

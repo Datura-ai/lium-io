@@ -6,6 +6,7 @@ import json
 import logging
 import re
 
+from core.config import settings
 from services.nvidia_devices import read_kernel_gpu_view
 
 from ..messages import HardwareIdentityMessages as Msg, render_message
@@ -94,6 +95,37 @@ def gpu_sources_disagree(reported: list[str], kernel: list[str] | None) -> bool:
     return kernel is not None and not set(reported) <= set(kernel)
 
 
+def gpu_identity_kernel_findings(
+    cards: list[dict],
+    kernel: list[str] | None,
+    minors: dict[str, int] | None,
+    pcis: dict[str, str] | None,
+) -> list[str]:
+    """The scrape's per-card identity against the validator's own container kernel read.
+
+    Both reads are in the executor container, so this is a consistency check, not a host proof.
+    A mismatch means the scrape's sources and the validator's procfs read do not describe the
+    same cards.
+    """
+    found: list[str] = []
+    for card in cards:
+        uuid = card.get("uuid")
+        if not isinstance(uuid, str) or not uuid:
+            found.append("identity_uuid_missing")
+            continue
+        if kernel is not None and uuid not in kernel:
+            found.append("identity_uuid_not_in_container_kernel")
+            continue
+        if minors is not None and minors.get(uuid) != card.get("minor"):
+            found.append("identity_minor_mismatch")
+        pci = card.get("pci")
+        if pcis is not None and isinstance(pci, str) and pci and pcis.get(uuid, "") != pci.lower():
+            found.append("identity_pci_mismatch")
+        if card.get("dev_node_present") is False:
+            found.append("identity_dev_node_missing")
+    return list(dict.fromkeys(found))
+
+
 def digest(values: list[str]) -> str:
     return hashlib.sha256("\n".join(values).encode()).hexdigest()[:16]
 
@@ -176,7 +208,10 @@ class HardwareIdentityCheck:
 
     async def run(self, ctx: Context) -> CheckResult:
         reported = sorted(set(reported_gpu_uuids(ctx)))
-        kernel_uuids, _ = await kernel_gpu_view(ctx)
+        identity = ctx.state.gpu_identity or {}
+        identity_cards = [card for card in (identity.get("cards") or []) if isinstance(card, dict)]
+        view = await kernel_gpu_view(ctx)
+        kernel_uuids = view.uuids
         kernel = sorted(set(kernel_uuids)) if kernel_uuids is not None else None
         gpus = kernel or reported
 
@@ -212,7 +247,8 @@ class HardwareIdentityCheck:
         host_kernel = None
         if gpu_sources_disagree(reported, kernel) and ctx.ssh is not None:
             # a container handed some of the host's cards lists only those; the host's own list is the full one
-            host_uuids, _ = await read_kernel_gpu_view(ctx.ssh, host_view=True)
+            host_view = await read_kernel_gpu_view(ctx.ssh, host_view=True)
+            host_uuids = host_view.uuids
             host_kernel = sorted(set(host_uuids)) if host_uuids else None
 
         findings = []
@@ -220,6 +256,18 @@ class HardwareIdentityCheck:
             findings.append("dmi_overlaid")
         if gpu_sources_disagree(reported, host_kernel or kernel):
             findings.append("gpu_sources_disagree")
+        identity_findings = gpu_identity_kernel_findings(
+            identity_cards, kernel, view.minors, view.pcis
+        )
+        if identity_findings:
+            if settings.VALIDATOR_LIUMD_EVIDENCE_MODE == "enforce":
+                findings.extend(identity_findings)
+            else:
+                logger.warning(
+                    "liumd gpu_identity container kernel cross-check: %s",
+                    identity_findings,
+                    extra=ctx.default_extra,
+                )
         if dmi_identity_drifted(previous, gpus, dmi_identity, boot_id):
             findings.append("dmi_changed_under_same_gpus")
 
@@ -233,6 +281,8 @@ class HardwareIdentityCheck:
             "host_kernel_gpu_uuids": host_kernel,
             "reported_gpu_uuids": reported,
             "dmi_overlays": overlays,
+            "identity_findings": identity_findings,
+            "identity_mode": settings.VALIDATOR_LIUMD_EVIDENCE_MODE,
             "findings": findings,
         }
         if not findings:

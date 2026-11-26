@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -66,7 +67,17 @@ def test_kernel_gpu_the_node_does_not_report_is_not_a_disagreement():
 
 
 def _ctx(
-    context_factory, *, stdout, kernel=("GPU-a",), reported="GPU-a", redis=None, rented_data=None, executor=None
+    context_factory,
+    *,
+    stdout,
+    kernel=("GPU-a",),
+    reported="GPU-a",
+    redis=None,
+    rented_data=None,
+    executor=None,
+    gpu_identity=None,
+    kernel_minors=None,
+    kernel_pcis=None,
 ):
     async def run(cmd, *args, **kwargs):
         return SimpleNamespace(exit_status=0, stdout=stdout, stderr="")
@@ -75,6 +86,9 @@ def _ctx(
         gpu_uuids=reported,
         kernel_gpu_uuids=list(kernel) if kernel is not None else None,
         kernel_gpu_uuids_read_attempted=True,
+        kernel_gpu_minors=kernel_minors,
+        kernel_gpu_pcis=kernel_pcis,
+        gpu_identity=gpu_identity,
         rented_data=rented_data,
     )
     services = build_services(redis=redis) if redis is not None else build_services()
@@ -338,3 +352,89 @@ async def test_a_dmi_change_stays_a_finding_when_the_session_drops_while_the_new
     assert not reconnect.called
     assert Msg.SPOOFED.reason in [e.reason_code for e in events]
     assert after.hardware_identity_passed is False
+
+
+def _identity_card(**overrides):
+    card = {
+        "uuid": "GPU-a",
+        "pci": "0000:00:1b.0",
+        "minor": 0,
+        "dev_node_present": True,
+        "sources": {},
+    }
+    card.update(overrides)
+    return card
+
+
+def _identity(*cards):
+    return {"cards": list(cards), "nvidia_module_present": True, "proc_driver_present": True}
+
+
+@pytest.mark.asyncio
+async def test_identity_block_matches_the_container_kernel(context_factory):
+    ctx = _ctx(
+        context_factory,
+        stdout=_stdout(),
+        gpu_identity=_identity(_identity_card()),
+        kernel_minors={"GPU-a": 0},
+        kernel_pcis={"GPU-a": "0000:00:1b.0"},
+    )
+
+    result = await _run(ctx)
+
+    assert result.passed is True
+    assert result.event.what_we_saw["identity_findings"] == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "value", "reason"),
+    [
+        ("minor", 7, "identity_minor_mismatch"),
+        ("pci", "0000:00:2f.0", "identity_pci_mismatch"),
+        ("dev_node_present", False, "identity_dev_node_missing"),
+    ],
+)
+async def test_identity_mismatch_follows_shadow_and_enforce(
+    context_factory, monkeypatch, caplog, field, value, reason
+):
+    kwargs = dict(
+        stdout=_stdout(),
+        gpu_identity=_identity(_identity_card(**{field: value})),
+        kernel_minors={"GPU-a": 0},
+        kernel_pcis={"GPU-a": "0000:00:1b.0"},
+    )
+
+    monkeypatch.setattr(hardware_identity.settings, "VALIDATOR_LIUMD_EVIDENCE_MODE", "shadow")
+    with caplog.at_level(logging.WARNING, logger=hardware_identity.__name__):
+        shadow = await _run(_ctx(context_factory, **kwargs))
+    assert shadow.passed is True
+    assert shadow.event.what_we_saw["identity_findings"] == [reason]
+    assert any(reason in record.getMessage() for record in caplog.records)
+
+    monkeypatch.setattr(hardware_identity.settings, "VALIDATOR_LIUMD_EVIDENCE_MODE", "enforce")
+    enforced = await _run(_ctx(context_factory, **kwargs))
+    assert enforced.passed is False
+    assert reason in enforced.event.what_we_saw["findings"]
+
+
+@pytest.mark.asyncio
+async def test_identity_uuid_not_in_the_container_kernel_follows_the_mode(context_factory, monkeypatch):
+    kwargs = dict(
+        stdout=_stdout(),
+        gpu_identity=_identity(_identity_card(uuid="GPU-z")),
+        kernel_minors={"GPU-a": 0},
+        kernel_pcis={"GPU-a": "0000:00:1b.0"},
+    )
+
+    monkeypatch.setattr(hardware_identity.settings, "VALIDATOR_LIUMD_EVIDENCE_MODE", "shadow")
+    shadow = await _run(_ctx(context_factory, **kwargs))
+    assert shadow.passed is True
+    assert shadow.event.what_we_saw["identity_findings"] == [
+        "identity_uuid_not_in_container_kernel"
+    ]
+
+    monkeypatch.setattr(hardware_identity.settings, "VALIDATOR_LIUMD_EVIDENCE_MODE", "enforce")
+    enforced = await _run(_ctx(context_factory, **kwargs))
+    assert enforced.passed is False
+    assert "identity_uuid_not_in_container_kernel" in enforced.event.what_we_saw["findings"]

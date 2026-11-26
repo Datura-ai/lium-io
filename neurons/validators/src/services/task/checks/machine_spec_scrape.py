@@ -591,7 +591,7 @@ class MachineSpecScrapeCheck:
         # the in-pod download figure is the validator's own reading (ContainerDownloadSpeedCheck), never the node's
         specs.pop(IN_POD_DOWNLOAD_KEY, None)
         specs.pop(IN_POD_DOWNLOAD_AT_KEY, None)
-        specs.pop("gpu_identity", None)
+        gpu_identity = specs.pop("gpu_identity", None)
         vloopback = specs.pop("vloopback_check", None)
         gpu_info = specs.get("gpu", {}) or {}
         gpu_count = gpu_info.get("count", 0) or 0
@@ -642,6 +642,7 @@ class MachineSpecScrapeCheck:
             gpu_splitting_min_count=gpu_splitting_min_count,
             gpu_model_count=gpu_model_count,
             gpu_uuids=gpu_uuids,
+            gpu_identity=gpu_identity if isinstance(gpu_identity, dict) else None,
             liumd_shadow_facts_task=task,
             liumd_shadow_facts_attempted=True,
         )

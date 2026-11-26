@@ -20,7 +20,12 @@ async def kernel_gpu_view(ctx: Context) -> KernelGpuView:
     the second check must not open another 15 s SSH read on the same wedged host.
     """
     if ctx.state.kernel_gpu_uuids_read_attempted:
-        return KernelGpuView(ctx.state.kernel_gpu_uuids, ctx.state.kernel_gpu_foreign_mounts)
+        return KernelGpuView(
+            ctx.state.kernel_gpu_uuids,
+            ctx.state.kernel_gpu_foreign_mounts,
+            ctx.state.kernel_gpu_minors,
+            ctx.state.kernel_gpu_pcis,
+        )
     if ctx.ssh is None:
         return KernelGpuView(uuids=None, foreign_mounts=[])
     return await read_kernel_gpu_view(ctx.ssh)
@@ -55,7 +60,8 @@ class BannedProviderCheck:
         rented_data = ctx.state.rented_data
         gpu_uuids = reported_gpu_uuids(ctx)
         # DAH-2662: match bans against the kernel's GPU list too (shapes: kernel_gpu_view)
-        kernel_uuids, foreign_mounts = await kernel_gpu_view(ctx)
+        view = await kernel_gpu_view(ctx)
+        kernel_uuids, foreign_mounts = view.uuids, view.foreign_mounts
         is_banned = bool(
             rented_data
             and rented_data.is_provider_banned(
@@ -93,6 +99,8 @@ class BannedProviderCheck:
                 kernel_gpu_uuids=kernel_uuids,
                 kernel_gpu_uuids_read_attempted=True,
                 kernel_gpu_foreign_mounts=foreign_mounts,
+                kernel_gpu_minors=view.minors,
+                kernel_gpu_pcis=view.pcis,
                 specs=specs,
             )
         }

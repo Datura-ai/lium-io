@@ -143,7 +143,8 @@ async def host_view_verdict(
     if ctx.ssh is None:
         return HostViewResult()
     try:
-        host_uuids, host_foreign_mounts = await read_kernel_gpu_view(ctx.ssh, host_view=True)
+        host_view = await read_kernel_gpu_view(ctx.ssh, host_view=True)
+        host_uuids, host_foreign_mounts = host_view.uuids, host_view.foreign_mounts
     except Exception as exc:
         return HostViewResult(host_kernel_view_error=repr(exc)[:300])
     if not host_uuids:
@@ -228,7 +229,8 @@ class GpuKernelCountCheck:
     async def _evaluate(self, ctx: Context) -> CheckResult:
         reported_uuids = reported_gpu_uuids(ctx)
         reported_count = reported_gpu_count(ctx, reported_uuids)
-        kernel_uuids, foreign_mounts = await kernel_gpu_view(ctx)
+        view = await kernel_gpu_view(ctx)
+        kernel_uuids, foreign_mounts = view.uuids, view.foreign_mounts
 
         kernel_check_fields = evaluate_kernel_view(
             reported_count=reported_count,
