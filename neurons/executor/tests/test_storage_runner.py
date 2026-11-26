@@ -2516,6 +2516,8 @@ def test_the_helper_gets_the_files_of_the_runner_that_launched_it(tmp_path: Path
     staged = tmp_path / "staged"
     (staged / "storage").mkdir(parents=True)
     (staged / "storage_runner.py").write_text("import sys\nfrom storage import marker\nprint(marker.NAME, *sys.argv[1:])\n")
+    # a regular package, as the real one: it must win over an installed `storage` further down sys.path
+    (staged / "storage" / "__init__.py").write_text("")
     (staged / "storage" / "marker.py").write_text("NAME = 'staged'\n")
     target = tmp_path / "in-helper"
     waiting = subprocess.Popen(
