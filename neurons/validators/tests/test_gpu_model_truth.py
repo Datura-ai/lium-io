@@ -241,17 +241,54 @@ async def test_a_first_sample_with_no_room_or_a_timeout_is_not_retried_every_cyc
     assert service.budgets == []
 
 
+def _lium_filler(ctx, owner="lium"):
+    ctx.state.rented_data.all_filler_containers_by_executor = {"executor-123": ["filler_active"]}
+    ctx.state.rented_data.default_job_owner_by_executor = {"executor-123": owner}
+    ssh = AsyncMock()
+    ssh.run.return_value = SimpleNamespace(exit_status=0, stdout="filler_active", stderr="")
+    return ctx.model_copy(update={"ssh": ssh})
+
+
 @pytest.mark.asyncio
-async def test_a_first_sample_with_a_wrong_answer_is_retried_next_cycle(context_factory, sample_never_due):
-    # DAH-6332 item 2: a sample with no verdict stores nothing, so the node is not left unjudged for a day
+@pytest.mark.parametrize("full_check, verdict_ttl", [(REAL_H100[1], "week"), (None, "day")], ids=["answers", "no_answer"])
+async def test_a_first_sample_with_a_wrong_answer_stops_the_filler_once_for_the_full_check(
+    context_factory, sample_never_due, full_check, verdict_ttl
+):
+    # DAH-6332 rework: the cycle after a wrong answer stops Lium's filler and runs the full check once
     redis = FakeRedis()
-    ctx, service = _filler_ctx(context_factory, redis, None, success=False, failure=WRONG_ANSWER)
-    assert (await CapabilityCheck().run(ctx)).passed is True
+    ctx, _ = _filler_ctx(context_factory, redis, None, success=False, failure=WRONG_ANSWER)
+    assert (await CapabilityCheck().run(_lium_filler(ctx))).passed is True
     assert _verdict_key() not in redis.ttl
 
+    ctx, service = _filler_ctx(
+        context_factory, redis, full_check, success=full_check is not None, failure=WRONG_ANSWER
+    )
+    result = await CapabilityCheck().run(_lium_filler(ctx))
+    assert service.budgets == [None]  # the full check, not a sample
+    assert result.event.what_we_saw["stopped_fillers_for_full_check"] == ["filler_active"]
+    assert result.passed is (full_check is not None)
+    assert redis.ttl[_verdict_key()] == (
+        capability.GPU_MODEL_VERDICT_TTL_SECONDS if verdict_ttl == "week" else capability.GPU_MODEL_NO_VERDICT_TTL_SECONDS
+    )
+
+    # the filler is back: the node is judged (or waits a day), so it is neither stopped nor sampled again
     ctx, service = _filler_ctx(context_factory, redis, None, success=False, failure=WRONG_ANSWER)
-    assert (await CapabilityCheck().run(ctx)).passed is True
-    assert len(service.budgets) == 1
+    result = await CapabilityCheck().run(_lium_filler(ctx))
+    assert result.passed is True
+    assert service.budgets == []
+    assert "stopped_fillers_for_full_check" not in result.event.what_we_saw
+
+
+@pytest.mark.asyncio
+async def test_another_owners_filler_is_never_stopped_for_the_full_check(context_factory, sample_never_due):
+    redis = FakeRedis()
+    for _ in range(2):
+        ctx, service = _filler_ctx(context_factory, redis, None, success=False, failure=WRONG_ANSWER)
+        ctx = _lium_filler(ctx, owner="miner")
+        result = await CapabilityCheck().run(ctx)
+        assert result.passed is True
+        assert len(service.budgets) == 1  # sampled again, as before
+        ctx.ssh.run.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -622,6 +659,7 @@ async def test_a_filler_sample_with_no_numbers_is_logged_and_does_not_fail(conte
     assert result.passed is True
     assert result.event.what_we_saw["matmul_sample"]["no_numbers"] is True
     assert json.loads(redis.store[_verdict_key()])["mismatches"] == []
+    assert redis.ttl[_verdict_key()] == capability.GPU_MODEL_VERDICT_TTL_SECONDS
 
 
 @pytest.mark.asyncio
