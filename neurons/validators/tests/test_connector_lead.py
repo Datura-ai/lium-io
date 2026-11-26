@@ -21,6 +21,9 @@ def _client(server: FakeServer) -> ComputeClient:
     client.miner_service = MagicMock()
     client.miner_service.redis_service.redis = FakeRedis(server=server)
     client.in_flight_drivers = set()
+    client.reply_in_send = False
+    client._lead_lock = None
+    client._lead_task = None
     client.message_queue = compute_client.OutgoingMessages()
     return client
 
@@ -137,6 +140,18 @@ async def test_sigterm_releases_the_lead_and_exits_0(tmp_path, monkeypatch) -> N
     assert not await FakeRedis(server=server).exists(compute_client.CONNECTOR_LEAD_LOCK_KEY)  # the new pod leads now
     assert client._lead_task.cancelled() or client._lead_task.done()
     assert not (tmp_path / "ready").exists()
+
+
+@pytest.mark.asyncio
+async def test_sigterm_before_the_lead_is_taken_exits_0(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(compute_client, "CONNECTOR_READY_FILE", str(tmp_path / "ready"))
+    exited, codes = _fake_exit(monkeypatch)
+    client = _client(FakeServer())
+    assert client._lead_lock is None and client._lead_task is None
+
+    await _sigterm(client, exited, 3)
+
+    assert codes == [0]
 
 
 @pytest.mark.asyncio

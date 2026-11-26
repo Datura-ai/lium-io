@@ -203,8 +203,6 @@ class AuthenticationError(Exception):
 
 class ComputeClient:
     HEARTBEAT_PERIOD = 60
-    # a reply popped from the queue whose send has not ended
-    reply_in_send = False
 
     def __init__(
         self, keypair: bittensor.Keypair, compute_app_uri: str, miner_service: MinerService
@@ -216,6 +214,11 @@ class ComputeClient:
         self.miner_drivers = asyncio.Queue()
         # the drivers not yet done, which a rollout's SIGTERM lets finish
         self.in_flight_drivers: set[asyncio.Task] = set()
+        # a reply popped from the queue whose send has not ended
+        self.reply_in_send = False
+        # set by take_connector_lead; a SIGTERM before it has no lead to release
+        self._lead_lock: aioredis.lock.Lock | None = None
+        self._lead_task: asyncio.Task | None = None
         self.miner_driver_awaiter_task = asyncio.create_task(self.miner_driver_awaiter())
         # self.heartbeat_task = asyncio.create_task(self.heartbeat())
         self.miner_service = miner_service
@@ -1453,11 +1456,11 @@ class ComputeClient:
         # the lead is kept through the drain: the new pod's restart sweep, which resumes every recorded create, starts
         # only once this pod no longer drives one
         await self._finish_in_flight_work(asyncio.get_running_loop().time() + SIGTERM_DRAIN_SECONDS)
-        if (lead_task := getattr(self, "_lead_task", None)) is not None:
-            lead_task.cancel()
-        if (lock := getattr(self, "_lead_lock", None)) is not None:
+        if self._lead_task is not None:
+            self._lead_task.cancel()
+        if self._lead_lock is not None:
             try:
-                await asyncio.wait_for(lock.release(), LEAD_RELEASE_TIMEOUT_SECONDS)
+                await asyncio.wait_for(self._lead_lock.release(), LEAD_RELEASE_TIMEOUT_SECONDS)
             except Exception as exc:
                 logger.warning(
                     _m("Could not release the connector lead; it expires", extra={**extra, "error": str(exc)})
