@@ -679,7 +679,7 @@ class ContainerCleanup:
             await ssh_client.run(DockerCommand.volume_remove(*orphans))
             # `volume_remove` ends in `|| true`: re-list to report only what is really gone
             # a pod volume is no cache kind, so list it by name; a list that fails counts nothing as removed
-            listed: Optional[list[str]] = await self._list_volume_names(ssh_client)
+            listed: list[str] | None = await self._list_volume_names(ssh_client)
             surviving: set[str] = set(orphans) if listed is None else {n for n in listed if n.startswith("volume_")}
             removed: list[str] = [name for name in orphans if name not in surviving]
             if removed:
@@ -742,7 +742,7 @@ class ContainerCleanup:
             # "leave the cache alone".
             return None
 
-    async def _list_volume_names(self, ssh_client: asyncssh.SSHClientConnection) -> Optional[list[str]]:
+    async def _list_volume_names(self, ssh_client: asyncssh.SSHClientConnection) -> list[str] | None:
         # every volume on the host; None when docker cannot list them
         result = await ssh_client.run('/usr/bin/docker volume ls --format "{{.Name}}"')
         if getattr(result, "exit_status", 0) != 0:

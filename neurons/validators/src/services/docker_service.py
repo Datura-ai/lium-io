@@ -6938,8 +6938,11 @@ class DockerService:
             )
         )
         # DAH-5192: a partial checkpoint (an interrupted download) is not "present": what it still lacks is charged.
+        # Only the requested names: `existing` holds every job cache on the host, and measuring resets an oversize one.
         missing_gb: dict[str, float] = {
-            name: await self._cache_missing_gb_resetting_oversize(ssh_client, name, default_extra) for name in existing
+            name: await self._cache_missing_gb_resetting_oversize(ssh_client, name, default_extra)
+            for name in requested_names
+            if name in existing
         }
         present: list[CacheVolume] = [
             volume for volume in payload.cache_volumes if volume.name in existing and not missing_gb.get(volume.name)

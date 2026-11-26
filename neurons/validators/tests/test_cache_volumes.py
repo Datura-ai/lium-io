@@ -1157,3 +1157,21 @@ async def test_a_hung_size_read_does_not_stall_the_create(docker_service, monkey
 
     assert await docker_service.reclaim_dphn_cache_for_rental(ssh_client, rental, {}) is True  # unreadable: as before
     assert _removed_volumes(ssh_client) == sorted(_DPHN)
+
+
+@pytest.mark.asyncio
+async def test_only_the_requested_caches_are_measured_not_every_cache_on_the_host(docker_service):
+    # Measuring resets an oversize cache, so a cache this launch did not ask for must not be measured.
+    requested = "engy_cache_hf_1561gb_kimi-k3-1a2b3c4d"
+    other = "engy_cache_hf_1561gb_kimi-k3-9f8e7d6c"
+    docker_service._find_cache_volumes_to_sweep = AsyncMock(return_value=[requested, other])
+    docker_service._cache_missing_gb_resetting_oversize = AsyncMock(return_value=0.0)
+    payload = _make_payload(
+        workload_kind=WorkloadKind.FILLER,
+        cache_volumes=[CacheVolume(name=requested, target="/root/.cache/huggingface")],
+    )
+
+    assert await docker_service.select_affordable_cache_volumes(HostSshClient([], free_gb=100), payload, {}) == (
+        payload.cache_volumes
+    )
+    assert [call.args[1] for call in docker_service._cache_missing_gb_resetting_oversize.await_args_list] == [requested]
