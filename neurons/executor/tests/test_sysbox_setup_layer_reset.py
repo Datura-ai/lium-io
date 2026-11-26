@@ -122,7 +122,7 @@ def _install_on_a_live_host(root, enable_fails: bool) -> subprocess.CompletedPro
     script = (
         f'host_path() {{ echo "{root}$1"; }}\nwarn() {{ echo "WARN $*"; }}\n'
         + f'systemctl() {{ echo "$*" >> "{log}"; [ "$1" = enable ] && {"return 1" if enable_fails else "return 0"}; [ "$1" = is-active ] && return 1; return 0; }}\n'
-        + 'docker() { return 1; }\n'
+        + f'docker() {{ echo "docker $*" >> "{log}"; return 1; }}\n'
         + f"LAYER_RESET_VERSION={_layer_reset_version()}\n"
         + _function("docker_containerd_address")
         + _function("systemd_quote")
@@ -161,6 +161,22 @@ def test_once_enable_works_the_next_install_adds_the_dependency_and_the_version(
     unit = (tmp_path / "etc/systemd/system/lium-sysbox-layer-reset.service").read_text()
     assert unit.splitlines()[0] == f"# lium-layer-reset-version={_layer_reset_version()}"
     assert unit.count("# lium-layer-reset-version=") == 1
+
+
+def test_the_install_on_a_live_host_starts_stops_and_restarts_nothing(tmp_path):
+    # the validator installs it on rented hosts too: every host call it makes is a read, a daemon-reload or an enable
+    # without --now, so running pods, Docker and Sysbox are untouched; the unit and drop-in act from the next boot
+    result = _install_on_a_live_host(tmp_path, enable_fails=False)
+
+    assert result.returncode == 0, result.stderr
+    assert (tmp_path / "systemctl.log").read_text().splitlines() == [
+        "show -p ExecStart --value docker",
+        "docker info --format {{.DockerRootDir}}",
+        "is-active -q docker",
+        "daemon-reload",
+        "enable lium-sysbox-layer-reset.service",
+        "daemon-reload",
+    ]
 
 
 @pytest.mark.skipif(os.getuid() == 0, reason="the not-root answer needs a non-root run")
