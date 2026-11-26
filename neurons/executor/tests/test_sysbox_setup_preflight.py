@@ -138,6 +138,7 @@ STUBS = {
     ),
     # records "<seconds> <command>" in .stub-docker/timeouts, then runs the command
     "timeout": '#!/bin/bash\necho "$*" >> "$SYSBOX_SETUP_HOST_ROOT/.stub-docker/timeouts"\nshift\nexec "$@"\n',
+    "systemctl": '#!/bin/bash\necho "$*" >> "$SYSBOX_SETUP_HOST_ROOT/.stub-docker/systemctl"\n',
     # `ip route` gives the default route; `ip route get X` routes X via it unless STUB_IP_LOCAL names X (a local subnet)
     "ip": textwrap.dedent(
         """\
@@ -438,7 +439,15 @@ def test_install_mode_does_not_change_the_plugin_under_a_rental(tmp_path):
 # ── fuse3 ───────────────────────────────────────────────────────────────────
 
 APPARMOR_RULE = "mount fstype=@{fuse_types} -> /var/lib/sysboxfs/**,"
-APPARMOR_ON = {"sys/module/apparmor/parameters/enabled": "Y\n", "etc/apparmor.d/fusermount3": "profile fusermount3 {}\n"}
+APPARMOR_UMOUNT_RULE = "umount /var/lib/sysboxfs/**,"
+BOTH_RULES = APPARMOR_RULE + "\n" + APPARMOR_UMOUNT_RULE + "\n"
+APPARMOR_ON = {
+    "sys/module/apparmor/parameters/enabled": "Y\n",
+    "sys/kernel/security/apparmor/profiles": "fusermount3 (enforce)\n",
+    "etc/apparmor.d/fusermount3": "profile fusermount3 {}\n",
+}
+# apparmor=0: the kernel holds no profiles, the file stays on disk
+APPARMOR_OFF = {"sys/module/apparmor/parameters/enabled": "N\n", "etc/apparmor.d/fusermount3": "profile fusermount3 {}\n"}
 
 
 def test_ubuntu_2604_fusermount3_profile_without_the_sysboxfs_rule_is_a_fix(tmp_path):
@@ -452,34 +461,130 @@ def test_ubuntu_2604_fusermount3_profile_without_the_sysboxfs_rule_is_a_fix(tmp_
 
 def test_install_reloads_the_profile_even_when_an_earlier_run_already_wrote_the_rule(tmp_path):
     # an earlier run may have appended the rule and then failed to reload: a rerun must retry the reload
-    files = {**APPARMOR_ON, "etc/apparmor.d/local/fusermount3": APPARMOR_RULE + "\n"}
+    files = {**APPARMOR_ON, "etc/apparmor.d/local/fusermount3": BOTH_RULES}
     rc, _, _ = run_check(tmp_path, "allow_sysboxfs_in_fusermount3_apparmor", files=files)
     assert rc == 0
     assert (tmp_path / "root/.stub-docker/apparmor").read_text() == "-r /etc/apparmor.d/fusermount3\n"
-    assert (tmp_path / "root/etc/apparmor.d/local/fusermount3").read_text().count(APPARMOR_RULE) == 1
+    assert (tmp_path / "root/etc/apparmor.d/local/fusermount3").read_text() == BOTH_RULES
+
+
+def test_a_profile_with_only_the_mount_rule_is_a_fix_and_the_install_adds_the_umount_rule(tmp_path):
+    # without umount a stopped container's sysbox-fs mount stays behind and every next job start fails
+    files = {**APPARMOR_ON, "etc/apparmor.d/local/fusermount3": APPARMOR_RULE + "\n"}
+    rc, out, fixes = run_check(tmp_path, "check_fusermount3_apparmor", files=files)
+    assert (rc, fixes) == (1, 1)
+
+    rc, _, _ = run_check(tmp_path, "allow_sysboxfs_in_fusermount3_apparmor", files=files)
+    local = (tmp_path / "root/etc/apparmor.d/local/fusermount3").read_text()
+    assert rc == 0
+    assert (local.count(APPARMOR_RULE), local.count(APPARMOR_UMOUNT_RULE)) == (1, 1)
+
+
+def test_install_mode_adds_the_umount_rule_on_a_host_where_sysbox_already_works(tmp_path):
+    # a hand-added mount-only rule means sysbox already starts containers, so the run takes the "already working" exit
+    files = {**APPARMOR_ON, "etc/apparmor.d/local/fusermount3": APPARMOR_RULE + "\n"}
+    proc = run_script(tmp_path, files=files)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Sysbox is already working." in proc.stdout
+    local = (tmp_path / "root/etc/apparmor.d/local/fusermount3").read_text()
+    assert (local.count(APPARMOR_RULE), local.count(APPARMOR_UMOUNT_RULE)) == (1, 1)
+    assert (tmp_path / "root/.stub-docker/apparmor").read_text() == "-r /etc/apparmor.d/fusermount3\n"
+
+
+def test_install_mode_adds_the_umount_rule_before_a_rental_stops_the_run(tmp_path):
+    # no local VERIFY_IMAGE and a pod_* rental: the run exits at abort_on_active_rentals, after the repair
+    files = {**APPARMOR_ON, "etc/apparmor.d/local/fusermount3": APPARMOR_RULE + "\n"}
+    proc = run_script(tmp_path, env={"STUB_PODS": "pod_4f1c", "STUB_NO_VERIFY_IMAGE": "1"}, files=files)
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "Rentals found (pod_* containers, running or stopped). Cannot proceed." in proc.stdout
+    local = (tmp_path / "root/etc/apparmor.d/local/fusermount3").read_text()
+    assert (local.count(APPARMOR_RULE), local.count(APPARMOR_UMOUNT_RULE)) == (1, 1)
+    assert (tmp_path / "root/.stub-docker/apparmor").read_text() == "-r /etc/apparmor.d/fusermount3\n"
+
+
+@pytest.mark.parametrize(
+    "local",
+    [APPARMOR_RULE + "\n# " + APPARMOR_UMOUNT_RULE + "\n", "# " + APPARMOR_UMOUNT_RULE + "\n"],
+    ids=["mount-and-commented-umount", "only-commented-umount"],
+)
+def test_a_commented_rule_does_not_count_and_the_install_adds_it(tmp_path, local):
+    # AppArmor ignores a commented line, so the rule it carries is still missing
+    files = {**APPARMOR_ON, "etc/apparmor.d/local/fusermount3": local}
+    rc, _, fixes = run_check(tmp_path, "check_fusermount3_apparmor", files=files)
+    assert (rc, fixes) == (1, 1)
+
+    rc, _, _ = run_check(tmp_path, "allow_sysboxfs_in_fusermount3_apparmor", files=files)
+    active = [line.strip() for line in (tmp_path / "root/etc/apparmor.d/local/fusermount3").read_text().splitlines()]
+    assert rc == 0
+    assert (active.count(APPARMOR_RULE), active.count(APPARMOR_UMOUNT_RULE)) == (1, 1)
+
+
+def test_install_gives_sysbox_services_time_to_start_and_a_restart(tmp_path):
+    # sysbox-ce 0.7.1: 10 s (fs) / 45 s (mgr) start timeouts and no Restart=, so a slow boot left sysbox down
+    rc, _, _ = run_check(tmp_path, "install_sysbox_restart_dropins")
+    assert rc == 0
+    for svc in ("sysbox-fs", "sysbox-mgr"):
+        dropin = tmp_path / f"root/etc/systemd/system/{svc}.service.d/lium-restart.conf"
+        assert dropin.read_text() == "[Service]\nTimeoutStartSec=90\nRestart=on-failure\nRestartSec=5\n"
+    assert (tmp_path / "root/.stub-docker/systemctl").read_text() == "daemon-reload\n"
+
+
+SYSBOX_DROPINS = {
+    f"etc/systemd/system/{svc}.service.d/lium-restart.conf": "[Service]\nRestart=on-failure\n"
+    for svc in ("sysbox-fs", "sysbox-mgr")
+}
+
+
+def test_check_sysbox_tells_a_node_without_the_restart_dropins_to_rerun_the_installer(tmp_path):
+    rc, out, fixes = run_check(tmp_path, "check_sysbox")
+    assert (rc, fixes) == (1, 1)
+    assert "restart-on-failure drop-in" in out
+
+
+def test_check_sysbox_passes_with_the_restart_dropins(tmp_path):
+    rc, _, fixes = run_check(tmp_path, "check_sysbox", files=SYSBOX_DROPINS)
+    assert (rc, fixes) == (0, 0)
 
 
 def test_install_with_apparmor_off_skips_the_reload(tmp_path):
     # apparmor_parser fails with AppArmor off (apparmor=0); the install must not stop on it
-    files = {**APPARMOR_ON, "sys/module/apparmor/parameters/enabled": "N\n"}
+    files = APPARMOR_OFF
     rc, _, _ = run_check(tmp_path, "allow_sysboxfs_in_fusermount3_apparmor", files=files)
     assert rc == 0
     assert not (tmp_path / "root/.stub-docker/apparmor").exists()
+
+
+def test_install_leaves_a_profile_the_provider_disabled_unloaded(tmp_path):
+    # aa-disable unloads the profile and links it under disable/; the file stays, AppArmor stays on. A reload would load
+    # it back and confine every fusermount3 again, e.g. FUSE mounts under /srv
+    files = {
+        **APPARMOR_ON,
+        "sys/kernel/security/apparmor/profiles": "man_groff (enforce)\n",
+        "etc/apparmor.d/disable/fusermount3": "",
+        "etc/apparmor.d/local/fusermount3": APPARMOR_RULE + "\n",
+    }
+    proc = run_script(tmp_path, env={"STUB_PODS": "pod_4f1c", "STUB_NO_VERIFY_IMAGE": "1"}, files=files)
+    assert "Rentals found (pod_* containers, running or stopped). Cannot proceed." in proc.stdout
+    assert not (tmp_path / "root/.stub-docker/apparmor").exists()
+    assert (tmp_path / "root/etc/apparmor.d/local/fusermount3").read_text() == APPARMOR_RULE + "\n"
+    rc, out, fixes = run_check(tmp_path, "check_fusermount3_apparmor", files=files)
+    assert (rc, fixes) == (0, 0)
+    assert "PASS fusermount3 may mount and unmount sysbox-fs" in out
 
 
 @pytest.mark.parametrize(
     "files",
     [
         {},
-        {**APPARMOR_ON, "etc/apparmor.d/local/fusermount3": APPARMOR_RULE + "\n"},
-        {**APPARMOR_ON, "sys/module/apparmor/parameters/enabled": "N\n"},
+        {**APPARMOR_ON, "etc/apparmor.d/local/fusermount3": BOTH_RULES},
+        APPARMOR_OFF,
     ],
     ids=["no-profile", "rule-in-local", "apparmor-off"],
 )
 def test_fusermount3_without_a_profile_or_with_the_rule_passes(tmp_path, files):
     rc, out, _ = run_check(tmp_path, "check_fusermount3_apparmor", files=files)
     assert rc == 0
-    assert "PASS fusermount3 may mount sysbox-fs" in out
+    assert "PASS fusermount3 may mount and unmount sysbox-fs" in out
 
 
 # ── the script as a provider runs it ─────────────────────────────────────────

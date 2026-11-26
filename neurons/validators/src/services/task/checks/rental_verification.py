@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 import asyncssh
+from clients.backend_client import HealthCheckTimedOut
 
 from core.config import settings
 from core.docker_utils import (
@@ -19,6 +20,7 @@ from protocol.vc_protocol.compute_requests import (
     FillerRunActiveResponse,
 )
 from services.redis_service import FILLER_REMOVED_BY_VALIDATOR_PREFIX
+from services.upload_nonce import upload_nonce_for_miner
 
 from ...const import (
     FILLER_CONTAINER_PREFIX,
@@ -53,6 +55,10 @@ _GPU_RUNTIME_QUARANTINE: dict[str, GpuRuntimeQuarantine] = {
     ),
 }
 
+# The backend's success=True answers for a node it found rented (its routes/validator.py HEALTH_CHECK_SKIPPED_RENTED,
+# HEALTH_CHECK_RENTED_DURING_CHECK)
+_RENTED_REASON_CODES = frozenset({"skipped_rented", "rented_during_check"})
+
 # The backend's health check may take 5 minutes. It waits no longer than the executor task has left, minus the
 # probe cleanup's time: a wait cut by the task cancel drops the node's whole cycle result (c8c6b803, 6 Nov).
 HEALTH_CHECK_TIMEOUT_SECONDS = 300
@@ -60,6 +66,9 @@ _CLEANUP_RESERVE_SECONDS = 30
 # The cleanup's ssh call has no timeout of its own; 10 s of the reserve stay for writing the result.
 _CLEANUP_TIMEOUT_SECONDS = 20
 _RESULT_RESERVE_SECONDS = 10
+# Below this much task time the backend's probe is not sent: it took up to 96 s in prod (21 Nov 2026, 323 runs,
+# p99 66 s), and a wait cut short reads as an API error the backend never made (ad2382f9: 1 s left, 21 Nov).
+RENTAL_CHECK_MIN_SECONDS = 120
 
 # How bad each per-container filler verdict is, worst wins. A GPU-split node yields one verdict per
 # bundle but the pipeline emits a single event, so the node must be judged by its worst container:
@@ -138,8 +147,9 @@ class RentalVerificationCheck:
             CheckResult with verification status
         """
         rented_data = ctx.state.rented_data
-        rented_executor = rental_of_this_node(ctx)
-        has_customer_rental = bool(rented_executor and rented_executor.pods)
+        # this run's own rental verdict (the rented halt's), not the snapshot's pod list: a pod the halt judged closed
+        # is still listed, and a hint built from it made the backend skip its probe and echo the hint back as a rental
+        has_customer_rental = ctx.rented
         # EVERY filler container on the node, not just one: a GPU-split DPHN node runs one filler per
         # VRAM bundle (DAH-2465), and checking only the first left the siblings unverifiable — a
         # removed sibling was never observed, so it was neither punished nor reconciled (DAH-2471).
@@ -221,6 +231,23 @@ class RentalVerificationCheck:
         # rent skips `--cpus` there too) and when the count is unreadable.
         cpu_count = advertised_cpu_count(ctx) if not ctx.executor.tdx_quote else None
 
+        seconds_for_the_probe = task_seconds_left(ctx) - _CLEANUP_RESERVE_SECONDS
+        if seconds_for_the_probe < RENTAL_CHECK_MIN_SECONDS:
+            return CheckResult(
+                passed=False,
+                event=render_message(
+                    Msg.NO_TASK_TIME,
+                    ctx=ctx,
+                    check_id=self.check_id,
+                    what={
+                        "executor_uuid": executor.uuid,
+                        "seconds_left": max(0, int(seconds_for_the_probe)),
+                        "seconds_needed": RENTAL_CHECK_MIN_SECONDS,
+                    },
+                ),
+                updates={},
+            )
+        probe_timeout = int(min(HEALTH_CHECK_TIMEOUT_SECONDS, seconds_for_the_probe))
         try:
             # Call backend API to verify executor health. Pass the rental hint: when this validator
             # already sees an active customer rental, the backend skips the container-creating check
@@ -237,9 +264,9 @@ class RentalVerificationCheck:
                 loopback_plugin=current_loopback_plugin_alias()
                 if settings.LOOPBACK_PLUGIN_V2_ENABLED
                 else LEGACY_LOOPBACK_PLUGIN_ALIAS,
-                timeout=int(
-                    max(1, min(HEALTH_CHECK_TIMEOUT_SECONDS, task_seconds_left(ctx) - _CLEANUP_RESERVE_SECONDS))
-                ),
+                # DAH-6606: the backend's upload is dated like this validator's own, so it can be required
+                upload_nonce=upload_nonce_for_miner(miner_hotkey),
+                timeout=probe_timeout,
             )
 
             # Handle API failure (None response) - fail this executor
@@ -259,6 +286,10 @@ class RentalVerificationCheck:
                     updates={},
                 )
 
+            # the backend found the node rented: a customer rental the cycle's snapshot did not see stops as rented,
+            # before any further executor work (LocalVerify, VerifyX) loads the renter's pod
+            if response.success and response.reason_code in _RENTED_REASON_CODES:
+                return await self._backend_found_a_rental(ctx, response)
             # Check if verification was successful
             if response.success:
                 event = render_message(
@@ -274,7 +305,11 @@ class RentalVerificationCheck:
                 return CheckResult(
                     passed=True,
                     event=event,
-                    updates={},
+                    # DAH-6784: only a container check the backend really ran is the full check; a success it
+                    # answered with a reason (skipped as rented or for a filler, a raced create) ran none
+                    updates={"idle_check_passed": True}
+                    if not has_customer_rental and response.reason_code is None
+                    else {},
                 )
             elif response.reason_code == CPU_QUOTA_EXCEEDS_HOST_REASON:
                 return self._cpu_quota_verdict(ctx, response)
@@ -304,6 +339,9 @@ class RentalVerificationCheck:
                         "job_score": 0.0,
                         "score_warning": quarantine.score_warning,
                         "clear_verified_job_info": True,
+                        # the backend runs the failing container check only on a node it saw unrented: a rental
+                        # placed since keeps its node, the reset applies only while no customer pod runs there
+                        "clear_verified_job_unrented_only": True,
                     },
                 )
             elif (response.error or "").endswith("visible: []"):
@@ -343,6 +381,24 @@ class RentalVerificationCheck:
                     updates={},
                 )
 
+        except HealthCheckTimedOut as e:
+            # a wait the task's time cut below the backend's full 300 s says nothing about the backend or the node
+            shortened = probe_timeout < HEALTH_CHECK_TIMEOUT_SECONDS
+            event = render_message(
+                Msg.NO_TASK_TIME if shortened else Msg.API_ERROR,
+                ctx=ctx,
+                check_id=self.check_id,
+                impact="This cycle fails; the task's time cut off the backend's rental probe, so this is not a "
+                "backend or API error"
+                if shortened
+                else None,
+                what={
+                    "error": str(e),
+                    "executor_uuid": executor.uuid,
+                    **({"cut_off_after_seconds": probe_timeout, "seconds_needed": HEALTH_CHECK_TIMEOUT_SECONDS} if shortened else {}),
+                },
+            )
+            return CheckResult(passed=False, event=event, updates={})
         except Exception as e:
             # Handle unexpected errors - fail this executor
             event = render_message(
@@ -370,6 +426,49 @@ class RentalVerificationCheck:
                 )
             except TimeoutError:
                 pass  # best effort: the 15-min stale sweep removes a probe left behind
+
+    async def _backend_found_a_rental(self, ctx: Context, response) -> CheckResult:
+        """The backend's rented answer counts every pod row it holds, one it is still removing included; the rented
+        list the snapshot and the rented halt read leaves such a pod out. Only a pod that list shows now is a rental
+        that started since the snapshot. Otherwise no probe ran on a node with no rental, so the check fails; a
+        backend that does not answer the re-read confirms nothing and fails the same way."""
+        try:
+            fresh = await ctx.services.backend.get_rented_executors_now()
+        except Exception:  # noqa: BLE001  (the event's rented_list_read says the re-read failed)
+            fresh = None
+        rental = rental_of_this_node(ctx, rented_data=fresh) if fresh is not None else None
+        if rental is not None and rental.pods:
+            return self._rented_since_the_snapshot(ctx, response)
+        return CheckResult(
+            passed=False,
+            event=render_message(
+                Msg.PROBE_SKIPPED_FOR_AN_UNLISTED_POD,
+                ctx=ctx,
+                check_id=self.check_id,
+                what={
+                    "executor_uuid": ctx.executor.uuid,
+                    "reason_code": response.reason_code,
+                    "rented_list_read": fresh is not None,
+                },
+            ),
+            updates={},
+        )
+
+    def _rented_since_the_snapshot(self, ctx: Context, response) -> CheckResult:
+        """No verdict from this run: the cycle's snapshot, which every later read of the context (the score, the rented
+        GPU count of a split node) comes from, still has the node idle. The result is held like a run the task had no
+        time for (CYCLE_END_READ_REASONS): the cycle-end rented read carries the last scored result only when it was
+        scored with this same rental, else the node gets no verdict and the next cycle scores it rented."""
+        return CheckResult(
+            passed=False,
+            event=render_message(
+                Msg.RENTED_SINCE_THE_SNAPSHOT,
+                ctx=ctx,
+                check_id=self.check_id,
+                what={"executor_uuid": ctx.executor.uuid, "reason_code": response.reason_code},
+            ),
+            updates={},
+        )
 
     def _cpu_quota_verdict(self, ctx: Context, response) -> CheckResult:
         """Render the CPU-quota verdict: the host's daemon refused `--cpus=<advertised>` at create.

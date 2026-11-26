@@ -46,6 +46,7 @@ from services.docker_service import (
     _remove_and_list_containers_command,
 )
 import services.docker_service as ds_module
+from services.host_memory_guard import host_memory_guard_script
 from services.image_flatten import flatten_wait_command
 from services.nvidia_devices import (
     MissingRentedGpuError,
@@ -503,11 +504,12 @@ def _wire_customer_create_over_the_host(
     containers_on_host: tuple[str, ...] | None = None,
     container_ids: dict[str, str] | None = None,
     listings_that_answer: int | None = None,
+    image_present: bool = True,
 ) -> AsyncMock:
     """Both early probes on; the cleanup, the sweeps and the port-check wait are the real
     ones over a stub SSH client, so every listing they run is a command on it. The host lists the
     probe's containers until the first rm, then ``ps_after_rm``."""
-    ssh_client = _deploy_ssh_client()
+    ssh_client = _deploy_ssh_client(inspect_exit=0 if image_present else 1)
     answer_as_the_deploy_host = ssh_client.run.side_effect
     names_on_host = list(probe.container_names or () if containers_on_host is None else containers_on_host)
     listings = 0
@@ -598,12 +600,13 @@ async def test_customer_create_keeps_the_listings_but_not_the_volume_facts_after
 
     assert type(result).__name__ == "ContainerCreated", getattr(result, "msg", "")
     # the fail-closed pid_max read every rental makes first and the host RAM read that clamps its memory limit,
-    # then the listing that finds the filler and the rm with its confirming listing in one command — the
-    # removal starts only once the host reads succeed
+    # the host memory guard, then the listing that finds the filler and the rm with its confirming listing in one
+    # command — the removal starts only once the host reads succeed
     assert "pod_ssh_host_key" in _cmds(ssh_client)[-1]
     assert _cmds(ssh_client)[:-1] == [
         "cat /proc/sys/kernel/pid_max",
         "cat /proc/meminfo",
+        host_memory_guard_script(),
         *([] if removal_lost_its_channel else [DOCKER_PS_ALL_NAMES_IDS_CMD, _FILLER_X_REMOVAL, DOCKER_PS_ALL_NAMES_IDS_CMD]),
         # the sizing measures the disk under the node flatten lock
         next((c for c in _cmds(ssh_client) if c.startswith(flatten_wait_command()[:40])), "no flatten wait"),
@@ -701,13 +704,14 @@ _RECREATED_ID = "b" * 64
         (_REMOVED_AT_SSH_CONNECT_ID, [_REMOVED_AT_SSH_CONNECT_ID], 0, 0, []),
         # a listing without IDs: the removal at SSH connect still targets the ID it listed, not the name
         (None, [_REMOVED_AT_SSH_CONNECT_ID], 0, 0, []),
-        # the kill is issued at SSH connect: confirmed before the image inspect and the probes finish
-        (None, [_REMOVED_AT_SSH_CONNECT_ID], 0, 0.05, ["host probed", "image inspected"]),
+        # the kill is issued only after the image inspect shows the early host probe is the one the create keeps
+        # (review on lium-io#2364: no probe that can still fail the create comes after the rm)
+        (None, [_REMOVED_AT_SSH_CONNECT_ID], 0, 0.05, ["docker run"]),
         # safety order: a PEARL filler is gone before its cap is lifted (beside the volume create, and again
         # right before docker run), and the Dolphin cache is reclaimed only once the filler that mounts it is gone
         (None, [_REMOVED_AT_SSH_CONNECT_ID], 0.05, 0, ["cache reclaim", "docker run", "power restore", "power restore"]),
     ],
-    ids=["same_instance", "cleanup_listing_without_ids", "before_the_image_inspect_and_the_probes_finish",
+    ids=["same_instance", "cleanup_listing_without_ids", "after_the_image_inspect",
          "before_power_restore_cache_reclaim_and_docker_run"],
 )
 async def test_the_filler_removed_at_ssh_connect_goes_first_and_only_once(
@@ -837,17 +841,22 @@ async def test_only_a_customer_create_removes_fillers_at_ssh_connect(
 ):
     svc = svc_fixture
     ssh_client = _wire_customer_create_over_the_host(svc, monkeypatch, probe=_probe_with_containers(container))
-    monkeypatch.setattr(svc, "_run_bootstrap_restore", AsyncMock())
+    monkeypatch.setattr(svc, "_run_bootstrap_restore", AsyncMock(side_effect=lambda **kwargs: kwargs["ssh_client"]))
     payload = _deploy_payload(**payload_fields)
     payload.bootstrap_restore = Mock(restore_log_id="restore-log") if bootstrap_restore else None
 
     result = await _run_create_container(svc, payload)
 
     assert type(result).__name__ == "ContainerCreated", getattr(result, "msg", "")
-    # the fail-closed pid_max read every rental makes and the host RAM read come first; only then does the removal
-    # run (at SSH connect for a customer create, at the cleanup step for a bootstrap restore), so it is always after
+    # the fail-closed pid_max read every rental makes, the host RAM read and the host memory guard come first; only
+    # then does the removal run (at SSH connect for a customer create, at the cleanup step for a bootstrap restore)
     assert "pod_ssh_host_key" in _cmds(ssh_client)[-1]
-    assert _cmds(ssh_client)[:-1] == ["cat /proc/sys/kernel/pid_max", "cat /proc/meminfo", *commands]
+    assert _cmds(ssh_client)[:-1] == [
+        "cat /proc/sys/kernel/pid_max",
+        "cat /proc/meminfo",
+        host_memory_guard_script(),
+        *commands,
+    ]
     svc.probe_prerun_host.assert_awaited_once()
     # the restore's removal at the cleanup step changed the host: its volume facts are probed again
     assert svc.probe_volume_host.await_count == (2 if bootstrap_restore else 1)
@@ -863,7 +872,7 @@ async def test_uncapped_pod_gets_gpu_power_back_while_its_volume_is_created(
     """DAH-3980: the live power query overlaps the volume create, unless a restore runs first."""
     svc = svc_fixture
     _wire_early_probes(svc, monkeypatch, image_present=True)
-    monkeypatch.setattr(svc, "_run_bootstrap_restore", AsyncMock())
+    monkeypatch.setattr(svc, "_run_bootstrap_restore", AsyncMock(side_effect=lambda **kwargs: kwargs["ssh_client"]))
     raise_low = AsyncMock(return_value=0)
     monkeypatch.setattr("services.docker_service.raise_low_power_limits_to_default", raise_low)
     raised_at_volume_creation: list[int] = []
@@ -1063,3 +1072,401 @@ def test_probe_shared_section_lists_nvswitch_nodes_only_with_a_switch(tmp_path, 
 
     shared_nodes = [line.split("\t", 1)[1].removeprefix(str(tmp_path)) for line in stdout.splitlines() if line.startswith("SHARED\t")]
     assert shared_nodes == ["/dev/nvidiactl", *expected_nvswitch_nodes]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("gpu_uuids", [None, ["GPU-1"]])
+async def test_a_one_session_host_answers_the_host_reads_beside_the_early_probes(svc_fixture, monkeypatch, gpu_uuids):
+    """Review on lium-platform#3256: on an sshd with MaxSessions=1 the early probe held the only session, the
+    kernel.pid_max read was refused its channel, and the create failed at `host_pid_max` as the node's own miss."""
+    svc = svc_fixture
+    _wire_early_probes(svc, monkeypatch, image_present=True)
+    sessions: list[str] = []
+
+    def one_session(name: str):
+        if sessions:
+            raise asyncssh.ChannelOpenError(asyncssh.OPEN_ADMINISTRATIVELY_PROHIBITED, f"{name} beside {sessions[0]}")
+        sessions.append(name)
+
+    async def probe_holding_the_session(*args, **kwargs):
+        one_session("probe")
+        await asyncio.sleep(0.05)
+        sessions.pop()
+        return _probe()
+
+    def reader(value: int):
+        async def read(*args, **kwargs):
+            try:
+                one_session("read")
+            except asyncssh.ChannelOpenError:
+                return None  # what the real reader makes of a refused channel: a miss
+            await asyncio.sleep(0.01)
+            sessions.pop()
+            return value
+
+        return read
+
+    svc.probe_prerun_host = AsyncMock(side_effect=probe_holding_the_session)
+    svc.probe_volume_host = AsyncMock(return_value=None)
+    monkeypatch.setattr(svc, "_read_host_pid_max", AsyncMock(side_effect=reader(4194304)))
+    monkeypatch.setattr(svc, "_read_host_ram_kib", AsyncMock(side_effect=reader(64 * 1024 * 1024)))
+    monkeypatch.setattr(svc, "_read_host_gpu_count", AsyncMock(side_effect=reader(8)))
+    payload = _deploy_payload()
+    payload.gpu_uuids = gpu_uuids
+
+    result = await _run_create_container(svc, payload)
+
+    assert type(result).__name__ == "ContainerCreated", getattr(result, "msg", "")
+    assert svc._read_host_gpu_count.await_count == (1 if gpu_uuids else 0)
+
+
+@pytest.mark.asyncio
+async def test_a_host_read_miss_fails_at_its_own_step(svc_fixture, monkeypatch):
+    """Review on lium-platform#3256: the backend counts a host read miss as the node's only under the step name this
+    validator uses once the reads no longer share the session with the early probes."""
+    svc = svc_fixture
+    _wire_early_probes(svc, monkeypatch, image_present=True)
+    monkeypatch.setattr(svc, "_read_host_pid_max", AsyncMock(return_value=None))
+
+    result = await _run_create_container(svc, _deploy_payload())
+
+    assert result.failure_step == ds_module.HOST_READ_PID_MAX_STEP == "host_read_pid_max"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pid_max", [None, 1000])
+async def test_a_refused_pid_max_opens_no_further_host_read(svc_fixture, monkeypatch, pid_max):
+    """Review on lium-io#2364: a host whose pid_max is unreadable or too low fails at the PID guard without the RAM read
+    opening another channel, which a stalled host may never grant (asyncssh's timeout does not bound the open)."""
+    svc = svc_fixture
+    _wire_early_probes(svc, monkeypatch, image_present=True)
+    monkeypatch.setattr(svc, "_read_host_pid_max", AsyncMock(return_value=pid_max))
+    never_answers = asyncio.Event()
+    monkeypatch.setattr(svc, "_read_host_ram_kib", AsyncMock(side_effect=lambda *a, **k: never_answers.wait()))
+
+    result = await asyncio.wait_for(_run_create_container(svc, _deploy_payload()), 5)
+
+    assert result.failure_step == ds_module.HOST_READ_PID_MAX_STEP
+    svc._read_host_ram_kib.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_filler_create_cancelled_at_ssh_connect_cleans_up_only_after_the_host_reads(svc_fixture, monkeypatch):
+    """Review on lium-io#2364: on an sshd with MaxSessions=1 a cancelled filler's cleanup that runs while the host
+    reads still hold the session gets no channel, leaves the filler running and then lifts its power cap. The
+    delete check, and so that cleanup, waits for the bounded reads to end."""
+    svc = svc_fixture
+    _wire_customer_create_over_the_host(svc, monkeypatch, probe=_probe_with_containers("filler_x"))
+    reads_done = []
+
+    async def slow_pid_max(_ssh):
+        await asyncio.sleep(0.05)
+        reads_done.append(True)
+        return 4194304
+
+    monkeypatch.setattr(svc, "_read_host_pid_max", slow_pid_max)
+    seen_at_abort: list[bool] = []
+
+    async def deleted(*args, **kwargs):
+        seen_at_abort.append(bool(reads_done))
+        raise RuntimeError("deleted")
+
+    monkeypatch.setattr(svc, "_abort_if_cancelled_by_delete", AsyncMock(side_effect=deleted))
+
+    await asyncio.wait_for(
+        _run_create_container(svc, _deploy_payload(workload_kind=WorkloadKind.FILLER, active_volume_names=["volume_x"])),
+        timeout=2,
+    )
+
+    assert seen_at_abort[:1] == [True]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("read", "step"),
+    [("_read_host_pid_max", "host_read_pid_max"), ("_read_host_ram_kib", "host_read_ram_kib")],
+)
+async def test_a_host_read_whose_channel_may_still_hold_the_session_stops_the_create_before_any_cleanup(
+    svc_fixture, monkeypatch, read, step
+):
+    """Review on lium-io#2364: a timed-out read whose channel close is not confirmed may still hold a one-session
+    sshd. The create stops at that read's step before the delete check, the filler cleanup or the power restore can
+    put a command on the session."""
+    svc = svc_fixture
+    _wire_customer_create_over_the_host(svc, monkeypatch, probe=_probe_with_containers("filler_x"))
+    monkeypatch.setattr(svc, "_read_host_pid_max", AsyncMock(return_value=4194304))
+    monkeypatch.setattr(
+        svc, read, AsyncMock(side_effect=ds_module.SshSessionMayStillBeTakenError("close not confirmed"))
+    )
+    monkeypatch.setattr(svc, "_abort_if_cancelled_by_delete", AsyncMock())
+
+    result = await asyncio.wait_for(
+        _run_create_container(svc, _deploy_payload(workload_kind=WorkloadKind.FILLER, active_volume_names=["volume_x"])),
+        timeout=5,
+    )
+
+    assert result.failure_step == step
+    svc._abort_if_cancelled_by_delete.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_timed_out_host_memory_guard_whose_channel_may_still_hold_the_session_stops_the_create(
+    svc_fixture, monkeypatch
+):
+    """Review on lium-io#2405: the guard runs on the host reads' session. A guard that times out and whose channel close
+    is not confirmed may still hold a one-session sshd, so the create stops at the guard's step before the delete
+    check, the filler cleanup or the power restore can put a command on the session."""
+    svc = svc_fixture
+    ssh_client = _wire_customer_create_over_the_host(svc, monkeypatch, probe=_probe_with_containers("filler_x"))
+    answer_through_run = ssh_client.create_process
+
+    async def create_process(command, *args, **kwargs):
+        if command != host_memory_guard_script():
+            return await answer_through_run(command, *args, **kwargs)
+        never = asyncio.Event()  # the guard neither ends nor confirms its channel closed
+        return Mock(wait=AsyncMock(side_effect=never.wait), wait_closed=AsyncMock(side_effect=never.wait), close=Mock())
+
+    ssh_client.create_process = create_process
+    monkeypatch.setattr(ds_module, "HOST_MEMORY_GUARD_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(svc, "_abort_if_cancelled_by_delete", AsyncMock())
+
+    result = await asyncio.wait_for(
+        _run_create_container(svc, _deploy_payload(workload_kind=WorkloadKind.FILLER, active_volume_names=["volume_x"])),
+        timeout=5,
+    )
+
+    assert result.failure_step == ds_module.HOST_MEMORY_GUARD_STEP == "host_memory_guard"
+    svc._abort_if_cancelled_by_delete.assert_not_awaited()
+    svc.probe_prerun_host.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_early_probes_start_only_after_host_reads_succeed_while_docker_connects(
+    svc_fixture, monkeypatch
+):
+    """Review on lium-io#2364: the early probes start only after the host reads succeeded, also when a read fails while
+    the Docker connection is still opening."""
+    svc = svc_fixture
+    _wire_early_probes(svc, monkeypatch, image_present=True)
+    monkeypatch.setattr(
+        svc, "_read_host_pid_max", AsyncMock(side_effect=ds_module.SshSessionMayStillBeTakenError("close not confirmed"))
+    )
+    factory = svc.rental_docker_client_factory
+    docker_ready = factory.__aenter__
+
+    async def slow_docker_connect():
+        await asyncio.sleep(0.05)  # the reads fail while Docker still connects
+        return await docker_ready()
+
+    # `async with` looks __aenter__ up on the type
+    monkeypatch.setattr(type(factory), "__aenter__", lambda self: slow_docker_connect())
+
+    result = await asyncio.wait_for(_run_create_container(svc, _deploy_payload(volume_limit_gb=10)), 5)
+
+    assert result.failure_step == ds_module.HOST_READ_PID_MAX_STEP
+    svc.probe_prerun_host.assert_not_awaited()
+    svc.probe_volume_host.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_filler_cancelled_before_docker_connects_cleans_up_with_no_early_probe_on_the_one_session(
+    svc_fixture, monkeypatch
+):
+    """Review on lium-io#2364: the host reads end while Docker still connects; a delete flagged before the first delete
+    check makes that check clean up. On a one-session sshd no early probe may hold the session through that cleanup."""
+    svc = svc_fixture
+    _wire_early_probes(svc, monkeypatch, image_present=True)
+    session_holders: list[str] = []
+
+    async def probe_holding_the_session(*args, **kwargs):
+        session_holders.append("probe")
+        await asyncio.sleep(0.2)
+        session_holders.remove("probe")
+        return _probe()
+
+    svc.probe_prerun_host = AsyncMock(side_effect=probe_holding_the_session)
+    held_at_cleanup: list[list[str]] = []
+
+    async def cleanup(*args, **kwargs):
+        held_at_cleanup.append(list(session_holders))
+        return False
+
+    monkeypatch.setattr(svc, "cleanup_failed_container_creation", AsyncMock(side_effect=cleanup))
+    monkeypatch.setattr(ds_module, "restore_filler_pod_gpu_power_limits", AsyncMock())
+    monkeypatch.setattr(ds_module.inflight_creates, "is_cancelled", lambda pod_id: True)
+    factory = svc.rental_docker_client_factory
+    docker_ready = factory.__aenter__
+
+    async def slow_docker_connect():
+        await asyncio.sleep(0.05)  # the reads are done, Docker still connects
+        return await docker_ready()
+
+    monkeypatch.setattr(type(factory), "__aenter__", lambda self: slow_docker_connect())
+
+    await asyncio.wait_for(
+        _run_create_container(svc, _deploy_payload(workload_kind=WorkloadKind.FILLER, active_volume_names=["volume_x"])),
+        timeout=5,
+    )
+
+    assert held_at_cleanup and held_at_cleanup[0] == []
+    svc.probe_prerun_host.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_filler_cleanup_waits_for_a_started_probe_and_stops_on_a_taken_session(svc_fixture, monkeypatch):
+    """Review on lium-io#2364: a cancelled filler's cleanup runs only once a started early probe has ended; a probe
+    whose channel may still hold the one session stops the cleanup and the power restore."""
+    svc = svc_fixture
+    payload = _deploy_payload(workload_kind=WorkloadKind.FILLER)
+    monkeypatch.setattr(ds_module.inflight_creates, "is_cancelled", lambda pod_id: True)
+    restore = AsyncMock()
+    monkeypatch.setattr(ds_module, "restore_filler_pod_gpu_power_limits", restore)
+    order: list[str] = []
+    monkeypatch.setattr(
+        svc, "cleanup_failed_container_creation", AsyncMock(side_effect=lambda **kw: order.append("cleanup"))
+    )
+
+    async def probe_ended():
+        order.append("probe ended")
+
+    with pytest.raises(ds_module._CreateCancelledByDelete):
+        await svc._abort_if_cancelled_by_delete(Mock(), payload, {}, probe_ended)
+    assert order == ["probe ended", "cleanup"]
+
+    order.clear()
+    restore.reset_mock()
+
+    async def session_taken():
+        raise ds_module.SshSessionMayStillBeTakenError("close not confirmed")
+
+    with pytest.raises(ds_module.SshSessionMayStillBeTakenError):
+        await svc._abort_if_cancelled_by_delete(Mock(), payload, {}, session_taken)
+    assert order == []
+    restore.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_probe_that_may_still_hold_the_session_stops_the_create_before_the_filler_removal(svc_fixture, monkeypatch):
+    """Review on lium-io#2364: the filler removal at SSH connect is irreversible. An early probe whose channel close is
+    not confirmed stops the customer create before that removal, so the node keeps its filler."""
+    svc = svc_fixture
+    _wire_customer_create_over_the_host(svc, monkeypatch, probe=_probe_with_containers("filler_x"))
+
+    async def probe_close_not_confirmed(*args, **kwargs):
+        await asyncio.sleep(0.05)  # still running when the removal would start
+        raise ds_module.SshSessionMayStillBeTakenError("close not confirmed")
+
+    svc.probe_prerun_host = AsyncMock(side_effect=probe_close_not_confirmed)
+    svc.remove_fillers_at_ssh_connect = AsyncMock(return_value=None)
+
+    result = await asyncio.wait_for(
+        _run_create_container(svc, _deploy_payload(active_volume_names=["volume_keep"])), timeout=5
+    )
+
+    assert result.failure_step == "prerun_host_probe"
+    svc.remove_fillers_at_ssh_connect.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_pull_keeps_the_filler_until_the_probe_after_it_passes(svc_fixture, monkeypatch):
+    """Review on lium-io#2364: a create that pulls the image re-runs the prerun probe after the pull. The filler stays
+    until that probe has passed, so a probe whose channel close is not confirmed fails the create with the filler kept."""
+    svc = svc_fixture
+    _wire_customer_create_over_the_host(svc, monkeypatch, probe=_probe_with_containers("filler_x"), image_present=False)
+    probes = 0
+
+    async def second_probe_close_not_confirmed(*args, **kwargs):
+        nonlocal probes
+        probes += 1
+        if probes == 1:
+            return _probe_with_containers("filler_x")
+        raise ds_module.SshSessionMayStillBeTakenError("close not confirmed")
+
+    svc.probe_prerun_host = AsyncMock(side_effect=second_probe_close_not_confirmed)
+    svc.remove_fillers_at_ssh_connect = AsyncMock(return_value=None)
+
+    result = await asyncio.wait_for(
+        _run_create_container(svc, _deploy_payload(active_volume_names=["volume_keep"])), timeout=5
+    )
+
+    assert probes == 2
+    assert result.failure_step == "prerun_host_probe"
+    svc.remove_fillers_at_ssh_connect.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_delete_while_the_early_probes_settle_keeps_the_filler(svc_fixture, monkeypatch):
+    """Review on lium-io#2364: the probe wait before the filler removal can outlast the first delete check. A delete
+    that arrives during it ends the customer create before the irreversible removal starts."""
+    svc = svc_fixture
+    _wire_customer_create_over_the_host(svc, monkeypatch, probe=_probe_with_containers("filler_x"))
+    deleted = False
+
+    async def probe_while_the_delete_arrives(*args, **kwargs):
+        nonlocal deleted
+        await asyncio.sleep(0.05)
+        deleted = True
+        return _probe_with_containers("filler_x")
+
+    svc.probe_prerun_host = AsyncMock(side_effect=probe_while_the_delete_arrives)
+    svc.remove_fillers_at_ssh_connect = AsyncMock(return_value=None)
+    monkeypatch.setattr(ds_module.inflight_creates, "is_cancelled", lambda pod_id: deleted)
+
+    await asyncio.wait_for(
+        _run_create_container(svc, _deploy_payload(active_volume_names=["volume_keep"])), timeout=5
+    )
+
+    assert deleted
+    svc.remove_fillers_at_ssh_connect.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_pull_waits_for_the_discarded_early_probe_and_stops_if_it_may_still_hold_the_session(
+    svc_fixture, monkeypatch
+):
+    # MaxSessions=1: with the image to pull, the early probe is discarded; the fallback probe must not open a
+    # channel beside it, and an early probe whose close is unconfirmed stops the create before any cleanup
+    svc = svc_fixture
+    _wire_early_probes(svc, monkeypatch, image_present=False)
+    running: list[int] = []
+
+    async def early_probe_then_unconfirmed_close(*args, **kwargs):
+        assert not running, "the fallback probe started while the early probe still held the session"
+        running.append(1)
+        await asyncio.sleep(0.2)
+        running.pop()
+        raise SshSessionMayStillBeTakenError("close not confirmed")
+
+    svc.probe_prerun_host = AsyncMock(side_effect=early_probe_then_unconfirmed_close)
+    svc.clean_existing_containers = AsyncMock()
+
+    result = await _run_create_container(svc, _deploy_payload())
+
+    assert type(result).__name__ == "FailedContainerRequest", getattr(result, "msg", "")
+    assert svc.probe_prerun_host.await_count == 1
+    svc.clean_existing_containers.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_delete_during_a_pulls_fallback_probe_stops_the_create_before_the_cleanup(svc_fixture, monkeypatch):
+    # every irreversible step re-checks the delete right before it: a pull's cleanup too, not only the filler removal
+    svc = svc_fixture
+    _wire_early_probes(svc, monkeypatch, image_present=False)
+    deleted = False
+    probes = 0
+
+    async def fallback_probe_while_the_delete_arrives(*args, **kwargs):
+        nonlocal deleted, probes
+        probes += 1
+        if probes == 2:
+            deleted = True
+        return _probe_with_containers("filler_x")
+
+    svc.probe_prerun_host = AsyncMock(side_effect=fallback_probe_while_the_delete_arrives)
+    svc.clean_existing_containers = AsyncMock(return_value=[])
+    monkeypatch.setattr(ds_module.inflight_creates, "is_cancelled", lambda pod_id: deleted)
+
+    await asyncio.wait_for(_run_create_container(svc, _deploy_payload()), timeout=5)
+
+    assert deleted
+    svc.clean_existing_containers.assert_not_awaited()

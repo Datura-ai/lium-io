@@ -22,6 +22,7 @@ from services.rental_docker_sdk import (
     RentalDockerOperationError,
     RentalDockerSdkClient,
     RentalDockerSdkClientFactory,
+    RentalDockerTransportNotReopened,
 )
 
 # The three error texts of the cluster, as the validator logged them.
@@ -182,20 +183,31 @@ async def test_run_container_retry_refuses_a_same_name_container_on_another_imag
     assert api.calls == ["create_container", "inspect_container"]
 
 
-@pytest.mark.asyncio
-async def test_run_container_retry_adopts_the_first_create_still_running_in_dockerd(monkeypatch):
-    """29 Oct: the first create outlived the 60 s read timeout; dockerd still held the name (409) while
-    inspect said 404. The retry waits for that create to register and adopts it, no third create."""
-    import services.rental_docker_sdk as sdk
-
-    monkeypatch.setattr(sdk, "_INFLIGHT_CREATE_POLL_SECONDS", 0)
-    api = _FakeApiClient(adapter=_FakeAdapter())
-    conflict = APIError(
+def _name_conflict() -> APIError:
+    return APIError(
         "Conflict",
         response=Mock(status_code=409, url="containers/create", reason="Conflict"),
         explanation='Conflict. The container name "/pod_test" is already in use by container "abc".',
     )
-    api.create_container_errors = [EOFError(), conflict]
+
+
+@pytest.mark.asyncio
+async def test_run_container_retry_adopts_the_first_create_however_long_dockerd_runs_it(monkeypatch):
+    """22 Nov (pod d98d08ae): the first create outlived the 60 s read timeout and dockerd kept running it
+    past the retry's 60 s wait (409 on the name, inspect 404), so the rent failed on its own name. The
+    retry waits while dockerd holds the name and adopts the container once it registers; no third create."""
+    import requests
+    import services.rental_docker_sdk as sdk
+
+    monkeypatch.setattr(sdk, "_INFLIGHT_CREATE_POLL_SECONDS", 0)
+    # the first create outlasts any fixed wait (the removed 60 s one included)
+    monkeypatch.setattr(sdk, "_INFLIGHT_CREATE_WAIT_SECONDS", 0, raising=False)
+    api = _FakeApiClient(adapter=_FakeAdapter())
+    api.create_container_errors = [
+        requests.exceptions.ReadTimeout("Read timed out. (read timeout=60)"),
+        _name_conflict(),
+        _name_conflict(),
+    ]
     inspects = iter([_not_found(), _not_found()])
 
     def inspect_container(name):
@@ -209,8 +221,105 @@ async def test_run_container_retry_adopts_the_first_create_still_running_in_dock
 
     assert await _client(api).run_container(_run_spec()) == "first"
     assert api.calls == [
-        "create_container", "inspect_container", "create_container",
-        "inspect_container", "inspect_container", "start",
+        "create_container",
+        "inspect_container", "create_container",
+        "inspect_container", "create_container",
+        "inspect_container", "start",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_the_resume_wait_ends_at_its_deadline_when_dockerd_never_frees_the_name(monkeypatch):
+    """Review: with no bound, a name dockerd keeps reserved retried the customer create forever and kept the
+    executor's fillers blocked. Past the deadline the create fails, without the 409 text (no own-leftover removal)."""
+    import requests
+    import services.rental_docker_sdk as sdk
+    from services.rental_docker_sdk import InflightCreateNameStillHeld
+
+    monkeypatch.setattr(sdk, "_INFLIGHT_CREATE_POLL_SECONDS", 0)
+    monkeypatch.setattr(sdk, "_INFLIGHT_CREATE_DEADLINE_SECONDS", 0)
+    api = _FakeApiClient(adapter=_FakeAdapter())
+    api.create_container_errors = [
+        requests.exceptions.ReadTimeout("Read timed out. (read timeout=60)"),
+        *[_name_conflict() for _ in range(50)],
+    ]
+
+    def inspect_container(name):
+        api.calls.append("inspect_container")
+        raise _not_found()
+
+    api.inspect_container = inspect_container
+
+    with pytest.raises(InflightCreateNameStillHeld) as raised:
+        await _client(api).run_container(_run_spec())
+    assert isinstance(raised.value, RentalDockerOperationError) and not isinstance(raised.value, ContainerNameTakenOnRetry)
+    assert "already in use" not in str(raised.value)
+    assert api.calls == ["create_container", "inspect_container", "create_container"]
+
+
+@pytest.mark.asyncio
+async def test_run_container_retry_creates_once_dockerd_released_the_name(monkeypatch):
+    """The first create failed in dockerd after the read timeout: the name is free again and the retry's
+    create is the only container."""
+    import requests
+    import services.rental_docker_sdk as sdk
+
+    monkeypatch.setattr(sdk, "_INFLIGHT_CREATE_POLL_SECONDS", 0)
+    api = _FakeApiClient(adapter=_FakeAdapter())
+    api.create_container_errors = [
+        requests.exceptions.ReadTimeout("Read timed out. (read timeout=60)"),
+        _name_conflict(),
+    ]
+
+    assert await _client(api).run_container(_run_spec()) == "cid"
+    assert api.calls == [
+        "create_container",
+        "inspect_container", "create_container",
+        "inspect_container", "create_container", "start",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_refusal_during_the_resume_wait_is_raised_once_dockerds_container_exists(monkeypatch):
+    """A filler's `before_create` refusal (a customer create started during the 409 wait) is checked on the
+    resume only once the container exists, so the caller's removal by name finds it; never started."""
+    import requests
+    import services.rental_docker_sdk as sdk
+    from services.rental_docker_sdk import ContainerCreateRefused
+
+    monkeypatch.setattr(sdk, "_INFLIGHT_CREATE_POLL_SECONDS", 0)
+    api = _FakeApiClient(adapter=_FakeAdapter())
+    api.create_container_errors = [
+        requests.exceptions.ReadTimeout("Read timed out. (read timeout=60)"),
+        _name_conflict(),
+        _name_conflict(),
+    ]
+    inspects = iter([_not_found(), _not_found()])
+
+    def inspect_container(name):
+        api.calls.append("inspect_container")
+        error = next(inspects, None)
+        if error is not None:
+            raise error
+        return {"Id": "first", "Config": {"Image": "lium/pod:1"}}
+
+    api.inspect_container = inspect_container
+
+    def before_create():
+        # the customer create starts after the first 409
+        if api.calls.count("create_container") >= 2:
+            raise ContainerCreateRefused("a customer create is running")
+
+    spec = _run_spec()
+    spec.before_create = before_create
+
+    with pytest.raises(ContainerCreateRefused):
+        await _client(api).run_container(spec)
+    assert api.calls == [
+        "create_container",
+        "inspect_container", "create_container",
+        "inspect_container", "create_container",
+        "inspect_container",
     ]
 
 
@@ -375,3 +484,59 @@ async def test_pull_whose_reply_ends_prematurely_is_retried_once_after_reopen():
 
     assert pulls == ["daturaai/pytorch:x", "daturaai/pytorch:x"]
     assert adapter.reopen_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_a_host_gone_silent_fails_the_inspect_as_a_dropped_transport_not_a_bare_timeout(
+    tmp_path, monkeypatch
+):
+    # a host stopped answering mid-create: the session under the Docker SDK died and every
+    # re-connect timed out at TCP. The create failure read "inspect container failed: timed out",
+    # so the backend kept the renter on that host.
+    import services.rental_docker_sdk as sdk
+
+    adapter_class = sdk._build_rental_ssh_http_adapter_class(
+        key_path=tmp_path / "key", known_hosts_path=tmp_path / "known_hosts"
+    )
+    adapter = adapter_class.__new__(adapter_class)
+    adapter.pools = SimpleNamespace(lock=threading.Lock(), get=lambda host: None)
+    adapter.ssh_host = "node"
+    dead = Mock(is_active=Mock(return_value=False))
+    adapter.ssh_client = Mock(get_transport=Mock(return_value=dead))
+    monkeypatch.setattr(adapter_class, "_connect", Mock(side_effect=TimeoutError("timed out")))
+
+    class _SilentHostApiClient(_FakeApiClient):
+        def inspect_container(self, name):
+            adapter.get_connection("http+docker://ssh/v1/containers/json")
+
+    api_client = _SilentHostApiClient(adapter=_FakeAdapter(reopen_error=TimeoutError("timed out")))
+
+    with pytest.raises(RentalDockerOperationError) as raised:
+        await _client(api_client).inspect_container_state(container_name="pod_test")
+
+    assert "Docker SDK inspect container failed on a dropped SSH transport" in str(raised.value)
+    # and it holds the node: the re-open's own timeout must not hide the drop from the strict classifier
+    from services.docker_service import is_host_fault_create_failure
+
+    assert is_host_fault_create_failure("container_health_check", raised.value)
+
+
+@pytest.mark.asyncio
+async def test_a_read_timeout_then_a_reset_while_reopening_still_holds_the_node():
+    # the first error is a read timeout (a transport error, not a strict drop); the re-open then hits a reset
+    import requests
+
+    from services.docker_service import is_host_fault_create_failure
+
+    class _TimeoutApiClient(_FakeApiClient):
+        def inspect_container(self, name):
+            raise requests.exceptions.ReadTimeout("read timed out")
+
+    api_client = _TimeoutApiClient(adapter=_FakeAdapter(reopen_error=ConnectionResetError("reset by peer")))
+
+    with pytest.raises(RentalDockerOperationError) as raised:
+        await _client(api_client).inspect_container_state(container_name="pod_test")
+
+    assert is_host_fault_create_failure("container_health_check", raised.value)
+    # the create reports it at ssh_connect: the node refused the new connection
+    assert isinstance(raised.value, RentalDockerTransportNotReopened)

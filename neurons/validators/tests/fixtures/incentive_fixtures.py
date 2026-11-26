@@ -34,7 +34,6 @@ def incentive_redis_service():
 
 @pytest.fixture
 def mock_settings(monkeypatch):
-    monkeypatch.setattr(settings, "PORTION_FOR_SYSBOX", 0.1)
     monkeypatch.setattr(settings, "PORTION_FOR_UPTIME", 0.2)
     monkeypatch.setattr(settings, "UPTIME_REQUIRED_MINUTES", 120)
     monkeypatch.setattr(settings, "BURNERS", [0, 1])
@@ -149,7 +148,7 @@ def validator_with_mocks(incentive_redis_service, mock_subtensor_client, mock_se
     validator.redis_service = incentive_redis_service
     validator.subtensor_client = mock_subtensor_client
     validator.file_encrypt_service = MagicMock()
-    validator.file_encrypt_service.ecrypt_miner_job_files = MagicMock(return_value={})
+    validator.file_encrypt_service.prepare_cycle_job_files = MagicMock(return_value={})
     validator.miner_service = MagicMock()
     validator.miner_service.request_job_to_miner = AsyncMock()
     validator.miner_service.publish_machine_specs = AsyncMock()

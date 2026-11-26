@@ -30,6 +30,7 @@ from ...const import (
 )
 from core.config import settings
 from services.gpu_reset import renter_gpu_reset_in_progress
+from services.rental_docker_sdk import _authorized_keys_lock
 from services.redis_service import (
     EXECUTOR_CREATE_LOCK_TIMEOUT,
     RECENT_FILLER_PREFIX,
@@ -42,13 +43,13 @@ from ..messages import PortCountMessages, TenantEnforcementMessages as Msg
 from ..messages import render_message
 from ..pipeline import Check, CheckResult, Context
 from . import port_connectivity
+from .gpu_fault_probe import forget_unknown_streak
 from .gpu_usage import _fillers_off_their_image
 from .port_connectivity import PortConnectivityCheck
 from .provider_maintenance import maintenance_failure, maintenance_window_at_cycle_start
 from .rental_owner import rental_of_this_node
 from .task_time import task_seconds_left
 from .port_count import (
-    hidden_from_renters_text,
     port_count_below_listing_floor,
     port_floor_what,
     split_port_shortfall,
@@ -240,6 +241,33 @@ class _DownedPodOutcome:
     container_state: ContainerState
 
 
+class HalfStartedStopRetryCheck:
+    """F-31: a failed start whose stop and kill failed may have left a pod running without its mount. Every such stop
+    on this node is retried first in the cycle, before any check that can halt it, rented or not: the pod may be gone
+    from the rental since (deleted, reassigned) while its old run still writes the renter's data unencrypted.
+    Never fails or halts the cycle; a stop still refused stays pending for the next one."""
+
+    check_id = "executor.recover.half_started_stops"
+    fatal = False
+
+    async def run(self, ctx: Context) -> CheckResult:
+        try:
+            async with asyncio.timeout(
+                min(_HALF_STARTED_STOP_CHECK_SEC, max(1.0, task_seconds_left(ctx) - POD_READ_RESERVE_SECONDS))
+            ):
+                await ctx.services.pod_recovery.retry_pending_half_started_stops(
+                    executor_info=ctx.executor,
+                    private_key=ctx.executor_ssh_private_key,
+                    default_extra=ctx.default_extra,
+                )
+        except Exception as exc:  # noqa: BLE001 — its own failures are logged inside; the cycle goes on
+            _log_recovery_failed("POD_HALF_STARTED_STOP_STILL_PENDING", ctx, None, None, exc)
+        event = render_message(
+            Msg.HALF_STARTED_STOPS_RETRIED, ctx=ctx, check_id=self.check_id, what={"executor_uuid": ctx.executor.uuid}
+        )
+        return CheckResult(passed=True, event=event)
+
+
 class TenantEnforcementCheck:
     """Handle the specialised flow when the executor is already rented to a tenant.
 
@@ -319,6 +347,10 @@ class TenantEnforcementCheck:
         closed_pod_ids: set[str] = set()
 
         def with_pod_states(result: CheckResult) -> CheckResult:
+            if result.updates.get("rented") is not False:
+                # the run ends here as rented and never reaches the kernel-fault probe, so the no-verdicts before
+                # and after it are not in a row. A stale-pod run goes on as idle (rented=False) and is probed: no reset.
+                forget_unknown_streak(ctx)
             return _with_pod_states(result, ctx, rented_pods, state_by_pod_id)
 
         # DAH-4709: inside the window every pod's state is still read for the backend, but a pod that is down
@@ -462,7 +494,7 @@ class TenantEnforcementCheck:
                     # Every listed pod is stale here (the check above): the floor applies to an idle node.
                     port_count_below_floor = port_count_below_listing_floor(ctx.state)
                     # DAH-3698 (owner rule): only a rented split node is exempt from its per-split ports, so a
-                    # node whose every listed pod is stale is idle and needs them, with or without the floor flag
+                    # node whose every listed pod is stale is idle and needs them
                     split_short = split_port_shortfall(ctx.state)
                     reprobed: dict[str, Any] = {}
                     if split_short is not None:
@@ -497,10 +529,7 @@ class TenantEnforcementCheck:
                                 updates={"default_extra": extra, "rented": False, "ssh_pub_keys": None, **reprobed},
                             )
                         )
-                    if (
-                        port_count_below_floor is not None
-                        and settings.ENFORCE_PORT_FLOOR_ON_STALE_POD
-                    ):
+                    if port_count_below_floor is not None:
                         event = render_message(
                             PortCountMessages.INSUFFICIENT_PORTS,
                             ctx=ctx,
@@ -515,19 +544,10 @@ class TenantEnforcementCheck:
                                 updates={"default_extra": extra, "rented": False, "ssh_pub_keys": None},
                             )
                         )
-                    impact = None
-                    if port_count_below_floor is not None:
-                        stale_what["port_floor"] = port_floor_what(ctx.state, port_count_below_floor)
-                        impact = (
-                            f"{hidden_from_renters_text(port_count_below_floor)}; "
-                            "the port floor applied only while the pod was listed"
-                        )
                     event = render_message(
                         Msg.STALE_POD_NOT_RUNNING,
                         ctx=ctx,
                         check_id=self.check_id,
-                        severity="warning" if port_count_below_floor is not None else None,
-                        impact=impact,
                         what=stale_what,
                         extra=extra,
                     )
@@ -539,6 +559,9 @@ class TenantEnforcementCheck:
                                 "default_extra": extra,
                                 "rented": False,
                                 "ssh_pub_keys": None,
+                                # a later halt judges only a fresher rental read, never this listing twice (a
+                                # second answer could differ)
+                                "rentals_judged_closed": ctx.state.rented_data,
                                 **reprobed,
                             },
                         )
@@ -837,6 +860,30 @@ class HostGpuContainerFailure(BaseModel):
     stdout_tail: str
 
 
+
+class RentedSinceStartCheck:
+    """DAH-5933 review, fast path: the rented halt again after a check that re-reads the rentals. PortCountCheck and
+    CapabilityCheck can find a customer pod that started during the run and put it in the snapshot; the halt then
+    handles that rental before `POST /verify` or VerifyX puts load on the node. A node still idle passes, and so does
+    the same snapshot an earlier halt judged all closed, until a fresher rental read lists a pod."""
+
+    check_id = TenantEnforcementCheck.check_id
+    replays_after_session_drop = TenantEnforcementCheck.replays_after_session_drop
+    fatal = True
+
+    def __init__(self, halt: TenantEnforcementCheck):
+        self.halt = halt
+
+    async def run(self, ctx: Context) -> CheckResult:
+        rented_executor = rental_of_this_node(ctx)
+        # the same snapshot an earlier halt judged all closed is not judged again; a fresher rental read is
+        if rented_executor and rented_executor.pods and ctx.state.rented_data is not ctx.rentals_judged_closed:
+            return await self.halt.run(ctx)
+        event = render_message(
+            Msg.STILL_NOT_RENTED, ctx=ctx, check_id=self.check_id, what={"executor_uuid": ctx.executor.uuid}
+        )
+        return CheckResult(passed=True, event=event)
+
 async def _host_gpu_container_failure(
     ctx: Context, pod_status: str | None
 ) -> HostGpuContainerFailure | None:
@@ -1037,6 +1084,8 @@ _RECOVERY_DEADLINE_SEC = EXECUTOR_CREATE_LOCK_TIMEOUT - 120
 _RECOVERY_MARK_CLEAR_TIMEOUT_SEC = 5
 # the running-pod mount probe: the backend's path lookup (10 s) and the docker probe (30 s)
 _MOUNT_PROBE_SECONDS = 40
+# three stops, a kill and their inspects of a pod left possibly running unmounted (F-31)
+_HALF_STARTED_STOP_CHECK_SEC = 45
 # a restore cut by the deadline still marks, records, parks and stops the pod: the 5 s mark, the 5 s DB record, three
 # 30 s commands and the record's 5 s drop after a park or stop that did not take
 _MOUNT_RESTORE_CLEANUP_RESERVE_SEC = 105
@@ -1193,7 +1242,7 @@ async def _clear_leftover_recovery_mark(
         return absence_confirmed
 
 
-def _log_recovery_failed(event: str, ctx: Context, container_name: str, pod_id: str, exc: Exception) -> None:
+def _log_recovery_failed(event: str, ctx: Context, container_name: str | None, pod_id: str | None, exc: Exception) -> None:
     logger.warning(
         _m(
             event,
@@ -1463,7 +1512,9 @@ async def _strip_foreign_pod_keys(
     # cat into the same file keeps its owner and mode; copy only on grep exit 0 or 1 (1 = every line went), never on
     # an error such as a full disk, which would leave an empty temp file and wipe the renter's keys.
     script = (
-        "f=/root/.ssh/authorized_keys; t=$(mktemp) || exit 1; "
+        # DAH-6441: under the add/remove lock, or a key removed between this grep and the cat comes back
+        _authorized_keys_lock("/root/.ssh", 1)
+        + "f=/root/.ssh/authorized_keys; t=$(mktemp) || exit 1; "
         f'grep -vF {patterns} "$f" > "$t" || [ $? -eq 1 ] && cat "$t" > "$f"; s=$?; rm -f "$t"; exit $s'
     )
     try:

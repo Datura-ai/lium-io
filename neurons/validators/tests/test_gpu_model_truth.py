@@ -670,6 +670,11 @@ async def test_a_faked_model_on_a_filler_node_removes_lium_filler_only(context_f
     assert result.event.what_we_saw.get("removed_fillers") == (["filler_active"] if removed else None)
 
 
+def test_a_bare_nvidia_h100_with_the_sxm_sm_count_passes_as_the_pcie_card():
+    assert gpu_model_mismatch(_specs("NVIDIA H100"), {"cc": "9.0", "sm_count": 132}) is None
+    assert gpu_model_mismatch(_specs("NVIDIA H100"), {"cc": "8.0", "sm_count": 108}) is not None
+
+
 @pytest.mark.asyncio
 async def test_a_carried_work_proof_failure_clears_on_a_right_answer_with_no_numbers(context_factory, monkeypatch):
     """Review (17 Nov): a filler-sample work-proof failure on card 1, the filler then removed. The normal path's pinned

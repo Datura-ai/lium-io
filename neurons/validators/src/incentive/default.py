@@ -96,13 +96,15 @@ class DefaultIncentive(BaseIncentive):
 
     @staticmethod
     def _record_outdated_image_reason(result: JobResult) -> bool:
-        """True when the executor image excludes this result from both pools: always for an UNOFFICIAL
-        image, and for an OUTDATED one only when EXECUTOR_IMAGE_CHECK_ENFORCE is on (DAH-2701). Off, an
-        OUTDATED report still travels on the result and its specs, but nothing is recorded or zeroed.
+        """True when the executor image excludes this result from both pools: always for an UNOFFICIAL image, and for
+        an OUTDATED one only on a node that was free when the image was read (DAH-6845). A rented OUTDATED node keeps
+        its share, the free GPUs of a partly rented split node included; its report still travels on the result.
         """
         report = result.executor_image_report or {}
         status = report.get("status")
-        if status != "UNOFFICIAL" and not (settings.EXECUTOR_IMAGE_CHECK_ENFORCE and status == "OUTDATED"):
+        # a report stored before rented_when_read existed (carried from Redis) falls back to the result's own rental state
+        was_free_when_image_read = not report.get("rented_when_read", result.is_rented) and not result.is_split_remainder
+        if status != "UNOFFICIAL" and not (status == "OUTDATED" and was_free_when_image_read):
             return False
         if not any(
             reason.reason == ZeroIncentiveReason.OUTDATED_EXECUTOR_IMAGE.value
@@ -224,18 +226,8 @@ class DefaultIncentive(BaseIncentive):
         job_result.gpu_portion = await self.redis_service.get_portion_per_gpu_type(job_result.gpu_model)
         job_result.mining_score = job_result.score * job_result.gpu_portion * job_result.gpu_count / job_result.total_gpu_count
 
-        # Sysbox runtime multiplier
-        is_rented_after_cutoff = (
-            job_result.is_rented
-            and job_result.rental_created_at
-            and job_result.rental_created_at >= settings.SYSBOX_RENTED_CUTOFF
-        )
-        if job_result.sysbox_runtime:
-            job_result.sysbox_multiplier = 1
-        else:
-            portion = settings.PORTION_FOR_SYSBOX_RENTED if is_rented_after_cutoff else settings.PORTION_FOR_SYSBOX
-
-            job_result.sysbox_multiplier = 1 - portion
+        # Sysbox is required: a rented node without it scores 0 (an idle one already fails SysboxRequiredCheck)
+        job_result.sysbox_multiplier = 1 if job_result.sysbox_runtime else 0
 
         # Minimum NVIDIA driver multiplier; rented executors are exempt.
         job_result.driver_multiplier = get_min_driver_multiplier(
@@ -262,12 +254,10 @@ class DefaultIncentive(BaseIncentive):
             * job_result.driver_multiplier
             * spot_rental_factor
         )
-        line: MinerLogLine = MinerLogLine.mining_score_calculated(
-            job_result, is_rented_after_cutoff, spot_rental_factor
-        )
+        line: MinerLogLine = MinerLogLine.mining_score_calculated(job_result, spot_rental_factor)
         job_result.record_incentive_log(line)
         logger.info(line.as_internal_log())
-        # a rented node zeroed by the Sysbox portion must say why (the idle path has its own reason)
+        # a rented node zeroed for no Sysbox must say why (the idle path has its own reason)
         if job_result.is_rented and job_result.sysbox_multiplier == 0:
             job_result.record_incentive_log(MinerLogLine.no_payout_because_rented_sysbox_not_confirmed(job_result))
         return job_result

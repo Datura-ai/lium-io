@@ -22,29 +22,36 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 
 from core.config import settings
 from core.utils import _m
 from incentive.config import BASE_GPU_MAP
-from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
-from services.executor_image_policy import ImageVerdict, normalize_sha256_digest
+from protocol.vc_protocol.compute_requests import RentedExecutor, RentedExecutorsResponse
+from services.executor_image_policy import normalize_sha256_digest
 from services.redis_service import (
     LAST_SCORED_RESULT_TTL_SECONDS,
     RedisService,
     RedisWrites,
     last_scored_result_key,
+    last_scored_result_vouch_key,
 )
-from services.task.availability import AvailabilityErrorCode
+from services.task.availability import AvailabilityErrorCode, _is_the_nodes_own_fault
+from services.task.checks.rental_owner import listed_under_another_miner, rental_owned_by
 from services.task.checks.executor_image import observed_executor_digest
 from services.task.messages import (
+    CYCLE_END_READ_REASONS,
     ExecutorImageMessages,
     FinalizeMessages,
     GpuPowerLimitMessages,
+    GpuUsageMessages,
     MachineSpecMessages,
+    NO_TASK_TIME_REASONS,
     PortConnectivityMessages,
     PortCountMessages,
+    RENTED_AFTER_START_REASONS,
     RentalVerificationMessages,
     SCRAPE_HOST_SIDE_FAILURE_REASONS,
     SCRAPE_UNDETERMINED_FAILURE_REASONS,
@@ -52,7 +59,7 @@ from services.task.messages import (
     UploadFilesMessages,
 )
 from services.task.models import VALIDATOR_REDIS_UNAVAILABLE, JobResult
-from services.task.result_handler import pods_rented_gpu_count
+from services.task.result_handler import rental_gpu_count
 
 logger = logging.getLogger(__name__)
 
@@ -74,7 +81,8 @@ MAX_ROLLOUT_GRACE_CYCLES = 2
 # the change is seen is cycle 1) and restarted by every change, a second push inside the window too.
 # Separate from the window: it changes only the image verdict, never withholds a result, so it has no
 # 1-hour cap. Many more nodes are still on the previous image after 2 cycles than after 8.
-PREVIOUS_RELEASE_CURRENT_CYCLES = 8
+# DAH-6845: 16 (~4 h): over 9 releases (16-19 Nov) up to 13 of ~650 nodes per release updated only after 2-4 h.
+PREVIOUS_RELEASE_CURRENT_CYCLES = 16
 
 # What a watchtower container recreate makes a running validation look like, in the order the
 # pipeline meets them: the connect never opens; the shell dies under the upload, under a check
@@ -135,6 +143,9 @@ class RolloutState:
     closed: bool = False
     # cycles since the last digest change, that cycle included; 0 until a change is seen
     previous_current_cycles_seen: int = 0
+    # releases replaced before `previous_digest` whose own 8 CURRENT cycles have not run out, as
+    # (digest, cycles since it was replaced): a second push must not cut a node's grace short
+    earlier_current: tuple[tuple[str, int], ...] = ()
 
     @classmethod
     def from_json(cls, raw: str | bytes) -> RolloutState:
@@ -155,6 +166,7 @@ class RolloutState:
             withheld=int(fields.get("withheld", 0)),
             closed=bool(fields.get("closed", False)),
             previous_current_cycles_seen=int(fields.get("previous_current_cycles_seen", 0)),
+            earlier_current=tuple((str(d), int(n)) for d, n in fields.get("earlier_current") or ()),
         )
 
     def to_json(self) -> str:
@@ -169,8 +181,21 @@ class RolloutState:
                 "withheld": self.withheld,
                 "closed": self.closed,
                 "previous_current_cycles_seen": self.previous_current_cycles_seen,
+                "earlier_current": [list(entry) for entry in self.earlier_current],
             }
         )
+
+    def earlier_after_replacing(self, new_digest: str) -> tuple[tuple[str, int], ...]:
+        """What `earlier_current` becomes when `digest` is replaced by `new_digest`: the outgoing
+        previous release joins it while its own grace runs, and a digest that is current again leaves it."""
+        entries = list(self.earlier_current)
+        if self.previous_digest and 0 < self.previous_current_cycles_seen <= PREVIOUS_RELEASE_CURRENT_CYCLES:
+            entries.append((self.previous_digest, self.previous_current_cycles_seen))
+        kept: dict[str, int] = {}
+        for digest, cycles in entries:
+            if digest not in (new_digest, self.digest):
+                kept[digest] = min(cycles, kept.get(digest, cycles))
+        return tuple(kept.items())
 
 
 @dataclass(frozen=True)
@@ -179,6 +204,7 @@ class WithheldVerdict:
 
     miner_hotkey: str
     result: JobResult
+    keeps_miner_active: bool = True
 
 
 @dataclass(frozen=True)
@@ -199,6 +225,7 @@ class RolloutWindow:
     cycles_seen: int
     grace_cycles: int
     previous_current_cycles_seen: int = 0
+    earlier_current: tuple[tuple[str, int], ...] = ()
 
     def covers(self, job_block: int) -> bool:
         if self.grace_cycles <= 0 or self.opened_job_block is None:
@@ -211,6 +238,12 @@ class RolloutWindow:
             return False
         return 0 < self.previous_current_cycles_seen <= PREVIOUS_RELEASE_CURRENT_CYCLES
 
+    def earlier_reading_current(self, job_block: int) -> tuple[str, ...]:
+        """Releases replaced before the previous one that still read CURRENT in this cycle."""
+        if self.opened_job_block is None or job_block < self.opened_job_block:
+            return ()
+        return tuple(d for d, n in self.earlier_current if 0 < n <= PREVIOUS_RELEASE_CURRENT_CYCLES)
+
     def as_extra(self) -> dict[str, object]:
         return {
             "rollout_digest": self.digest,
@@ -220,6 +253,7 @@ class RolloutWindow:
             "rollout_cycles_seen": self.cycles_seen,
             "rollout_grace_cycles": self.grace_cycles,
             "rollout_previous_current_cycles_seen": self.previous_current_cycles_seen,
+            "rollout_earlier_current": [list(entry) for entry in self.earlier_current],
         }
 
 
@@ -289,6 +323,9 @@ class ExecutorRolloutTracker:
             cycles_seen=state.cycles_seen + 1,
             previous_current_cycles_seen=state.previous_current_cycles_seen
             + (1 if state.previous_current_cycles_seen else 0),
+            earlier_current=tuple(
+                (d, n + 1) for d, n in state.earlier_current if n + 1 <= PREVIOUS_RELEASE_CURRENT_CYCLES
+            ),
         )
         await self._save(counted)
         return counted
@@ -311,6 +348,7 @@ class ExecutorRolloutTracker:
                 last_job_block=job_block,
                 cycles_seen=1,
                 previous_current_cycles_seen=1,
+                earlier_current=state.earlier_after_replacing(digest),
             )
             await self._save(opened)
             return self._log_window(
@@ -325,7 +363,13 @@ class ExecutorRolloutTracker:
         # window is NOT reopened or extended — withheld cycles would chain, and three in a row
         # are what trips the backend's 1-hour inactive sweep.
         # its previous release (the one just replaced) gets a fresh CURRENT grace of its own
-        chained = replace(state, digest=digest, previous_digest=state.digest, previous_current_cycles_seen=1)
+        chained = replace(
+            state,
+            digest=digest,
+            previous_digest=state.digest,
+            previous_current_cycles_seen=1,
+            earlier_current=state.earlier_after_replacing(digest),
+        )
         await self._save(chained)
         return self._log_window(
             "[rollout-grace] executor image changed again before one cycle after the "
@@ -384,6 +428,7 @@ class ExecutorRolloutTracker:
             cycles_seen=state.cycles_seen,
             grace_cycles=self.grace_cycles,
             previous_current_cycles_seen=state.previous_current_cycles_seen,
+            earlier_current=state.earlier_current,
         )
 
     async def _load(self) -> RolloutState:
@@ -416,29 +461,19 @@ def _observed_digest(result: JobResult) -> str | None:
 def rollout_grace_reason(result: JobResult, window: RolloutWindow, job_block: int) -> str | None:
     """The reason code this result's verdict is withheld for, or None when the verdict stands.
 
-    Withheld: the window covers this cycle, the run ended on one of `ROLLOUT_FAILURE_REASONS` (or
-    it ended without failing — the rented halt or finalize — with score 0 and the image check had
-    read OUTDATED: a rented executor's image check passes, so the run halts as RENTED instead of
-    failing), and, for every reason but OUTDATED, the executor's observed image is not the new
-    digest. The OUTDATED-without-failing case counts only while `EXECUTOR_IMAGE_CHECK_ENFORCE` is
-    on: off (the default since DAH-3439), the image check passes an OUTDATED node and leaves its
-    score alone, so a score of 0 under an OUTDATED report came from another gate (price cap, TDX) and stands. An executor that already runs
-    the new image failed for a reason of its own; a rented executor that failed a later check of
-    its own (pod not running, filler killed) failed for that reason, OUTDATED or not; and a result
-    with a score is never touched.
+    Withheld: the window covers this cycle, the run ended on one of `ROLLOUT_FAILURE_REASONS`, and,
+    for every reason but OUTDATED, the executor's observed image is not the new digest. A rented
+    OUTDATED node keeps its score (DAH-6845), so a rented run that ended without failing at score 0
+    under an OUTDATED report got that 0 from another gate (price cap, TDX) and stands. An executor
+    that already runs the new image failed for a reason of its own; a rented executor that failed a
+    later check of its own (pod not running, filler killed) failed for that reason, OUTDATED or not;
+    and a result with a score is never touched.
     """
     if not window.covers(job_block) or result.score > 0:
         return None
     reason = result.failure_reason_code
     if reason not in ROLLOUT_FAILURE_REASONS:
-        ended_without_failing = reason in RUN_ENDED_WITHOUT_FAILING
-        outdated = (
-            settings.EXECUTOR_IMAGE_CHECK_ENFORCE
-            and (result.executor_image_report or {}).get("status") == ImageVerdict.OUTDATED.value
-        )
-        if not (ended_without_failing and outdated):
-            return None
-        reason = _OUTDATED
+        return None
     # OUTDATED is withheld whatever the observed digest says: old = not pulled yet, new = the
     # validator's own snapshot predated the push. Every other reason on an executor that already
     # runs the new image is that executor's own failure.
@@ -483,6 +518,7 @@ def withhold_rollout_verdicts(
                         "job_block": job_block,
                         "reason_code": reason,
                         "observed_digest": _observed_digest(result),
+                        "is_rented": result.is_rented,
                         **window.as_extra(),
                     },
                 )
@@ -499,6 +535,7 @@ def withhold_renter_gpu_reset_verdicts(
 ) -> tuple[dict[str, list[JobResult]], list[WithheldVerdict]]:
     """DAH-4658: a scrape held for the renter's own GPU reset gets no verdict, as a rollout failure gets none.
     DAH-5805: neither does a run the validator's own Redis ended; the node is not scored 0 for it.
+    DAH-5933: nor a rental probe the task had no time left for, when no last scored result was carried.
     DAH-5851: neither does an idle node's port check deferred for disk pressure; it is never carried, so no
     idle pay comes from the republished ports."""
     standing_by_miner: dict[str, list[JobResult]] = {}
@@ -511,14 +548,23 @@ def withhold_renter_gpu_reset_verdicts(
             if not (redis_fault or port_check_deferred or _held_for_renter_gpu_reset(result)):
                 standing_by_miner[miner_hotkey].append(result)
                 continue
-            withheld.append(WithheldVerdict(miner_hotkey=miner_hotkey, result=result))
+            withheld.append(
+                WithheldVerdict(
+                    miner_hotkey=miner_hotkey,
+                    result=result,
+                    # the node's own checks can spend the task's time, and a provider can start a create on his own
+                    # node: neither keeps a miner active (reviews)
+                    keeps_miner_active=result.failure_reason_code not in NO_TASK_TIME_REASONS
+                    and result.failure_reason_code != TenantEnforcementMessages.RENTED_SINCE_CYCLE_START.reason,
+                )
+            )
             logger.info(
                 _m(
                     "Verdict withheld: the validator's Redis was unavailable"
                     if redis_fault
                     else "Verdict withheld: the port check was deferred for disk pressure"
                     if port_check_deferred
-                    else "Verdict withheld: the renter is resetting the node's GPUs, or its power tier is unknown",
+                    else "Verdict withheld: the renter is resetting the node's GPUs, its power tier is unknown, or the task had no time left for a check",
                     extra={
                         "miner_hotkey": miner_hotkey,
                         "executor_uuid": result.executor_info.uuid,
@@ -555,19 +601,169 @@ def withhold_session_lost_verdicts(
     return standing_by_miner, withheld
 
 
+# DAH-6564: failures a rental or filler that started or ended during the cycle produces (the checks judge the node
+# against the list read at the cycle start). An OUTDATED image fails only a node that list has free (DAH-6845), so a
+# rental that starts later in the cycle gets no verdict instead of a zero, and the next cycle scores it rented
+RENTAL_CHANGE_REASONS = frozenset(
+    {
+        PortCountMessages.INSUFFICIENT_PORTS.reason,
+        RentalVerificationMessages.FAILED.reason,
+        GpuUsageMessages.USAGE_HIGH.reason,
+        ExecutorImageMessages.OUTDATED.reason,
+    }
+)
+# one hash for the fleet: "<miner hotkey>:<executor uuid>" -> {"batches": [withheld job_batch_ids], "at": epoch}
+RENTAL_CHANGE_STATE_KEY = "rental_change_withheld"
+# cycles withheld by this rule since the node last passed; the backend's 45 min inactive sweep is not reset by it
+MAX_RENTAL_CHANGE_WITHHELD_CYCLES = 2
+RENTAL_CHANGE_STATE_MAX_AGE_SECONDS = 7 * 24 * 3600
+
+
+def has_rental_change_candidates(job_results: dict[str, list[JobResult]]) -> bool:
+    return any(
+        result.failure_reason_code in RENTAL_CHANGE_REASONS for results in job_results.values() for result in results
+    )
+
+
+def node_rentals(rented_data: RentedExecutorsResponse, miner_hotkey: str, result: JobResult) -> frozenset[str]:
+    """The node's pod ids and filler container names in one rented list, owned as the checks own them
+    (checks/rental_owner.py): the executor uuid is the miner's word."""
+    executor = result.executor_info
+    uuid = str(executor.uuid)
+    rental = rental_owned_by(rented_data.executors.get(uuid), miner_hotkey, executor.address, executor.port)
+    pods = {f"pod:{pod.pod_id}" for pod in rental.pods} if rental else set()
+    if listed_under_another_miner(rented_data, uuid, miner_hotkey):
+        return frozenset(pods)
+    return frozenset(pods | {f"filler:{name}" for name in rented_data.get_filler_containers(uuid)})
+
+
+def _rental_change(
+    result: JobResult,
+    miner_hotkey: str,
+    at_start: RentedExecutorsResponse,
+    at_end: RentedExecutorsResponse,
+    published_early: set[str],
+) -> tuple[frozenset[str], frozenset[str]] | None:
+    """(rentals at the cycle start, at its end) when the rule may withhold this failure, else None."""
+    reason = result.failure_reason_code
+    if reason not in RENTAL_CHANGE_REASONS or str(result.executor_info.uuid) in published_early:
+        return None
+    # a node that declares fewer ports than it needs fails whatever its rentals are
+    if result.validation_event and _is_the_nodes_own_fault(result.validation_event.model_dump()):
+        return None
+    # an earlier check's finding (a GPU fault) hides the node and must be published
+    if any(error.get("reason_code") != reason for error in result.availability_errors or []):
+        return None
+    before, after = node_rentals(at_start, miner_hotkey, result), node_rentals(at_end, miner_hotkey, result)
+    return None if before == after else (before, after)
+
+
+async def withhold_rental_change_verdicts(
+    job_results: dict[str, list[JobResult]],
+    rented_at_start: RentedExecutorsResponse,
+    rented_at_end: RentedExecutorsResponse | None,
+    redis_service: RedisService,
+    published_early: set[str],
+) -> tuple[dict[str, list[JobResult]], list[WithheldVerdict]]:
+    """DAH-6564: a ports, rental-check, GPU-usage or free-node outdated-image failure on a node whose pods or
+    fillers changed between the cycle-start list and the cycle-end list gets no verdict, at most
+    MAX_RENTAL_CHANGE_WITHHELD_CYCLES cycles since the node's last real pass. No cycle-end list, or Redis not
+    answering: every verdict stands."""
+    candidates = has_rental_change_candidates(job_results)
+    if candidates and rented_at_end is None:
+        logger.warning(_m("Rental-change rule: the cycle-end rented list gave no answer; every verdict stands"))
+    try:
+        state = {
+            (field.decode() if isinstance(field, bytes) else field): json.loads(raw)
+            for field, raw in (await redis_service.hgetall(RENTAL_CHANGE_STATE_KEY)).items()
+        }
+    except Exception as exc:
+        if candidates:
+            logger.warning(_m("Rental-change rule: state unreadable; every verdict stands", extra={"error": str(exc)}))
+        return job_results, []
+    now = time.time()
+    writes = RedisWrites()
+    standing: dict[str, list[JobResult]] = {}
+    pending: list[tuple[WithheldVerdict, dict]] = []
+    for miner_hotkey, results in job_results.items():
+        standing[miner_hotkey] = []
+        for result in results:
+            field = f"{miner_hotkey}:{result.executor_info.uuid}"
+            change = None
+            if result.is_successful and not result.carried_for_renter_gpu_reset:
+                if field in state:
+                    writes.hdel(RENTAL_CHANGE_STATE_KEY, field)
+                    state.pop(field)
+            elif rented_at_end is not None:
+                change = _rental_change(result, miner_hotkey, rented_at_start, rented_at_end, published_early)
+            if change is None:
+                standing[miner_hotkey].append(result)
+                continue
+            before, after = change
+            batches = state.get(field, {}).get("batches", [])
+            extra = {
+                "miner_hotkey": miner_hotkey,
+                "executor_uuid": result.executor_info.uuid,
+                "job_batch_id": result.job_batch_id,
+                "reason_code": result.failure_reason_code,
+                "started": sorted(after - before),
+                "ended": sorted(before - after),
+            }
+            if result.job_batch_id not in batches and len(batches) >= MAX_RENTAL_CHANGE_WITHHELD_CYCLES:
+                logger.info(
+                    _m(
+                        "Rental-change rule: cap reached, the verdict stands",
+                        extra={**extra, "withheld_cycles_since_pass": len(batches)},
+                    )
+                )
+                standing[miner_hotkey].append(result)
+                continue
+            if result.job_batch_id not in batches:
+                batches = [*batches, result.job_batch_id]
+            state[field] = {"batches": batches, "at": now}
+            writes.hset(RENTAL_CHANGE_STATE_KEY, field, json.dumps(state[field]))
+            pending.append(
+                (
+                    WithheldVerdict(miner_hotkey=miner_hotkey, result=result, keeps_miner_active=False),
+                    {**extra, "withheld_cycles_since_pass": len(batches)},
+                )
+            )
+    for field, entry in state.items():
+        if now - entry.get("at", 0) > RENTAL_CHANGE_STATE_MAX_AGE_SECONDS:
+            writes.hdel(RENTAL_CHANGE_STATE_KEY, field)
+    try:
+        await redis_service.write_atomically(writes)
+    except Exception as exc:
+        if pending:
+            logger.warning(_m("Rental-change rule: state not written; every verdict stands", extra={"error": str(exc)}))
+        return job_results, []
+    for withheld, extra in pending:
+        logger.info(_m("Verdict withheld: the node's rentals or fillers changed during the cycle", extra=extra))
+    return standing, [withheld for withheld, _ in pending]
+
+
 def session_kept_hotkeys(withheld_results: list[WithheldVerdict]) -> set[str]:
     """The miners a withheld verdict keeps active this cycle. Not one whose session died in the port check (review
-    4469609776): a miner can close SSH itself, and that must not earn the eligibility floor."""
-    return {withheld.miner_hotkey for withheld in withheld_results if not withheld.result.session_lost_in_port_check}
+    4469609776): a miner can close SSH itself, and that must not earn the eligibility floor. Nor one withheld for a
+    rental change (DAH-6564): a provider can change his own node's rentals."""
+    return {
+        withheld.miner_hotkey
+        for withheld in withheld_results
+        if withheld.keeps_miner_active and not withheld.result.session_lost_in_port_check
+    }
 
 
 def has_renter_gpu_reset_holds(job_results: dict[str, list[JobResult]]) -> bool:
     return any(_held_for_renter_gpu_reset(result) for results in job_results.values() for result in results)
 
 
-# a cycle that cannot tell the node's state gives no verdict: the renter's GPU reset (DAH-4658), or a power tier
-# reading whose clear was not confirmed (F-43)
-_HELD_REASONS = (MachineSpecMessages.SCRAPE_GPU_RESET_IN_PROGRESS.reason, GpuPowerLimitMessages.TIER_STATE_UNKNOWN.reason)
+# a cycle that cannot tell the node's state gives no verdict: the renter's GPU reset (DAH-4658), a power tier
+# reading whose clear was not confirmed (F-43), or a check the task had no time left for (DAH-5933)
+_HELD_REASONS = (
+    MachineSpecMessages.SCRAPE_GPU_RESET_IN_PROGRESS.reason,
+    GpuPowerLimitMessages.TIER_STATE_UNKNOWN.reason,
+    *CYCLE_END_READ_REASONS,
+)
 
 
 def _held_for_renter_gpu_reset(result: JobResult) -> bool:
@@ -586,28 +782,109 @@ _FRESH_PAY_FIELDS = (
 )
 
 
+def rental_pod_ids(rental: RentedExecutor | None) -> frozenset[str] | None:
+    """The rental state a carry compares: no rental -> empty, a rental -> its pod ids, one listed with no pod -> None."""
+    if rental is None:
+        return frozenset()
+    if not rental.pods:
+        return None
+    return frozenset(str(pod.pod_id) for pod in rental.pods)
+
+
+def rental_state_unchanged(
+    held: JobResult,
+    previous: JobResult | None,
+    rental_at_start: RentedExecutor | None,
+    rental_at_end: RentedExecutor | None,
+) -> bool:
+    """The one rule every carry goes through (DAH-5933): a kept result stands in for a held cycle only when it was
+    scored with exactly the node's rental state that cycle saw at its start (the snapshot) and at the cycle-end read:
+    no rental, or the same rental pod ids holding the same known GPU count. A cycle that itself saw the node rented
+    after its start (RENTED_AFTER_START_REASONS: found during the check, or a renter's create it stopped for) saw a
+    change. Anything else is withheld: never scored or paid.
+    `rental_at_start` / `rental_at_end` are the node's own rentals (rental_owned_by), None for none."""
+    if held.failure_reason_code in RENTED_AFTER_START_REASONS:
+        return False
+    if previous is None or previous.rental_pod_ids is None:
+        return False
+    at_start, at_end = rental_pod_ids(rental_at_start), rental_pod_ids(rental_at_end)
+    if at_start is None or at_end is None or not at_start == at_end == frozenset(previous.rental_pod_ids):
+        return False
+    if previous.is_rented != bool(at_end):
+        return False
+    if not at_end:
+        return True
+    # a split node is paid rented and idle GPUs apart: the same pods holding another count, or a count nobody knows,
+    # is not the allocation the kept result was scored with
+    count_at_end = rental_gpu_count(rental_at_end)
+    return count_at_end is not None and rental_gpu_count(rental_at_start) == count_at_end == previous.rented_gpu_count
+
+
 async def carry_renter_gpu_reset_results(
     job_results: dict[str, list[JobResult]],
     redis_service: RedisService,
     rented_executor_ids: set[str],
     rented_data: RentedExecutorsResponse | None,
     miner_coldkeys: dict[str, str | None],
+    rented_at_end: RentedExecutorsResponse | None = None,
+    *,
+    job_block: int,
 ) -> None:
-    """DAH-4658: a scrape held for the renter's own GPU reset takes the node's last scored result, in place.
-
-    The provider loses nothing: the carried result is scored as in the cycle it came from, with this cycle's
-    pay flags and a fresh ban lookup. A node the backend no longer lists as rented (`rented_executor_ids`,
-    lower-case), or without a readable last result, keeps the held one, and `withhold_renter_gpu_reset_verdicts`
-    takes it out.
+    """DAH-4658: a held scrape (the renter's own GPU reset, an unconfirmed power tier, no task time) takes the node's
+    last scored result, in place, scored as in the cycle it came from with this cycle's pay flags and a fresh ban
+    lookup. It carries only by `rental_state_unchanged`, on the cycle-start snapshot `rented_data` and the cycle-end
+    read `rented_at_end`. With no end read (None: the backend gave none) a GPU-reset or power-tier hold still carries,
+    on the start snapshot: its own scrape ran inside that rental; a no-task-time or rented-during-check one does not. A kept result that fails the rule is
+    dropped, and so is one a cycle saw rented after its start even when a read is missing: the rental state it was
+    scored with is gone. A held result not carried is taken out by
+    `withhold_renter_gpu_reset_verdicts`. The GPU-reset and power-tier holds carry a rented node only; a no-task-time
+    hold carries a rented or an idle node once (`_spend_kept_result`, `_take_idle_pass`). A kept result is eligible
+    only while every cycle since it was scored vouched for it (`_last_scored_result`, `_take_idle_pass`).
+    `rented_executor_ids` is kept for the caller's signature.
     """
+    def by_uuid(rented: RentedExecutorsResponse | None) -> dict[str, RentedExecutor] | None:
+        return None if rented is None else {str(uuid).lower(): rental for uuid, rental in rented.executors.items()}
+
+    rentals_at_start, rentals_at_end = by_uuid(rented_data), by_uuid(rented_at_end)
     for miner_hotkey, results in job_results.items():
         for index, held in enumerate(results):
             if not _held_for_renter_gpu_reset(held):
                 continue
-            if str(held.executor_info.uuid).lower() not in rented_executor_ids:
-                continue
-            previous = await _last_scored_result(redis_service, miner_hotkey, held)
+            previous = _take_idle_pass(miner_hotkey, held, job_block)
+            in_redis = previous is None
+            if in_redis:
+                previous = await _last_scored_result(redis_service, miner_hotkey, held, job_block)
             if previous is None:
+                continue
+            # a GPU-reset or power-tier hold carries a rented node only, on its start snapshot as before this change:
+            # its own scrape ran inside that rental. A no-task-time or rented-during-check cycle needs the end read
+            needs_end_read = held.failure_reason_code in CYCLE_END_READ_REASONS
+            if rentals_at_start is None or (rentals_at_end is None and needs_end_read):
+                # a rental state that cannot be read carries nothing; one the cycle saw change still drops the kept result
+                seen_rented = held.failure_reason_code in RENTED_AFTER_START_REASONS
+                if in_redis and seen_rented:
+                    await _spend_kept_result(redis_service, miner_hotkey, held)
+                continue
+            info = held.executor_info
+            uuid = str(info.uuid).lower()
+            # owned as the checks own it: the uuid is the miner's word, so another miner's rental on another endpoint
+            # under it is not this node's (review at a8afce8)
+            rental_at_start = rental_owned_by(rentals_at_start.get(uuid), miner_hotkey, info.address, info.port)
+            rental_at_end = (
+                rental_at_start
+                if rentals_at_end is None
+                else rental_owned_by(rentals_at_end.get(uuid), miner_hotkey, info.address, info.port)
+            )
+            if not rental_state_unchanged(held, previous, rental_at_start, rental_at_end):
+                if in_redis:
+                    await _spend_kept_result(redis_service, miner_hotkey, held)
+                continue
+            no_task_time = held.failure_reason_code in NO_TASK_TIME_REASONS
+            rented_now = rental_at_end is not None
+            if not no_task_time and not rented_now:
+                continue
+            rented_gpu_count = rental_gpu_count(rental_at_end) if rented_now else 0
+            if no_task_time and in_redis and not await _spend_kept_result(redis_service, miner_hotkey, held):
                 continue
             results[index] = previous.model_copy(
                 update={
@@ -626,14 +903,14 @@ async def carry_renter_gpu_reset_results(
                         if rented_data
                         else previous.filler_revenue_usd_per_hour
                     ),
-                    # the hold ends the run before the rented check, so the held result counts no rented GPU
-                    "rented_gpu_count": pods_rented_gpu_count(rented_data, str(held.executor_info.uuid))
-                    or previous.rented_gpu_count,
+                    "rented_gpu_count": rented_gpu_count or previous.rented_gpu_count,
                 }
             )
             logger.info(
                 _m(
-                    "Score carried: the renter is resetting the node's GPUs, the last scored result stands",
+                    "Score carried: the task had no time left for a check, the last scored result stands"
+                    if no_task_time
+                    else "Score carried: the renter is resetting the node's GPUs, the last scored result stands",
                     extra={
                         "miner_hotkey": miner_hotkey,
                         "executor_uuid": held.executor_info.uuid,
@@ -677,13 +954,68 @@ def _filler_revenue_now(rented_data: RentedExecutorsResponse | None, previous: J
     )
 
 
-async def _last_scored_result(
-    redis_service: RedisService, miner_hotkey: str, held: JobResult
-) -> JobResult | None:
-    """None when there is none or it cannot be read: the held result is then withheld, as before."""
+async def _spend_kept_result(redis_service: RedisService, miner_hotkey: str, held: JobResult) -> bool:
+    """Drops the node's kept result. A cycle the task had no time for carries the last pass once: the next such
+    cycle, with no pass between, is withheld. The node's own checks spend the task's time, so a node that keeps
+    running out of it never keeps its score (review). A kept result invalidated by a rental change is dropped here
+    too. False when it could not be deleted: the held result is withheld then, and since a withheld cycle vouches for
+    nothing, the row left behind is not eligible in any later cycle either (`_last_scored_result`)."""
     try:
-        raw = await redis_service.get(last_scored_result_key(miner_hotkey, held.executor_info.uuid))
-        return JobResult.model_validate_json(raw) if raw else None
+        await redis_service.delete(last_scored_result_key(miner_hotkey, held.executor_info.uuid))
+        return True
+    except Exception as exc:
+        logger.warning(
+            _m(
+                "Kept result could not be dropped; the held verdict is withheld",
+                extra={"miner_hotkey": miner_hotkey, "executor_uuid": held.executor_info.uuid, "error": str(exc)},
+            )
+        )
+        return False
+
+
+# DAH-5933: each node's idle pass of the last cycle, in this process only and never in Redis: taking or dropping one
+# cannot fail, and a restart starts with none (the next held cycle is withheld). (result, job block it was scored on)
+_idle_passes: dict[tuple[str, str], tuple[JobResult, int]] = {}
+
+
+def _take_idle_pass(miner_hotkey: str, held: JobResult, job_block: int) -> JobResult | None:
+    """The node's idle pass kept by the cycle right before this one, or None. Taken on read, so whatever this cycle
+    decides, no later cycle finds it; only a pass this cycle scores is kept for the next."""
+    kept = _idle_passes.pop((miner_hotkey, held.executor_info.uuid), None)
+    if kept is None or kept[1] < job_block - settings.BLOCKS_FOR_JOB:
+        return None
+    return kept[0]
+
+
+async def _last_scored_result(
+    redis_service: RedisService, miner_hotkey: str, held: JobResult, job_block: int
+) -> JobResult | None:
+    """The node's kept rented result (an idle one is `_take_idle_pass`'s), or None: none, unreadable, or not vouched
+    for by the cycle right before this one (the held result is then withheld, as before). Eligibility is a fact of
+    the store, not of a process: every cycle that keeps the result eligible writes its job block with the cycle's
+    results (`remember_rented_scored_results`). A cycle that dropped it, withheld the node, or wrote nothing at all
+    (a Redis outage, a restart) leaves no vouch, so a row such a cycle could not delete is never read as eligible
+    again. The read takes the vouch it finds, so a cycle that shares the job block of the one before it cannot
+    leave that cycle's vouch behind."""
+    try:
+        # the read spends the vouch: only this cycle's own write can vouch for the next one, so a cycle that drops the
+        # result (on any job block) and cannot delete it leaves nothing a later cycle accepts
+        raw, vouch = await redis_service.read_and_take(
+            last_scored_result_key(miner_hotkey, held.executor_info.uuid),
+            last_scored_result_vouch_key(miner_hotkey, held.executor_info.uuid),
+        )
+        if not raw:
+            return None
+        # a cycle an operator asks for runs on the job block of the cycle before it, so the vouch may be this block too
+        if vouch is None or int(vouch) < job_block - settings.BLOCKS_FOR_JOB:
+            logger.info(
+                _m(
+                    "Last scored result not vouched for by the previous cycle; the held verdict is withheld",
+                    extra={"miner_hotkey": miner_hotkey, "executor_uuid": held.executor_info.uuid, "vouch": vouch},
+                )
+            )
+            return None
+        return JobResult.model_validate_json(raw)
     except Exception as exc:
         logger.warning(
             _m(
@@ -695,24 +1027,40 @@ async def _last_scored_result(
 
 
 async def remember_rented_scored_results(
-    job_results: dict[str, list[JobResult]], redis_service: RedisService
+    job_results: dict[str, list[JobResult]], redis_service: RedisService, *, job_block: int
 ) -> None:
-    """DAH-4658: keep each rented node's scored result of this cycle for `carry_renter_gpu_reset_results`.
+    """DAH-4658: keep each node's scored result of this cycle for `carry_renter_gpu_reset_results`.
 
     Any other standing result drops the kept one, so only the cycle right before a reset is carried.
     A carried result is not kept again, so the TTL bounds how long one result can stand in. A Redis
     error only logs: the next cycle writes again.
+
+    A rented pass is kept in Redis, as on main, and in the same write each node whose kept rented result stays
+    eligible (a new pass, or a carried one) is vouched for at `job_block`; a node withheld this cycle is left out of
+    `job_results` and gets no vouch (`_last_scored_result`). DAH-5933: an idle pass is kept in this process only
+    (`_take_idle_pass`), and the cycle's idle passes replace the last cycle's, so a node withheld this cycle has none.
     """
     writes = RedisWrites()
+    idle_passes: dict[tuple[str, str], tuple[JobResult, int]] = {}
     for miner_hotkey, results in job_results.items():
         for result in results:
+            vouch = last_scored_result_vouch_key(miner_hotkey, result.executor_info.uuid)
             if result.carried_for_renter_gpu_reset:
+                if result.is_rented:
+                    writes.set(vouch, str(job_block), ex=LAST_SCORED_RESULT_TTL_SECONDS)
                 continue
             key = last_scored_result_key(miner_hotkey, result.executor_info.uuid)
             if result.is_rented and result.is_successful:
                 writes.set(key, result.model_dump_json(), ex=LAST_SCORED_RESULT_TTL_SECONDS)
-            else:
-                writes.delete(key)
+                writes.set(vouch, str(job_block), ex=LAST_SCORED_RESULT_TTL_SECONDS)
+                continue
+            writes.delete(key)
+            writes.delete(vouch)
+            if result.is_successful:
+                # a copy as it stands now, as the rented pass's Redis copy is: scoring later sets flags on `result`
+                idle_passes[(miner_hotkey, result.executor_info.uuid)] = (result.model_copy(deep=True), job_block)
+    _idle_passes.clear()
+    _idle_passes.update(idle_passes)
     try:
         await redis_service.write_atomically(writes)
     except Exception as exc:

@@ -45,3 +45,36 @@ async def test_records_nothing_and_never_raises_without_a_digest(repo_digests, e
     )
 
     assert await redis.get(f"{FILLER_IMAGE_DIGESTS_PREFIX}filler_x") is None
+
+
+@pytest.mark.asyncio
+async def test_records_the_image_repository_the_filler_was_started_from():
+    from services.redis_service import FILLER_IMAGE_REPOSITORY_PREFIX
+
+    redis = FakeRedis()
+
+    await DockerService._record_filler_image_best_effort(
+        SimpleNamespace(redis_service=redis), _docker(()), "img", "filler_x", {}, "docker.io/daturaai/pearl-miner:0.5.0"
+    )
+
+    assert await redis.get(f"{FILLER_IMAGE_REPOSITORY_PREFIX}filler_x") == "daturaai/pearl-miner"
+
+
+@pytest.mark.asyncio
+async def test_a_failed_repository_write_still_records_the_digests():
+    from services.redis_service import FILLER_IMAGE_REPOSITORY_PREFIX
+
+    class RepositoryWriteFails(FakeRedis):
+        async def set(self, key, value, *args, **kwargs):
+            if key.startswith(FILLER_IMAGE_REPOSITORY_PREFIX):
+                raise OSError("redis gone")
+            return await super().set(key, value, *args, **kwargs)
+
+    redis = RepositoryWriteFails()
+
+    await DockerService._record_filler_image_best_effort(
+        SimpleNamespace(redis_service=redis), _docker(("daturaai/pearl-miner@sha256:aaa",)), "img", "filler_x", {},
+        "daturaai/pearl-miner:0.5.0",
+    )
+
+    assert await redis.get(f"{FILLER_IMAGE_DIGESTS_PREFIX}filler_x") == '["sha256:aaa"]'

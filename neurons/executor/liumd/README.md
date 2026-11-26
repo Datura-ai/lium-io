@@ -3,12 +3,17 @@
 The executor image installs the vendored `liumd-amd64` or `liumd-arm64` binary at
 `/usr/local/bin/liumd`.
 
-Both files are the unsigned CI artifacts built from the liumd source head `25f8f05508ac`:
+Both files are the unsigned build artifacts built from the liumd merged source `7f4249f9c6fe`:
 
 | binary | sha256 |
 | --- | --- |
-| `liumd-amd64` | `1b88754fd33a515cd98e68c94a21b0aaa833f1a0e06d56e5176da3876b6d1555` |
-| `liumd-arm64` | `cc12eda4fb8042a6aa60d957e52a8ed674d67d9bda29f26ec6d4a765ccba4625` |
+| `liumd-amd64` | `042583398bdd26daa1e789815496dc33c91e051f5ab0551f4ac262c5cf66f1da` |
+| `liumd-arm64` | `6c5977e3713918c3910e32a8ec223ed0f20be1a04eb499f4941e38bada4d889d` |
+
+This build adds `data_sysbox_layer_reset_version` (lium-platform#3411) and
+`hard_disk_unsized_containers` (lium-platform#3405).
+It also keeps an NVIDIA GB10 card whose driver reports its memory as Not Supported, and gives the
+local-volume walk its own time budget after the layer reads.
 
 `provenance-amd64.json`/`provenance-arm64.json` are the same run's metadata, kept beside the
 binaries for traceability. `manifest.json` is the validator refresh manifest: it names the

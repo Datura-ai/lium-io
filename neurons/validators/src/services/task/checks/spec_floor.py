@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import re
 
-from core.config import settings
-
 from ..messages import SpecFloorMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
@@ -16,6 +14,13 @@ _GPU_UUID = re.compile(
     r"^GPU-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE
 )
 _ZERO_UUID = "GPU-00000000-0000-0000-0000-000000000000"
+# the scrape hashes the docker, nvidia-smi and libnvidia-ml files as "<md5>:<sha256>"
+_FILE_CHECKSUM = re.compile(r"^[0-9a-f]{32}:[0-9a-f]{64}$")
+# md5 and sha256 of zero bytes: none of those files is empty on a real host
+_EMPTY_INPUT_DIGESTS = {
+    "d41d8cd98f00b204e9800998ecf8427e",
+    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+}
 
 
 def _int(value) -> int:
@@ -41,13 +46,28 @@ def spec_floor_findings(specs: dict) -> list[str]:
     # already fails a node whose distinct card set is short.
     if any(not _GPU_UUID.match(u) or u.upper() == _ZERO_UUID for u in uuids):
         findings.append("gpu_uuid_format")
+    checksums = specs.get("md5_checksums")
+    # absent as a whole, the NVML digest check fails the node on its missing libnvidia-ml digest
+    if checksums is not None and not _file_checksums_plausible(checksums):
+        findings.append("file_checksums")
     return findings
+
+
+def _file_checksums_plausible(checksums) -> bool:
+    if not isinstance(checksums, dict):
+        return False
+    for name in ("docker", "nvidia_smi", "libnvidia_ml"):
+        value = checksums.get(name)
+        if not isinstance(value, str) or not _FILE_CHECKSUM.match(value):
+            return False
+        if _EMPTY_INPUT_DIGESTS & set(value.split(":")):
+            return False
+    return True
 
 
 class SpecFloorCheck:
     """Hard floors on the scraped specs: CPU cores, RAM per GPU, GPU count against the listed cards, GPU UUID
-    format. Pure data, before the rented short-circuit. With SPEC_FLOOR_ENFORCEMENT_ENABLED off, a node below
-    the floors is logged with its findings only. On: fatal on an idle node; under a live rental the run goes on
+    format, the file checksums' shape (none of an empty file). Pure data, before the rented short-circuit. Fatal on an idle node; under a live rental the run goes on
     to the rented-pod checks and the score is zeroed through spec_floor_passed."""
 
     check_id = "host.validate.spec_floor"
@@ -58,11 +78,7 @@ class SpecFloorCheck:
         if not findings:
             event = render_message(Msg.OK, ctx=ctx, check_id=self.check_id, what={})
             return CheckResult(passed=True, event=event)
-        what = {"findings": findings}
-        if not settings.SPEC_FLOOR_ENFORCEMENT_ENABLED:
-            event = render_message(Msg.WARNING, ctx=ctx, check_id=self.check_id, what=what)
-            return CheckResult(passed=True, event=event)
-        event = render_message(Msg.REJECTED, ctx=ctx, check_id=self.check_id, what=what)
+        event = render_message(Msg.REJECTED, ctx=ctx, check_id=self.check_id, what={"findings": findings})
         if not has_live_rental(ctx):
             return CheckResult(passed=False, event=event)
         return CheckResult(

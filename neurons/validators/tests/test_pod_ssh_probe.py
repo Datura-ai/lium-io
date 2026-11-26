@@ -433,7 +433,6 @@ async def test_the_published_spec_carries_the_observations_and_the_backend_reads
 
     with patch("services.miner_service.settings") as settings:
         settings.DRY_RUN = False
-        settings.POD_STATES_REPORT_ENABLED = False
         await MinerService.publish_machine_specs(
             service, result, "hk-E2", "ck-E2", is_whole_miner_batch=False
         )
@@ -468,7 +467,6 @@ async def test_the_published_spec_carries_the_ssh_host_key():
 
     with patch("services.miner_service.settings") as settings:
         settings.DRY_RUN = False
-        settings.POD_STATES_REPORT_ENABLED = False
         await MinerService.publish_machine_specs(
             service, results, "hk-E2", "ck-E2", is_whole_miner_batch=False
         )
@@ -499,7 +497,6 @@ async def test_the_published_spec_carries_host_runtime_fault(fault):
 
     with patch("services.miner_service.settings") as settings:
         settings.DRY_RUN = False
-        settings.POD_STATES_REPORT_ENABLED = False
         await MinerService.publish_machine_specs(service, [result], "hk-E3", "ck-E3", is_whole_miner_batch=False)
 
     (_channel, payload), _ = service.redis_service.publish.call_args
@@ -526,7 +523,6 @@ async def test_an_unverified_ssh_host_key_is_not_forwarded():
 
     with patch("services.miner_service.settings") as settings:
         settings.DRY_RUN = False
-        settings.POD_STATES_REPORT_ENABLED = False
         await MinerService.publish_machine_specs(
             service, results, "hk-E2", "ck-E2", is_whole_miner_batch=False
         )
