@@ -506,6 +506,7 @@ async def reset_leftover_clock_locks(
     keep_pod_id: str | None = None,
     expected: dict[str, str] | None = None,
     purpose: str = "check",
+    node_id: str | None = None,
 ) -> list[str]:
     """Safety net before a create: `-rgc` every GPU of the new pod (None/empty = every host GPU), with or
     without a lock record, so neither a lost record nor a lock set outside Lium hands a renter locked clocks (as
@@ -514,7 +515,8 @@ async def reset_leftover_clock_locks(
     or 4: nobody locked it from here) is not counted; any other failure is, record or not. While Redis cannot say
     which GPUs have a record, every failed reset counts. A GPU whose record names `keep_pod_id` (the pod's own edit or reboot) keeps its lock and
     record (review). `expected` (uuid -> the record read before the GPU lock) resets only a GPU whose record is
-    still that one: a new renter's lock taken meanwhile is left alone (review F-83)."""
+    still that one: a new renter's lock taken meanwhile is left alone (review F-83). A GPU with no record whose reset gave no
+    answer is logged per GPU, not counted, for now (review 6076421144: staged until a week of 8-GPU creates is read)."""
     if not gpu_uuids:
         host = await _run(runner, HOST_GPUS_COMMAND)
         gpu_uuids = [gpu.uuid for gpu in parse_host_gpus(host.stdout or "")]
@@ -526,11 +528,20 @@ async def reset_leftover_clock_locks(
                 return []  # unknown: touch nothing, the caller judges again next cycle
             if not gpu_uuids:
                 return []
-        return await _reset_leftovers(runner, redis, gpu_uuids, keep_pod_id, purpose)
+        return await _reset_leftovers(runner, redis, gpu_uuids, keep_pod_id, purpose, node_id)
+
+
+def _no_answer(failure: str | None) -> bool:
+    return failure is not None and failure.endswith("gave no answer")
 
 
 async def _reset_leftovers(
-    runner: SSHCommandRunner, redis: RedisService, gpu_uuids: list[str], keep_pod_id: str | None, purpose: str
+    runner: SSHCommandRunner,
+    redis: RedisService,
+    gpu_uuids: list[str],
+    keep_pod_id: str | None,
+    purpose: str,
+    node_id: str | None = None,
 ) -> list[str]:
     try:
         raws = {uuid: await redis.get(_lock_key(uuid)) for uuid in gpu_uuids}
@@ -547,12 +558,19 @@ async def _reset_leftovers(
         await _forget(redis, [uuid for uuid, failure in failures.items() if failure is None])
     except Exception:
         pass  # the GPUs are reset; a record left over costs the next create one more -rgc (review)
-    # fail closed: a GPU with no verdict (its -rgc killed on the host, or its line lost) may still hold lowered clocks,
-    # record or not; only a completed exit 3/4 on an unrecorded GPU (no clock control from here) is not counted
+    # fail closed on a recorded GPU and on any answered failure; a completed exit 3/4 on an unrecorded GPU (no clock
+    # control from here) is not counted. An unrecorded GPU with no answer has no sign we lowered its clocks: logged only
+    # shortcut: staged rollout (review 6076421144), flip to counted after a week of reset_outcome lines from 8-GPU creates
     refused = [
         uuid for uuid in gpu_uuids
-        if failures[uuid] is not None and (uuid in recorded or failures[uuid] not in _NO_CLOCK_CONTROL)
+        if failures[uuid] is not None
+        and (uuid in recorded or (failures[uuid] not in _NO_CLOCK_CONTROL and not _no_answer(failures[uuid])))
     ]
+    for uuid in (u for u in gpu_uuids if u not in recorded and _no_answer(failures[u])):
+        logger.warning(
+            "gpu_clock_action=reset_no_answer_unrecorded purpose=%s node=%s pod=%s gpu=%s failure=%s",
+            purpose, node_id or "-", keep_pod_id or "-", uuid, failures[uuid],
+        )
     for uuid in (u for u in gpu_uuids if failures[u] is not None):
         logger.warning(
             "gpu_clock_action=rgc_failed gpu=%s recorded=%s failure=%s",

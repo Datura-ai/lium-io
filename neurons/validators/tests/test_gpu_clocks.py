@@ -408,16 +408,24 @@ async def test_an_answered_failed_or_not_found_application_or_memory_reset_keeps
 @pytest.mark.parametrize("app_mem_exit", [None, 137], ids=["no-line", "killed"])
 @pytest.mark.parametrize("rgc_exit", [0, 3, 4])
 @pytest.mark.parametrize("recorded", [False, True])
-async def test_an_application_or_memory_reset_that_gave_no_answer_refuses_the_create_as_a_no_answer_rgc_does(
-    app_mem_exit, rgc_exit, recorded
+async def test_an_application_or_memory_reset_that_gave_no_answer_refuses_the_create_only_on_a_recorded_gpu(
+    app_mem_exit, rgc_exit, recorded, caplog
 ):
-    """Ruling: any clock reset of a GPU that gave no answer (graphics, application or memory) leaves its clocks
-    unknown, so the GPU refuses the create, with or without a lock record, and a record stays for the next try."""
+    """Any clock reset that gave no answer (graphics, application or memory) leaves the GPU's clocks unknown: a GPU with
+    a lock record refuses the create and keeps its record; one without is logged per GPU and the create goes on (review
+    6076421144, staged until a week of 8-GPU creates is read)."""
     host, redis = FakeHost(rgc_exit=rgc_exit, app_mem_exit=app_mem_exit), FakeRedis()
     if recorded:
         redis.store[f"gpu_clock_lock:{U[0]}"] = json.dumps({"pod_id": "old"})
-    assert await reset_leftover_clock_locks(host, redis, [U[0], U[1]]) == [U[0], U[1]]
+    with caplog.at_level("WARNING", logger="services.gpu_clocks"):
+        refused = await reset_leftover_clock_locks(
+            host, redis, [U[0], U[1]], keep_pod_id="pod9", purpose="create", node_id="node7"
+        )
+    assert refused == ([U[0]] if recorded else [])
     assert (f"gpu_clock_lock:{U[0]}" in redis.store) == recorded
+    logged = [r.getMessage() for r in caplog.records if "reset_no_answer_unrecorded" in r.getMessage()]
+    assert len(logged) == (1 if recorded else 2)
+    assert logged[-1].startswith(f"gpu_clock_action=reset_no_answer_unrecorded purpose=create node=node7 pod=pod9 gpu={U[1]} ")
 
 
 @pytest.mark.asyncio
@@ -454,13 +462,13 @@ async def test_every_create_reset_logs_one_outcome_line(rgc_exit, app_mem_exit, 
 
 
 @pytest.mark.asyncio
-async def test_a_gpu_whose_rgc_was_killed_has_no_verdict_and_refuses_the_create_record_or_not():
-    """Fail closed: a -rgc killed on the host gave no verdict, so the GPU may still hold lowered clocks; it refuses the
-    create without a lock record too, and a recorded one keeps its record."""
+async def test_a_gpu_whose_rgc_was_killed_has_no_verdict_and_refuses_the_create_only_with_a_record():
+    """A -rgc killed on the host gave no verdict: a recorded GPU may still hold our lowered clocks, so it refuses the
+    create and keeps its record; an unrecorded one is logged only (review 6076421144)."""
     host, redis = FakeHost(rgc_exit=137), FakeRedis()
-    assert await reset_leftover_clock_locks(host, redis, [U[0], U[1]]) == [U[0], U[1]]
+    assert await reset_leftover_clock_locks(host, redis, [U[0], U[1]]) == []
     redis.store[f"gpu_clock_lock:{U[0]}"] = json.dumps({"pod_id": "old"})
-    assert await reset_leftover_clock_locks(host, redis, [U[0], U[1]]) == [U[0], U[1]]
+    assert await reset_leftover_clock_locks(host, redis, [U[0], U[1]]) == [U[0]]
     assert f"gpu_clock_lock:{U[0]}" in redis.store
 
 
@@ -716,25 +724,25 @@ async def test_the_pods_own_edit_or_reboot_keeps_its_lock_and_another_pods_creat
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("recorded", [[], [U[1]]], ids=["no-records", "one-record"])
-async def test_a_create_reset_whose_ssh_call_fails_answers_every_gpu(recorded):
+async def test_a_create_reset_whose_ssh_call_fails_refuses_on_every_recorded_gpu(recorded):
     host, redis = FakeHost(), FakeRedis()
     for uuid in recorded:
         redis.store[f"gpu_clock_lock:{uuid}"] = json.dumps({"pod_id": "old"})
     host.run = AsyncMock(side_effect=OSError("connection lost"))
 
-    assert await reset_leftover_clock_locks(host, redis, [U[0], U[1]]) == [U[0], U[1]]
+    assert await reset_leftover_clock_locks(host, redis, [U[0], U[1]]) == recorded
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("recorded", [[], [U[0], U[1]]], ids=["no-records", "both-recorded"])
 async def test_a_create_reset_that_overruns_keeps_the_answered_gpus_and_refuses_on_the_unanswered(recorded):
     """The call's answer is lost past the runner's budget: the GPU that answered is read back from the host's results
-    file (its record goes), and only the unanswered one refuses the create, with or without a lock record."""
+    file (its record goes), and only the unanswered one refuses the create, when it has a lock record."""
     host, redis = FakeHost(rgc_exit=None, answered=[U[0]]), FakeRedis()
     for uuid in recorded:
         redis.store[f"gpu_clock_lock:{uuid}"] = json.dumps({"pod_id": "old"})
 
-    assert await reset_leftover_clock_locks(host, redis, [U[0], U[1]]) == [U[1]]
+    assert await reset_leftover_clock_locks(host, redis, [U[0], U[1]]) == ([U[1]] if recorded else [])
     assert host.commands[-1].startswith("cat /tmp/lium-gpu-clock-reset-") and host.files == {}, "read back, removed"
     assert f"gpu_clock_lock:{U[0]}" not in redis.store
     assert (f"gpu_clock_lock:{U[1]}" in redis.store) == bool(recorded)
@@ -764,9 +772,15 @@ async def test_a_partial_answer_counts_its_lines_whatever_the_calls_exit_code(ca
 
 
 @pytest.mark.asyncio
-async def test_a_create_reset_that_overruns_with_no_line_refuses_every_gpu_without_a_lock_record():
+async def test_a_create_reset_that_overruns_with_no_line_goes_on_for_gpus_without_a_lock_record():
     host, redis = FakeHost(rgc_exit=None), FakeRedis()
-    assert await reset_leftover_clock_locks(host, redis, [U[0], U[1]]) == [U[0], U[1]]
+    assert await reset_leftover_clock_locks(host, redis, [U[0], U[1]]) == []
+
+
+@pytest.mark.asyncio
+async def test_an_unrecorded_gpus_answered_failed_reset_still_refuses_the_create():
+    """Log-only covers no answer only: an answered failure (not 3/4) refuses, record or not."""
+    assert await reset_leftover_clock_locks(FakeHost(rgc_exit=6), FakeRedis(), [U[0]]) == [U[0]]
 
 
 @pytest.mark.asyncio
