@@ -49,6 +49,8 @@ FLATTEN_MAX_LEASES = 2
 FLATTEN_BUSY_EXIT = 92
 FLATTEN_NO_DISK_EXIT = 95
 FLATTEN_MEASURE_FAILED_EXIT = 90
+# flatten_wait: flock's wait for the node flatten lock ran out, so a copy is still running
+FLATTEN_LOCK_TIMEOUT_EXIT = 96
 
 FLATTEN_NO_DISK_RENTER_SENTENCE = (
     "not enough free disk on this node to prepare this image; choose another node or a smaller image"
@@ -73,6 +75,10 @@ def flatten_no_disk_sentence(short_bytes: int) -> str:
 
 class FlattenMeasureFailed(RuntimeError):
     """Only the disk measure failed, after the node lock was held and the mark written."""
+
+
+class FlattenLockTimedOut(RuntimeError):
+    """An image copy held the node flatten lock for the whole wait: the node is busy, not failing."""
 
 
 class FlattenSizeUnreadable(RuntimeError):
@@ -259,7 +265,11 @@ def flatten_wait_command() -> str:
     # flatten that has not started copying refuses once it sees the mark (nothing to print without flock)
     return (
         f"command -v flock >/dev/null || exit 0; exec 9>>{FLATTEN_LOCK_PATH}; "
-        f"flock -w {FLATTEN_TIMEOUT_SECONDS + 300} 9 || exit 1; touch {FLATTEN_SIZED_PATH} || exit 1; "
+        # -E: only flock's own wait running out exits FLATTEN_LOCK_TIMEOUT_EXIT; any other flock status (a crash, an
+        # error, or a host flock returning one of this command's own codes) is the plain lock failure (1), named on stderr
+        f"flock -E {FLATTEN_LOCK_TIMEOUT_EXIT} -w {FLATTEN_TIMEOUT_SECONDS + 300} 9 || "
+        f'{{ s=$?; [ "$s" -eq {FLATTEN_LOCK_TIMEOUT_EXIT} ] && exit $s; echo "flock failed: exit $s" >&2; exit 1; }}; '
+        f"touch {FLATTEN_SIZED_PATH} || exit 1; "
         f"{df_command(root)} || exit {FLATTEN_MEASURE_FAILED_EXIT}"
     )
 
@@ -277,8 +287,11 @@ async def wait_for_node_flatten(ssh_client: asyncssh.SSHClientConnection) -> int
     result = await ssh_client.run(flatten_wait_command(), check=False, timeout=FLATTEN_TIMEOUT_SECONDS + 420)
     if result.exit_status == FLATTEN_MEASURE_FAILED_EXIT:
         raise FlattenMeasureFailed("measuring the disk under the node flatten lock failed")
+    if result.exit_status == FLATTEN_LOCK_TIMEOUT_EXIT:
+        raise FlattenLockTimedOut("an image copy on this node held the flatten lock for the whole wait")
     if result.exit_status != 0:
-        raise RuntimeError(f"waiting for any image copy on this node failed (exit {result.exit_status})")
+        detail = str(result.stderr or "").strip()[-200:]
+        raise RuntimeError(f"waiting for any image copy on this node failed (exit {result.exit_status}) {detail}")
     out = str(result.stdout or "")
     try:
         return parse_df_available_bytes(out) if out.strip() else None

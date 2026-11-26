@@ -2,7 +2,7 @@ import enum
 import posixpath
 import re
 from datetime import datetime
-from typing import Literal
+from typing import Any, Literal
 
 from datura.requests.base import BaseRequest
 from datura.requests.miner_requests import PodLog
@@ -198,6 +198,8 @@ class MinerJobEnryptedFiles(BaseModel):
     # DAH-2794: the same obfuscated source the binary was frozen from, so a pipeline that can
     # deliver it over stdin needs no upload and one that cannot still has the binary.
     machine_scrape_source: str
+    # DAH-5899: file_encrypt_service.ScrapeBinaryBuild; None when the binary is already in tmp_directory
+    machine_scrape_binary_build: Any = None
     # score_file_name: str
 
 
@@ -855,8 +857,9 @@ class FailedContainerRequest(ContainerBaseResponse):
     # setup steps (never their stderr). Renter-safe: the renter's own Dockerfile output, never executor
     # host data. None for every other failure and from old validators.
     build_log_tail: str | None = Field(default=None, repr=False)
-    # DAH-3505: the Docker daemon's bounded reason for a failed volume step, or the fixed
-    # dead-SSH-session hint for any other step. Never executor host data; None otherwise.
+    # DAH-3505: the Docker daemon's bounded reason for a failed volume step, a fixed sentence saying whether a
+    # failed flatten_wait timed out on the node's disk lock, or the fixed dead-SSH-session hint for any other
+    # step. Never executor host data; None otherwise.
     step_detail: str | None = None
 
 

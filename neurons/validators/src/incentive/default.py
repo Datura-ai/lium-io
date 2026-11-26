@@ -96,13 +96,15 @@ class DefaultIncentive(BaseIncentive):
 
     @staticmethod
     def _record_outdated_image_reason(result: JobResult) -> bool:
-        """True when the executor image excludes this result from both pools: always for an UNOFFICIAL
-        image, and for an OUTDATED one only when EXECUTOR_IMAGE_CHECK_ENFORCE is on (DAH-2701). Off, an
-        OUTDATED report still travels on the result and its specs, but nothing is recorded or zeroed.
+        """True when the executor image excludes this result from both pools: always for an UNOFFICIAL image, and for
+        an OUTDATED one only on a node that was free when the image was read (DAH-6845). A rented OUTDATED node keeps
+        its share, the free GPUs of a partly rented split node included; its report still travels on the result.
         """
         report = result.executor_image_report or {}
         status = report.get("status")
-        if status != "UNOFFICIAL" and not (settings.EXECUTOR_IMAGE_CHECK_ENFORCE and status == "OUTDATED"):
+        # a report stored before rented_when_read existed (carried from Redis) falls back to the result's own rental state
+        was_free_when_image_read = not report.get("rented_when_read", result.is_rented) and not result.is_split_remainder
+        if status != "UNOFFICIAL" and not (status == "OUTDATED" and was_free_when_image_read):
             return False
         if not any(
             reason.reason == ZeroIncentiveReason.OUTDATED_EXECUTOR_IMAGE.value

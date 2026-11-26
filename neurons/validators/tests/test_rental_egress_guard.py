@@ -304,7 +304,7 @@ async def test_a_stalled_inspect_is_cut_off_before_the_deadline_and_the_run_is_k
     ctx = context_factory(ssh=SimpleNamespace(run=stalled))
     sink = AsyncMock()
     started = asyncio.get_running_loop().time()
-    ok, events, _ = await asyncio.wait_for(Pipeline([guard, _Finalize()], sink).run(ctx), timeout=5)
+    ok, events, _ = await asyncio.wait_for(Pipeline([_RootLogin(), guard, _Finalize()], sink).run(ctx), timeout=5)
 
     assert asyncio.get_running_loop().time() - started < 2
     assert ok is True and finalized == [True]
@@ -352,15 +352,32 @@ async def test_the_guard_runs_once_per_cycle_however_the_pipeline_ends(context_f
 
     sink = AsyncMock()
     completion = RentalEgressGuardCheck(last_run=last_run)
-    ok, events, _ = await Pipeline([_Step(), completion, _Scored()], sink).run(context_factory(ssh=ssh))
+    pipeline = Pipeline([_RootLogin(), _Step(), completion, _Scored()], sink)
+    ok, events, _ = await pipeline.run(context_factory(ssh=ssh))
 
     assert ok is (exit_ != "fatal")
     assert ran == (["step", "scored"] if exit_ == "passed" else ["step"])
-    assert [event.check_id for event in events] == ran
+    assert [event.check_id for event in events] == ["login", *ran]
     assert sink.emit.await_args_list[-1].args[0].check_id == RentalEgressGuardCheck.check_id
     [helper] = _helper_calls(ssh)
     assert helper_command(link_local_drop_script("br-0123456789ab", []), "0").removeprefix("exec ") in helper
     assert len(last_run) == 1
+
+
+class _RootLogin:
+    """The run's login check, confirming root: completion steps run only after one."""
+
+    check_id = "login"
+    fatal = True
+
+    async def run(self, ctx):
+        from services.task.messages import LoginUserMessages
+        from services.task.pipeline import CheckResult
+
+        return CheckResult(
+            passed=True,
+            event=rental_egress_guard.render_message(LoginUserMessages.ROOT, ctx=ctx, check_id=self.check_id, what={}),
+        )
 
 
 @pytest.mark.parametrize("template", ["MISMATCH", "BINDING_UNVERIFIED"])

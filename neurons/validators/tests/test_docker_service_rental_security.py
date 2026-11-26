@@ -539,7 +539,9 @@ async def test_fresh_create_fails_when_sysbox_cannot_align_the_volume_owner(
     # A range wider than one slice means sysbox picks a different base per
     # container, so the mount owner cannot be aligned. A fresh rental fails
     # before the container exists instead of starting on runc.
-    ssh_client = RecordingSSHClient(stdout="sysbox:231072:1048576")
+    ssh_client = InstalledPluginSSHClient(
+        f"docker.io/{docker_service_module.S3FS_PLUGIN_IMAGE}", stdout="sysbox:231072:1048576"
+    )
     _patch_create_harness(monkeypatch, docker_service, ssh_client)
     plugin_spy = AsyncMock()
     monkeypatch.setattr(docker_service, "remove_s3fs_volume_plugin", plugin_spy)
@@ -752,6 +754,126 @@ async def test_create_s3fs_volume_retries_a_failed_plugin_install(
     assert _s3fs_install_count(ssh_client) == expected_installs
     # the instance is still configured and enabled after the retried install
     assert any("plugin enable s3fs-celium-volume-safe" in command for command in ssh_client.commands)
+
+
+class InstalledPluginSSHClient(RecordingSSHClient):
+    # answers `plugin inspect` with the installed instance's reference, `docker ps` with the containers holding the
+    # volume, `plugin rm` with plugin_rm_exit, every other command with `stdout`
+    # `disabled`: the instance was left disabled, so `volume rm` fails (and the volume keeps it in use) until enabled
+    def __init__(self, reference: str, stdout: str = "", plugin_rm_exit: int = 0, holders: str = "", disabled=False):
+        super().__init__(stdout=stdout)
+        self.reference = reference
+        self.plugin_rm_exit = plugin_rm_exit
+        self.holders = holders
+        self.disabled = disabled
+
+    async def run(self, command, *args, **kwargs):
+        self.commands.append(command)
+        if "plugin inspect --format '{{.PluginReference}}'" in command:
+            return SimpleNamespace(stdout=self.reference + "\n", stderr="", exit_status=0)
+        if command.startswith("/usr/bin/docker ps -aq --filter volume="):
+            return SimpleNamespace(stdout=self.holders, stderr="", exit_status=0)
+        if command.startswith("/usr/bin/docker plugin enable "):
+            self.disabled = False
+        if command.startswith("/usr/bin/docker volume rm ") and self.disabled:
+            self.plugin_rm_exit = 1
+            return SimpleNamespace(stdout="", stderr="driver s3fs-celium-volume-safe is disabled", exit_status=1)
+        if command.startswith("/usr/bin/docker plugin rm "):
+            stderr = "plugin s3fs-celium-volume-safe is in use" if self.plugin_rm_exit else ""
+            return SimpleNamespace(stdout="", stderr=stderr, exit_status=self.plugin_rm_exit)
+        return SimpleNamespace(stdout=self.stdout, stderr="", exit_status=0)
+
+
+@pytest.mark.parametrize(
+    ("reference", "current"),
+    [
+        # the mochoa build (s3fs 1.86: retries go out unsigned)
+        ("docker.io/mochoa/s3fs-volume-plugin:latest", False),
+        (f"docker.io/{docker_service_module.S3FS_PLUGIN_IMAGE}", True),
+        # `docker plugin create` records the name without the registry
+        (docker_service_module.S3FS_PLUGIN_IMAGE, True),
+        (f"docker.io/{docker_service_module.S3FS_PLUGIN_IMAGE}-old", False),
+    ],
+)
+def test_only_our_plugin_build_counts_as_current(reference, current):
+    assert docker_service_module._s3fs_plugin_is_current(reference) is current
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("removed", [True, False], ids=["removed", "removal_fails"])
+async def test_an_instance_of_another_build_is_removed_with_its_volume_or_the_rental_fails(
+    docker_service, monkeypatch, removed
+):
+    # review on #2397: `plugin rm` failed while the old volume kept the instance in use, the install accepted
+    # "already exists", and the rental ran on the old build
+    ssh_client = InstalledPluginSSHClient("docker.io/mochoa/s3fs-volume-plugin:latest", plugin_rm_exit=0 if removed else 1)
+    stream_logs = AsyncMock(return_value=(True, ""))
+    monkeypatch.setattr(docker_service, "execute_and_stream_logs", stream_logs)
+
+    is_success, message = await docker_service.create_s3fs_volume(
+        ssh_client=ssh_client,
+        log_extra={},
+        volume_info=_s3fs_volume_info(),
+        log_tag="tag",
+        sysbox_subuid_base=None,
+    )
+
+    # no container references the volume; its handle goes first, then the instance it held in use
+    assert ssh_client.commands[1:6] == [
+        "/usr/bin/docker ps -aq --filter volume=celium-volume-safe",
+        "/usr/bin/docker plugin enable s3fs-celium-volume-safe",
+        "/usr/bin/docker volume rm celium-volume-safe",
+        "/usr/bin/docker plugin disable s3fs-celium-volume-safe -f",
+        "/usr/bin/docker plugin rm s3fs-celium-volume-safe",
+    ]
+    installed = any("plugin install" in command for command in ssh_client.commands)
+    if removed:
+        assert is_success is True and installed
+    else:
+        assert is_success is False and "could not be removed" in message and "in use" in message
+        assert not installed
+        stream_logs.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_an_instance_of_another_build_left_disabled_is_still_replaced(docker_service, monkeypatch):
+    # review on #2397: the old instance was force-disabled with its volume kept; Docker refused `volume rm` on the
+    # disabled driver, so `plugin rm` failed and the rental stopped before the install
+    ssh_client = InstalledPluginSSHClient("docker.io/mochoa/s3fs-volume-plugin:latest", disabled=True)
+    monkeypatch.setattr(docker_service, "execute_and_stream_logs", AsyncMock(return_value=(True, "")))
+
+    is_success, message = await docker_service.create_s3fs_volume(
+        ssh_client=ssh_client,
+        log_extra={},
+        volume_info=_s3fs_volume_info(),
+        log_tag="tag",
+        sysbox_subuid_base=None,
+    )
+
+    assert is_success is True, message
+    assert any("plugin install" in command for command in ssh_client.commands)
+
+
+@pytest.mark.asyncio
+async def test_an_instance_of_another_build_stays_while_a_container_references_its_volume(docker_service, monkeypatch):
+    # review on #2397: an edit/reboot parks the pod's stopped container, which keeps the volume; `plugin rm` then
+    # failed after `disable -f` and the pod came back without its Volume
+    ssh_client = InstalledPluginSSHClient("docker.io/mochoa/s3fs-volume-plugin:latest", holders="0123456789ab\n")
+    monkeypatch.setattr(docker_service, "execute_and_stream_logs", AsyncMock(return_value=(True, "")))
+
+    is_success, _ = await docker_service.create_s3fs_volume(
+        ssh_client=ssh_client,
+        log_extra={},
+        volume_info=_s3fs_volume_info(),
+        log_tag="tag",
+        sysbox_subuid_base=None,
+    )
+
+    assert is_success is True
+    assert "/usr/bin/docker volume rm celium-volume-safe" not in ssh_client.commands
+    assert "/usr/bin/docker plugin rm s3fs-celium-volume-safe" not in ssh_client.commands
+    # the instance is only reconfigured and comes back enabled, as for one of our build
+    assert ssh_client.commands[-1] == "/usr/bin/docker plugin enable s3fs-celium-volume-safe"
 
 
 @pytest.mark.asyncio

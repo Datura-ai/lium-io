@@ -413,32 +413,30 @@ class DiskHealthMessages:
 
 class GpuThermalThrottleMessages:
     THROTTLED = MessageTemplate(
-        event="GPU thermal throttling under load",
+        # the check names the cause in the event and remediation (gpu_thermal_throttle.CAUSES)
+        event="GPU throttled under load",
         reason="GPU_THERMAL_THROTTLE",
         severity="warning",
         category="env",
         impact="Proceed; score not changed (observation only)",
-        remediation="A busy GPU is held far below its clock by a thermal or hardware slowdown, or by a power cap "
-        "while its power limit is at the default (see gpus[]: temperature_c, graphics_clock_mhz, "
-        "max_graphics_clock_mhz, clocks_event_reasons, reasons). Check `nvidia-smi -q -d "
-        "PERFORMANCE,TEMPERATURE,POWER`, the fans, airflow, the power supply and the datacenter cooling; the "
-        "renter is getting a fraction of the card's speed.",
+        remediation="See gpus[]: causes, temperature_c, graphics_clock_mhz, max_graphics_clock_mhz, "
+        "clocks_event_reasons. A renter on this card gets a fraction of its speed. On a rented node, pause new "
+        "rentals and wait for running ones to end before work that shuts the node down.",
     )
     COLLAPSED = MessageTemplate(
-        event="GPU clock collapsed by thermal throttling",
+        event="GPU clock collapsed under load",
         reason="GPU_THERMAL_COLLAPSE",
         severity="error",
         # an availability error: the backend hides the node and refuses new rentals at once
         category=AVAILABILITY_CATEGORY,
         impact="Node hidden, job skipped and score set to 0 until the hold ends (see remediation)",
-        remediation="A busy GPU runs below half its max clock with a thermal or hardware slowdown set (see "
-        "gpus[], held_gpu_uuids: temperature_c, graphics_clock_mhz, max_graphics_clock_mhz, reasons). Fix the "
-        "cooling (fans, airflow, datacenter temperature; `nvidia-smi -q -d PERFORMANCE,TEMPERATURE`). The hold "
-        "ends when the card runs busy at half its max clock or more with no thermal slowdown (for example under "
-        "the Lium filler or the host's own load), or after 7 days, or when the card is replaced.",
+        remediation="A busy GPU runs below half its max clock with a slowdown the driver reports (see gpus[], "
+        "held_gpu_uuids: causes, temperature_c, graphics_clock_mhz, max_graphics_clock_mhz, reasons). The hold "
+        "ends when the card runs busy at half its max clock or more with no slowdown (for example under the Lium "
+        "filler or the host's own load), or after 7 days, or when the card is replaced.",
     )
     OK = MessageTemplate(
-        event="GPU clocks not thermally throttled",
+        event="GPU clocks not throttled",
         reason="GPU_THERMAL_THROTTLE_OK",
         severity="info",
         category="env",
@@ -739,6 +737,17 @@ class NvmlDigestMessages:
         impact="Score set to 0; previous verification cleared",
         remediation="Reinstall the NVIDIA driver matching this version and ensure libnvidia-ml is not tampered.",
     )
+    DIGEST_UNREAD = MessageTemplate(
+        event="NVML library digest mismatch not confirmed",
+        reason="NVML_DIGEST_UNREAD",
+        severity="warning",
+        category="env",
+        impact="Score set to 0 for this cycle; verification kept",
+        remediation=(
+            "No action needed if the next check passes. "
+            "If it repeats, reinstall the NVIDIA driver matching this version."
+        ),
+    )
     DRIVER_UNKNOWN = MessageTemplate(
         event="Unknown NVIDIA driver version",
         reason="NVML_DRIVER_UNKNOWN",
@@ -772,6 +781,18 @@ class SpecChangeMessages:
         category="env",
         impact="Verification reset; score set to 0",
         remediation="Keep GPU configuration stable between checks.",
+    )
+    SPEC_MODEL_CHANGED = MessageTemplate(
+        event="Other GPUs of another model",
+        reason="SPEC_CHANGED",
+        severity="warning",
+        category="env",
+        impact="Node stays unverified; score set to 0",
+        remediation=(
+            "Restore this node's original GPUs or point it back to its original machine. To register another machine "
+            "at the same IP and port, first free that address by updating the existing node's address or deleting "
+            "the existing node. A rented node cannot be deleted."
+        ),
     )
     SPEC_UNCHANGED = MessageTemplate(
         event="GPU inventory stable",
@@ -909,7 +930,15 @@ class ExecutorImageMessages:
         reason="EXECUTOR_IMAGE_OUTDATED",
         severity="error",
         category="policy",
-        impact="Score set to 0 until the image is current",
+        impact="Free node: validation failed, off the rent list until the image is current",
+    )
+    # DAH-6845: a rented node on an OUTDATED image passes and keeps its incentive, so the event is a warning
+    RENTED_OUTDATED = MessageTemplate(
+        event="Executor image is outdated",
+        reason="EXECUTOR_IMAGE_OUTDATED",
+        severity="warning",
+        category="policy",
+        impact="Rental and incentive continue; update the image before the rental ends",
     )
     UNOFFICIAL = MessageTemplate(
         event="Executor is not an official build",
@@ -917,14 +946,6 @@ class ExecutorImageMessages:
         severity="error",
         category="policy",
         impact="Score set to 0 until the node runs the official executor image",
-    )
-    # Same reason code as OUTDATED so log queries keep matching; severity says it is not scored.
-    OUTDATED_WARNING = MessageTemplate(
-        event="Executor image is outdated",
-        reason="EXECUTOR_IMAGE_OUTDATED",
-        severity="warning",
-        category="policy",
-        impact="Warning only until EXECUTOR_IMAGE_CHECK_ENFORCE is on: score and incentive unchanged",
     )
 
 
@@ -1069,6 +1090,31 @@ class SysboxLayerResetMessages:
         impact="Proceed; score not changed",
         remediation=OUTDATED.remediation,
     )
+    REMOVE_PENDING = MessageTemplate(
+        event="Host boot-time layer reset to be removed",
+        reason="SYSBOX_LAYER_RESET_REMOVE_PENDING",
+        severity="info",
+        category="env",
+        impact="Proceed",
+    )
+    REMOVED = MessageTemplate(
+        event="Host boot-time layer reset removed",
+        reason="SYSBOX_LAYER_RESET_REMOVED",
+        severity="info",
+        category="env",
+        impact="Proceed",
+    )
+    REMOVE_FAILED = MessageTemplate(
+        event="Host boot-time layer reset could not be removed",
+        reason="SYSBOX_LAYER_RESET_REMOVE_FAILED",
+        severity="warning",
+        category="env",
+        impact="Proceed; score not changed",
+        remediation=(
+            "Run `sudo bash nvidia_docker_sysbox_setup.sh --remove-layer-reset` from lium-io neurons/executor on the "
+            "host: it removes lium-sysbox-layer-reset.service and Docker's drop-in for it, and restarts nothing."
+        ),
+    )
     UNKNOWN = MessageTemplate(
         event="Host boot-time layer reset not reported",
         reason="SYSBOX_LAYER_RESET_UNKNOWN",
@@ -1115,6 +1161,38 @@ class PidHostRequiredMessages:
     OK = MessageTemplate(
         event="Executor PID namespace check passed",
         reason="EXECUTOR_PID_HOST_OK",
+        severity="info",
+        category="policy",
+        impact="Proceed",
+    )
+
+
+class HostPidMaxMessages:
+    # DAH-7041: the create refuses every rental on this host (docker_service HOST_READ_PID_MAX_STEP)
+    UNUSABLE = MessageTemplate(
+        event="Host kernel.pid_max is not usable for a rental",
+        reason="HOST_PID_MAX_UNUSABLE",
+        severity="error",
+        # an availability error: the backend hides the node and refuses new rentals, a rental on it runs on
+        category=AVAILABILITY_CATEGORY,
+        impact="Verification failed; node hidden and not rentable until the host reports a usable kernel.pid_max "
+        "(a running rental is kept)",
+        remediation=(
+            "Every rental on this node is refused: `cat /proc/sys/kernel/pid_max` over the executor's SSH must print "
+            "one number and nothing else (the Linux default is 4194304 on 64-bit hosts). Check that the root shell "
+            "prints no banner or profile text for a command, and that sysctl kernel.pid_max has not been lowered."
+        ),
+    )
+    NOT_READ = MessageTemplate(
+        event="Host kernel.pid_max not read this cycle",
+        reason="HOST_PID_MAX_NOT_READ",
+        severity="info",
+        category="policy",
+        impact="Proceed; the read got no answer, which says nothing about the host's setting",
+    )
+    OK = MessageTemplate(
+        event="Host kernel.pid_max is usable for a rental",
+        reason="HOST_PID_MAX_OK",
         severity="info",
         category="policy",
         impact="Proceed",
@@ -1193,6 +1271,24 @@ class CollateralStatusMessages:
         severity="info",
         category="policy",
         impact="None; the last known collateral status is reported, or none deposited when there is none",
+    )
+
+
+class LoginUserMessages:
+    ROOT = MessageTemplate(
+        event="Validator logged in as root",
+        reason="LOGIN_USER_ROOT",
+        severity="info",
+        category="policy",
+        impact="Proceed",
+    )
+    NOT_ROOT = MessageTemplate(
+        event="Executor SSH user must be root",
+        reason="LOGIN_USER_NOT_ROOT",
+        severity="error",
+        category="policy",
+        impact="Verification failed; the node is not validated while its SSH login is not root",
+        remediation="Run the executor from the standard image, which logs the validator in as root.",
     )
 
 
@@ -1482,6 +1578,13 @@ class TenantEnforcementMessages:
         category="policy",
         impact="Proceed",
     )
+    STILL_NOT_RENTED = MessageTemplate(
+        event="Executor still not rented after the parallel checks",
+        reason="EXECUTOR_STILL_NOT_RENTED",
+        severity="info",
+        category="policy",
+        impact="Proceed",
+    )
     POD_NOT_RUNNING = MessageTemplate(
         event="Pod not running",
         reason="POD_NOT_RUNNING",
@@ -1546,6 +1649,14 @@ class TenantEnforcementMessages:
         severity="info",
         category="policy",
         impact="Proceed",
+    )
+    # the run gives no verdict and its kept result is dropped: the cycle saw the rental state change
+    RENTED_SINCE_CYCLE_START = MessageTemplate(
+        event="Executor rented since the cycle started",
+        reason="RENTED_SINCE_CYCLE_START",
+        severity="info",
+        category="policy",
+        impact="Validation halted — no verdict this cycle",
     )
 
 
@@ -1869,9 +1980,8 @@ class RegistryPullMessages:
     )
 
 
-CONTAINER_DOWNLOAD_SLOW_REMEDIATION = (
-    "a container on this node downloads from PyPI or Hugging Face too slowly or cannot connect, so a renter's "
-    "`pip install` or model download crawls; remove any traffic shaping or extra firewall rules added on docker "
+_CONTAINER_NETWORK_FIX = (
+    "remove any traffic shaping or extra firewall rules added on docker "
     "traffic (keep docker's own NAT rules); "
     "if the uplink MTU (`ip link`) is below 1500, recreate the rentals network with it while no pod container exists, running or stopped: "
     "`docker network rm lium-rentals` then `docker network create -d bridge -o "
@@ -1880,6 +1990,19 @@ CONTAINER_DOWNLOAD_SLOW_REMEDIATION = (
     "https://files.pythonhosted.org/packages/9b/b4/e3c7e6fab0f77fff6194afa173d1f2342073d91b1d3b4b30b17c3fb4407a/"
     "numpy-2.1.2-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl` on the host must finish in seconds"
 )
+
+
+def container_network_remediation(*, upload: bool = False, download: bool = True) -> str:
+    """The provider instructions for the side that failed: downloads, the upload, or both."""
+    sides = [s for s, on in (("downloads from PyPI or Hugging Face", download), ("uploads", upload)) if on]
+    uses = [u for u, on in (("`pip install` or model download", download), ("upload of results", upload)) if on]
+    return (
+        f"a container on this node {' and '.join(sides)} too slowly or cannot connect, so a renter's "
+        f"{' and '.join(uses)} crawls; {_CONTAINER_NETWORK_FIX}"
+    )
+
+
+CONTAINER_DOWNLOAD_SLOW_REMEDIATION = container_network_remediation()
 
 
 class ContainerDownloadSpeedMessages:
@@ -1932,6 +2055,24 @@ class ContainerDownloadSpeedMessages:
     )
 
 
+def rented_throughput_remediation(*, upload: bool = False, download: bool = True) -> str:
+    """RENTED_THROUGHPUT_SLOW's instructions, naming the network side that failed (downloads, the upload, or both)."""
+    sides = (
+        ("downloading from PyPI or Hugging Face below 10 Mbps", download),
+        ("uploading below the upload minimum", upload),
+    )
+    net = [s for s, on in sides if on]
+    return (
+        f"repeated readings found a container on this rented node {', or '.join(net)}, or writing to its disk below "
+        "50 MB/s, while the node's own traffic on that resource stayed "
+        "under its busy threshold (200 Mbps on the network cards, 200 MB/s on the docker disk). Remove any "
+        "traffic shaping or I/O "
+        "throttling on docker traffic and containers, check the docker bridge MTU against the uplink "
+        "(`ip link`), and check the disk under the docker root (`docker info -f '{{.DockerRootDir}}'`) "
+        "for a failing or full drive"
+    )
+
+
 class RentedThroughputMessages:
     """A renter on a node listed at ~3 Gbps downloaded at 0.7-2 MB/s and the disk crawled."""
 
@@ -1941,15 +2082,7 @@ class RentedThroughputMessages:
         severity="error",
         category="runtime",
         impact="Score set to 0",
-        remediation=(
-            "repeated readings found a container on this rented node downloading from PyPI or Hugging Face below "
-            "10 Mbps, or writing to its disk below 50 MB/s, while the node's own traffic on that resource stayed "
-            "under its busy threshold (200 Mbps on the network cards, 200 MB/s on the docker disk). Remove any "
-            "traffic shaping or I/O "
-            "throttling on docker traffic and containers, check the docker bridge MTU against the uplink "
-            "(`ip link`), and check the disk under the docker root (`docker info -f '{{.DockerRootDir}}'`) "
-            "for a failing or full drive"
-        ),
+        remediation=rented_throughput_remediation(),  # the check passes the failed side's version
     )
     # DAH-5453: the reading was due but the earlier checks left too little cycle time, several cycles in a row
     NOT_RUN = MessageTemplate(
@@ -2042,6 +2175,20 @@ class VerifyXMessages:
         severity="info",
         category="policy",
         impact="Rental probe gets this cycle's time to clear its standing failure; reused last-known VerifyX EMA",
+    )
+    NO_TASK_TIME = MessageTemplate(
+        event="VerifyX not finished: not enough task time left",
+        reason="VERIFYX_NO_TASK_TIME",
+        severity="warning",
+        category="policy",
+        impact=(
+            "No verdict this cycle; the node's last scored result stands. The validator's budget, not the node, "
+            "ended it"
+        ),
+        remediation=(
+            "The checks before VerifyX used most of the executor task's time, and VerifyX gets only what the checks "
+            "after it can spare. The next cycle runs it again."
+        ),
     )
     NO_SPECS = MessageTemplate(
         event="VerifyX validation skipped (no specs)",
@@ -2528,6 +2675,29 @@ class RentalVerificationMessages:
         category="policy",
         impact="Proceed",
     )
+    # the backend found a customer rental on the node, started after this cycle's snapshot: the node is scored as
+    # rented and no further check puts load on it
+    RENTED_SINCE_THE_SNAPSHOT = MessageTemplate(
+        event="Node rented during this check",
+        reason="RENTAL_STARTED_DURING_CHECK",
+        severity="info",
+        category="policy",
+        impact=(
+            "No verdict this cycle: the node's rentals changed during it, so no earlier result stands in; the next "
+            "cycle scores the node rented"
+        ),
+        remediation="No action needed.",
+    )
+    # the backend skipped its probe for a pod it still holds but no longer lists as a rental (one it is removing): no
+    # probe ran and the node is not rented, so the check fails instead of being held as a new rental
+    PROBE_SKIPPED_FOR_AN_UNLISTED_POD = MessageTemplate(
+        event="Rental probe skipped for a pod that is not a listed rental",
+        reason="RENTAL_PROBE_SKIPPED_UNLISTED_POD",
+        severity="warning",
+        category="policy",
+        impact="This cycle fails: the rental probe did not run, and the node has no listed rental",
+        remediation="No action needed if a rental on this node just ended; the next cycle probes the node again.",
+    )
     FAILED = MessageTemplate(
         event="Rental verification failed",
         reason="RENTAL_NOT_VERIFIED",
@@ -2592,6 +2762,17 @@ class RentalVerificationMessages:
         category="policy",
         impact="Proceed with existing rental status",
         remediation="Check backend API connectivity and logs",
+    )
+    NO_TASK_TIME = MessageTemplate(
+        event="Rental verification not run: not enough task time left",
+        reason="RENTAL_CHECK_NO_TASK_TIME",
+        severity="warning",
+        category="policy",
+        impact="This cycle fails; the backend's rental probe was not sent, so this is not a backend or API error",
+        remediation=(
+            "The checks before the rental verification used the executor task's time. A slow VerifyX download is "
+            "the usual cause: check the host's download speed. The next cycle runs it again."
+        ),
     )
     FILLER_VERIFIED = MessageTemplate(
         event="Lium default job runtime verified",
@@ -3296,3 +3477,21 @@ class SshdAuthLogMessages:
         category="runtime",
         impact="Proceed; observation only",
     )
+
+
+# DAH-5933: the run left the backend's rental probe, or VerifyX, too little time; the validator's budget, not the
+# node, decides that, so it is no failed check: an idle node carries its last scored result too
+NO_TASK_TIME_REASONS = (RentalVerificationMessages.NO_TASK_TIME.reason, VerifyXMessages.NO_TASK_TIME.reason)
+# results the cycle's snapshot cannot score, held for the cycle-end rented read: a budget stop (above), or a node the
+# backend found rented after the snapshot listed it idle (its GPU count and pool come from that read, never the snapshot)
+# a rental that started after the cycle-start snapshot: one the backend found during the check, or a renter's create
+# the run stopped for (DAH-5750). The cycle saw the rental state change, so its kept result never stands in for it
+RENTED_AFTER_START_REASONS = (
+    RentalVerificationMessages.RENTED_SINCE_THE_SNAPSHOT.reason,
+    TenantEnforcementMessages.RENTED_SINCE_CYCLE_START.reason,
+)
+CYCLE_END_READ_REASONS = (*NO_TASK_TIME_REASONS, *RENTED_AFTER_START_REASONS)
+# DAH-5933 review at ea74f37: a budget stop after a check that already zeroed the cycle's score. Its own code, since
+# the last event before the stop can be one a rollout withholds (a warn-only EXECUTOR_IMAGE_OUTDATED): no rule withholds
+# or carries this one, so the zero is published as it is
+ZEROED_BEFORE_THE_BUDGET_STOP = "SCORE_ZEROED_BEFORE_THE_TASK_TIME_RAN_OUT"

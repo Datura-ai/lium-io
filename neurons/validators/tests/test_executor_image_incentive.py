@@ -1,21 +1,10 @@
 from unittest.mock import AsyncMock
 
 import pytest
-from core.config import settings
 from datura.requests.miner_requests import ExecutorSSHInfo
 from incentive.config import IncentiveConfig
 from incentive.rental_price import RentalPriceIncentive
 from services.task.models import JobResult
-
-
-@pytest.fixture
-def enforce(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(settings, "EXECUTOR_IMAGE_CHECK_ENFORCE", True)
-
-
-@pytest.fixture
-def warn_only(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(settings, "EXECUTOR_IMAGE_CHECK_ENFORCE", False)
 
 
 def failed_idle_result() -> JobResult:
@@ -43,22 +32,66 @@ def failed_idle_result() -> JobResult:
     )
 
 
-@pytest.mark.asyncio
-async def test_rented_outdated_executor_keeps_job_result_but_gets_zero_mining_score(enforce):
-    result = failed_idle_result().model_copy(
+def _rented(status: str) -> JobResult:
+    failed = failed_idle_result()
+    # a node that passed validation otherwise, so its score is not 0 by another path
+    result = failed.model_copy(
         update={
+            "executor_info": failed.executor_info.model_copy(update={"price_per_gpu": 1.0}),
+            "score": 1.0,
             "job_score": 1.0,
+            "log_status": "success",
             "is_rented": True,
             "gpu_model": "NVIDIA H200",
-            "gpu_count": 8,
+            # 4 cards: an 8x flagship needs NCU or splitting first
+            "gpu_count": 4,
+            "collateral_deposited": True,
+            "sysbox_runtime": True,
+            "spec": {"hard_disk": {"total": 2000 * 1024**2}, "gpu": {"details": [{"capacity": 141 * 1024}] * 4}},
         }
     )
-    incentive = RentalPriceIncentive(
-        IncentiveConfig(),
-        AsyncMock(),
-        {"miner": [result]},
-        {"NVIDIA H200": 8},
+    result.executor_image_report = {**result.executor_image_report, "status": status, "rented_when_read": True}
+    return result
+
+
+async def _scored(result: JobResult) -> JobResult:
+    redis = AsyncMock(get_portion_per_gpu_type=AsyncMock(return_value=0.3))
+    incentive = RentalPriceIncentive(IncentiveConfig(), redis, {"miner": [result]}, {"NVIDIA H200": 4})
+    return await incentive.calculate_executor_score(result)
+
+
+async def assert_scored_as_on_a_current_image(result: JobResult) -> None:
+    """The node earns what the same node on a CURRENT image earns, and that twin earns something: a mining score
+    above 0 when rented, the idle-pool share when free."""
+    current = result.model_copy(deep=True)
+    current.executor_image_report = {**current.executor_image_report, "status": "CURRENT"}
+    expected = await _scored(current)
+    assert expected.mining_score > 0 or expected.eligible_for_rental_share, [
+        r.reason for r in expected.zero_incentive_reasons
+    ]
+    scored = await _scored(result)
+    assert (scored.mining_score, scored.eligible_for_rental_share) == (
+        expected.mining_score,
+        expected.eligible_for_rental_share,
     )
+
+
+@pytest.mark.asyncio
+async def test_rented_outdated_executor_keeps_its_incentive():
+    # DAH-6845: an old image never costs a renter's node its share; it leaves the rent list once free
+    result = _rented("OUTDATED")
+    incentive = RentalPriceIncentive(IncentiveConfig(), AsyncMock(), {"miner": [result]}, {"NVIDIA H200": 8})
+
+    await incentive._pre_process_job_result("miner", result)
+
+    assert "outdated_executor_image" not in [r.reason for r in result.zero_incentive_reasons]
+    await assert_scored_as_on_a_current_image(result)
+
+
+@pytest.mark.asyncio
+async def test_rented_unofficial_executor_keeps_job_result_but_gets_zero_mining_score():
+    result = _rented("UNOFFICIAL")
+    incentive = RentalPriceIncentive(IncentiveConfig(), AsyncMock(), {"miner": [result]}, {"NVIDIA H200": 8})
 
     await incentive._pre_process_job_result("miner", result)
 
@@ -66,3 +99,38 @@ async def test_rented_outdated_executor_keeps_job_result_but_gets_zero_mining_sc
     assert result.zero_incentive_reasons[0].reason == "outdated_executor_image"
 
 
+
+
+@pytest.mark.asyncio
+async def test_outdated_image_read_while_rented_keeps_its_incentive_when_the_rental_ended_later():
+    # DAH-6845 review: the rental ended between the image reading and the cycle end
+    result = _rented("OUTDATED").model_copy(update={"is_rented": False})
+    incentive = RentalPriceIncentive(IncentiveConfig(), AsyncMock(), {"miner": [result]}, {"NVIDIA H200": 8})
+
+    await incentive._pre_process_job_result("miner", result)
+
+    assert "outdated_executor_image" not in [r.reason for r in result.zero_incentive_reasons]
+    await assert_scored_as_on_a_current_image(result)
+
+
+@pytest.mark.asyncio
+async def test_outdated_image_read_on_a_free_node_is_excluded():
+    result = failed_idle_result()
+    incentive = RentalPriceIncentive(IncentiveConfig(), AsyncMock(), {"miner": [result]}, {"NVIDIA H200": 8})
+
+    await incentive._pre_process_job_result("miner", result)
+
+    assert "outdated_executor_image" in [r.reason for r in result.zero_incentive_reasons]
+
+
+@pytest.mark.asyncio
+async def test_a_rented_outdated_result_stored_before_the_read_time_state_keeps_its_incentive():
+    # DAH-6845 review: a result carried from Redis over a renter's GPU reset was stored without rented_when_read
+    result = _rented("OUTDATED")
+    result.executor_image_report = {k: v for k, v in result.executor_image_report.items() if k != "rented_when_read"}
+    incentive = RentalPriceIncentive(IncentiveConfig(), AsyncMock(), {"miner": [result]}, {"NVIDIA H200": 8})
+
+    await incentive._pre_process_job_result("miner", result)
+
+    assert "outdated_executor_image" not in [r.reason for r in result.zero_incentive_reasons]
+    await assert_scored_as_on_a_current_image(result)

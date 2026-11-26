@@ -39,8 +39,12 @@ _DOCKER_SDK_SSH_ADAPTER_LOCK = threading.Lock()
 # timeouts) plus one more attempt of the same call with its own timeout; there is no third try.
 _DOCKER_SSH_REOPEN_TIMEOUT_SECONDS = 15
 # a create that outlived the client's read timeout holds its name in dockerd until it registers the container
-_INFLIGHT_CREATE_WAIT_SECONDS = 60
 _INFLIGHT_CREATE_POLL_SECONDS = 2
+# the resume's overall bound on dockerd holding the pod's name: far past the slowest create seen (2 min in prod, a
+# create copying a large image into a new volume), so a slow create is still adopted, while a name dockerd never
+# frees fails the create instead of retrying forever and holding the executor's other creates. A container that
+# registers after it is a closed pod's container, which the next create's sweep of closed pods removes.
+_INFLIGHT_CREATE_DEADLINE_SECONDS = 600
 TRANSPORT_ERROR_CLASS = "transport"
 # The texts docker-py/urllib3/paramiko produce when the SSH channel under a Docker call is gone.
 # Plain substrings, matched against every exception text in the cause chain.
@@ -121,11 +125,16 @@ class RentalDockerConnectionError(RuntimeError):
 
 
 class ContainerCreateRefused(Exception):
-    """Raised by a run spec's `before_create` (nothing was created) or `before_start` (created, never started)."""
+    """Raised by a run spec's `before_create` (nothing was created; on the resume after a dropped create, created
+    and never started), `before_start` or `before_start_call` (created, never started)."""
 
 
 class RentalDockerOperationError(RuntimeError):
     """Raised when Docker SDK reports a rental Docker operation failure."""
+
+
+class InflightCreateNameStillHeld(RentalDockerOperationError):
+    """The resume waited _INFLIGHT_CREATE_DEADLINE_SECONDS and dockerd still held the pod's name: the create fails."""
 
 
 def created_container_id(exc: BaseException) -> str | None:
@@ -434,11 +443,15 @@ class ContainerRunSpec:
     network_id: str | None = None
     # DAH-5117: LIUM_POD_ID_LABEL for a pod or filler, so the stale cleanup knows the container is Lium's
     labels: dict[str, str] = field(default_factory=dict)
-    # runs in the Docker thread right before the create call; may raise ContainerCreateRefused
+    # runs in the Docker thread right before the create call (on the resume, once the container exists);
+    # may raise ContainerCreateRefused
     before_create: Callable[[], None] | None = field(default=None, repr=False, compare=False)
     # runs in the Docker thread between the create and the start call with the names of every container
     # on the host; may raise ContainerCreateRefused, and the created container is then left unstarted
     before_start: Callable[[list[str]], None] | None = field(default=None, repr=False, compare=False)
+    # runs in the Docker thread right before the start call, on every path (created or adopted); may raise
+    # ContainerCreateRefused, and the container is then left unstarted
+    before_start_call: Callable[[], None] | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         # DAH-6302: Docker reads nano_cpus 0 as no limit, so a share that rounded down to 0 gets one core
@@ -660,8 +673,36 @@ class RentalDockerSdkClient:
         return await self._retry_once_on_transport_drop(
             operation="run container",
             attempt=lambda: self._run_container_once(spec, adopt_existing=False),
-            resume=lambda: self._run_container_once(spec, adopt_existing=True),
+            resume=lambda: self._resume_run_container(spec),
         )
+
+    async def _resume_run_container(self, spec: ContainerRunSpec) -> str | None:
+        """The retry after the first `containers/create` lost its answer: adopt that create's container.
+
+        dockerd may still be running that create (a create that copies the image's files into a new
+        volume takes minutes): it holds the name (409) while inspect answers 404 until the container is
+        registered. As long as dockerd keeps the name held, the first create's outcome is still coming,
+        so the retry waits for it: adopted once registered, or created here once dockerd released the
+        name because that create failed. A delete of the pod does not end the wait: leaving would let
+        that container register with nobody to remove it. Either way the caller's delete checkpoint
+        after the run removes the container a delete overtook. The wait ends at
+        _INFLIGHT_CREATE_DEADLINE_SECONDS: a name dockerd never frees fails the create
+        (InflightCreateNameStillHeld) rather than retrying it forever.
+        """
+        deadline = time.monotonic() + _INFLIGHT_CREATE_DEADLINE_SECONDS
+        while True:
+            try:
+                return await self._run_container_once(spec, adopt_existing=True)
+            except RentalDockerOperationError as exc:
+                if f'"/{spec.name}" is already in use' not in str(exc):
+                    raise
+                if time.monotonic() >= deadline:
+                    # no 409 text: the caller's own-leftover removal is for a container that exists, not a held name
+                    raise InflightCreateNameStillHeld(
+                        f"Docker still held the container name {spec.name} "
+                        f"{_INFLIGHT_CREATE_DEADLINE_SECONDS} s after the first create lost its answer"
+                    ) from exc
+            await asyncio.sleep(_INFLIGHT_CREATE_POLL_SECONDS)
 
     async def _run_container_once(self, spec: ContainerRunSpec, *, adopt_existing: bool) -> str | None:
         try:
@@ -1202,7 +1243,9 @@ class RentalDockerSdkClient:
             host_config = self._api_client.create_host_config(
                 **_build_host_config_kwargs(spec)
             )
-            if spec.before_create is not None:
+            # On the resume dockerd may still hold the name for the first create's container, so the check
+            # runs below, once a container exists for the caller's removal by name to find.
+            if spec.before_create is not None and not adopt_existing:
                 spec.before_create()
             try:
                 created = self._api_client.create_container(
@@ -1221,17 +1264,13 @@ class RentalDockerSdkClient:
                     }
                     or None,
                 )
-            except Exception as exc:
+            except Exception:
                 if spec.network and spec.network != RENTAL_NETWORK_NAME:
                     # the bridge removed between the check above and the create: the same refusal, the host's
                     self._guarded_pod_network_sync(spec.network, spec.network_id)
-                # The first attempt's create timed out on the client but still runs in dockerd: it holds
-                # the name (409) while inspect answers 404 until it registers the container. Adopt it then.
-                if not adopt_existing or f'"/{spec.name}" is already in use' not in str(exc):
-                    raise
-                adopted_id = self._wait_for_inflight_create_sync(spec)
-                if adopted_id is None:
-                    raise
+                raise
+        if spec.before_create is not None and adopt_existing:
+            spec.before_create()
         container_id = created.get("Id") if isinstance(created, dict) else adopted_id
         container_id = container_id if isinstance(container_id, str) and container_id else None
         # Started by ID, never a same-name successor (a restored container that took the name since the create); a
@@ -1245,6 +1284,8 @@ class RentalDockerSdkClient:
                         for name in container.get("Names") or ()
                     ]
                 )
+            if spec.before_start_call is not None:
+                spec.before_start_call()
             try:
                 self._api_client.start(container_id or spec.name)
             except Exception:
@@ -1256,16 +1297,6 @@ class RentalDockerSdkClient:
                 exc.container_id = container_id
             raise
         return container_id
-
-    def _wait_for_inflight_create_sync(self, spec: ContainerRunSpec) -> str | None:
-        """The adopted ID once the in-flight create of `spec.name` registers; None after the wait."""
-        deadline = time.monotonic() + _INFLIGHT_CREATE_WAIT_SECONDS
-        while time.monotonic() < deadline:
-            time.sleep(_INFLIGHT_CREATE_POLL_SECONDS)
-            adopted_id = self._adopt_container_by_name_sync(spec)
-            if adopted_id is not None:
-                return adopted_id
-        return None
 
     def _adopt_container_by_name_sync(self, spec: ContainerRunSpec) -> str | None:
         """The idempotency check before a retried `containers/create`.

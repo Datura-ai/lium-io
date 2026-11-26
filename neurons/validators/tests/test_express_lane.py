@@ -751,6 +751,38 @@ async def test_a_session_lost_in_the_port_check_is_retried_not_a_failed_first_pa
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("check", ["rental", "verifyx", "rented", "created"])
+async def test_a_rental_probe_the_task_had_no_time_for_is_no_failed_first_pass(monkeypatch, wallet, check):
+    """DAH-5933: the validator's budget left the rental probe (or VerifyX) no time, or the backend found the node
+    rented during the check (review 4656859541): the scored cycle has no verdict for it, so nothing is published, the
+    node is not validated, and it is asked again as a deferral until MAX_ATTEMPTS leaves it to the cycle."""
+    from services.task.messages import RentalVerificationMessages, TenantEnforcementMessages, VerifyXMessages
+
+    no_time_reason = {
+        "rental": RentalVerificationMessages.NO_TASK_TIME.reason,
+        "verifyx": VerifyXMessages.NO_TASK_TIME.reason,
+        "rented": RentalVerificationMessages.RENTED_SINCE_THE_SNAPSHOT.reason,
+        # DAH-5750: a renter's create the run stopped for is deferred the same way
+        "created": TenantEnforcementMessages.RENTED_SINCE_CYCLE_START.reason,
+    }[check]
+
+    new_node = str(uuid4())
+    harness = _Harness(monkeypatch, {"miner-a": [_portal_executor(new_node)]}, [_Neuron("miner-a")])
+
+    def no_time(payload, executor_id):
+        result = _job_result(executor_id, score=0.0)
+        result.failure_reason_code = no_time_reason
+        return {"miner_hotkey": "miner-a", "miner_coldkey": "c", "results": [result]}
+
+    harness.job_for = no_time
+    assert await harness.tick_and_settle() == 1
+    harness.miner_service.publish_machine_specs.assert_not_awaited()
+    pending = harness.lane._pending[new_node]
+    assert (pending.failed_runs, pending.attempts) == (0, 1) and pending.not_before > 0
+    assert await harness.redis_service.get_validated_executors() == set()
+
+
+@pytest.mark.asyncio
 async def test_a_session_lost_after_snapshot_misses_used_max_attempts_keeps_the_node_queued(
     monkeypatch, wallet
 ):
@@ -1273,3 +1305,105 @@ async def test_a_recheck_whose_sessions_are_lost_keeps_its_runs_for_a_verdict(mo
             harness.lane._recheck_pending[node].not_before = 0.0
     assert await harness.redis_service.get_executor_recheck_requests() == set()
     assert await harness.tick_and_settle() == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("covers", [True, False])
+async def test_a_first_pass_the_rollout_explains_is_left_to_the_cycle_not_published_as_a_zero(
+    monkeypatch, wallet, covers
+):
+    """lio#2389 review: an OUTDATED zero published here would take a node updating right after a mid-cycle push off
+    the rent list; the cycle withholds that verdict in the rollout window, so the lane leaves the node to it."""
+    from services.executor_rollout import RolloutWindow
+    from services.task.messages import ExecutorImageMessages
+
+    new_node = str(uuid4())
+    harness = _Harness(monkeypatch, {"miner-a": [_portal_executor(new_node)]}, [_Neuron("miner-a")])
+    harness.inputs.job_block = 100
+    window = RolloutWindow(
+        digest="sha256:" + "b" * 64,
+        previous_digest="sha256:" + "a" * 64,
+        started_at=datetime.now(UTC),
+        opened_job_block=100,
+        cycles_seen=1 if covers else 0,
+        grace_cycles=2,
+    )
+    harness.inputs.rollout_window = window
+
+    def outdated(payload, executor_id):
+        result = _job_result(executor_id, score=0.0)
+        result.failure_reason_code = ExecutorImageMessages.OUTDATED.reason
+        return {"miner_hotkey": "miner-a", "miner_coldkey": "c", "results": [result]}
+
+    harness.job_for = outdated
+    assert await harness.tick_and_settle() == 1
+
+    if covers:
+        harness.miner_service.publish_machine_specs.assert_not_awaited()
+        assert new_node in harness.lane._left_to_cycle and new_node not in harness.lane._pending
+    else:
+        harness.miner_service.publish_machine_specs.assert_awaited_once()
+
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pushed_mid_cycle", [True, False])
+async def test_an_outdated_failure_after_a_push_that_landed_mid_cycle_is_left_to_the_cycle(
+    monkeypatch, wallet, pushed_mid_cycle
+):
+    """lio#2389 review 4697119137: the window the cycle read at its start does not cover a push that lands after it;
+    the cycle end's read opens a window on this cycle and withholds the OUTDATED zero, so the lane must not publish
+    it. Only the registry read tells that push apart, and it never counts a cycle."""
+    from services.executor_rollout import RolloutWindow
+    from services.task.messages import ExecutorImageMessages
+
+    node = str(uuid4())
+    harness = _Harness(monkeypatch, {"miner-a": [_portal_executor(node)]}, [_Neuron("miner-a")])
+    harness.inputs.job_block = 100
+    old = "sha256:" + "a" * 64
+    harness.inputs.rollout_window = RolloutWindow(
+        digest=old, previous_digest=None, started_at=None, opened_job_block=None, cycles_seen=0, grace_cycles=2
+    )
+    harness.lane.registry_digest = AsyncMock(return_value="sha256:" + "b" * 64 if pushed_mid_cycle else old)
+
+    def outdated(payload, executor_id):
+        result = _job_result(executor_id, score=0.0)
+        result.failure_reason_code = ExecutorImageMessages.OUTDATED.reason
+        return {"miner_hotkey": "miner-a", "miner_coldkey": "c", "results": [result]}
+
+    harness.job_for = outdated
+    assert await harness.tick_and_settle() == 1
+
+    harness.lane.registry_digest.assert_awaited_once()
+    if pushed_mid_cycle:
+        harness.miner_service.publish_machine_specs.assert_not_awaited()
+        assert node in harness.lane._left_to_cycle
+    else:
+        harness.miner_service.publish_machine_specs.assert_awaited_once()
+
+@pytest.mark.asyncio
+async def test_a_passed_result_is_published_without_reading_the_rollout_window(monkeypatch, wallet):
+    """lio#2389 review 4694852173: only a failure can be withheld, so a pass never looks at the rollout window."""
+    import core.express_lane as express_lane
+    from services.executor_rollout import RolloutWindow
+
+    grace = Mock(return_value=None)
+    monkeypatch.setattr(express_lane, "rollout_grace_reason", grace)
+    node = str(uuid4())
+    harness = _Harness(monkeypatch, {"miner-a": [_portal_executor(node)]}, [_Neuron("miner-a")])
+    harness.lane.registry_digest = AsyncMock(return_value="sha256:" + "c" * 64)
+    harness.inputs.job_block = 100
+    harness.inputs.rollout_window = RolloutWindow(
+        digest="sha256:" + "b" * 64,
+        previous_digest="sha256:" + "a" * 64,
+        started_at=datetime.now(UTC),
+        opened_job_block=100,
+        cycles_seen=1,
+        grace_cycles=2,
+    )
+
+    assert await harness.tick_and_settle() == 1
+
+    grace.assert_not_called()
+    harness.lane.registry_digest.assert_not_awaited()
+    harness.miner_service.publish_machine_specs.assert_awaited_once()

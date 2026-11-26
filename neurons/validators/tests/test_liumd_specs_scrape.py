@@ -1,4 +1,4 @@
-"""DAH-4689: the liumd machine-scrape document, without a Python fallback in specs mode."""
+"""DAH-4689: the liumd machine-scrape document, with a Python fallback in specs mode."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 from helpers import build_context_config, build_services, build_state, make_context
+from services.liumd_exec_client import LiumdRefusal
 from services.local_verify_client import LocalVerifyAnswer, LocalVerifyUnavailable
 from services.task import liumd_shadow
 from services.task.checks import machine_spec_scrape
@@ -117,7 +118,7 @@ async def test_the_liumd_document_replaces_the_python_scrape(monkeypatch):
     ids=["no-early-read", "not-supported", "empty-specs", "no-gpu-key"],
 )
 @pytest.mark.asyncio
-async def test_an_unusable_liumd_document_fails_without_the_python_scrape(
+async def test_an_unusable_liumd_document_falls_back_to_the_python_scrape(
     monkeypatch, outcome, reason
 ):
     _liumd_on(monkeypatch)
@@ -126,13 +127,86 @@ async def test_an_unusable_liumd_document_fails_without_the_python_scrape(
 
     result = await MachineSpecScrapeCheck().run(_ctx(runner))
 
-    assert result.passed is False
-    assert result.event.reason_code == Msg.SCRAPE_FAILED_ON_HOST.reason
-    assert result.event.what_we_saw["delivery"] == "liumd"
-    assert result.event.what_we_saw["liumd_reason"] == reason
-    assert result.updates == {}
-    assert len(runner.calls) == 0
+    assert result.passed is True
+    assert result.event.reason_code == Msg.SCRAPE_OK.reason
+    assert result.event.what_we_saw["delivery"] == "stdin"
+    assert result.event.what_we_saw["liumd_fallback_reason"] == reason
+    state = result.updates["state"]
+    assert state.specs["gpu"]["count"] == 1
+    assert state.scrape_specs is not None
+    assert state.liumd_shadow_facts_task is None
+    assert len(runner.calls) == 1
     assert len(start) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_failed_python_fallback_reports_the_liumd_reason(monkeypatch):
+    _liumd_on(monkeypatch)
+    _start_reading(monkeypatch, LocalVerifyUnavailable("binary_refresh_failed", "curl exit None"))
+    runner = DummySSHCommandRunner(result=make_command_result(success=False))
+
+    result = await MachineSpecScrapeCheck().run(_ctx(runner))
+
+    assert result.passed is False
+    assert result.event.what_we_saw["delivery"] == "stdin"
+    assert result.event.what_we_saw["liumd_fallback_reason"] == "binary_refresh_failed"
+    assert len(runner.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_liumd_refusal_keeps_its_error_and_detail_as_the_fallback_reason(monkeypatch):
+    _liumd_on(monkeypatch)
+    refusal = LiumdRefusal(
+        exit_status=3, error="docker_unavailable", detail="cannot reach the docker daemon",
+        echoed=True, round_trip_ms=15,
+    )
+    _start_reading(monkeypatch, refusal)
+    runner = DummySSHCommandRunner(result=make_command_result(success=True, stdout=FERNET_TOKEN))
+
+    result = await MachineSpecScrapeCheck().run(_ctx(runner))
+
+    assert result.passed is True
+    assert result.event.what_we_saw["liumd_fallback_reason"] == "docker_unavailable"
+    assert result.event.what_we_saw["liumd_fallback_detail"] == "cannot reach the docker daemon"
+
+
+@pytest.mark.asyncio
+async def test_a_slow_liumd_read_times_out_and_falls_back(monkeypatch):
+    _liumd_on(monkeypatch)
+    monkeypatch.setattr(machine_spec_scrape, "LIUMD_SPECS_MIN_READ_SECONDS", 0.01)
+    monkeypatch.setattr(machine_spec_scrape, "LIUMD_SPECS_READ_TIMEOUT_SECONDS", 0.01)
+
+    async def slow():
+        await asyncio.sleep(1)
+        return _answer(LIUMD_SPECS)
+
+    task = asyncio.ensure_future(slow())
+    monkeypatch.setattr(liumd_shadow, "start_facts_after_scrape", lambda ctx: task)
+    runner = DummySSHCommandRunner(result=make_command_result(success=True, stdout=FERNET_TOKEN))
+
+    result = await MachineSpecScrapeCheck().run(_ctx(runner))
+
+    assert result.passed is True
+    assert result.event.what_we_saw["liumd_fallback_reason"] == "timeout"
+    assert len(runner.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_an_unexpected_liumd_read_error_falls_back(monkeypatch):
+    _liumd_on(monkeypatch)
+
+    async def boom():
+        raise RuntimeError("shadow bug")
+
+    task = asyncio.ensure_future(boom())
+    monkeypatch.setattr(liumd_shadow, "start_facts_after_scrape", lambda ctx: task)
+    runner = DummySSHCommandRunner(result=make_command_result(success=True, stdout=FERNET_TOKEN))
+
+    result = await MachineSpecScrapeCheck().run(_ctx(runner))
+
+    assert result.passed is True
+    assert result.event.what_we_saw["liumd_fallback_reason"] == "error"
+    assert len(runner.calls) == 1
 
 
 @pytest.mark.asyncio
@@ -217,47 +291,3 @@ def test_normalization_maps_the_liumd_contract_without_mutating_the_snapshot():
     assert normalized["os"] == "Ubuntu 24.04 LTS"
     assert "vloopback_check" not in normalized
     assert raw == snapshot
-
-
-@pytest.mark.asyncio
-async def test_a_failed_binary_refresh_fails_specs_mode(monkeypatch):
-    _liumd_on(monkeypatch)
-    _start_reading(
-        monkeypatch,
-        LocalVerifyUnavailable("binary_refresh_failed", "manifest unavailable"),
-    )
-    runner = DummySSHCommandRunner(result=make_command_result(success=False))
-
-    result = await MachineSpecScrapeCheck().run(_ctx(runner))
-
-    assert result.passed is False
-    assert result.event.reason_code == Msg.SCRAPE_FAILED_ON_HOST.reason
-    assert result.event.what_we_saw["liumd_reason"] == "binary_refresh_failed"
-    assert runner.calls == []
-
-
-@pytest.mark.asyncio
-async def test_a_stale_answer_does_not_fail_specs_mode(monkeypatch):
-    _liumd_on(monkeypatch)
-    _start_reading(monkeypatch, _answer(LIUMD_SPECS))
-    runner = DummySSHCommandRunner(result=make_command_result(success=False))
-
-    result = await MachineSpecScrapeCheck().run(_ctx(runner))
-
-    assert result.passed is True
-    assert result.event.what_we_saw["delivery"] == "liumd"
-    assert runner.calls == []
-
-
-@pytest.mark.asyncio
-async def test_shadow_mode_still_runs_the_python_scrape(monkeypatch):
-    monkeypatch.setattr(machine_spec_scrape.settings, "VALIDATOR_LIUMD_SPECS", False)
-    monkeypatch.setattr(machine_spec_scrape.settings, "VALIDATOR_LIUMD_SHADOW", True)
-    monkeypatch.setattr(machine_spec_scrape.settings, "DRY_RUN", False)
-    runner = DummySSHCommandRunner(result=make_command_result(success=True, stdout=FERNET_TOKEN))
-
-    result = await MachineSpecScrapeCheck().run(_ctx(runner))
-
-    assert result.passed is True
-    assert result.event.reason_code == Msg.SCRAPE_OK.reason
-    assert len(runner.calls) == 1

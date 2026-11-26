@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import copy
 import json
 import logging
@@ -9,6 +10,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass, fields, replace
 from typing import Any, Literal
 
+from services import executor_payload
 from services.file_encrypt_service import ORIGINAL_KEYS
 from services.gpu_spec_table import classify_gpu_model, list_sxm_on_pcie_adapter_as_pcie
 
@@ -20,9 +22,12 @@ from ..messages import MessageTemplate, render_message
 from ..models import ValidationEvent
 from ..pipeline import CheckResult, Context
 from ..runner import SSHCommandResult
+from .container_download_speed import SPECS_KEY as IN_POD_DOWNLOAD_KEY
+from .container_download_speed import SPECS_MEASURED_AT_KEY as IN_POD_DOWNLOAD_AT_KEY
 from .gpu_loss_hold import GpuLossHoldCheck
 from .rented_gpu_drop import RentedGpuDropCheck, missing_gpus_under_reset
-from .upload_files import UploadFailed, upload_validation_files_to_fresh_remote_dir
+from .task_time import task_seconds_left
+from .upload_files import UPLOAD_TIMEOUT, UploadFailed, upload_validation_files_to_fresh_remote_dir
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +38,12 @@ logger = logging.getLogger(__name__)
 # per-executor timeout. The upload gets one attempt for exactly that reason.
 STDIN_FAILURE_RETRY_WINDOW_MS = 120_000
 FALLBACK_UPLOAD_ATTEMPTS = 1
+
+# Specs mode reads liumd first, then falls back to the Python scrape when liumd cannot produce a
+# usable document. The read is capped so the fallback still fits inside the machine-scrape timeout.
+LIUMD_SPECS_READ_TIMEOUT_SECONDS = 180
+LIUMD_SPECS_FALLBACK_RESERVE_SECONDS = 90
+LIUMD_SPECS_MIN_READ_SECONDS = 5.0
 
 # The scrape says only two things on stdout: a Fernet token when it worked, and a JSON object
 # with an "error" key when it ran but had nothing to report. Every Fernet token is base64url of
@@ -388,7 +399,7 @@ async def scrape_gpu_details(ctx: Context, timeout: int) -> list[dict[str, Any]]
     DAH-6469: GpuThermalThrottleCheck reads the cards under its own load with it. It writes nothing to ctx.state, so
     the checks after it keep the cycle's own scrape."""
     if ctx.config.machine_scrape_source:
-        command, stdin_text = f"{shlex.quote(ctx.executor.python_path)} -I -", ctx.config.machine_scrape_source
+        command, stdin_text = f"{shlex.quote(executor_payload.EXECUTOR_PYTHON)} -I -", ctx.config.machine_scrape_source
     elif ctx.state.remote_dir and ctx.config.machine_scrape_filename:
         command, stdin_text = _binary_command(ctx.state.remote_dir, ctx.config.machine_scrape_filename), None
     else:
@@ -426,29 +437,69 @@ class MachineSpecScrapeCheck:
 
     async def run(self, ctx: Context) -> CheckResult:
         liumd_specs = settings.VALIDATOR_LIUMD_SPECS and not settings.DRY_RUN
-        if liumd_specs:
-            return await self._scrape_with_liumd(ctx)
-
         timeout = ctx.config.machine_scrape_timeout or self.DEFAULT_TIMEOUT
+
+        if liumd_specs:
+            result, fallback_reason = await self._scrape_with_liumd(ctx, timeout)
+            if result.passed or fallback_reason is None:
+                return result
+            detail = str(result.event.what_we_saw.get("detail") or "")[:300]
+            logger.warning(
+                _m(
+                    "liumd machine specs unavailable; using the Python scrape",
+                    extra=get_extra_info(
+                        {**ctx.default_extra, "liumd_reason": fallback_reason, "detail": detail}
+                    ),
+                )
+            )
+            if ctx.config.machine_scrape_source:
+                fallback = await self._scrape_from_source(ctx, timeout, start_shadow=False)
+            else:
+                fallback = await self._scrape_uploaded_binary(ctx, timeout, start_shadow=False)
+            fallback.event.what_we_saw["liumd_fallback_reason"] = fallback_reason
+            if detail:
+                fallback.event.what_we_saw["liumd_fallback_detail"] = detail
+            return fallback
 
         if ctx.config.machine_scrape_source:
             return await self._scrape_from_source(ctx, timeout, start_shadow=True)
         return await self._scrape_uploaded_binary(ctx, timeout, start_shadow=True)
 
-    async def _scrape_with_liumd(self, ctx: Context) -> CheckResult:
-        """Use the full machine-scrape document from the same early `liumd run`."""
+    async def _scrape_with_liumd(
+        self, ctx: Context, timeout: int
+    ) -> tuple[CheckResult, str | None]:
+        """Use the liumd machine-scrape document, or report why the Python fallback must run."""
         from services.local_verify_client import LocalVerifyAnswer
 
         from ..liumd_shadow import start_facts_after_scrape
 
         task = start_facts_after_scrape(ctx)
         if task is None:
-            return self._fail_liumd(ctx, None, "no early liumd read")
-        answer = await task
+            result = self._fail_liumd(ctx, None, "no early liumd read")
+            return result, self._liumd_reason(result)
+        budget = max(
+            LIUMD_SPECS_MIN_READ_SECONDS,
+            min(
+                float(timeout) - LIUMD_SPECS_FALLBACK_RESERVE_SECONDS,
+                LIUMD_SPECS_READ_TIMEOUT_SECONDS,
+            ),
+        )
+        try:
+            answer = await asyncio.wait_for(task, timeout=budget)
+        except TimeoutError:
+            result = self._fail_liumd(ctx, None, "liumd read timed out", reason="timeout")
+            return result, "timeout"
+        except Exception as exc:  # a shadow bug must not fail the scrape
+            result = self._fail_liumd(
+                ctx, None, f"{type(exc).__name__}: {exc}"[:300], reason="error"
+            )
+            return result, "error"
         if not isinstance(answer, LocalVerifyAnswer):
-            return self._fail_liumd(ctx, answer)
+            result = self._fail_liumd(ctx, answer)
+            return result, self._liumd_reason(result)
         if not answer.specs:
-            return self._fail_liumd(ctx, answer, "empty liumd specs")
+            result = self._fail_liumd(ctx, answer, "empty liumd specs")
+            return result, self._liumd_reason(result)
 
         specs = _normalize_liumd_document(answer.specs)
         gpu_info = specs.get("gpu")
@@ -456,10 +507,15 @@ class MachineSpecScrapeCheck:
         if not isinstance(gpu_info, dict) or not isinstance(raw_gpu_details, list) or not all(
             isinstance(detail, dict) for detail in raw_gpu_details
         ):
-            return self._fail_liumd(ctx, answer, "malformed liumd specs")
+            result = self._fail_liumd(ctx, answer, "malformed liumd specs")
+            return result, self._liumd_reason(result)
         if not raw_gpu_details:
-            return await self._fail_without_gpus(ctx, answer, specs)
-        return self._result_from_specs(ctx, specs, delivery="liumd", task=task, snapshot=False)
+            return await self._fail_without_gpus(ctx, answer, specs), None
+        return self._result_from_specs(ctx, specs, delivery="liumd", task=task, snapshot=False), None
+
+    @staticmethod
+    def _liumd_reason(result: CheckResult) -> str:
+        return str(result.event.what_we_saw.get("liumd_reason") or "unavailable")
 
     async def _fail_without_gpus(
         self, ctx: Context, answer: Any, specs: dict[str, Any]
@@ -502,6 +558,9 @@ class MachineSpecScrapeCheck:
     ) -> CheckResult:
         specs.pop("port_verify_first_miss", None)
         specs.pop("split_disk", None)
+        # the in-pod download figure is the validator's own reading (ContainerDownloadSpeedCheck), never the node's
+        specs.pop(IN_POD_DOWNLOAD_KEY, None)
+        specs.pop(IN_POD_DOWNLOAD_AT_KEY, None)
         vloopback = specs.pop("vloopback_check", None)
         gpu_info = specs.get("gpu", {}) or {}
         gpu_count = gpu_info.get("count", 0) or 0
@@ -569,12 +628,17 @@ class MachineSpecScrapeCheck:
         *,
         reason: str | None = None,
     ) -> CheckResult:
+        from services.liumd_exec_client import LiumdRefusal
         from services.local_verify_client import LocalVerifyUnavailable
 
         if reason is None:
             if isinstance(answer, LocalVerifyUnavailable):
                 reason = answer.reason or "unavailable"
                 detail = detail or answer.detail
+            elif isinstance(answer, LiumdRefusal):
+                # liumd answered and refused: its own error code and detail say why, not "malformed"
+                reason = answer.error or "refused"
+                detail = detail or answer.detail or f"liumd exit {answer.exit_status}"
             elif answer is None:
                 reason = "no_early_read"
             else:
@@ -603,7 +667,7 @@ class MachineSpecScrapeCheck:
         # from sys.path, so a file left next to the SSH login shell cannot shadow psutil or
         # json. It does not disable site processing: a .pth or sitecustomize inside the image
         # still runs and prints, which is what `_decrypt_payload` searches through.
-        command = f"{shlex.quote(ctx.executor.python_path)} -I -"
+        command = f"{shlex.quote(executor_payload.EXECUTOR_PYTHON)} -I -"
         scrape_run = await ctx.runner.run(
             command,
             timeout=timeout,
@@ -631,9 +695,33 @@ class MachineSpecScrapeCheck:
         if scrape_run.exit_code != 0 and _scrape_reported_its_own_failure(scrape_run.stdout):
             return result
 
+        if not await self._binary_ready_in_time(ctx, timeout):
+            return result
+
         return await self._retry_scrape_with_uploaded_binary(
             ctx, timeout, fallback_from=StdinAttempt.from_failed_result(result), start_shadow=start_shadow
         )
+
+    async def _binary_ready_in_time(self, ctx: Context, timeout: int) -> bool:
+        # DAH-5899: the cycle builds its binary only now, once for every node that needs it; the build counts
+        # against the task's time, and a retry whose scrape would no longer fit keeps the stdin verdict
+        # (upload up to UPLOAD_TIMEOUT, then the scrape's own timeout)
+        if ctx.config.machine_scrape_binary_build is None:
+            return True
+        seconds_the_retry_needs = timeout + UPLOAD_TIMEOUT
+        wait_seconds = task_seconds_left(ctx) - seconds_the_retry_needs
+        if wait_seconds <= 0:
+            return False
+        try:
+            await ctx.config.machine_scrape_binary_build.ensure(wait_seconds)
+        except Exception as exc:
+            logger.error(
+                _m("[scrape] binary not ready; keeping the stdin result", extra=get_extra_info(
+                    {**ctx.default_extra, "error": repr(exc)[:400]}
+                ))
+            )
+            return False
+        return task_seconds_left(ctx) >= seconds_the_retry_needs
 
     async def _retry_scrape_with_uploaded_binary(
         self,
