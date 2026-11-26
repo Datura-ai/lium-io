@@ -41,7 +41,7 @@ async def test_semi_batch_publishes_a_mapped_port_on_the_host_port_the_router_fo
     runner.run = mocker.AsyncMock(return_value=CONTAINER_STARTED)
     runner.cleanup = mocker.AsyncMock()
     port_tester = mocker.Mock()
-    port_tester.test_many = mocker.AsyncMock(side_effect=lambda _s, _h, chunk, *_a: (chunk, []))
+    port_tester.test_many = mocker.AsyncMock(side_effect=lambda _h, chunk, *_a: (chunk, []))
 
     await SemiBatchVerifier(port_tester, runner).verify(ports, ssh_client=mocker.Mock(), host="1.2.3.4")
 
@@ -69,7 +69,7 @@ async def test_semi_batch_one_busy_host_port_fails_only_itself(mocker):
     runner.run = mocker.AsyncMock(side_effect=run)
     runner.cleanup = mocker.AsyncMock()
     port_tester = mocker.Mock()
-    port_tester.test_many = mocker.AsyncMock(side_effect=lambda _s, _h, chunk, *_a: (chunk, []))
+    port_tester.test_many = mocker.AsyncMock(side_effect=lambda _h, chunk, *_a: (chunk, []))
 
     successful, failed = await SemiBatchVerifier(port_tester, runner).verify(
         ports, ssh_client=mocker.Mock(), host="1.2.3.4"
