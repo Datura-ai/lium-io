@@ -42,10 +42,11 @@ logger = logging.getLogger(__name__)
 
 # DAH-6241: each node's last GPU model verdict, one entry per card below its reported model, so a
 # node that runs a filler (no full matmul) is still judged by the last answer each card gave. Keyed
-# by miner and executor, as the post-rental recheck marker is. A sample that gave no answer (no
-# memory, timeout, our own error) stores nothing, so the node is sampled again next cycle.
+# by miner and executor, as the post-rental recheck marker is. A sample that found no room or timed
+# out keeps an empty verdict for a day; any other sample with no answer is retried next cycle.
 GPU_MODEL_VERDICT_KEY = "gpu_model_verdict:{miner_hotkey}:{executor_uuid}"
 GPU_MODEL_VERDICT_TTL_SECONDS = 7 * 24 * 60 * 60
+GPU_MODEL_NO_VERDICT_TTL_SECONDS = 24 * 60 * 60
 
 
 class CapabilityCheck:
@@ -100,6 +101,9 @@ class CapabilityCheck:
                 elif not seen and sample.get("passed"):
                     # a right answer without numbers is still a verdict; a sample with none is retried next cycle
                     mismatches = await judge_gpu_model(ctx, [], set())
+                elif not seen and sample.get("error_kind") in ("no_memory", "timeout"):
+                    # a card the filler leaves no room on fails every time: retry once a day, not every cycle
+                    await _store_gpu_model_verdict(ctx, [], GPU_MODEL_NO_VERDICT_TTL_SECONDS)
             if mismatches:
                 # the node earns nothing, so Lium's filler no longer runs on it (as SshdBootstrapCheck)
                 rented_data = ctx.state.rented_data

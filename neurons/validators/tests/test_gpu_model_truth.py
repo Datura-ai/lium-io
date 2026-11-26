@@ -138,16 +138,19 @@ FAKE_H100 = ("NVIDIA H100 80GB HBM3", {"cc": "8.0", "sm_count": 108})
 REAL_H100 = ("NVIDIA H100 80GB HBM3", {"cc": "9.0", "sm_count": 132})
 
 
-def _filler_ctx(context_factory, redis, metrics, *, success=True, specs=None):
+NO_ROOM = ValidationResult(  # a busy card: the filler holds the VRAM
+    success=False,
+    returned_uuid="None",
+    stderr="Failed to allocate d_A: out of memory",
+    error_message=f"{UUID_MISMATCH_ERROR_PREFIX}: expected 'nonce', got 'None'",
+)
+TIMED_OUT = ValidationResult(success=False, timed_out=True, error_message="timed out")
+WRONG_ANSWER = ValidationResult(success=False, error_message="unexpected stdout")
+
+
+def _filler_ctx(context_factory, redis, metrics, *, success=True, specs=None, failure=NO_ROOM):
     service = SamplingValidationService(
-        result=ValidationResult(success=True, metrics=metrics)
-        if success
-        else ValidationResult(  # a busy card: the filler holds the VRAM
-            success=False,
-            returned_uuid="None",
-            stderr="Failed to allocate d_A: out of memory",
-            error_message=f"{UUID_MISMATCH_ERROR_PREFIX}: expected 'nonce', got 'None'",
-        )
+        result=ValidationResult(success=True, metrics=metrics) if success else failure
     )
     state = build_state(
         specs=specs or _specs(FAKE_H100[0]),
@@ -224,14 +227,29 @@ async def test_a_failed_sample_keeps_a_stored_mismatch(context_factory, monkeypa
 
 
 @pytest.mark.asyncio
-async def test_a_failed_first_sample_is_retried_next_cycle(context_factory, sample_never_due):
+@pytest.mark.parametrize("failure", [NO_ROOM, TIMED_OUT], ids=["no_memory", "timeout"])
+async def test_a_first_sample_with_no_room_or_a_timeout_is_not_retried_every_cycle(
+    context_factory, sample_never_due, failure
+):
+    redis = FakeRedis()
+    ctx, service = _filler_ctx(context_factory, redis, None, success=False, failure=failure)
+    assert (await CapabilityCheck().run(ctx)).passed is True
+    assert redis.ttl[_verdict_key()] == capability.GPU_MODEL_NO_VERDICT_TTL_SECONDS
+
+    ctx, service = _filler_ctx(context_factory, redis, None, success=False, failure=failure)
+    assert (await CapabilityCheck().run(ctx)).passed is True
+    assert service.budgets == []
+
+
+@pytest.mark.asyncio
+async def test_a_first_sample_with_a_wrong_answer_is_retried_next_cycle(context_factory, sample_never_due):
     # DAH-6332 item 2: a sample with no verdict stores nothing, so the node is not left unjudged for a day
     redis = FakeRedis()
-    ctx, service = _filler_ctx(context_factory, redis, None, success=False)
+    ctx, service = _filler_ctx(context_factory, redis, None, success=False, failure=WRONG_ANSWER)
     assert (await CapabilityCheck().run(ctx)).passed is True
     assert _verdict_key() not in redis.ttl
 
-    ctx, service = _filler_ctx(context_factory, redis, None, success=False)
+    ctx, service = _filler_ctx(context_factory, redis, None, success=False, failure=WRONG_ANSWER)
     assert (await CapabilityCheck().run(ctx)).passed is True
     assert len(service.budgets) == 1
 
