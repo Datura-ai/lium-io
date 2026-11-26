@@ -149,7 +149,7 @@ async def evict_cache_volumes_oldest_first(
     volume_names: list[str],
     run_removal: Callable[[str], Awaitable[object]],
     has_room: Callable[[], Awaitable[bool]],
-    evict_first_prefix: tuple[str, ...] | None = None,
+    evict_first_prefixes: tuple[str, ...] | None = None,
     volume_remove: Callable[[str], str] = DockerCommand.volume_remove,
     keep_image: str | None = None,
 ) -> None:
@@ -180,7 +180,7 @@ async def evict_cache_volumes_oldest_first(
     ordered: list[str] = sorted(
         volume_names,
         key=lambda name: (
-            not (evict_first_prefix and name.startswith(evict_first_prefix)),
+            not (evict_first_prefixes and name.startswith(evict_first_prefixes)),
             created_at.get(name, "~"),
             name,
         ),
@@ -678,7 +678,9 @@ class ContainerCleanup:
 
             await ssh_client.run(DockerCommand.volume_remove(*orphans))
             # `volume_remove` ends in `|| true`: re-list to report only what is really gone
-            surviving: set[str] = set(await self._get_cache_volumes(ssh_client, ("volume_",)))
+            # a pod volume is no cache kind, so list it by name; a list that fails counts nothing as removed
+            listed: Optional[list[str]] = await self._list_volume_names(ssh_client)
+            surviving: set[str] = set(orphans) if listed is None else {n for n in listed if n.startswith("volume_")}
             removed: list[str] = [name for name in orphans if name not in surviving]
             if removed:
                 logger.info(
@@ -740,17 +742,18 @@ class ContainerCleanup:
             # "leave the cache alone".
             return None
 
+    async def _list_volume_names(self, ssh_client: asyncssh.SSHClientConnection) -> Optional[list[str]]:
+        # every volume on the host; None when docker cannot list them
+        result = await ssh_client.run('/usr/bin/docker volume ls --format "{{.Name}}"')
+        if getattr(result, "exit_status", 0) != 0:
+            return None
+        return [name for name in (line.strip() for line in (result.stdout or "").splitlines()) if name]
+
     async def _get_cache_volumes(
         self, ssh_client: asyncssh.SSHClientConnection, name_prefixes: tuple[str, ...]
     ) -> list[str]:
-        result = await ssh_client.run('/usr/bin/docker volume ls --format "{{.Name}}"')
-        if getattr(result, "exit_status", 0) != 0:
-            return []
-        return sorted(
-            name
-            for name in (line.strip() for line in (result.stdout or "").splitlines())
-            if is_cache_volume_name(name, name_prefixes)
-        )
+        names: list[str] = await self._list_volume_names(ssh_client) or []
+        return sorted(name for name in names if is_cache_volume_name(name, name_prefixes))
 
     async def sweep_abandoned_download_temporaries(
         self,

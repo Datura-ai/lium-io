@@ -385,7 +385,10 @@ ENGY_CACHE_COMPLETE_SHARE = 0.98
 
 
 class CacheCharge(StrEnum):
-    """How a launch charges an existing cache of a kind against free disk (DockerService._cache_missing_gb)."""
+    """How a launch charges an existing cache of a kind against free disk.
+
+    Applied by DockerService._cache_missing_gb_resetting_oversize.
+    """
 
     # its own size is unknown: the whole set when it is empty (the reclaim's wipe leaves it so), else nothing
     WHOLE_WHEN_EMPTY = "whole_when_empty"

@@ -391,3 +391,14 @@ async def test_the_stale_cleanup_removes_never_started_check_containers(cleanup)
 
     assert await cleanup.remove_never_started_check_containers(ssh_client, "exec-1") == 1
     assert any(c.startswith(f"/usr/bin/docker rm -f {CHECK_ID} ") for c in ssh_client.commands)
+
+
+@pytest.mark.asyncio
+async def test_a_removal_docker_refuses_is_not_counted_as_removed(cleanup):
+    # the re-list after `volume rm ... || true` must see pod volumes, which are no cache kind (review r4704472500)
+    volume = f"volume_{POD}"
+    ssh_client = VolumeHostSsh(
+        dangling=[volume], created={volume: "2026-09-10T08:00:00Z"}, volumes=[volume], refuses={volume}
+    )
+    assert await cleanup.remove_orphan_rental_volumes(ssh_client, _snapshot([LIVE]), "exec-1", AsyncMock(return_value=True)) == 0
+    assert _removed(ssh_client) == [volume]

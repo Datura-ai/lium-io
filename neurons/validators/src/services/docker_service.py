@@ -6697,7 +6697,7 @@ class DockerService:
         A filler this create just killed can still be exiting and mount its cache, so dockerd refuses the
         `volume rm` (prod 4 Nov, 8x B300 Engy and Dolphin): the cache's files are then unlinked on the host
         (_wipe_volume_cmd), only while every container mounting it is one of ``killed_fillers``; the empty volume
-        is swept later, and a filler asking for it again is charged the whole download (_cache_missing_gb).
+        is swept later, and a filler asking for it again is charged the whole download (_cache_missing_gb_resetting_oversize).
         Only for CUSTOMER_RENTAL, and best-effort — a failure here must never break the rent.
         """
         if payload.workload_kind != WorkloadKind.CUSTOMER_RENTAL or not payload.volume_limit_gb:
@@ -6830,7 +6830,7 @@ class DockerService:
                     cache_volumes,
                     remove,
                     rental_fits,
-                    evict_first_prefix=listed_as_free_prefixes,
+                    evict_first_prefixes=listed_as_free_prefixes,
                     volume_remove=volume_remove,
                     keep_image=payload.docker_image,
                 )
@@ -6939,7 +6939,7 @@ class DockerService:
         )
         # DAH-5192: a partial checkpoint (an interrupted download) is not "present": what it still lacks is charged.
         missing_gb: dict[str, float] = {
-            name: await self._cache_missing_gb(ssh_client, name, default_extra) for name in existing
+            name: await self._cache_missing_gb_resetting_oversize(ssh_client, name, default_extra) for name in existing
         }
         present: list[CacheVolume] = [
             volume for volume in payload.cache_volumes if volume.name in existing and not missing_gb.get(volume.name)
@@ -7031,10 +7031,11 @@ class DockerService:
             return None
         return (sum(int(kb) for kb in sizes_kb) * 1024 + sum(int(size) for size in image_bytes)) / 1024**3
 
-    async def _cache_missing_gb(
+    async def _cache_missing_gb_resetting_oversize(
         self, ssh_client: asyncssh.SSHClientConnection, volume_name: str, default_extra: dict
     ) -> float:
         """GB an existing cache still costs a launch, by its kind's CacheCharge (CACHE_KINDS); 0 when unknown.
+        A REST_OF_SIZE cache over its size is removed here and charged whole.
 
         Measured in a helper container that mounts the volume by name (the SSH session lands inside the executor
         container, where the volume's host path does not exist). A checkpoint is a few hundred large files, so
