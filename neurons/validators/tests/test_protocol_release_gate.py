@@ -30,20 +30,35 @@ def test_the_validator_protocol_file_matches_lium_protocol():
     assert gate.VALIDATOR_PROTOCOL.read_text().strip() == version
 
 
-def test_every_image_build_runs_the_check_unless_it_opts_out():
-    dockerfile = (_PATH.parent / "Dockerfile").read_text()
-    # a build that passes nothing, as prod's does, is checked
-    assert "ARG ALLOW_PROTOCOL_AHEAD=0\n" in dockerfile
-    assert 'RUN [ "$ALLOW_PROTOCOL_AHEAD" = 1 ] || python3 protocol_release_gate.py' in dockerfile
-    assert "protocol_release_gate.py" not in (_PATH.parent / ".dockerignore").read_text()
+def _run_docker_build(tmp_path, tag):
+    import os
+    import subprocess
+
+    fake = tmp_path / "docker"
+    fake.write_text('#!/bin/sh\necho "$@" >> "$DOCKER_CALLS"\n')
+    fake.chmod(0o755)
+    calls = tmp_path / "calls"
+    env = {
+        **os.environ,
+        "PATH": f"{tmp_path}:{os.environ['PATH']}",
+        "TAG": tag,
+        "DOCKER_CALLS": str(calls),
+    }
+    done = subprocess.run(
+        ["bash", "docker_build.sh"], cwd=_PATH.parent, env=env, capture_output=True, text=True
+    )
+    return done.returncode, calls.read_text() if calls.exists() else ""
 
 
-def test_only_the_prod_build_is_held_by_the_check():
-    """Staging and dev run ahead of the prod backend; prod (latest) passes nothing and is checked."""
-    repo = _PATH.parents[2]
-    staging = (repo / ".github" / "workflows" / "validator_cd_staging.yml").read_text()
-    assert "context: ./neurons/validators" in staging
-    assert "ALLOW_PROTOCOL_AHEAD=1" in staging
-    build = (_PATH.parent / "docker_build.sh").read_text()
-    assert 'if [ "$TAG" != "latest" ]; then\n  ALLOW_PROTOCOL_AHEAD=1' in build
-    assert "ALLOW_PROTOCOL_AHEAD" not in (repo / ".github" / "workflows" / "validator_cd_prod.yml").read_text()
+def test_only_the_prod_build_runs_the_check(tmp_path):
+    """The prod (latest) build is held while the validator is ahead of the prod backend; any other build is not."""
+    ahead = gate.refusal(gate.VALIDATOR_PROTOCOL.read_text(), gate.PIN.read_text()) is not None
+    rc, calls = _run_docker_build(tmp_path, "latest")
+    assert (rc != 0) == ahead
+    assert ("build" in calls) == (not ahead)
+    rc, calls = _run_docker_build(tmp_path, "dev")
+    assert rc == 0 and "build" in calls
+    # every other build of the Dockerfile (staging workflow, dev environments) does not run it
+    assert "protocol_release_gate" not in (_PATH.parent / "Dockerfile").read_text()
+    prod = (_PATH.parents[2] / ".github" / "workflows" / "validator_cd_prod.yml").read_text()
+    assert 'TAG: "latest"' in prod and "bash ./docker_build.sh" in prod
