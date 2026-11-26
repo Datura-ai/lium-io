@@ -2192,7 +2192,7 @@ def test_the_gpu_check_has_time_for_all_its_calls():
     assert module._GPU_CHECK_TIMEOUT_SECONDS == 120
 
 
-# 7be61cf6 shape (26 Nov): 8 listed cards, every device node and kernel minor in place, but CUDA cannot use
+# A node of this shape: 8 listed cards, every device node and kernel minor in place, but CUDA cannot use
 # them as listed
 SHAPE_UUIDS = tuple(f"GPU-{i}{i}{i}{i}{i}{i}{i}{i}-1111-2222-3333-444444444444" for i in range(8))
 SHAPE_LISTING = "".join(
@@ -2224,7 +2224,7 @@ def test_gpu_count_passes_every_listed_card_working_as_itself_under_cuda_and_pyt
 
 
 def test_gpu_count_fails_a_node_whose_cuda_devices_are_not_its_listed_gpus():
-    """Regression (7be61cf6, 26 Nov): nvidia-smi, the device nodes and the CUDA device count all said 8, the
+    """Regression: nvidia-smi, the device nodes and the CUDA device count all said 8, the
     probe passed, and a renter's PyTorch saw one device of another model."""
     other = "cuda\t0\tok\t" + SHAPE_UUIDS[0] + "\t48541\tNVIDIA RTX A6000\n"
     # the driver API: one device of another model, the others take no context
