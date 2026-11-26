@@ -170,9 +170,46 @@ def test_an_unknown_containerd_root_fails_the_gate_closed():
     assert "could not be measured" in line.message
     assert line.fields["total_disk_gb"] is None
     assert line.fields["disk_unknown"] is True
-    assert "ctr" in line.message and "readable config" not in line.message
+    # the marker's own reason reaches the provider, and installing ctr is not offered for a root off the host
+    assert "'/gone' is not on the host" in line.message
+    assert "Install containerd's ctr" not in line.message
     # switching image stores hides the node's existing containers, so the line never suggests it
     assert "containerd-snapshotter" not in line.message
+
+
+def test_a_missing_ctr_is_the_only_unknown_root_told_to_install_ctr():
+    spec = {
+        "gpu": {"details": [{"capacity": 141 * MB_PER_GB} for _ in range(8)]},
+        "hard_disk": {},
+        "hard_disk_scrape_error": (
+            "containerd root unknown: no ctr on the host, so containerd's loaded root cannot be asked"
+        ),
+    }
+
+    measured = _build_incentive()._insufficient_disk(_make_job(spec=spec))
+    line = MinerLogLine.no_payout_because_insufficient_disk_for_vram(_make_job(spec=spec), measured)
+
+    assert measured.needs_ctr is True
+    assert "Install containerd's ctr CLI" in line.message
+    assert "no ctr on the host" in line.message
+
+
+def test_the_gate_log_does_not_count_an_unknown_root_as_disk_short(monkeypatch):
+    spec = {
+        "gpu": {"details": [{"capacity": 141 * MB_PER_GB} for _ in range(8)]},
+        "hard_disk": {},
+        "hard_disk_scrape_error": "containerd root unknown: Docker reports no containerd address",
+    }
+    incentive = _build_incentive()
+    measured = incentive._insufficient_disk(_make_job(spec=spec))
+    logged = []
+    monkeypatch.setattr("incentive.rental_price.logger.info", lambda message: logged.append(message))
+
+    incentive._log_insufficient_disk(_make_job(spec=spec), measured)
+
+    fields = logged[0].extra
+    assert fields["total_disk_gb"] is None
+    assert fields["disk_unknown"] is True
 
 
 def test_an_unknown_containerd_root_stays_closed_after_verifyx_fills_the_totals():
