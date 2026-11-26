@@ -13,6 +13,7 @@ from fakeredis.aioredis import FakeRedis
 
 import clients.compute_client as compute_client
 from clients.compute_client import ComputeClient
+from services.docker_service import CONTAINER_STOP_GRACE_SECONDS
 
 
 def _client(server: FakeServer) -> ComputeClient:
@@ -303,3 +304,8 @@ def test_run_sh_execs_the_connector() -> None:
     run_sh = (Path(__file__).parents[1] / "run.sh").read_text()
     assert "exec pdm run src/connector.py" in run_sh
     assert "exec pdm run src/validator.py" in run_sh
+
+
+def test_the_sigterm_drain_outlasts_a_delete_s_container_stop() -> None:
+    # a normal pod delete is the 30 s stop grace plus the volume wipe; a shorter drain cuts it and the node stays DELETING
+    assert compute_client.SIGTERM_DRAIN_SECONDS >= CONTAINER_STOP_GRACE_SECONDS + 15

@@ -140,9 +140,9 @@ CONNECTOR_LEAD_LOCK_TTL_SECONDS = 6
 CONNECTOR_READY_FILE = "/tmp/connector-ready"  # the deployment's readinessProbe
 # a renewal's interval: a release slower than that is a Redis fault, and the lock then just expires in its TTL
 LEAD_RELEASE_TIMEOUT_SECONDS = CONNECTOR_LEAD_LOCK_TTL_SECONDS / 3
-# after a rollout's SIGTERM, in-flight creates, deletes and GPU resets and their replies finish up to this, inside
-# the deployment's 30 s termination grace
-SIGTERM_DRAIN_SECONDS = 25
+# after a rollout's SIGTERM, in-flight creates, deletes and GPU resets and their replies finish up to this: above a
+# delete's 30 s container stop grace plus the volume wipe (~33 s), and inside the deployment's 60 s termination grace
+SIGTERM_DRAIN_SECONDS = 50
 # the SIGTERM handler's task, held so it is not collected before it exits
 _sigterm_exits: set[asyncio.Task] = set()
 
