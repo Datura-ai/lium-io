@@ -8829,15 +8829,30 @@ async def test_create_container_encrypted_restore_stops_before_docker_run_withou
     restore_spy.assert_not_awaited()
 
 
+@pytest.mark.parametrize("is_sysbox", [True, False])
+@pytest.mark.parametrize("storage_limit_gb", [40, None])
+@pytest.mark.parametrize(
+    ("inspected", "failure_step"),
+    [
+        ("vloopback:v2", None),
+        # the backend's REBOOT_FAILED retry reads the step: a gone disk is not retried every hour
+        (docker_service_module.WorkspaceVolumeMissingError("volume_existing gone"), "workspace_volume_missing"),
+        (RuntimeError("volume_existing could not be inspected"), "docker_data_volume_driver"),
+    ],
+)
 @pytest.mark.asyncio
-async def test_recreated_sysbox_pod_on_existing_volume_still_caps_var_lib_docker(
+async def test_a_restart_inspects_its_kept_volume_before_binding_it(
     docker_service,
     monkeypatch,
+    is_sysbox,
+    storage_limit_gb,
+    inspected,
+    failure_step,
 ):
-    # restart/edit: the workspace volume is reused, so no create_local_volume returns its driver
+    # restart/edit reuses the workspace volume: a missing one would be bound as a new empty one by docker run
     _patch_create_container_happy_path(docker_service, monkeypatch)
-    driver_of = AsyncMock(return_value="vloopback:v2")
-    monkeypatch.setattr(docker_service, "_vloopback_driver_of_volume", driver_of)
+    driver_of = AsyncMock(**({"return_value": inspected} if failure_step is None else {"side_effect": inspected}))
+    monkeypatch.setattr(docker_service, "_driver_of_reused_volume", driver_of)
     payload = ContainerCreateRequest(
         miner_hotkey="miner",
         executor_id=str(uuid4()),
@@ -8849,62 +8864,8 @@ async def test_recreated_sysbox_pod_on_existing_volume_still_caps_var_lib_docker
         cpu_count=1,
         memory_gb=1,
         volume_limit_gb=80,
-        storage_limit_gb=40,
-        is_sysbox=True,
-        local_volume="volume_existing",
-        available_ports=[PayloadPortMapping(internal_port=20020, external_port=20020)],
-        pod_mapping=[],
-        active_container_names=[],
-        active_volume_names=[],
-    )
-    executor_info = ExecutorSSHInfo(
-        uuid=payload.executor_id,
-        address="127.0.0.1",
-        port=8080,
-        ssh_username="root",
-        ssh_port=2200,
-        python_path="/usr/bin/python",
-        root_dir="/root/app",
-        ssh_host_key=FAKE_SSH_HOST_KEY,
-    )
-
-    await docker_service.create_container(
-        payload=payload,
-        executor_info=executor_info,
-        keypair=Mock(ss58_address="validator-hotkey"),
-        private_key="encrypted",
-    )
-
-    run_spec = docker_service.rental_docker_client_factory.client.run_specs[-1]
-    [dind] = run_spec.driver_volumes
-    assert (dind.target, dind.driver) == ("/var/lib/docker", "vloopback:v2")
-    assert dind.driver_opts["size"] == "20g"
-    assert run_spec.storage_limit_gb == 20
-    assert driver_of.await_args.args[1] == "volume_existing"
-
-
-@pytest.mark.asyncio
-async def test_a_restart_whose_kept_volume_is_gone_reports_its_own_step(
-    docker_service,
-    monkeypatch,
-):
-    # the backend's REBOOT_FAILED retry reads the step: a gone disk is not retried every hour
-    _patch_create_container_happy_path(docker_service, monkeypatch)
-    driver_of = AsyncMock(side_effect=docker_service_module.WorkspaceVolumeMissingError("volume_existing gone"))
-    monkeypatch.setattr(docker_service, "_vloopback_driver_of_volume", driver_of)
-    payload = ContainerCreateRequest(
-        miner_hotkey="miner",
-        executor_id=str(uuid4()),
-        pod_id=str(uuid4()),
-        workload_kind=WorkloadKind.CUSTOMER_RENTAL,
-        docker_image="daturaai/dind:test",
-        user_public_keys=["ssh-ed25519 test-key"],
-        gpu_uuids=["GPU-test"],
-        cpu_count=1,
-        memory_gb=1,
-        volume_limit_gb=80,
-        storage_limit_gb=40,
-        is_sysbox=True,
+        storage_limit_gb=storage_limit_gb,
+        is_sysbox=is_sysbox,
         local_volume="volume_existing",
         available_ports=[PayloadPortMapping(internal_port=20020, external_port=20020)],
         pod_mapping=[],
@@ -8929,8 +8890,18 @@ async def test_a_restart_whose_kept_volume_is_gone_reports_its_own_step(
         private_key="encrypted",
     )
 
-    assert isinstance(result, FailedContainerRequest), result
-    assert result.failure_step == "workspace_volume_missing"
+    assert driver_of.await_args.args[1] == "volume_existing"
+    if failure_step is not None:
+        assert isinstance(result, FailedContainerRequest), result
+        assert result.failure_step == failure_step
+        return
+    run_spec = docker_service.rental_docker_client_factory.client.run_specs[-1]
+    if is_sysbox and storage_limit_gb:
+        [dind] = run_spec.driver_volumes
+        assert (dind.target, dind.driver, dind.driver_opts["size"]) == ("/var/lib/docker", "vloopback:v2", "20g")
+        assert run_spec.storage_limit_gb == 20
+    else:
+        assert not run_spec.driver_volumes
 
 
 @pytest.mark.asyncio

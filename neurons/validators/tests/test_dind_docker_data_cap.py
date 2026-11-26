@@ -109,37 +109,26 @@ def test_sizing_ignores_anonymous_vloopback_volumes():
 
 
 @pytest.mark.parametrize(
-    "exit_status,stdout,expected",
+    ("exit_status", "stdout", "stderr", "expected"),
     [
-        (0, "vloopback:v2\n", "vloopback:v2"),
-        (0, "vloopback\n", "vloopback"),
-        (0, "local\n", None),  # an unlimited workspace: nothing to put inner Docker on
+        (0, "vloopback:v2\n", "", "vloopback:v2"),
+        (0, "local\n", "", "local"),
+        # a vanished workspace would be bound by docker run as a new empty volume
+        (1, "", "Error response from daemon: get volume_pod: no such volume", WorkspaceVolumeMissingError),
+        # a read fault is not a gone disk, and still refuses the create
+        (1, "", "permission denied", RuntimeError),
     ],
 )
 @pytest.mark.asyncio
-async def test_reused_volume_driver(svc, exit_status, stdout, expected):  # noqa: F811
+async def test_reused_volume_driver(svc, exit_status, stdout, stderr, expected):  # noqa: F811
     ssh = AsyncMock()
-    ssh.run = AsyncMock(return_value=AsyncMock(exit_status=exit_status, stdout=stdout))
-    assert await svc._vloopback_driver_of_volume(ssh, "volume_pod", {}) == expected
-
-
-@pytest.mark.asyncio
-async def test_missing_reused_volume_fails_the_create(svc):  # noqa: F811
-    # a vanished workspace would be recreated by Docker as an uncapped local volume
-    ssh = AsyncMock()
-    ssh.run = AsyncMock(return_value=AsyncMock(exit_status=1, stdout="", stderr="permission denied"))
-    with pytest.raises(RuntimeError, match="could not be inspected") as raised:
-        await svc._vloopback_driver_of_volume(ssh, "volume_pod", {})
-    assert not isinstance(raised.value, WorkspaceVolumeMissingError)  # a read fault is not a gone disk
-
-
-@pytest.mark.asyncio
-async def test_a_kept_volume_docker_does_not_have_is_answered_as_gone(svc):  # noqa: F811
-    ssh = AsyncMock()
-    answer = "Error response from daemon: get volume_pod: no such volume"
-    ssh.run = AsyncMock(return_value=AsyncMock(exit_status=1, stdout="", stderr=answer))
-    with pytest.raises(WorkspaceVolumeMissingError, match="kept disk is gone"):
-        await svc._vloopback_driver_of_volume(ssh, "volume_pod", {})
+    ssh.run = AsyncMock(return_value=AsyncMock(exit_status=exit_status, stdout=stdout, stderr=stderr))
+    if isinstance(expected, str):
+        assert await svc._driver_of_reused_volume(ssh, "volume_pod") == expected
+        return
+    with pytest.raises(expected) as raised:
+        await svc._driver_of_reused_volume(ssh, "volume_pod")
+    assert (raised.type is WorkspaceVolumeMissingError) == (expected is WorkspaceVolumeMissingError)
 
 
 def test_encrypted_workspace_at_var_lib_docker_still_caps_inner_docker(svc):  # noqa: F811

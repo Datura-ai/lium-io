@@ -220,6 +220,8 @@ async def test_a_successful_edit_runs_the_same_host_commands(svc, monkeypatch):
         f" | grep -q '^kept_unmounted_{payload.pod_id}_'",
         "nvidia-smi --query-gpu=uuid,power.limit,power.default_limit,power.min_limit,power.max_limit"
         " --format=csv,noheader,nounits",
+        # the kept workspace is read before the run spec binds its name (a missing one would be created empty)
+        f"/usr/bin/docker volume inspect {payload.local_volume} --format '{{{{.Driver}}}}'",
         # DAH-4663: the clock-lock safety net resets the pod's GPUs, inside the failed-create cleanup, before docker run
         # then, in the same call, each reset under its own SIGKILL timeout: application and memory clocks back to default
         "nvidia-smi -i GPU-test -rgc >/dev/null 2>&1; echo GPU-test $?; sh -c "
