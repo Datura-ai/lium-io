@@ -154,15 +154,22 @@ def remove_probe_marker():
 probe_volume = "lium-loopback-probe-" + generation
 probe_container = probe_volume
 
+# what the last cleanup could not remove: the plugin keeps the probe's mount lease until Docker's unmount
+# reaches it, and a plugin turned off before that keeps the lease for good, so no later probe can remove
+# its volume (DAH-7237)
+probe_left = []
+
 def remove_probe_leftovers():
     # the container first: a `docker run` cut off by its timeout leaves it running with the volume
     # attached. Returns what stayed behind
+    probe_left[:] = ["the probe cleanup"]  # stays if a call below is cut off
     leftovers = []
     removed = run_docker("rm", "-f", probe_container, timeout=CLEANUP_SECONDS)
     if removed.returncode and "no such container" not in removed.stderr.lower():
         leftovers.append("container " + probe_container)
     if run_docker("volume", "rm", "-f", probe_volume, timeout=CLEANUP_SECONDS).returncode:
         leftovers.append("volume " + probe_volume)
+    probe_left[:] = leftovers
     return leftovers
 
 def mount_probe_volume():
@@ -245,6 +252,8 @@ def disable_unless_it_owns_volumes(plugin_id):
         raise RuntimeError("kept enabled, " + str(error)) from None
     if owned:
         raise RuntimeError("kept enabled: the plugin owns " + str(len(owned)) + " volume(s)")
+    if probe_left:
+        raise RuntimeError("kept enabled: the probe left " + ", ".join(probe_left))
     disable_plugin(plugin_id)
 
 def read_saved_config(plugin_id):

@@ -457,7 +457,9 @@ def test_setup_fails_without_a_marker_when_an_abandoned_probe_container_cannot_b
     assert "an earlier probe left container lium-loopback-probe-v3, volume lium-loopback-probe-v3" in result.stderr
     assert not (tmp_path / "probe-ok").exists()
     assert not any(call[0] == "run" for call in state["calls"])
-    assert state["enabled"] is False
+    # and the plugin stays on: turned off now, it would keep the probe's mount lease for good (DAH-7237)
+    assert "kept enabled: the probe left container lium-loopback-probe-v3, volume lium-loopback-probe-v3" in result.stderr
+    assert state["enabled"] is True
 
 
 def test_setup_removes_a_probe_container_its_timeout_cut_off_before_its_volume(tmp_path: Path) -> None:
@@ -637,7 +639,7 @@ def test_a_failed_probe_never_disables_a_v3_plugin_that_owns_volumes(
     assert not (tmp_path / "probe-ok").exists()
 
 
-@pytest.mark.parametrize(("failure", "reason"), _PROBE_FAILURES)
+@pytest.mark.parametrize(("failure", "reason"), [p for p in _PROBE_FAILURES if p.id != "leftover-probe"])
 def test_a_failed_probe_disables_a_v3_plugin_that_owns_no_volume(
     tmp_path: Path, failure: dict[str, Any], reason: str
 ) -> None:
@@ -675,6 +677,30 @@ def test_a_leftover_probe_beside_real_volumes_never_disables_the_plugin(tmp_path
     assert "kept enabled: the plugin owns 2 volume(s)" in result.stderr
     assert not any(call[1] == "disable" for call in _plugin_calls(tmp_path))
     assert json.loads((tmp_path / "state.json").read_text())["enabled"] is True
+
+
+@pytest.mark.parametrize(
+    ("leftover", "left"),
+    [
+        pytest.param({"containers": ["lium-loopback-probe-v3"], "rm_exit": 1},
+                     "container lium-loopback-probe-v3, volume lium-loopback-probe-v3", id="container-and-volume"),
+        pytest.param({"volume_rm_exit": 1, "volumes": {"lium-loopback-probe-v3": "vloopback:v3"}},
+                     "volume lium-loopback-probe-v3", id="volume-the-plugin-calls-in-use"),
+    ],
+)
+def test_a_probe_that_cannot_be_removed_keeps_the_plugin_enabled_with_no_other_volume(
+    tmp_path: Path, leftover: dict[str, Any], left: str
+) -> None:
+    # Arrange: the node's state before any rental: the plugin refuses to remove its probe volume as still in
+    # use. Turned off then, the plugin would keep that lease, and every later probe would fail the same way
+    result = _run_failing_probe(tmp_path, leftover)
+
+    # Assert: kept on, not handed out, and the reason names what was left
+    assert result.returncode == 1
+    assert "kept enabled: the probe left " + left in result.stderr
+    assert not any(call[1] == "disable" for call in _plugin_calls(tmp_path))
+    assert json.loads((tmp_path / "state.json").read_text())["enabled"] is True
+    assert not (tmp_path / "probe-ok").exists()
 
 
 def test_a_failed_probe_keeps_the_plugin_enabled_when_its_volumes_cannot_be_listed(tmp_path: Path) -> None:
