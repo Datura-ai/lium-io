@@ -101,7 +101,9 @@ if sys.argv[1] == "volume":
         volumes.pop(sys.argv[-1], None)
         save_state()
     if sys.argv[2] == "ls":
-        print("\n".join(state.get("volume_drivers", []) + list(volumes.values())))
+        # `{{.Name}} {{.Driver}}`; volume_drivers are volumes of other names, listed by driver only
+        listed = [f"other-{i} {driver}" for i, driver in enumerate(state.get("volume_drivers", []))]
+        print("\n".join(listed + [name + " " + driver for name, driver in volumes.items()]))
     sys.exit(state.get("volume_" + sys.argv[2] + "_exit", 0))
 action = sys.argv[2]
 plugin_id = "a" * 64
@@ -582,6 +584,127 @@ def test_setup_reports_a_disable_that_times_out_after_a_failed_probe(tmp_path: P
 
 
 
+_PROBE_FAILURES: list[Any] = [
+    pytest.param({"run_exit": 1}, "probe volume mount failed", id="mount-refused"),
+    pytest.param({"volume_create_exit": 1}, "probe volume create failed", id="create-refused"),
+    pytest.param(
+        {"containers": ["lium-loopback-probe-v3"], "rm_exit": 1}, "an earlier probe left", id="leftover-probe"
+    ),
+    pytest.param({"run_hang": True, "probe_seconds": 1}, "docker run --rm timed out", id="probe-timed-out"),
+]
+
+
+def _run_failing_probe(tmp_path: Path, overrides: dict[str, Any], **state: Any) -> subprocess.CompletedProcess:
+    overrides = dict(overrides)
+    probe_seconds = overrides.pop("probe_seconds", None)
+    arguments = _setup_arguments(tmp_path, {"installed": True, "enabled": True, **overrides, **state})
+    if probe_seconds:
+        arguments[2] = _SETUP_SCRIPT.replace("PROBE_SECONDS = 60", f"PROBE_SECONDS = {probe_seconds}")
+    return _run_on_a_virtual_clock(arguments)
+
+
+@pytest.mark.parametrize(
+    "owner",
+    [
+        pytest.param({"data_files": ["volume_rental"]}, id="disk-file-in-data-dir"),
+        pytest.param({"volumes": {"volume_rental": "vloopback:v3"}}, id="listed-by-alias"),
+        pytest.param({"volumes": {"volume_rental": "a" * 64}}, id="listed-by-id"),
+        pytest.param({"volumes": {"volume_rental": "a" * 12}}, id="listed-by-short-id"),
+    ],
+)
+@pytest.mark.parametrize(("failure", "reason"), _PROBE_FAILURES)
+def test_a_failed_probe_never_disables_a_v3_plugin_that_owns_volumes(
+    tmp_path: Path, failure: dict[str, Any], reason: str, owner: dict[str, Any]
+) -> None:
+    # Arrange: an enabled v3 without the marker (it lives on tmpfs, so a reboot drops it) still holds a
+    # rental's disk. A disabled plugin hides its volumes, and Docker let a plain disable through while
+    # volumes existed (its refcounts are not restored after a daemon restart): that rental's restart then
+    # found no disk (DAH-7217)
+    for name in owner.get("data_files", []):
+        (tmp_path / "vloopback-v3").mkdir(exist_ok=True)
+        (tmp_path / "vloopback-v3" / name).write_bytes(b"")
+    state = {"volumes": owner["volumes"]} if "volumes" in owner else {}
+
+    # Act
+    result = _run_failing_probe(tmp_path, failure, **state)
+
+    # Assert: setup fails and hands nothing out, the plugin stays enabled, the reason says why
+    assert result.returncode == 1
+    assert reason in result.stderr
+    assert "kept enabled: the plugin owns 1 volume(s)" in result.stderr
+    assert not any(call[1] == "disable" for call in _plugin_calls(tmp_path))
+    assert json.loads((tmp_path / "state.json").read_text())["enabled"] is True
+    assert not (tmp_path / "probe-ok").exists()
+
+
+@pytest.mark.parametrize(("failure", "reason"), _PROBE_FAILURES)
+def test_a_failed_probe_disables_a_v3_plugin_that_owns_no_volume(
+    tmp_path: Path, failure: dict[str, Any], reason: str
+) -> None:
+    # Arrange: only the probe's own volume (and its disk file) and volumes of other drivers are on the host
+    (tmp_path / "vloopback-v3").mkdir()
+    (tmp_path / "vloopback-v3" / "lium-loopback-probe-v3").write_bytes(b"")
+    (tmp_path / "vloopback-v3" / "a-folder").mkdir()
+
+    # Act
+    result = _run_failing_probe(tmp_path, failure, volume_drivers=["local", "vloopback:v2"])
+
+    # Assert: disabled as before, so the backend's health check and new volumes use the older plugin
+    assert result.returncode == 1
+    assert reason in result.stderr
+    assert "kept enabled" not in result.stderr
+    assert sum(call[1] == "disable" for call in _plugin_calls(tmp_path)) == 1
+    assert json.loads((tmp_path / "state.json").read_text())["enabled"] is False
+
+
+def test_a_leftover_probe_beside_real_volumes_never_disables_the_plugin(tmp_path: Path) -> None:
+    # Arrange: what the node showed: a probe volume an earlier setup left that cannot be removed, next to
+    # the disks of two rentals, one of them running
+    (tmp_path / "vloopback-v3").mkdir()
+    for name in ("lium-loopback-probe-v3", "volume_stopped", "volume_running"):
+        (tmp_path / "vloopback-v3" / name).write_bytes(b"")
+
+    # Act
+    result = _run_failing_probe(
+        tmp_path, {"volume_rm_exit": 1}, volumes={"lium-loopback-probe-v3": "vloopback:v3"}
+    )
+
+    # Assert
+    assert result.returncode == 1
+    assert "an earlier probe left volume lium-loopback-probe-v3" in result.stderr
+    assert "kept enabled: the plugin owns 2 volume(s)" in result.stderr
+    assert not any(call[1] == "disable" for call in _plugin_calls(tmp_path))
+    assert json.loads((tmp_path / "state.json").read_text())["enabled"] is True
+
+
+def test_a_failed_probe_keeps_the_plugin_enabled_when_its_volumes_cannot_be_listed(tmp_path: Path) -> None:
+    # Arrange: the daemon refuses the listing, so setup cannot tell whether a rental's disk is on the plugin
+    result = _run_failing_probe(tmp_path, {"run_exit": 1, "volume_ls_exit": 1})
+
+    # Assert: the safe side is to keep it enabled and not hand it out
+    assert result.returncode == 1
+    assert "kept enabled, cannot list the volumes" in result.stderr
+    assert not any(call[1] == "disable" for call in _plugin_calls(tmp_path))
+    assert not (tmp_path / "probe-ok").exists()
+
+
+def test_setup_keeps_a_disabled_earlier_v3_build_whose_disk_files_are_still_there(tmp_path: Path) -> None:
+    # Arrange: Docker lists no volume of a disabled plugin, but its data directory still holds a disk
+    (tmp_path / "vloopback-v3").mkdir()
+    (tmp_path / "vloopback-v3" / "volume_rental").write_bytes(b"")
+    arguments = _setup_arguments(
+        tmp_path, {"installed": True, "installed_manifest": "sha256:" + "0" * 64, "marker_before": "old"}
+    )
+
+    # Act
+    result = _run_on_a_virtual_clock(arguments)
+
+    # Assert: the earlier build is not removed
+    assert result.returncode == 1
+    assert "still owns volumes" in result.stderr
+    assert [call[1] for call in _plugin_calls(tmp_path)] == ["inspect"]
+
+
 def _script_with_one_second_cleanup_and_disable_tries() -> str:
     return _SETUP_SCRIPT.replace("CLEANUP_SECONDS = 10", "CLEANUP_SECONDS = 1").replace(
         "DISABLE_TRY_SECONDS = 10", "DISABLE_TRY_SECONDS = 1"
@@ -591,8 +714,8 @@ def _script_with_one_second_cleanup_and_disable_tries() -> str:
 def test_setup_whose_install_took_most_of_the_deadline_reports_a_hung_disable_inside_it(tmp_path: Path) -> None:
     # Arrange: the install eats into the validator's deadline, the probe never returns and the daemon
     # hangs on every disable (review, 30.10: the probe's budget started after install and enable, so the
-    # deadline cut the disable tries and stderr only said the setup was cut short). The reserve is 15 s
-    # with 1 s cleanups and disable tries, so 2 s of install leaves the probe about 3 s
+    # deadline cut the disable tries and stderr only said the setup was cut short). The reserve is 16 s
+    # with 1 s cleanups and disable tries, so 2 s of install leaves the probe about 2 s
     deadline_seconds = 20
     arguments = _setup_arguments(
         tmp_path, {"install_delay": 2, "run_hang": True, "disable_hang": True}, deadline_seconds=deadline_seconds
@@ -613,7 +736,7 @@ def test_setup_whose_install_took_most_of_the_deadline_reports_a_hung_disable_in
 
 
 def test_setup_with_no_time_left_to_probe_never_enables_the_plugin(tmp_path: Path) -> None:
-    # Arrange: the install outlasts what the deadline leaves before the 15 s reserve and the daemon would
+    # Arrange: the install outlasts what the deadline leaves before the 16 s reserve and the daemon would
     # hang on every disable (review, 30.10: an enable the probe had no time for left a disable to the deadline)
     deadline_seconds = 20
     arguments = _setup_arguments(
