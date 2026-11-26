@@ -27,19 +27,6 @@ services:
     oom_score_adj: -900
     environment:
       - NVIDIA_DRIVER_CAPABILITIES=all
-    labels:
-      autoheal: true
-    healthcheck:
-      # probe the app itself on the loopback (no docker networking involved):
-      # a wedged agent goes unhealthy and autoheal restarts it, while nvidia-smi
-      # only proved the GPU driver was alive. Conservative thresholds so a
-      # host-IO storm (~2.5 min of continuous failure needed) cannot trigger
-      # false restarts.
-      test: [ "CMD-SHELL", "curl -fsS --max-time 5 http://127.0.0.1:${INTERNAL_PORT}/version || exit 1" ]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 120s
     deploy:
       resources:
         reservations:
@@ -62,14 +49,6 @@ services:
     oom_score_adj: -900
     depends_on:
       - executor
-
-  autoheal:
-    restart: always
-    image: willfarrell/autoheal
-    # autoheal is what restarts a wedged executor, so it must itself survive a host OOM.
-    oom_score_adj: -900
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
 
 volumes:
   reserve_data:
