@@ -20,7 +20,7 @@ from payload_models.payloads import (
 )
 from services.docker_service import _node_left_delete_command, inflight_creates
 
-from tests.test_delete_drops_dirty_volume import _delete, _delete_payload, _executor_info, _wire_delete
+from tests.test_delete_drops_dirty_volume import _delete, _delete_payload, _wire_delete
 from tests.test_docker_service import (  # noqa: F401
     _make_ssh_command_result,
     docker_service,
@@ -212,18 +212,6 @@ async def test_a_reported_host_key_that_builds_no_policy_never_connects(docker_s
     result = await _delete(docker_service, _payload())
 
     assert isinstance(result, FailedContainerRequest) and order == []
-
-
-@pytest.mark.asyncio
-async def test_a_node_that_reports_no_host_key_keeps_mains_policy(docker_service):
-    # backup/restore and Jupyter on a non-attested node without a key ran on main; only a reported key must build a policy
-    from services.attestation_service import HostPolicyResult
-    from services.docker_service import DockerService
-
-    executor = _executor_info(_delete_payload()).model_copy(update={"ssh_host_key": None})
-    docker_service.attestation_service.prepare_host_policy = AsyncMock(return_value=HostPolicyResult())
-
-    assert await DockerService._prepare_known_hosts_policy(docker_service, executor, None, {}) is None
 
 
 def test_a_node_left_delete_is_never_declined_as_renting_in_progress():

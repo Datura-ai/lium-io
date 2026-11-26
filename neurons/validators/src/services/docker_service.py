@@ -5148,7 +5148,7 @@ class DockerService:
         executor: ExecutorSSHInfo,
         miner_hotkey: str | None,
         log_context: dict,
-    ) -> asyncssh.SSHKnownHosts | None:
+    ) -> asyncssh.SSHKnownHosts:
         """Single chokepoint for every rental-path SSH host-key policy.
 
         N3 (CVM attestation gap remediation): an unexpected error here fails closed — no host-key policy means no rental
@@ -5173,9 +5173,8 @@ class DockerService:
                 f"Unable to prepare host-key policy for executor "
                 f"{executor.address}:{executor.port}; refusing unpinned rental SSH"
             ) from exc
-        if host_policy.known_hosts is None and (executor.ssh_host_key or "").strip():
-            # a reported key that built no policy would connect unchecked (asyncssh reads None as "verify nothing");
-            # a node that reports no key keeps main's behaviour, decided by each caller
+        if host_policy.known_hosts is None:
+            # asyncssh reads known_hosts=None as "verify no host key"
             raise AttestationError(
                 f"No host-key policy for executor {executor.address}:{executor.port}; refusing unpinned rental SSH"
             )
