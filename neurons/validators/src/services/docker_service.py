@@ -256,12 +256,12 @@ from services.storage_operations import (
     release_storage_volume_lock,
     take_storage_volume_lock,
     note_started_storage_helper,
+    run_job_with_secrets,
     remove_finished_helpers_mounting,
     report_storage_operation_failed,
     start_storage_operation,
     supports_bootstrap_restore,
     supports_storage_operation,
-    upload_secrets_file,
     wait_for_storage_operation,
 )
 from services.task.runner import SSHCommandRunner
@@ -11711,7 +11711,7 @@ class DockerService:
                     # would put the backup's plaintext on a disk the renter asked to encrypt, and
                     # the old encrypted mode would hand the executor the passphrase.
                     current_step = "bootstrap_restore_probe"
-                    if not await supports_bootstrap_restore(ssh_client, executor_info.python_path):
+                    if not await supports_bootstrap_restore(ssh_client, executor_payload.EXECUTOR_PYTHON):
                         raise RuntimeError(
                             "executor image cannot restore into an encrypted volume at create time "
                             "(no workspace.bootstrap); the provider must update the executor image"
@@ -12999,7 +12999,7 @@ class DockerService:
         try:
             files = await start_storage_operation(
                 ssh_client,
-                executor_info.python_path,
+                executor_payload.EXECUTOR_PYTHON,
                 operation_id,
                 spec,
                 retain_terminal_artifacts=True,
@@ -13023,33 +13023,32 @@ class DockerService:
         local_volume: str,
         local_volume_path: str,
     ) -> None:
-        local_jobs = Path(__file__).resolve().parent.parent / "miner_jobs"
-        remote_script = "/root/app/restore_storage.py"
-        remote_helper = "/root/app/workspace_mount.py"
-        async with ssh_client.start_sftp_client() as sftp:
-            await sftp.put(str(local_jobs / "restore_storage.py"), remote_script)
-            await sftp.put(str(local_jobs / "workspace_mount.py"), remote_helper)
-        command = [
-            executor_info.python_path,
-            remote_script,
-            "--api-url",
-            settings.COMPUTE_REST_API_URL_EXTERNAL,
-            "--target-volume",
-            local_volume,
-            "--restore-path",
-            restore.restore_path or local_volume_path,
-            "--backup-source-path",
-            restore.legacy_object_key or "",
-            "--secrets-file",
-            await upload_secrets_file(ssh_client, restore.auth_token, restore.backup_volume_info),
-            "--restore-log-id",
-            restore.restore_log_id,
-            "--backup-volume-name",
-            restore.backup_volume_info.name,
-            "--target-volume-path",
-            local_volume_path,
-        ]
-        await ssh_client.run(shlex.join(command), check=True)
+        # the validator's restore job, staged first; its credentials file only then (run_job_with_secrets)
+        await run_job_with_secrets(
+            ssh_client,
+            "restore",
+            executor_payload.RESTORE_JOB,
+            restore.auth_token,
+            restore.backup_volume_info,
+            lambda secrets_file: [
+                "--api-url",
+                settings.COMPUTE_REST_API_URL_EXTERNAL,
+                "--target-volume",
+                local_volume,
+                "--restore-path",
+                restore.restore_path or local_volume_path,
+                "--backup-source-path",
+                restore.legacy_object_key or "",
+                "--secrets-file",
+                secrets_file,
+                "--restore-log-id",
+                restore.restore_log_id,
+                "--backup-volume-name",
+                restore.backup_volume_info.name,
+                "--target-volume-path",
+                local_volume_path,
+            ],
+        )
 
     async def _report_pull_progress(self, docker_client, image: str, log_tag: str, every: float = 15) -> None:
         """DAH-6025: a big pull showed one 'Pulling' line for minutes, and renters cancelled pods that were
