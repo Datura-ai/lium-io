@@ -66,6 +66,20 @@ def test_provider_side_load_attributes_cpu_and_disk():
     assert load.disk_kb == 1528 * GB_KB  # 1700 - (100 + 12 + 60)
 
 
+def test_provider_side_load_on_a_split_store_subtracts_only_docker_bytes_on_data_root():
+    # liumd's split-store reading: data-root holds 900 GB used, 70 GB of it docker's; the store elsewhere is ignored
+    specs = {**SN13_SPECS, "hard_disk": {**SN13_SPECS["hard_disk"], "data_root_used": 900 * GB_KB,
+                                         "data_root_docker_used": 70 * GB_KB}}
+    load = compute_provider_side_load(specs, 32, {"pod_renter"})
+    assert load.disk_kb == 830 * GB_KB
+
+
+def test_provider_side_load_without_split_store_fields_keeps_the_old_formula():
+    assert "data_root_docker_used" not in SN13_SPECS["hard_disk"]
+    load = compute_provider_side_load(SN13_SPECS, 32, {"pod_renter"})
+    assert load.disk_kb == 1528 * GB_KB
+
+
 def test_provider_side_load_clamps_negative_to_zero():
     load = compute_provider_side_load(
         {

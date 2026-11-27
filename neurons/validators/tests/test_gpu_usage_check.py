@@ -1418,6 +1418,51 @@ async def test_a_lium_named_container_is_judged_by_the_backend(
     assert result.passed is expected_pass
 
 
+@pytest.mark.parametrize(
+    "filler_run,expected_pass",
+    [
+        (FillerRunActiveResponse(active=True, status="RUNNING"), True),
+        (FillerRunActiveResponse(active=False, status="STARTING"), True),
+        (FillerRunActiveResponse(active=False, status="STOPPED"), False),
+        (FillerRunActiveResponse(active=False), False),
+        (None, False),  # no answer: the load is judged as it was before the question
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_late_filler_at_full_load_is_judged_by_the_backend_once(context_factory, filler_run, expected_pass):
+    # DAH-7071: a live filler started after the snapshot is settled by the backend on every path,
+    # with one question per container.
+    state = _idle_state(
+        [{"gpu_utilization": 100, "memory_utilization": 95, "memory_used_mb": 70000}],
+        [{"pid": 111, "info": "0::/../docker-a.scope", "container_name": LATE_FILLER}],
+    )
+    services = build_services()
+    services.backend.get_filler_run_active.return_value = filler_run
+    ctx = context_factory(services=services, config=build_context_config(), state=state)
+
+    result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is expected_pass
+    services.backend.get_filler_run_active.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_a_late_filler_the_backend_disowned_is_not_asked_about_again(context_factory):
+    # DAH-7071: the idle path reuses the answer the load path already got.
+    state = _idle_state(
+        [{"gpu_utilization": 0, "memory_utilization": 0, "memory_used_mb": 20000}],
+        [{"pid": 111, "info": "0::/../docker-a.scope", "container_name": LATE_FILLER}],
+    )
+    services = build_services()
+    services.backend.get_filler_run_active.return_value = FillerRunActiveResponse(active=False, status="STOPPED")
+    ctx = context_factory(services=services, config=build_context_config(), state=state)
+
+    result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is False
+    services.backend.get_filler_run_active.assert_awaited_once()
+
+
 @pytest.mark.parametrize("gpu_utilization", [0, 5])
 @pytest.mark.parametrize("closed_minutes,expected_pass", [(5, True), (30, False)])
 @pytest.mark.asyncio
