@@ -35,6 +35,7 @@ def _install(root) -> None:
         + _function("docker_containerd_address")
         + _function("systemd_quote")
         + _function("systemd_env")
+        + _function("layer_reset_step")
         + _function("layer_reset_program")
         + _function("shift_sysbox_layers_back_at_boot")
         + "shift_sysbox_layers_back_at_boot\n"
@@ -123,11 +124,12 @@ def _install_on_a_live_host(root, enable_fails: bool) -> subprocess.CompletedPro
     script = (
         f'host_path() {{ echo "{root}$1"; }}\nwarn() {{ echo "WARN $*"; }}\n'
         + f'systemctl() {{ echo "$*" >> "{log}"; [ "$1" = enable ] && {"return 1" if enable_fails else "return 0"}; [ "$1" = is-active ] && return 1; return 0; }}\n'
-        + 'docker() { return 1; }\n'
+        + f'docker() {{ echo "docker $*" >> "{log}"; return 1; }}\n'
         + f"LAYER_RESET_VERSION={_layer_reset_version()}\n"
         + _function("docker_containerd_address")
         + _function("systemd_quote")
         + _function("systemd_env")
+        + _function("layer_reset_step")
         + _function("layer_reset_program")
         + _function("shift_sysbox_layers_back_at_boot")
         + "shift_sysbox_layers_back_at_boot\n"
@@ -165,6 +167,22 @@ def test_once_enable_works_the_next_install_adds_the_dependency_and_the_version(
     assert unit.count("# lium-layer-reset-version=") == 1
 
 
+def test_the_install_on_a_live_host_starts_stops_and_restarts_nothing(tmp_path):
+    # the validator installs it on rented hosts too: every host call it makes is a read, a daemon-reload or an enable
+    # without --now, so running pods, Docker and Sysbox are untouched; the unit and drop-in act from the next boot
+    result = _install_on_a_live_host(tmp_path, enable_fails=False)
+
+    assert result.returncode == 0, result.stderr
+    assert (tmp_path / "systemctl.log").read_text().splitlines() == [
+        "show -p ExecStart --value docker",
+        "docker info --format {{.DockerRootDir}}",
+        "is-active -q docker",
+        "daemon-reload",
+        "enable lium-sysbox-layer-reset.service",
+        "daemon-reload",
+    ]
+
+
 @pytest.mark.skipif(os.getuid() == 0, reason="the not-root answer needs a non-root run")
 def test_install_layer_reset_mode_answers_one_line_and_installs_nothing_without_root(tmp_path):
     result = subprocess.run(
@@ -182,21 +200,69 @@ def test_install_layer_reset_mode_never_runs_the_reset_or_restarts_docker():
     assert not re.search(r"systemctl (re)?start|systemctl restart|/usr/local/sbin/lium-sysbox-layer-reset|--dry-run", branch)
 
 
-@pytest.mark.parametrize("body, answer", [
-    ("echo noise; return 0", "layer_reset_installed 9"),
-    ("echo noise; return 1", "layer_reset_failed install"),
-    ("printf 'Failed to enable unit:\\n\\tUnit file is masked.\\n' >&2; return 1",
-     "layer_reset_failed install Failed to enable unit: Unit file is masked."),
-])
-def test_install_layer_reset_mode_names_why_the_install_failed_under_set_e(body, answer):
-    # DAH-7052 rollout: hosts failing every cycle said only "install"; the step's own error now rides on the line
-    branch = re.search(r"^    --install-layer-reset\)\n(.*?^        ;;)$", open(SCRIPT).read(), re.S | re.M).group(1)
+def _install_mode_answer(root, fail: str = "", why: str = "boom") -> str:
+    # the --install-layer-reset branch as the validator runs it (as root, on a live Sysbox host), its files under `root`
+    branch = re.search(r"^    --install-layer-reset\)\n(.*?)^        ;;$", open(SCRIPT).read(), re.S | re.M).group(1)
+    log = root / "systemctl.log"
     script = (
-        "set -e\nLAYER_RESET_VERSION=9\nid() { echo 0; }\ncommand() { return 0; }\n"
-        f"shift_sysbox_layers_back_at_boot() {{ {body}; }}\ncase x in\n    x)\n{branch}\nesac\n"
+        f'host_path() {{ echo "{root}$1"; }}\nid() {{ echo 0; }}\ncommand() {{ [ "$1" = -v ] && return 0; builtin command "$@"; }}\n'
+        + f"docker() {{ return 1; }}\nFAIL={fail!r}\nWHY={why!r}\n"
+        + f'systemctl() {{ echo "$1" >> "{log}"; case "$FAIL:$1:$(grep -c . "{log}")" in '
+        + "daemon-reload:daemon-reload:3|enable:enable:*|last-daemon-reload:daemon-reload:5) "
+        + 'echo "$WHY" >&2; return 1;; *:is-active:*) return 1;; esac; return 0; }\n'
+        + 'sed() { [ "$FAIL" = version-line ] && [ "$1" = -i ] && { echo "$WHY" >&2; return 4; }; command sed "$@"; }\n'
+        + f"LAYER_RESET_VERSION={_layer_reset_version()}\n"
+        + _function("docker_containerd_address")
+        + _function("systemd_quote")
+        + _function("systemd_env")
+        + _function("layer_reset_step")
+        + _function("layer_reset_program")
+        + _function("shift_sysbox_layers_back_at_boot")
+        + "case --install-layer-reset in\n    --install-layer-reset)\n" + branch + "        ;;\nesac\n"
     )
-    result = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=60)
-    assert (result.returncode, result.stdout) == (0, answer + "\n"), result.stderr
+    env = {k: v for k, v in os.environ.items() if k != "SYSBOX_SETUP_HOST_ROOT"}
+    result = subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=env, timeout=60)
+    assert result.returncode == 0, result.stderr
+    return result.stdout
+
+
+@pytest.mark.skipif(os.getuid() == 0, reason="root writes through the file and directory blockers")
+@pytest.mark.parametrize(
+    ("step", "blocker"),
+    [
+        ("mkdir", "usr/local"),  # a file where a directory must go
+        ("program", "usr/local/sbin/lium-sysbox-layer-reset/x"),  # a directory where the program goes
+        ("unit", "etc/systemd/system/lium-sysbox-layer-reset.service/x"),
+        ("daemon-reload", None),
+        ("enable", None),
+        ("drop-in", "etc/systemd/system/docker.service.d/lium-sysbox-layer-reset.conf/x"),
+        ("version-line", None),
+        ("last-daemon-reload", None),
+    ],
+)
+def test_a_failed_install_answers_its_step_and_why(tmp_path, step, blocker):
+    if blocker:
+        (tmp_path / blocker).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / blocker).write_text("")
+
+    answer = _install_mode_answer(tmp_path, fail="" if blocker else step)
+
+    reported = step.removeprefix("last-")
+    assert answer.startswith(f"layer_reset_failed {reported} ") and answer.count("\n") == 1, answer
+    if not blocker:
+        assert answer == f"layer_reset_failed {reported} boom\n"
+
+
+def test_a_failed_install_reason_is_one_printable_bounded_line(tmp_path):
+    answer = _install_mode_answer(tmp_path, fail="enable", why="\x1b[31mevil\tkey=value " + "x" * 300)
+
+    line = answer.removesuffix("\n")
+    assert line.startswith("layer_reset_failed enable ") and all(" " <= c <= "~" for c in line)
+    assert len(line.removeprefix("layer_reset_failed enable ")) <= 120
+
+
+def test_a_working_install_still_answers_its_version(tmp_path):
+    assert _install_mode_answer(tmp_path) == f"layer_reset_installed {_layer_reset_version()}\n"
 
 
 def _remove_on_a_live_host(root, disable_fails: bool = False) -> subprocess.CompletedProcess:

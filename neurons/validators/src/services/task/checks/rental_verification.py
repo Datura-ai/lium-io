@@ -212,6 +212,11 @@ class RentalVerificationCheck:
 
         # Use the first verified port
         container_port = verified_ports[0]
+        # DAH-6946: verified_ports holds outside ports only; on a node with RENTING_PORT_MAPPINGS the router forwards
+        # the outside port to a different host port, and the test container must listen there, as a rental's does
+        host_port = dict((external, internal) for internal, external in ctx.state.verified_port_pairs).get(
+            container_port, container_port
+        )
 
         # The UUIDs this cycle's scrape saw. The backend probes for exactly these instead of
         # `--gpus all`, so a host advertising cards it cannot hand over fails here rather than in a
@@ -257,6 +262,7 @@ class RentalVerificationCheck:
                 miner_port=ctx.miner_port,
                 miner_hotkey=miner_hotkey,
                 container_port=container_port,
+                host_port=host_port,
                 executor_id=executor.uuid,
                 rental_in_progress=has_customer_rental,
                 gpu_uuids=gpu_uuids,
@@ -305,7 +311,11 @@ class RentalVerificationCheck:
                 return CheckResult(
                     passed=True,
                     event=event,
-                    updates={},
+                    # DAH-6784: only a container check the backend really ran is the full check; a success it
+                    # answered with a reason (skipped as rented or for a filler, a raced create) ran none
+                    updates={"idle_check_passed": True}
+                    if not has_customer_rental and response.reason_code is None
+                    else {},
                 )
             elif response.reason_code == CPU_QUOTA_EXCEEDS_HOST_REASON:
                 return self._cpu_quota_verdict(ctx, response)
@@ -335,6 +345,9 @@ class RentalVerificationCheck:
                         "job_score": 0.0,
                         "score_warning": quarantine.score_warning,
                         "clear_verified_job_info": True,
+                        # the backend runs the failing container check only on a node it saw unrented: a rental
+                        # placed since keeps its node, the reset applies only while no customer pod runs there
+                        "clear_verified_job_unrented_only": True,
                     },
                 )
             elif (response.error or "").endswith("visible: []"):

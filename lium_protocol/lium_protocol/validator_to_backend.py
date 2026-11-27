@@ -331,6 +331,10 @@ class ExecutorSpecRequest(ValidatorMessage):
     # it (`RENTED_POD_PROC_FUSE_DISCONNECTED`); [] = judged and clean. A pod not listed was not judged. None = no check
     # judged a pod, or a publisher that predates the field.
     rented_pod_faults: dict[str, list[str]] | None = pydantic.Field(default=None, max_length=POD_STATES_MAX_ITEMS)
+    # The check_ids of the checks that can reset a node idle-only (`ResetVerifiedJobRequest.unrented_only`) that this
+    # cycle ran in full on the node and passed; a skipped run, or a pass reached without that check's own probe, is not
+    # listed. [] when none did; None from a validator that does not send it.
+    idle_checks_passed: list[str] | None = None
     # When an express recheck outside the cycle started; its `job_batch_id` is still the cycle's. None for a cycle's
     # own report and from a publisher that predates the field.
     check_started_at: datetime | None = None
@@ -381,6 +385,9 @@ class ResetVerifiedJobRequest(ValidatorMessage):
     miner_hotkey: str
     executor_uuid: str
     reason: ResetVerifiedJobReason = ResetVerifiedJobReason.DEFAULT
+    # the check meant the reset for an idle node only; the backend applies it only while no customer pod runs
+    # on the node. False (an older validator) = applied as before; an older backend ignores the field.
+    unrented_only: bool = False
 
 
 @VALIDATOR_MESSAGES.register
@@ -490,8 +497,8 @@ class SshPubKeyRemoved(PodContainerResponse):
 @VALIDATOR_MESSAGES.register
 class FailedContainerRequest(PodContainerResponse):
     message_type: ValidatorMessageType = ValidatorMessageType.FailedRequest
-    # the failed request's command_id, echoed for an AddSshPublicKeyRequest and (since lium-io#2028) a
-    # ContainerCreateRequest; empty otherwise and from older validators
+    # the failed request's command_id, echoed for an AddSshPublicKeyRequest, (since lium-io#2028) a
+    # ContainerCreateRequest and (DAH-7216) a ContainerDeleteRequest; empty otherwise and from older validators
     command_id: str = ""
     error_type: FailedContainerErrorTypes = FailedContainerErrorTypes.ContainerCreationFailed
     error_code: FailedContainerErrorCodes | None = None

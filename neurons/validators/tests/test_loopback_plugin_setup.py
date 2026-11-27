@@ -101,7 +101,9 @@ if sys.argv[1] == "volume":
         volumes.pop(sys.argv[-1], None)
         save_state()
     if sys.argv[2] == "ls":
-        print("\n".join(state.get("volume_drivers", []) + list(volumes.values())))
+        # `{{.Name}} {{.Driver}}`; volume_drivers are volumes of other names, listed by driver only
+        listed = [f"other-{i} {driver}" for i, driver in enumerate(state.get("volume_drivers", []))]
+        print("\n".join(listed + [name + " " + driver for name, driver in volumes.items()]))
     sys.exit(state.get("volume_" + sys.argv[2] + "_exit", 0))
 action = sys.argv[2]
 plugin_id = "a" * 64
@@ -117,6 +119,10 @@ def plugin():
     identity = "b" * 64 if state.get("enable_switch_id") and state.get("enabled") else plugin_id
     return {"Id": identity, "Enabled": state.get("enabled", False), "Settings": {"Env": env}}
 
+if state.get(action + "_stderr"):
+    print(state[action + "_stderr"], file=sys.stderr)
+if action == "install" and state.get("install_leaves_nothing"):
+    sys.exit(1)
 if action == "install":
     if state.get("install_waits_for_release"):
         wait_for_release()
@@ -451,7 +457,9 @@ def test_setup_fails_without_a_marker_when_an_abandoned_probe_container_cannot_b
     assert "an earlier probe left container lium-loopback-probe-v3, volume lium-loopback-probe-v3" in result.stderr
     assert not (tmp_path / "probe-ok").exists()
     assert not any(call[0] == "run" for call in state["calls"])
-    assert state["enabled"] is False
+    # and the plugin stays on: turned off now, it would keep the probe's mount lease for good (DAH-7237)
+    assert "kept enabled: the probe left container lium-loopback-probe-v3, volume lium-loopback-probe-v3" in result.stderr
+    assert state["enabled"] is True
 
 
 def test_setup_removes_a_probe_container_its_timeout_cut_off_before_its_volume(tmp_path: Path) -> None:
@@ -469,7 +477,7 @@ def test_setup_removes_a_probe_container_its_timeout_cut_off_before_its_volume(t
     state = json.loads((tmp_path / "state.json").read_text())
     for result in results:
         assert result.returncode == 1
-        assert "probe volume failed: TimeoutExpired" in result.stderr
+        assert "docker run --rm timed out" in result.stderr
         assert "could not be disabled" not in result.stderr
     assert state["containers"] == []
     assert state["enabled"] is False
@@ -578,6 +586,187 @@ def test_setup_reports_a_disable_that_times_out_after_a_failed_probe(tmp_path: P
 
 
 
+_PROBE_FAILURES: list[Any] = [
+    pytest.param({"run_exit": 1}, "probe volume mount failed", id="mount-refused"),
+    pytest.param({"volume_create_exit": 1}, "probe volume create failed", id="create-refused"),
+    pytest.param(
+        {"containers": ["lium-loopback-probe-v3"], "rm_exit": 1}, "an earlier probe left", id="leftover-probe"
+    ),
+    pytest.param({"run_hang": True, "probe_seconds": 1}, "docker run --rm timed out", id="probe-timed-out"),
+]
+
+
+def _run_failing_probe(
+    tmp_path: Path, overrides: dict[str, Any], lock_held_seconds: float = 0, **state: Any
+) -> subprocess.CompletedProcess:
+    overrides = dict(overrides)
+    probe_seconds = overrides.pop("probe_seconds", None)
+    arguments = _setup_arguments(tmp_path, {"installed": True, "enabled": True, **overrides, **state})
+    if probe_seconds:
+        arguments[2] = _SETUP_SCRIPT.replace("PROBE_SECONDS = 60", f"PROBE_SECONDS = {probe_seconds}")
+    return _run_on_a_virtual_clock(arguments, lock_held_seconds=lock_held_seconds)
+
+
+@pytest.mark.parametrize(
+    "owner",
+    [
+        pytest.param({"data_files": ["volume_rental"]}, id="disk-file-in-data-dir"),
+        pytest.param({"volumes": {"volume_rental": "vloopback:v3"}}, id="listed-by-alias"),
+        pytest.param({"volumes": {"volume_rental": "a" * 64}}, id="listed-by-id"),
+        pytest.param({"volumes": {"volume_rental": "a" * 12}}, id="listed-by-short-id"),
+    ],
+)
+@pytest.mark.parametrize(("failure", "reason"), _PROBE_FAILURES)
+def test_a_failed_probe_never_disables_a_v3_plugin_that_owns_volumes(
+    tmp_path: Path, failure: dict[str, Any], reason: str, owner: dict[str, Any]
+) -> None:
+    # Arrange: an enabled v3 without the marker (it lives on tmpfs, so a reboot drops it) still holds a
+    # rental's disk. A disabled plugin hides its volumes, and Docker let a plain disable through while
+    # volumes existed (its refcounts are not restored after a daemon restart): that rental's restart then
+    # found no disk (DAH-7217)
+    for name in owner.get("data_files", []):
+        (tmp_path / "vloopback-v3").mkdir(exist_ok=True)
+        (tmp_path / "vloopback-v3" / name).write_bytes(b"")
+    state = {"volumes": owner["volumes"]} if "volumes" in owner else {}
+
+    # Act
+    result = _run_failing_probe(tmp_path, failure, **state)
+
+    # Assert: setup fails and hands nothing out, the plugin stays enabled, the reason says why
+    assert result.returncode == 1
+    assert reason in result.stderr
+    assert "kept enabled: the plugin owns 1 volume(s)" in result.stderr
+    assert not any(call[1] == "disable" for call in _plugin_calls(tmp_path))
+    assert json.loads((tmp_path / "state.json").read_text())["enabled"] is True
+    assert not (tmp_path / "probe-ok").exists()
+
+
+@pytest.mark.parametrize(("failure", "reason"), [p for p in _PROBE_FAILURES if p.id != "leftover-probe"])
+def test_a_failed_probe_disables_a_v3_plugin_that_owns_no_volume(
+    tmp_path: Path, failure: dict[str, Any], reason: str
+) -> None:
+    # Arrange: only the probe's own volume (and its disk file) and volumes of other drivers are on the host
+    (tmp_path / "vloopback-v3").mkdir()
+    (tmp_path / "vloopback-v3" / "lium-loopback-probe-v3").write_bytes(b"")
+    (tmp_path / "vloopback-v3" / "a-folder").mkdir()
+
+    # Act
+    result = _run_failing_probe(tmp_path, failure, volume_drivers=["local", "vloopback:v2"])
+
+    # Assert: disabled as before, so the backend's health check and new volumes use the older plugin
+    assert result.returncode == 1
+    assert reason in result.stderr
+    assert "kept enabled" not in result.stderr
+    assert sum(call[1] == "disable" for call in _plugin_calls(tmp_path)) == 1
+    assert json.loads((tmp_path / "state.json").read_text())["enabled"] is False
+
+
+def test_a_leftover_probe_beside_real_volumes_never_disables_the_plugin(tmp_path: Path) -> None:
+    # Arrange: what the node showed: a probe volume an earlier setup left that cannot be removed, next to
+    # the disks of two rentals, one of them running
+    (tmp_path / "vloopback-v3").mkdir()
+    for name in ("lium-loopback-probe-v3", "volume_stopped", "volume_running"):
+        (tmp_path / "vloopback-v3" / name).write_bytes(b"")
+
+    # Act
+    result = _run_failing_probe(
+        tmp_path, {"volume_rm_exit": 1}, volumes={"lium-loopback-probe-v3": "vloopback:v3"}
+    )
+
+    # Assert
+    assert result.returncode == 1
+    assert "an earlier probe left volume lium-loopback-probe-v3" in result.stderr
+    assert "kept enabled: the plugin owns 3 volume(s)" in result.stderr
+    assert not any(call[1] == "disable" for call in _plugin_calls(tmp_path))
+    assert json.loads((tmp_path / "state.json").read_text())["enabled"] is True
+
+
+@pytest.mark.parametrize(
+    ("leftover", "kept", "lock_held_seconds"),
+    [
+        pytest.param({"containers": ["lium-loopback-probe-v3"], "rm_exit": 1},
+                     "the probe left container lium-loopback-probe-v3, volume lium-loopback-probe-v3", 0,
+                     id="container-and-volume"),
+        pytest.param({"volume_rm_exit": 1, "volumes": {"lium-loopback-probe-v3": "vloopback:v3"}},
+                     "the plugin owns 1 volume(s)", 0, id="volume-the-plugin-calls-in-use"),
+        # lock held 70 s of 150: the probe window (150 - 88 = 62 s) is gone before this run's cleanup, so only
+        # Docker's listing shows the volume an earlier setup left
+        pytest.param({"containers": ["lium-loopback-probe-v3"], "volumes": {"lium-loopback-probe-v3": "vloopback:v3"}},
+                     "the plugin owns 1 volume(s)", 70, id="another-setup-held-the-lock-past-the-probe-window"),
+    ],
+)
+def test_a_probe_that_cannot_be_removed_keeps_the_plugin_enabled_with_no_other_volume(
+    tmp_path: Path, leftover: dict[str, Any], kept: str, lock_held_seconds: float
+) -> None:
+    # Arrange: the node's state before any rental: the plugin refuses to remove its probe volume as still in
+    # use. Turned off then, the plugin would keep that lease, and every later probe would fail the same way
+    result = _run_failing_probe(tmp_path, leftover, lock_held_seconds)
+
+    # Assert: kept on, not handed out, and the reason names what was left
+    assert result.returncode == 1
+    assert "kept enabled: " + kept in result.stderr
+    assert not any(call[1] == "disable" for call in _plugin_calls(tmp_path))
+    assert json.loads((tmp_path / "state.json").read_text())["enabled"] is True
+    assert not (tmp_path / "probe-ok").exists()
+
+
+def test_a_probe_disk_file_no_cleanup_removed_keeps_the_plugin_enabled_when_docker_does_not_list_it(
+    tmp_path: Path,
+) -> None:
+    # Arrange: another setup held the lock past the probe window, so this run never reaches its cleanup.
+    # The probe's disk file an earlier setup left is still in the plugin's folder, but Docker does not list
+    # the probe volume: the file alone may hold the plugin's lease
+    (tmp_path / "vloopback-v3").mkdir()
+    (tmp_path / "vloopback-v3" / "lium-loopback-probe-v3").write_bytes(b"")
+
+    # Act
+    result = _run_failing_probe(tmp_path, {}, lock_held_seconds=70)
+
+    # Assert: counted as an owned volume, so the plugin is not turned off
+    assert result.returncode == 1
+    assert "kept enabled: the plugin owns 1 volume(s)" in result.stderr
+    assert not any(call[1] == "disable" for call in _plugin_calls(tmp_path))
+    assert json.loads((tmp_path / "state.json").read_text())["enabled"] is True
+
+
+def test_a_failed_probe_keeps_the_plugin_enabled_when_its_volumes_cannot_be_listed(tmp_path: Path) -> None:
+    # Arrange: the daemon refuses the listing, so setup cannot tell whether a rental's disk is on the plugin
+    result = _run_failing_probe(tmp_path, {"run_exit": 1, "volume_ls_exit": 1})
+
+    # Assert: the safe side is to keep it enabled and not hand it out
+    assert result.returncode == 1
+    assert "kept enabled, cannot list the volumes" in result.stderr
+    assert not any(call[1] == "disable" for call in _plugin_calls(tmp_path))
+    assert not (tmp_path / "probe-ok").exists()
+
+
+@pytest.mark.parametrize(
+    "earlier_root",
+    [pytest.param(False, id="this-data-root"), pytest.param(True, id="an-earlier-docker-data-root")],
+)
+def test_setup_keeps_a_disabled_earlier_v3_build_whose_disk_files_are_still_there(
+    tmp_path: Path, earlier_root: bool
+) -> None:
+    # Arrange: Docker lists no volume of a disabled plugin, but the data directory it was set up with still
+    # holds a disk, also when Docker has since moved to another data root (the fake's "-wrong" DATA_DIR)
+    data_dir = tmp_path / ("vloopback-v3-wrong" if earlier_root else "vloopback-v3")
+    data_dir.mkdir()
+    (data_dir / "volume_rental").write_bytes(b"")
+    arguments = _setup_arguments(
+        tmp_path,
+        {"installed": True, "installed_manifest": "sha256:" + "0" * 64, "marker_before": "old",
+         "root_mismatch": earlier_root},
+    )
+
+    # Act
+    result = _run_on_a_virtual_clock(arguments)
+
+    # Assert: the earlier build is not removed
+    assert result.returncode == 1
+    assert "still owns volumes" in result.stderr
+    assert [call[1] for call in _plugin_calls(tmp_path)] == ["inspect"]
+
+
 def _script_with_one_second_cleanup_and_disable_tries() -> str:
     return _SETUP_SCRIPT.replace("CLEANUP_SECONDS = 10", "CLEANUP_SECONDS = 1").replace(
         "DISABLE_TRY_SECONDS = 10", "DISABLE_TRY_SECONDS = 1"
@@ -587,8 +776,8 @@ def _script_with_one_second_cleanup_and_disable_tries() -> str:
 def test_setup_whose_install_took_most_of_the_deadline_reports_a_hung_disable_inside_it(tmp_path: Path) -> None:
     # Arrange: the install eats into the validator's deadline, the probe never returns and the daemon
     # hangs on every disable (review, 30.10: the probe's budget started after install and enable, so the
-    # deadline cut the disable tries and stderr only said the setup was cut short). The reserve is 15 s
-    # with 1 s cleanups and disable tries, so 2 s of install leaves the probe about 3 s
+    # deadline cut the disable tries and stderr only said the setup was cut short). The reserve is 16 s
+    # with 1 s cleanups and disable tries, so 2 s of install leaves the probe about 2 s
     deadline_seconds = 20
     arguments = _setup_arguments(
         tmp_path, {"install_delay": 2, "run_hang": True, "disable_hang": True}, deadline_seconds=deadline_seconds
@@ -602,14 +791,14 @@ def test_setup_whose_install_took_most_of_the_deadline_reports_a_hung_disable_in
     assert result.elapsed < deadline_seconds
     assert "cut short" not in result.stderr
     assert result.returncode == 1
-    assert "probe volume failed: TimeoutExpired" in result.stderr
+    assert "docker run --rm timed out" in result.stderr
     assert "could not be disabled" in result.stderr
     assert sum(call[1] == "disable" for call in _plugin_calls(tmp_path)) == 3
     assert not (tmp_path / "probe-ok").exists()
 
 
 def test_setup_with_no_time_left_to_probe_never_enables_the_plugin(tmp_path: Path) -> None:
-    # Arrange: the install outlasts what the deadline leaves before the 15 s reserve and the daemon would
+    # Arrange: the install outlasts what the deadline leaves before the 16 s reserve and the daemon would
     # hang on every disable (review, 30.10: an enable the probe had no time for left a disable to the deadline)
     deadline_seconds = 20
     arguments = _setup_arguments(
@@ -666,7 +855,7 @@ def test_setup_reports_a_probe_that_ran_out_of_its_budget_and_a_disable_that_hun
 
     # Assert
     assert result.returncode == 1
-    assert "probe volume failed: TimeoutExpired" in result.stderr
+    assert "docker run --rm timed out" in result.stderr
     assert "could not be disabled" in result.stderr
     assert not (tmp_path / "probe-ok").exists()
 
@@ -685,8 +874,59 @@ def test_setup_cut_short_by_the_validators_deadline_says_so_on_stderr(tmp_path: 
 
     # Assert
     assert process.returncode == 1
-    assert "setup cut short by the validator's deadline" in stderr
+    assert "setup cut short by the validator's deadline during docker run --rm" in stderr
     assert not (tmp_path / "probe-ok").exists()
+
+
+
+def test_setup_cut_short_while_reading_the_plugins_saved_config_names_that_read(tmp_path: Path) -> None:
+    # Arrange: plugin inspect answers, then the read of the plugin's saved config blocks (a named pipe) until the
+    # validator's `timeout` sends SIGTERM; the reason must not name the inspect that already returned
+    arguments = _setup_arguments(tmp_path, {"installed": True, "enabled": True})
+    config = tmp_path / "plugins" / ("a" * 64) / "config.json"
+    config.unlink()
+    os.mkfifo(config)
+    process = subprocess.Popen(arguments, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    writer = None
+    while writer is None:  # a non-blocking writer opens only once the setup waits on the pipe as its reader
+        assert process.poll() is None, process.communicate()
+        try:
+            writer = os.open(config, os.O_WRONLY | os.O_NONBLOCK)
+        except OSError:
+            time.sleep(0.01)
+
+    # Act: the setup now waits in the read, with the writer held open and nothing written
+    try:
+        process.send_signal(signal.SIGTERM)
+        _, stderr = process.communicate(timeout=20)
+    finally:
+        os.close(writer)
+
+    # Assert
+    assert process.returncode == 1
+    assert any(call[1] == "inspect" for call in _plugin_calls(tmp_path))
+    assert "setup cut short by the validator's deadline during the read of the plugin's saved config" in stderr
+
+@pytest.mark.skipif(not Path("/proc/locks").exists(), reason="reads blocked lock waiters from /proc/locks")
+def test_setup_cut_short_while_waiting_for_the_setup_lock_names_the_wait(tmp_path: Path) -> None:
+    # Arrange: another setup holds the lock when the validator's `timeout` sends SIGTERM
+    arguments = _setup_arguments(tmp_path, {}, alias="vloopback:v3")
+    with open(tmp_path / "setup.lock", "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        process = subprocess.Popen(arguments, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        while not _blocked_on(tmp_path / "setup.lock"):  # the setup is waiting for the lock, not still starting
+            assert process.poll() is None, "the setup ended before it waited for the lock"
+            time.sleep(0.01)
+
+        # Act
+        process.send_signal(signal.SIGTERM)
+        _, stderr = process.communicate(timeout=20)
+
+    # Assert: the reason names the lock wait, and no docker command ran
+    assert process.returncode == 1
+    assert "setup cut short by the validator's deadline during the wait for the setup lock" in stderr
+    assert json.loads((tmp_path / "state.json").read_text())["calls"] == []
+
 
 def _blocked_on(lock_path: Path) -> bool:
     """True while some process waits for the flock on lock_path (Linux lists blocked waiters with `->`)."""
@@ -747,3 +987,49 @@ async def test_setup_command_quotes_the_root_and_never_installs_a_digest(alias, 
     assert args[4:8] == [alias, tag, digest, generation]
     assert args[8] == ("" if generation == "v2" else "docker.io/library/alpine:3.19")
     assert "sha256" not in tag
+
+
+@pytest.mark.parametrize(
+    "overrides, reason",
+    [
+        (
+            {"install_leaves_nothing": True,
+             "install_stderr": "Error response from daemon: Get https://bot:hunter2@registry.example/v2/:\n  unauthorized"},
+            "installation did not produce a plugin: Error response from daemon: "
+            "Get https://registry.example/v2/: unauthorized",
+        ),
+        (
+            {"enable_exit": 1, "enable_stderr": "Error response from daemon: dial unix plugin.sock: connect refused"},
+            "verified plugin remains disabled: Error response from daemon: dial unix plugin.sock: connect refused",
+        ),
+        (
+            {"install_leaves_nothing": True,
+             "install_stderr": 'Get "https://blobs.example/b/l?X-Amz-Signature=hunter2&X-Amz-Expires=60": EOF'},
+            'installation did not produce a plugin: Get "https://blobs.example/b/l": EOF',
+        ),
+        (
+            {"enable_exit": 1, "enable_stderr": "pull https://u:hunter2@blobs.example/b/l?sig=hunter2#hunter2 failed"},
+            "verified plugin remains disabled: pull https://blobs.example/b/l failed",
+        ),
+        (
+            {"install_leaves_nothing": True,
+             "install_stderr": "Get https://bot:hun@ter2@registry.example/v2/: unauthorized"},
+            "installation did not produce a plugin: Get https://registry.example/v2/: unauthorized",
+        ),
+        (
+            {"enable_exit": 1, "enable_stderr": "pull https://u:hun/ter2@blobs.example/b/l failed"},
+            "verified plugin remains disabled: pull https://blobs.example/b/l failed",
+        ),
+    ],
+)
+def test_setup_failure_carries_docker_s_own_reason_without_credentials(tmp_path: Path, overrides, reason) -> None:
+    # Arrange
+    arguments = _setup_arguments(tmp_path, overrides)
+
+    # Act
+    result = subprocess.run(arguments, capture_output=True, text=True, timeout=20)
+
+    # Assert
+    assert result.returncode == 1
+    assert result.stderr.strip() == reason
+    assert "hunter2" not in result.stderr and "ter2" not in result.stderr

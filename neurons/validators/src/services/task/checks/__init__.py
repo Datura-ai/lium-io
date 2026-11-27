@@ -30,6 +30,7 @@ from .hardware_identity import HardwareIdentityCheck
 from .inspector import InspectorRentedCheck
 from .local_verify import LocalVerifyCheck
 from .machine_spec_scrape import MachineSpecScrapeCheck
+from .login_user import LoginUserCheck
 from .node_account import NodeAccountCheck
 from .nvlink_fault import NvlinkFaultCheck
 from .nvml_digest import NvmlDigestCheck
@@ -50,6 +51,7 @@ from .rented_throughput import RentedThroughputCheck
 from .rented_gpu_drop import RentedGpuDropCheck
 from .provider_maintenance import ProviderMaintenanceCheck
 from .rented_machine import HalfStartedStopRetryCheck, RentedSinceStartCheck, TenantEnforcementCheck
+from .rented_mid_cycle import RentedMidCycleCheck
 from .score import ScoreCheck
 from .spec_change import SpecChangeCheck
 from .storage_limit import StorageLimitCheck
@@ -60,6 +62,7 @@ from .start_gpu_monitor import StartGPUMonitorCheck
 from .docker_cpu import DockerCpuCheck
 from .needrestart_guard import NeedrestartGuardCheck
 from .sysbox_layer_reset import SysboxLayerResetCheck
+from .host_pid_max import HostPidMaxCheck
 from .pid_host_required import PidHostRequiredCheck
 from .sysbox_required import SysboxRequiredCheck
 from .tdx_host import TdxHostCheck
@@ -105,6 +108,7 @@ __all__ = [
     "SshdAuthLogCheck",
     "LocalVerifyCheck",
     "MachineSpecScrapeCheck",
+    "LoginUserCheck",
     "NodeAccountCheck",
     "NvlinkFaultCheck",
     "NvmlDigestCheck",
@@ -124,12 +128,14 @@ __all__ = [
     "HalfStartedStopRetryCheck",
     "RentedSinceStartCheck",
     "TenantEnforcementCheck",
+    "RentedMidCycleCheck",
     "ScoreCheck",
     "StaleContainerCleanupCheck",
     "StartGPUMonitorCheck",
     "DockerCpuCheck",
     "NeedrestartGuardCheck",
     "SysboxLayerResetCheck",
+    "HostPidMaxCheck",
     "PidHostRequiredCheck",
     "SysboxRequiredCheck",
     "SpecChangeCheck",

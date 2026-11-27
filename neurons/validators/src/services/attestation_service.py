@@ -740,6 +740,12 @@ class AttestationService:
                 tee_type = "dstack/tdx+nvcc"
 
         known_hosts = self._build_known_hosts(executor)
+        if known_hosts is None and executor.ssh_host_key.strip():
+            # asyncssh reads known_hosts=None as "verify nothing": a reported key that builds no policy is refused for
+            # every caller (rental SSH and validation alike), not connected unchecked
+            raise AttestationError(
+                f"Executor {executor.address}:{executor.port} reported an SSH host key that builds no host-key policy"
+            )
         return HostPolicyResult(
             known_hosts=known_hosts,
             attestation_digest=attestation_digest,

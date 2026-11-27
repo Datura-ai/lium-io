@@ -111,3 +111,35 @@ async def test_attestation_service_accepts_fixture_quote(monkeypatch, address, e
     # No GPU evidence supplied and enforcement off → not performed, still passed.
     assert host_policy.gpu_attestation_passed is None
     assert host_policy.attestation_passed is True
+
+
+def _executor_reporting(ssh_host_key: str | None) -> ExecutorSSHInfo:
+    # model_copy skips the field's format rule, which refuses the two-line value the refusal test needs
+    return ExecutorSSHInfo(
+        uuid="test-executor", address="192.0.2.10", port=2222, ssh_username="exec-user", ssh_port=2222,
+        python_path="/usr/bin/python", root_dir="/opt/executor",
+    ).model_copy(update={"ssh_host_key": ssh_host_key})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("check_registered_key", [True, False])
+async def test_a_reported_host_key_that_builds_no_policy_is_refused_for_rentals_and_validation(
+    monkeypatch, check_registered_key
+):
+    # a second line asyncssh cannot read makes the builder return None, which asyncssh reads as "verify nothing";
+    # the validation cycle passes check_registered_key=False
+    monkeypatch.setattr(settings, "TDX_VERIFIER_URL", None)
+
+    with pytest.raises(AttestationError):
+        await AttestationService().prepare_host_policy(
+            _executor_reporting(f"{_other_key()}\nx"), check_registered_key=check_registered_key
+        )
+
+
+@pytest.mark.asyncio
+async def test_a_node_that_reports_no_host_key_gets_an_empty_policy(monkeypatch):
+    monkeypatch.setattr(settings, "TDX_VERIFIER_URL", None)
+
+    host_policy = await AttestationService().prepare_host_policy(_executor_reporting(None), check_registered_key=False)
+
+    assert host_policy.known_hosts is None

@@ -29,3 +29,31 @@ def test_every_v100_board_name_is_a_v100(raw):
 def test_names_outside_the_v100_boards_pass_through(raw):
     # V100S is its own card; a size no V100 has is not one
     assert normalize_gpu_model(raw) == raw
+
+
+@pytest.mark.parametrize(
+    ("raw", "canonical"),
+    [
+        # ticket-1398 (25 Nov): the add-node check refused a P100 the driver names by its board
+        ("Tesla P100-PCIE-16GB", "NVIDIA Tesla P100"),
+        ("Tesla P100-PCIE-12GB", "NVIDIA Tesla P100"),
+        ("Tesla P100-SXM2-16GB", "NVIDIA Tesla P100"),
+        ("Tesla P40", "NVIDIA Tesla P40"),
+        ("Tesla M40", "NVIDIA Tesla M40"),
+        ("Tesla M40 24GB", "NVIDIA Tesla M40"),
+        (" Tesla P100-PCIE-16GB ", "NVIDIA Tesla P100"),
+    ],
+)
+def test_every_tesla_board_name_is_its_rate_key(raw, canonical):
+    assert normalize_gpu_model(raw) == canonical
+
+
+@pytest.mark.parametrize("raw", ["Tesla K80", "Tesla P4", "Tesla P100-PCIE-16GB-extra"])
+def test_a_tesla_with_no_rate_key_passes_through(raw):
+    assert normalize_gpu_model(raw) == raw
+
+
+def test_the_preflight_and_reference_lookup_accept_a_p100_board_name():
+    from services.gpu_spec_table import reference_gpu_model
+
+    assert reference_gpu_model("Tesla P100-PCIE-16GB", 16384) == "NVIDIA Tesla P100"

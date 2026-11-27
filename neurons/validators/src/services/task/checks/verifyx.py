@@ -686,11 +686,6 @@ def _first_pass_challenge_config() -> dict[str, float]:
     return {
         "memory_max_test_gb": settings.FIRST_PASS_VERIFYX_MEMORY_MAX_TEST_GB,
         "storage_throughput_test_gb": settings.FIRST_PASS_VERIFYX_STORAGE_TEST_GB,
-        # the waits are sized in libverifyx.so, which knows the package and speed-test sizes
-        "network_floor_mbps": min(
-            settings.verifyx.NETWORK_MIN_DOWNLOAD_SPEED_MBPS, settings.verifyx.NETWORK_MIN_PACKAGE_DOWNLOAD_SPEED_MBPS
-        ),
-        "network_min_timeout_seconds": settings.FIRST_PASS_VERIFYX_NETWORK_TIMEOUT_SECONDS,
     }
 
 
@@ -1221,7 +1216,7 @@ class VerifyXColdRetryCheck:
             )
 
         # Cut at the deadline less the margin (never past its own SSH timeout) and judge on the
-        # first sample. Raced against a rental-state watcher: a create (customer or filler) started
+        # first sample. Raced against a rental-state watcher: a renter's create started
         # after the rental data the pre-retry lookup used was read cuts it off at the next poll, within RENTAL_WATCH_INTERVAL_SECONDS
         # plus one Redis read, even if its pending-pod marker is already gone. A pod can share the node
         # for that long at most. An outer cancel still propagates.

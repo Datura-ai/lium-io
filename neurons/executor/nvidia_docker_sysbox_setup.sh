@@ -266,6 +266,12 @@ systemd_env() {
     printf 'Environment=%s\n' "$(systemd_quote "$1=$2")"
 }
 
+layer_reset_step() {
+    # names the step an --install-layer-reset stopped at, for its one answer line
+    LAYER_RESET_FAILED_STEP=$1
+    return 1
+}
+
 layer_reset_program() {
     # the boot reset program; also what removal leaves for a pending journal
     cat <<'PY'
@@ -662,12 +668,12 @@ shift_sysbox_layers_back_at_boot() {
     bin=$(host_path /usr/local/sbin/lium-sysbox-layer-reset)
     unit=$(host_path /etc/systemd/system/lium-sysbox-layer-reset.service)
     dropin=$(host_path /etc/systemd/system/docker.service.d/lium-sysbox-layer-reset.conf)
-    mkdir -p "$(dirname "$bin")" "$(dirname "$unit")" "$(dirname "$dropin")" || return 1
-    layer_reset_program > "$bin" || return 1
-    chmod 755 "$bin" || return 1
+    mkdir -p "$(dirname "$bin")" "$(dirname "$unit")" "$(dirname "$dropin")" || layer_reset_step mkdir || return 1
+    layer_reset_program > "$bin" || layer_reset_step program || return 1
+    chmod 755 "$bin" || layer_reset_step program || return 1
     # the version line goes in last, once the unit is enabled and Docker's drop-in is in place: a cut-off or failed
     # install reads as an old version (no line), so the validator installs again next check
-    cat > "$unit" <<UNIT || return 1
+    cat > "$unit" <<UNIT || layer_reset_step unit || return 1
 [Unit]
 Description=Lium: shift sysbox pods' layers back after an unclean stop
 After=local-fs.target sysbox.service sysbox-mgr.service containerd.service
@@ -694,18 +700,22 @@ UNIT
         systemctl is-active -q docker && touch /run/lium-docker-started  # this boot's Docker already started
         # Docker must never depend on a unit that is not enabled: no drop-in until enable succeeded, none left after
         # a failure (an older install's drop-in included)
-        if ! { systemctl daemon-reload && systemctl enable lium-sysbox-layer-reset.service >/dev/null; }; then
-            rm -f "$dropin"; systemctl daemon-reload >/dev/null 2>&1; return 1
-        fi
+        if ! systemctl daemon-reload; then
+            layer_reset_step daemon-reload
+        elif ! systemctl enable lium-sysbox-layer-reset.service >/dev/null; then
+            layer_reset_step enable
+        fi || { rm -f "$dropin"; systemctl daemon-reload >/dev/null 2>&1; return 1; }
     fi
     # DAH-7052: Docker starts after the reset (After=), whether it worked or not (Wants=, not Requires=): a reset that
     # fails or times out costs the pods it did not shift their sudo/apt until the next boot, never Docker and the
     # executor on the whole host (the reset log names the failure)
     if ! printf '[Unit]\nWants=lium-sysbox-layer-reset.service\nAfter=lium-sysbox-layer-reset.service\n[Service]\nExecStartPost=/bin/touch /run/lium-docker-started\n' \
-        > "$dropin" || ! sed -i "1i # lium-layer-reset-version=$LAYER_RESET_VERSION" "$unit"; then
-        rm -f "$dropin"; [ -n "${SYSBOX_SETUP_HOST_ROOT:-}" ] || systemctl daemon-reload >/dev/null 2>&1; return 1
-    fi
-    [ -n "${SYSBOX_SETUP_HOST_ROOT:-}" ] || systemctl daemon-reload
+        > "$dropin"; then
+        layer_reset_step drop-in
+    elif ! sed -i "1i # lium-layer-reset-version=$LAYER_RESET_VERSION" "$unit"; then
+        layer_reset_step version-line
+    fi || { rm -f "$dropin"; [ -n "${SYSBOX_SETUP_HOST_ROOT:-}" ] || systemctl daemon-reload >/dev/null 2>&1; return 1; }
+    [ -n "${SYSBOX_SETUP_HOST_ROOT:-}" ] || systemctl daemon-reload || layer_reset_step daemon-reload
 }
 
 remove_layer_reset() {
@@ -1561,14 +1571,15 @@ case "${1:-}" in
         elif [ ! -x /usr/bin/python3 ]; then echo "layer_reset_skipped no_python3"
         elif ! command -v sysbox-runc >/dev/null 2>&1; then echo "layer_reset_skipped no_sysbox"
         else
-            # the failing step's own error rides on the result line (one line, cut short), so the validator's event
-            # names why a host keeps failing instead of only that it did
-            rc=0; err=$(shift_sysbox_layers_back_at_boot 2>&1 >/dev/null) || rc=$?
-            if [ "$rc" = 0 ]; then echo "layer_reset_installed $LAYER_RESET_VERSION"
+            # the failing step and the last line it wrote to stderr: one line, printable, bounded
+            err=$(mktemp) || { echo "layer_reset_failed install mktemp"; exit 0; }
+            LAYER_RESET_FAILED_STEP=""
+            if shift_sysbox_layers_back_at_boot >/dev/null 2>"$err"; then echo "layer_reset_installed $LAYER_RESET_VERSION"
             else
-                err=$(printf '%s' "$err" | tr -s '\n\t' '  ' | cut -c1-160)
-                echo "layer_reset_failed install${err:+ $err}"
+                why=$(grep -v '^[[:space:]]*$' "$err" | tail -n 1 | tr -d '\n' | tr -c '[:print:]' ' ' | cut -c1-120)
+                echo "layer_reset_failed ${LAYER_RESET_FAILED_STEP:-install} $why"
             fi
+            rm -f "$err"
         fi
         exit 0
         ;;

@@ -1,9 +1,12 @@
+import functools
 import logging
 import pathlib
+import re
 from enum import Enum
 from typing import TYPE_CHECKING, Literal
 
 import bittensor
+import yarl
 from datura.chain import (
     DEFAULT_ENDPOINT_RETRY_AFTER_SECONDS,
     PUBLIC_NODE_SOURCE,
@@ -20,6 +23,34 @@ from incentive.config import IncentiveConfig
 from lium_core.shared_config import DEFAULT_SHARED_CONFIG, SharedConfigClient
 
 logger = logging.getLogger(__name__)
+
+# host:port as written, checked before yarl normalizes it: yarl drops a trailing '/' and reads '8_000' as a port
+_ORIGIN_ENTRY = re.compile(r"(\[[0-9A-Fa-f:.]+\]|[^\s/?#@\[\]:]+):[0-9]+")
+
+
+@functools.lru_cache(maxsize=4)
+def _parse_miner_origins(value: str) -> frozenset[tuple[str, int]]:
+    """CONFIGURED_MINER_ORIGINS as (host, port) pairs. A malformed entry is skipped (and logged once per value), so one
+    typo never stops the validator dialling every other miner; cached, since every miner request reads it."""
+    origins = set()
+    for entry in (e.strip() for e in value.split(",")):
+        if not entry:
+            continue
+        host, _, port = entry.rpartition(":")
+        if ":" in host and not host.startswith("["):
+            entry = f"[{host}]:{port}"  # a bare IPv6 address
+        # parsed as the request URL is (miner_service compares yarl's host and port), so an entry matches however its
+        # host is written (case, IPv6 form) and only an ASCII port in range is one: str.isdigit() also accepts '²'
+        try:
+            url = yarl.URL(f"http://{entry}") if _ORIGIN_ENTRY.fullmatch(entry) else None
+            origin = url and (url.host, url.explicit_port)
+        except ValueError:
+            origin = None
+        if origin and origin[0] and origin[1]:
+            origins.add(origin)
+        else:
+            logger.warning("CONFIGURED_MINER_ORIGINS entry %r is not host:port; skipped", entry)
+    return frozenset(origins)
 
 
 class FeatureFlag(str, Enum):
@@ -142,6 +173,11 @@ class Settings(BaseSettings):
     # DAH-5592: how long a host-fault create failure is sent again on each new backend socket (redis_service)
     HOST_FAULT_FAILURE_RESEND_SECONDS: int = Field(default=2 * 3600, gt=0)
     COMPUTE_APP_URI: str = Field(env="COMPUTE_APP_URI", default="wss://lium.io/api")
+    CONFIGURED_MINER_ORIGINS: str = Field(
+        default="",
+        description="Comma-separated host:port of miners this validator's operator set up itself (a dev copy's "
+        "in-cluster central miner). Dialled as configured; every address a miner reports must be public.",
+    )
     COMPUTE_REST_API_URL: str | None = Field(
         env="COMPUTE_REST_API_URL", default="https://lium.io/api"
     )
@@ -305,13 +341,12 @@ class Settings(BaseSettings):
     # measurements are still taken and published; only the amount of RAM/disk written shrinks.
     FIRST_PASS_VERIFYX_MEMORY_MAX_TEST_GB: int = Field(env="FIRST_PASS_VERIFYX_MEMORY_MAX_TEST_GB", default=16)
     FIRST_PASS_VERIFYX_STORAGE_TEST_GB: int = Field(env="FIRST_PASS_VERIFYX_STORAGE_TEST_GB", default=1)
-    # The first pass's shortest VerifyX network wait (package try, each speed-test direction). The
-    # library sizes each wait from its transfer at the acceptance floor plus a margin, between this and
-    # VERIFYX NETWORK_TIMEOUT_SECONDS, and gives a failed package one sized try plus a 10 s retry: a slow
-    # mirror cost a new node 4 min at two 120 s tries, while a healthy node at the floor still has time
-    # for a 500 MiB package. Cycle challenges send no floor and keep the full wait. A library without
-    # sizing ignores the keys and waits the full time.
-    FIRST_PASS_VERIFYX_NETWORK_TIMEOUT_SECONDS: int = Field(env="FIRST_PASS_VERIFYX_NETWORK_TIMEOUT_SECONDS", default=45)
+    # The shortest VerifyX speed-test wait (each direction), sent in every challenge, first pass and cycle
+    # alike. The library sizes each speed-test direction from its transfer at the acceptance floor plus a
+    # margin, between this and VERIFYX NETWORK_TIMEOUT_SECONDS. Package download tries are not sized: they
+    # keep the full NETWORK_TIMEOUT_SECONDS, because a package's speed is set by its source, not by the node
+    # (DAH-7126). A library without sizing ignores the keys and waits the full time.
+    VERIFYX_NETWORK_MIN_TIMEOUT_SECONDS: int = Field(env="VERIFYX_NETWORK_MIN_TIMEOUT_SECONDS", default=45)
     # liumd phase 1 (DAH-2834): for an executor whose `/version` advertises `local_verify/1`, run the
     # capability matmul and VerifyX with ONE signed `POST /verify` instead of the SSH commands, and
     # judge the answer with the same unseal/verify code. The POST travels through a direct-tcpip
@@ -529,6 +564,10 @@ class Settings(BaseSettings):
     # read 32-88 Mbps on healthy nodes (DAH-2959), so 50 would flag them; the defect is two orders of magnitude lower.
     CONTAINER_DOWNLOAD_SPEED_CHECK_ENABLED: bool = Field(env="CONTAINER_DOWNLOAD_SPEED_CHECK_ENABLED", default=True)
     CONTAINER_DOWNLOAD_SPEED_MIN_MBPS: float = Field(env="CONTAINER_DOWNLOAD_SPEED_MIN_MBPS", default=10.0, gt=0)
+    # the same container's upload of 16 MiB to Cloudflare's speed-test sink (what a pod sends: checkpoints, results)
+    CONTAINER_UPLOAD_SPEED_MIN_MBPS: float = Field(env="CONTAINER_UPLOAD_SPEED_MIN_MBPS", default=10.0, gt=0)
+    # DAH-6887 rollout switch, off by default
+    CONTAINER_SPEED_FLEET_RULE_ENFORCED: bool = Field(env="CONTAINER_SPEED_FLEET_RULE_ENFORCED", default=False)
     CONTAINER_DOWNLOAD_SPEED_INTERVAL_HOURS: float = Field(
         env="CONTAINER_DOWNLOAD_SPEED_INTERVAL_HOURS", default=6.0, gt=0
     )
@@ -602,12 +641,6 @@ class Settings(BaseSettings):
         env="EXECUTOR_IMAGE_REF",
         default="daturaai/compute-subnet-executor:latest",
     )
-    # DAH-2701 compares the executor container's image digest with EXECUTOR_IMAGE_REF's.
-    # False (default): an OUTDATED verdict is logged with both digests and the score, the
-    # incentive and the validation result are unchanged. True: an idle OUTDATED executor fails
-    # validation and every OUTDATED executor earns 0. Off until nodes auto-update again
-    # (DAH-3419): with Watchtower stalled, 99 executors earned 0 for it in one hour on 11 Sep.
-    EXECUTOR_IMAGE_CHECK_ENFORCE: bool = Field(env="EXECUTOR_IMAGE_CHECK_ENFORCE", default=False)
     # DAH-3405: for this many validation cycles, counting the one in which the registry digest of
     # EXECUTOR_IMAGE_REF was seen to change, an executor that fails the way a watchtower restart
     # makes it fail (SSH gone, scrape failed, ports missing, image not yet the new one) gets no
@@ -634,15 +667,7 @@ class Settings(BaseSettings):
     # and the per-executor job-result dump after scoring; asyncssh and sqlalchemy keep their own levels.
     LOG_LEVEL: str = Field(env="LOG_LEVEL", default="INFO", description="Root log level (DEBUG, INFO, WARNING, ...)")
 
-    # DAH-4299: whether an idle provider-chosen spot node is paid is decided as for a secure node
-    # (its GPU model is in the unrented program and every idle-pool gate passes), not by whether a
-    # Lium filler runs on it: a filler Lium did not start is Lium's doing (Fish). Provider-caused
-    # cases stay excluded by the shared rules. The amount is unchanged. False: paid only while a
-    # Lium filler runs on it, as before.
-    SPOT_IDLE_PAY_SECURE_DECISION_ENABLED: bool = Field(
-        env="SPOT_IDLE_PAY_SECURE_DECISION_ENABLED", default=False
-    )
-    # Spot rental incentive, independent of the flag above. True: a rented spot node the backend
+    # Spot rental incentive. True: a rented spot node the backend
     # lists in provider_spot_executor_ids earns rental incentive at 0.5 x what the same node would
     # earn rented as secure (0.5 = SPOT_RENTAL_INCENTIVE_FACTOR); a node that is spot as a
     # restriction earns 0 as before; the free remainder of a partially rented spot node takes spot idle pay instead.
@@ -1030,6 +1055,14 @@ class Settings(BaseSettings):
             chain_endpoint=self.BITTENSOR_CHAIN_ENDPOINT,
             network=self.BITTENSOR_NETWORK,
         )
+
+    def configured_miner_origins(self) -> set[tuple[str, int]]:
+        """(host, port) of the miners the operator configured: CONFIGURED_MINER_ORIGINS and the debug local miner."""
+        origins = set(_parse_miner_origins(self.CONFIGURED_MINER_ORIGINS))
+        if self.debug.USE_LOCAL_MINER and self.debug.MINER_ADDRESS and self.debug.MINER_PORT:
+            # parsed like every configured origin, so it matches however MINER_ADDRESS is written
+            origins |= _parse_miner_origins(f"{self.debug.MINER_ADDRESS}:{self.debug.MINER_PORT}")
+        return origins
 
     def get_debug_miner(self) -> dict:
         if not self.debug.MINER_ADDRESS or not self.debug.MINER_PORT:

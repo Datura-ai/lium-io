@@ -157,6 +157,18 @@ async def test_a_host_the_install_does_not_reach_warns_and_keeps_its_score(conte
 
 
 @pytest.mark.asyncio
+async def test_a_failed_install_keeps_its_step_and_why_printable_and_bounded(context_factory, mode):
+    mode("all")
+    stdout = "layer_reset_failed enable Failed to enable unit: \x1b[31mread-only\x00 file system" + " x" * 200 + "\n"
+
+    result = await _run(context_factory, {"sysbox_layer_reset_version": 0}, _ssh(stdout))
+
+    install = result.event.what_we_saw["install"]
+    assert install.startswith("failed enable Failed to enable unit: ?[31mread-only? file system")
+    assert len(install) == 200 and all(" " <= c <= "~" for c in install)
+
+
+@pytest.mark.asyncio
 async def test_an_ssh_error_in_the_install_never_fails_the_check(context_factory, mode):
     mode("all")
     ssh = SimpleNamespace(run=AsyncMock(side_effect=OSError("connection lost")))
@@ -227,31 +239,22 @@ def test_every_scrape_key_is_registered_in_both_obfuscation_tables():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("status", [None, "RUNNING", "STOPPED"])
-async def test_a_rented_host_waits_for_an_idle_cycle(context_factory, mode, status):
-    # a stopped pod is a live rental too: daemon-reload and the boot-time Docker dependency wait until no pod is listed
+@pytest.mark.parametrize("status", [None, "RUNNING", "STOPPED", "no list"])
+async def test_a_rented_host_gets_the_install_too(context_factory, mode, status):
+    # the install starts, stops and restarts nothing (test_sysbox_setup_layer_reset.py), so a rented host, a stopped
+    # pod's or one with no rented list this cycle, gets it now rather than at an idle cycle that may never come
     mode("all")
-    rented = _rented_data(miner_hotkey=HOTKEY)
-    rented.executors["executor-123"].pods[0].status = status
+    rented = None
+    if status != "no list":
+        rented = _rented_data(miner_hotkey=HOTKEY)
+        rented.executors["executor-123"].pods[0].status = status
     ssh = _ssh(f"layer_reset_installed {CURRENT}\n")
     state = build_state(specs={"sysbox_layer_reset_version": 0}, rented_data=rented)
 
     result = await SysboxLayerResetCheck().run(context_factory(state=state, ssh=ssh, miner_hotkey=HOTKEY))
 
-    assert (result.passed, result.event.reason_code) == (True, Msg.OUTDATED.reason)
-    ssh.run.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_no_rented_list_this_cycle_installs_nothing(context_factory, mode):
-    mode("all")
-    ssh = _ssh(f"layer_reset_installed {CURRENT}\n")
-    state = build_state(specs={"sysbox_layer_reset_version": 0}, rented_data=None)
-
-    result = await SysboxLayerResetCheck().run(context_factory(state=state, ssh=ssh, miner_hotkey=HOTKEY))
-
-    assert result.event.reason_code == Msg.OUTDATED.reason
-    ssh.run.assert_not_awaited()
+    assert (result.passed, result.event.reason_code) == (True, Msg.INSTALLED.reason)
+    assert ssh.run.await_args.args[0] == INSTALL_COMMAND
 
 
 def test_off_is_the_default():

@@ -30,7 +30,7 @@ from core.config import settings
 from core.utils import _m
 from incentive.config import BASE_GPU_MAP
 from protocol.vc_protocol.compute_requests import RentedExecutor, RentedExecutorsResponse
-from services.executor_image_policy import ImageVerdict, normalize_sha256_digest
+from services.executor_image_policy import normalize_sha256_digest
 from services.redis_service import (
     LAST_SCORED_RESULT_TTL_SECONDS,
     RedisService,
@@ -51,6 +51,7 @@ from services.task.messages import (
     NO_TASK_TIME_REASONS,
     PortConnectivityMessages,
     PortCountMessages,
+    RENTED_AFTER_START_REASONS,
     RentalVerificationMessages,
     SCRAPE_HOST_SIDE_FAILURE_REASONS,
     SCRAPE_UNDETERMINED_FAILURE_REASONS,
@@ -80,7 +81,8 @@ MAX_ROLLOUT_GRACE_CYCLES = 2
 # the change is seen is cycle 1) and restarted by every change, a second push inside the window too.
 # Separate from the window: it changes only the image verdict, never withholds a result, so it has no
 # 1-hour cap. Many more nodes are still on the previous image after 2 cycles than after 8.
-PREVIOUS_RELEASE_CURRENT_CYCLES = 8
+# DAH-6845: 16 (~4 h): over 9 releases (16-19 Nov) up to 13 of ~650 nodes per release updated only after 2-4 h.
+PREVIOUS_RELEASE_CURRENT_CYCLES = 16
 
 # What a watchtower container recreate makes a running validation look like, in the order the
 # pipeline meets them: the connect never opens; the shell dies under the upload, under a check
@@ -459,29 +461,19 @@ def _observed_digest(result: JobResult) -> str | None:
 def rollout_grace_reason(result: JobResult, window: RolloutWindow, job_block: int) -> str | None:
     """The reason code this result's verdict is withheld for, or None when the verdict stands.
 
-    Withheld: the window covers this cycle, the run ended on one of `ROLLOUT_FAILURE_REASONS` (or
-    it ended without failing — the rented halt or finalize — with score 0 and the image check had
-    read OUTDATED: a rented executor's image check passes, so the run halts as RENTED instead of
-    failing), and, for every reason but OUTDATED, the executor's observed image is not the new
-    digest. The OUTDATED-without-failing case counts only while `EXECUTOR_IMAGE_CHECK_ENFORCE` is
-    on: off (the default since DAH-3439), the image check passes an OUTDATED node and leaves its
-    score alone, so a score of 0 under an OUTDATED report came from another gate (price cap, TDX) and stands. An executor that already runs
-    the new image failed for a reason of its own; a rented executor that failed a later check of
-    its own (pod not running, filler killed) failed for that reason, OUTDATED or not; and a result
-    with a score is never touched.
+    Withheld: the window covers this cycle, the run ended on one of `ROLLOUT_FAILURE_REASONS`, and,
+    for every reason but OUTDATED, the executor's observed image is not the new digest. A rented
+    OUTDATED node keeps its score (DAH-6845), so a rented run that ended without failing at score 0
+    under an OUTDATED report got that 0 from another gate (price cap, TDX) and stands. An executor
+    that already runs the new image failed for a reason of its own; a rented executor that failed a
+    later check of its own (pod not running, filler killed) failed for that reason, OUTDATED or not;
+    and a result with a score is never touched.
     """
     if not window.covers(job_block) or result.score > 0:
         return None
     reason = result.failure_reason_code
     if reason not in ROLLOUT_FAILURE_REASONS:
-        ended_without_failing = reason in RUN_ENDED_WITHOUT_FAILING
-        outdated = (
-            settings.EXECUTOR_IMAGE_CHECK_ENFORCE
-            and (result.executor_image_report or {}).get("status") == ImageVerdict.OUTDATED.value
-        )
-        if not (ended_without_failing and outdated):
-            return None
-        reason = _OUTDATED
+        return None
     # OUTDATED is withheld whatever the observed digest says: old = not pulled yet, new = the
     # validator's own snapshot predated the push. Every other reason on an executor that already
     # runs the new image is that executor's own failure.
@@ -560,8 +552,10 @@ def withhold_renter_gpu_reset_verdicts(
                 WithheldVerdict(
                     miner_hotkey=miner_hotkey,
                     result=result,
-                    # the node's own checks can spend the task's time: that keeps no miner active (review)
-                    keeps_miner_active=result.failure_reason_code not in NO_TASK_TIME_REASONS,
+                    # the node's own checks can spend the task's time, and a provider can start a create on his own
+                    # node: neither keeps a miner active (reviews)
+                    keeps_miner_active=result.failure_reason_code not in NO_TASK_TIME_REASONS
+                    and result.failure_reason_code != TenantEnforcementMessages.RENTED_SINCE_CYCLE_START.reason,
                 )
             )
             logger.info(
@@ -608,12 +602,14 @@ def withhold_session_lost_verdicts(
 
 
 # DAH-6564: failures a rental or filler that started or ended during the cycle produces (the checks judge the node
-# against the list read at the cycle start)
+# against the list read at the cycle start). An OUTDATED image fails only a node that list has free (DAH-6845), so a
+# rental that starts later in the cycle gets no verdict instead of a zero, and the next cycle scores it rented
 RENTAL_CHANGE_REASONS = frozenset(
     {
         PortCountMessages.INSUFFICIENT_PORTS.reason,
         RentalVerificationMessages.FAILED.reason,
         GpuUsageMessages.USAGE_HIGH.reason,
+        ExecutorImageMessages.OUTDATED.reason,
     }
 )
 # one hash for the fleet: "<miner hotkey>:<executor uuid>" -> {"batches": [withheld job_batch_ids], "at": epoch}
@@ -669,9 +665,10 @@ async def withhold_rental_change_verdicts(
     redis_service: RedisService,
     published_early: set[str],
 ) -> tuple[dict[str, list[JobResult]], list[WithheldVerdict]]:
-    """DAH-6564: a ports, rental-check or GPU-usage failure on a node whose pods or fillers changed between the
-    cycle-start list and the cycle-end list gets no verdict, at most MAX_RENTAL_CHANGE_WITHHELD_CYCLES cycles
-    since the node's last real pass. No cycle-end list, or Redis not answering: every verdict stands."""
+    """DAH-6564: a ports, rental-check, GPU-usage or free-node outdated-image failure on a node whose pods or
+    fillers changed between the cycle-start list and the cycle-end list gets no verdict, at most
+    MAX_RENTAL_CHANGE_WITHHELD_CYCLES cycles since the node's last real pass. No cycle-end list, or Redis not
+    answering: every verdict stands."""
     candidates = has_rental_change_candidates(job_results)
     if candidates and rented_at_end is None:
         logger.warning(_m("Rental-change rule: the cycle-end rented list gave no answer; every verdict stands"))
@@ -803,9 +800,10 @@ def rental_state_unchanged(
     """The one rule every carry goes through (DAH-5933): a kept result stands in for a held cycle only when it was
     scored with exactly the node's rental state that cycle saw at its start (the snapshot) and at the cycle-end read:
     no rental, or the same rental pod ids holding the same known GPU count. A cycle that itself saw the node rented
-    after its start (RENTAL_STARTED_DURING_CHECK) saw a change. Anything else is withheld: never scored or paid.
+    after its start (RENTED_AFTER_START_REASONS: found during the check, or a renter's create it stopped for) saw a
+    change. Anything else is withheld: never scored or paid.
     `rental_at_start` / `rental_at_end` are the node's own rentals (rental_owned_by), None for none."""
-    if held.failure_reason_code == RentalVerificationMessages.RENTED_SINCE_THE_SNAPSHOT.reason:
+    if held.failure_reason_code in RENTED_AFTER_START_REASONS:
         return False
     if previous is None or previous.rental_pod_ids is None:
         return False
@@ -863,7 +861,7 @@ async def carry_renter_gpu_reset_results(
             needs_end_read = held.failure_reason_code in CYCLE_END_READ_REASONS
             if rentals_at_start is None or (rentals_at_end is None and needs_end_read):
                 # a rental state that cannot be read carries nothing; one the cycle saw change still drops the kept result
-                seen_rented = held.failure_reason_code == RentalVerificationMessages.RENTED_SINCE_THE_SNAPSHOT.reason
+                seen_rented = held.failure_reason_code in RENTED_AFTER_START_REASONS
                 if in_redis and seen_rented:
                     await _spend_kept_result(redis_service, miner_hotkey, held)
                 continue

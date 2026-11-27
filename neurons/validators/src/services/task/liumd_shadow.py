@@ -600,6 +600,13 @@ NOT_COMPARABLE_SPEC_PATHS = frozenset(
         "hard_disk.free",
         "hard_disk.utilization",
         "hard_disk.engy_cache_used_gb",
+        # DAH-5238: data-root apart from a containerd store; only liumd reads these (no Python scrape field)
+        "hard_disk.engy_cache_released_gb",
+        "hard_disk.data_root_used",
+        "hard_disk.data_root_docker_used",
+        "hard_disk.data_root_free",
+        # liumd emits it at the top level, next to hard_disk_docker_scrape_error
+        "hard_disk_content_scrape_error",
         "hard_disk.images",
         "hard_disk.containers",
         "hard_disk.volumes",
