@@ -141,6 +141,7 @@ async def test_dry_run_installs_nothing(context_factory, mode):
     "stdout",
     [
         "layer_reset_skipped no_python3\n",
+        "layer_reset_skipped no_systemd\n",
         "layer_reset_failed install\n",
         "layer_reset_failed nsenter_failed\n",
         "layer_reset_installed 1\n",  # an older script answered: not this validator's version
