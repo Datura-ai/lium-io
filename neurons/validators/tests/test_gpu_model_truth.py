@@ -282,13 +282,18 @@ async def test_a_first_sample_with_a_wrong_answer_stops_the_filler_once_for_the_
 @pytest.mark.asyncio
 async def test_another_owners_filler_is_never_stopped_for_the_full_check(context_factory, sample_never_due):
     redis = FakeRedis()
+    budgets = []
     for _ in range(2):
         ctx, service = _filler_ctx(context_factory, redis, None, success=False, failure=WRONG_ANSWER)
         ctx = _lium_filler(ctx, owner="miner")
         result = await CapabilityCheck().run(ctx)
         assert result.passed is True
-        assert len(service.budgets) == 1  # sampled again, as before
+        budgets.append(len(service.budgets))
         ctx.ssh.run.assert_not_awaited()
+
+    # review: the one-day entry is stored as before, so the node is not sampled every cycle
+    assert budgets == [1, 0]
+    assert redis.ttl[_verdict_key()] == capability.GPU_MODEL_NO_VERDICT_TTL_SECONDS
 
 
 @pytest.mark.asyncio
@@ -771,11 +776,16 @@ async def test_an_out_of_turn_retry_moves_to_the_next_card_each_cycle(context_fa
 
 
 @pytest.mark.asyncio
-async def test_a_full_check_with_no_answer_after_the_stop_fails_without_the_workload_waiver(
-    context_factory, sample_never_due, monkeypatch
+@pytest.mark.parametrize(
+    "listed_now, waived", [(["filler_active"], False), (["filler_active", "filler_new"], True)], ids=["stopped", "placed_since"]
+)
+async def test_a_full_check_with_no_answer_after_the_stop_is_waived_only_for_a_filler_placed_since(
+    context_factory, sample_never_due, monkeypatch, listed_now, waived
 ):
-    # review: the backend still lists the stopped filler, so a no-answer must not read as Lium's workload
-    waiver = AsyncMock(return_value=SimpleNamespace(kind="filler", container_names=["filler_active"], snapshot=None))
+    # review: the backend still lists the stopped filler, so it is no waiver; a filler the default job placed during
+    # the full check is, as on any other node
+    snapshot = RentedExecutorsResponse(executors={}, banned_guids=[])
+    waiver = AsyncMock(return_value=capability._LiumWorkload(kind="filler", container_names=tuple(listed_now), snapshot=snapshot))
     monkeypatch.setattr(capability, "lium_workload_live_now", waiver)
     redis = FakeRedis()
     await redis.set(capability._full_check_due_key(_filler_ctx(context_factory, redis, None)[0]), "0")
@@ -784,10 +794,8 @@ async def test_a_full_check_with_no_answer_after_the_stop_fails_without_the_work
     result = await CapabilityCheck().run(_lium_filler(ctx))
 
     assert service.budgets == [None]
-    assert result.passed is False
-    assert result.event.reason_code != Msg.RENTED_SKIPPED.reason
-    assert result.event.what_we_saw["stopped_fillers_for_full_check"] == ["filler_active"]
-    waiver.assert_not_awaited()
+    assert result.passed is waived
+    assert (result.event.reason_code == Msg.RENTED_SKIPPED.reason) is waived
 
 
 TWO_H100 = {"gpu": {"count": 2, "details": [{"name": REAL_H100[0], "uuid": "GPU-0"}, {"name": REAL_H100[0], "uuid": "GPU-1"}]}}
