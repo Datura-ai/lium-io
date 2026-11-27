@@ -5,6 +5,7 @@ import hashlib
 import json
 import logging
 import re
+import time
 
 from services.nvidia_devices import read_kernel_gpu_view
 
@@ -60,6 +61,10 @@ DMI_FILE_KINDS = ("regular file", "regular empty file")
 FINDINGS_NAMED = 8  # the peer writes mountinfo, so the event names at most this many
 HW_ID_KEY_PREFIX = "hardware_identity"
 HW_ID_TTL_SECONDS = 30 * 24 * 3600
+# two machines behind one node, a standing finding; the plain record overwrites itself and would pass the
+# next check
+HW_ID_HOLD_KEY_PREFIX = "hardware_identity_hold"
+DMI_HISTORY_MAX = 64
 
 
 def dmi_overlay_findings(mountinfo: str, file_fs: str) -> list[str]:
@@ -140,6 +145,13 @@ def boot_history(previous: dict | None) -> list[str]:
     return list(previous.get("boots") or ([previous["boot"]] if previous.get("boot") else []))
 
 
+def dmi_history(previous: dict | None) -> list[str]:
+    """Digests of the DMI identities this node was seen with; a record from before the history seeds it."""
+    if not previous:
+        return []
+    return list(previous.get("dmis") or ([digest([previous["dmi"]])] if previous.get("dmi") else []))
+
+
 def dmi_identity_drifted(previous: dict | None, gpus: list[str], dmi_identity: str, boot_id: str = "") -> bool:
     """DMI identity changed between checks while the GPU set stayed: the board did not change, the overlay did.
 
@@ -171,7 +183,10 @@ class HardwareIdentityCheck:
     fingerprint (a hash of the kernel's GPU UUIDs, NVML's when the kernel list is unreadable) and
     the DMI hash are logged on every event.
 
-    A finding fails the node. An unreadable host, SSH error or Redis outage decides nothing.
+    A finding fails the node. An unreadable host, SSH error or Redis outage decides nothing. A drift back to an
+    identity already seen under the same GPUs is two machines answering for one node: it holds the node for
+    HW_ID_TTL_SECONDS, whatever the checks in between read (a node that switched machines for one check a few
+    times a day and passed every check in between).
     """
 
     check_id = "host.validate.hardware_identity"
@@ -199,17 +214,31 @@ class HardwareIdentityCheck:
         # "<product_uuid>|<board_serial>|"; both unreadable reads as no identity
         dmi_identity = values.strip() if values.strip().strip("|") else ""
 
-        previous = None
+        previous = hold = None
+        drifted = False
         key = f"{HW_ID_KEY_PREFIX}:{ctx.executor.uuid}"
+        hold_key = f"{HW_ID_HOLD_KEY_PREFIX}:{ctx.executor.uuid}"
         try:
             raw = await ctx.services.redis.get(key)
             previous = json.loads(raw) if raw else None
+            raw_hold = await ctx.services.redis.get(hold_key)
+            hold = json.loads(raw_hold) if raw_hold else None
+            drifted = dmi_identity_drifted(previous, gpus, dmi_identity, boot_id)
             if gpus and dmi_identity and not overlays:
                 boots = boot_history(previous)
                 if boot_id and boot_id not in boots:
                     boots = [*boots, boot_id][-BOOT_HISTORY_MAX:]
+                dmis = dmi_history(previous)
+                identity = digest([dmi_identity])
+                if drifted and identity in dmis and hold is None:
+                    hold = {"since": int(time.time()), "dmi_identity_hashes": [dmis[-1], identity]}
+                    await ctx.services.redis.set(hold_key, json.dumps(hold), ex=HW_ID_TTL_SECONDS)
+                if identity not in dmis:
+                    dmis = [*dmis, identity][-DMI_HISTORY_MAX:]
                 await ctx.services.redis.set(
-                    key, json.dumps({"gpus": gpus, "dmi": dmi_identity, "boots": boots}), ex=HW_ID_TTL_SECONDS
+                    key,
+                    json.dumps({"gpus": gpus, "dmi": dmi_identity, "boots": boots, "dmis": dmis}),
+                    ex=HW_ID_TTL_SECONDS,
                 )
         except Exception:
             logger.warning("hardware identity record unavailable", exc_info=True, extra=ctx.default_extra)
@@ -228,8 +257,10 @@ class HardwareIdentityCheck:
             findings.append("dmi_overlaid")
         if gpu_sources_disagree(reported, host_kernel or kernel):
             findings.append("gpu_sources_disagree")
-        if dmi_identity_drifted(previous, gpus, dmi_identity, boot_id):
+        if drifted:
             findings.append("dmi_changed_under_same_gpus")
+        if hold is not None:
+            findings.append("machines_alternate_behind_node")
 
         what = {
             "gpu_fingerprint": digest(gpus) if gpus else None,
@@ -243,6 +274,7 @@ class HardwareIdentityCheck:
             "reported_gpu_uuids": reported,
             "dmi_overlays": overlays,
             "findings": findings,
+            "alternation_hold": hold,
         }
         if not findings:
             return CheckResult(passed=True, event=render_message(Msg.OK, ctx=ctx, check_id=self.check_id, what=what))
