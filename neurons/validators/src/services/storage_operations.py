@@ -301,6 +301,9 @@ async def start_storage_operation(
             f"install -d -m 0700 {shlex.quote(str(REMOTE_OPERATION_DIRECTORY))}",
             check=True,
         )
+        if await _remote_file_exists(ssh_client, files.cancel):
+            # cancelled before this dispatch reached the node: a cancelled operation never runs
+            return files
         existing_state = await _operation_state(ssh_client, files)
         if existing_state == "STARTING" and await _remote_file_exists(ssh_client, files.spec):
             # A repeated backend dispatch can arrive while the first wrapper is between
@@ -373,15 +376,16 @@ async def start_storage_operation(
         # Bootstrap callers consume the terminal files; detached online jobs
         # remove them themselves after the runner has finished reporting.
         wrapper = (
-            f"rm -f {shlex.quote(str(files.status))} {shlex.quote(str(files.cancel))}; "
+            # a cancel that landed after the checks above leaves its marker: the runner never starts
+            f"rm -f {shlex.quote(str(files.status))}; "
+            f"test ! -e {shlex.quote(str(files.cancel))} || {{ rm -rf -- \"$D\"; rm -f {shlex.quote(str(files.spec))}; exit 0; }}; "
             f"{runner} & child=$!; "
             f"printf '%s\\n' \"$child\" > {shlex.quote(str(files.pid))}; "
             "trap 'kill -TERM \"$child\" 2>/dev/null || true' TERM INT; "
             'wait "$child"; result=$?; '
             f"printf '%s\\n' \"$result\" > {shlex.quote(str(files.status))}; "
             'rm -rf -- "$D"; '
-            f"rm -f {shlex.quote(str(files.spec))} {shlex.quote(str(files.pid))} "
-            f"{shlex.quote(str(files.cancel))}{terminal_cleanup}"
+            f"rm -f {shlex.quote(str(files.spec))} {shlex.quote(str(files.pid))}{terminal_cleanup}"
         )
         launch_command = (
             f"D={shlex.quote(stage_dir)} nohup /bin/sh -c {shlex.quote(wrapper)} "
@@ -556,7 +560,11 @@ async def cancel_storage_operation(
     # Targets are named, never a stored PID (the executor shares the host's PID namespace, so a stale PID
     # could be an unrelated process). SIGTERM to the helper: its storage_runner.py stops restic and reports CANCELLED.
     command = (
-        f"touch {shlex.quote(str(files.cancel))}; "
+        # the marker stays for good (an empty file per cancelled operation; ids are never reused): nothing bounds how
+        # late a dispatch still in flight reaches the node, so no age makes removing it safe
+        # a cancel ahead of the launch may find no directory yet; without its marker the cancel has failed
+        f"m=0; {{ install -d -m 0700 {shlex.quote(str(REMOTE_OPERATION_DIRECTORY))} "
+        f"&& touch {shlex.quote(str(files.cancel))}; }} || m=1; "
         f"/usr/bin/docker kill --signal TERM {helper} >/dev/null 2>&1 || true; "
         f'attempt=0; while test "$(/usr/bin/docker inspect -f {{{{.State.Running}}}} {helper} 2>/dev/null)" = true '
         '&& test "$attempt" -lt 120; do sleep 0.25; attempt=$((attempt + 1)); done; '
@@ -570,7 +578,7 @@ async def cancel_storage_operation(
         f"/usr/bin/docker rm -f -- {helper} >/dev/null 2>&1 || true; "
         f'attempt=0; while pgrep -f -- {legacy_runner} >/dev/null && test "$attempt" -lt 40; do '
         "sleep 0.25; attempt=$((attempt + 1)); done; "
-        f"! pgrep -f -- {legacy_runner} >/dev/null"
+        f'! pgrep -f -- {legacy_runner} >/dev/null && test "$m" = 0'
     )
     result = await ssh_client.run(command, check=False)
     if result.exit_status != 0:
@@ -671,7 +679,8 @@ def _remove_operation_artifacts_command(files: StorageOperationFiles) -> str:
         "rm -f "
         + " ".join(
             shlex.quote(str(path))
-            for path in (files.status, files.log, files.pid, files.spec, files.cancel)
+            # never the cancel marker: it is what keeps a later dispatch of a cancelled operation from running it
+            for path in (files.status, files.log, files.pid, files.spec)
         )
         + (
             f"; /usr/bin/docker rm -f -- {shlex.quote(files.helper)} >/dev/null 2>&1 || true"

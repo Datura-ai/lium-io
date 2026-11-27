@@ -596,3 +596,39 @@ async def test_forget_matches_the_record_and_reporter_whatever_the_id_case():
 
     assert removed == [f"{OPERATION_ID}|1"]
     assert redis.values == {}
+
+
+@pytest.mark.parametrize("cancel_lands", ["before_launch", "before_the_wrapper_starts"])
+def test_a_cancelled_operation_never_runs(node: Path, monkeypatch: pytest.MonkeyPatch, cancel_lands: str) -> None:
+    """The backend's cancel and its dispatch are separate validator tasks: the cancel can finish on the node before
+    the launch reaches it, or between the launch's checks and its wrapper starting. Either way the runner never runs,
+    and neither the spec (the repository credentials) nor the staged runner stays."""
+    import asyncio as aio
+
+    monkeypatch.setattr(storage_operations, "_report_cancelled", AsyncMock(return_value=True))
+    ran = node / "ran"
+    _runner(node, f"open({str(ran)!r}, 'w').close()\n")
+    files = storage_operations.StorageOperationFiles.for_operation(OPERATION_ID)
+
+    async def cancel() -> None:
+        await storage_operations.cancel_storage_operation(_node_client(), await _held(), OPERATION_ID)
+
+    async def run(command: str, check: bool = False, input: str | None = None) -> SimpleNamespace:
+        if "nohup" in command and cancel_lands == "before_the_wrapper_starts":
+            await cancel()
+        return await _run_locally(command, check, input)
+
+    async def dispatch() -> None:
+        if cancel_lands == "before_launch":
+            await cancel()
+        await storage_operations.start_storage_operation(
+            _node_client(run), sys.executable, OPERATION_ID, {"engine": "restic"}, retain_terminal_artifacts=False
+        )
+
+    aio.run(dispatch())
+    for staged in (node / "service").iterdir():
+        _wait_for(staged, gone=True)  # a launched wrapper removes its staged runner as it ends
+
+    assert not ran.exists()
+    assert not Path(str(files.spec)).exists()
+    assert Path(str(files.cancel)).exists()  # the marker stays for any later dispatch of the operation
