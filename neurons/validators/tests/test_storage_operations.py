@@ -632,3 +632,41 @@ def test_a_cancelled_operation_never_runs(node: Path, monkeypatch: pytest.Monkey
     assert not ran.exists()
     assert not Path(str(files.spec)).exists()
     assert Path(str(files.cancel)).exists()  # the marker stays for any later dispatch of the operation
+
+
+@pytest.mark.parametrize("cancel_lands", ["before_launch", "before_the_wrapper_starts", "while_it_runs"])
+def test_a_bootstrap_wait_on_a_cancelled_operation_ends_cancelled_not_failed(
+    node: Path, monkeypatch: pytest.MonkeyPatch, cancel_lands: str
+) -> None:
+    """The bootstrap restore waits for its operation and reports FAILED on a launch error. A cancelled operation
+    (never started, or stopped by its runner with exit 130) must end the wait as cancelled, so that report never
+    overwrites the CANCELLED the cancel already sent."""
+    import asyncio as aio
+
+    monkeypatch.setattr(storage_operations, "_report_cancelled", AsyncMock(return_value=True))
+    files = storage_operations.StorageOperationFiles.for_operation(OPERATION_ID)
+    # the real runner sees the marker through its cancellation probe and exits 130
+    _runner(node, f"import os, sys, time\nwhile not os.path.exists({str(files.cancel)!r}): time.sleep(0.05)\nsys.exit(130)\n")
+
+    async def cancel() -> None:
+        await storage_operations.cancel_storage_operation(_node_client(), await _held(), OPERATION_ID)
+
+    async def run(command: str, check: bool = False, input: str | None = None) -> SimpleNamespace:
+        if "nohup" in command and cancel_lands == "before_the_wrapper_starts":
+            await cancel()
+        return await _run_locally(command, check, input)
+
+    async def bootstrap() -> None:
+        if cancel_lands == "before_launch":
+            await cancel()
+        launched = await storage_operations.start_storage_operation(
+            _node_client(run), sys.executable, OPERATION_ID, {"engine": "restic"}, retain_terminal_artifacts=True
+        )
+        if cancel_lands == "while_it_runs":
+            Path(str(files.cancel)).touch()  # the marker a cancel leaves while the runner works
+        await storage_operations.wait_for_storage_operation(
+            _node_client(), launched, poll_interval_seconds=0.05, launch_grace_polls=4
+        )
+
+    with pytest.raises(storage_operations.StorageOperationCancelled):
+        aio.run(bootstrap())

@@ -191,6 +191,11 @@ class StorageOperationLaunchError(RuntimeError):
     pass
 
 
+class StorageOperationCancelled(RuntimeError):
+    """The operation's cancel marker is on the node: it ended, or never started, because it was cancelled. Not a
+    launch error, so a waiting caller never reports FAILED over the CANCELLED the cancel already reported."""
+
+
 @dataclass(frozen=True)
 class StorageOperationFiles:
     spec: PurePosixPath
@@ -457,6 +462,7 @@ async def wait_for_storage_operation(
                     "storage operation returned an invalid status"
                 ) from error
             if exit_code != 0:
+                await _raise_if_cancelled(ssh_client, files)
                 detail = await _tail_operation_log(ssh_client, files.log, files.helper)
                 await _remove_operation_artifacts(ssh_client, files)
                 raise StorageOperationLaunchError(
@@ -467,6 +473,7 @@ async def wait_for_storage_operation(
         if state == "RUNNING":
             runner_seen = True
         elif state in {"EXITED", "INVALID"} or runner_seen:
+            await _raise_if_cancelled(ssh_client, files)
             detail = await _tail_operation_log(ssh_client, files.log, files.helper)
             await _remove_operation_artifacts(ssh_client, files)
             raise StorageOperationLaunchError(
@@ -475,12 +482,20 @@ async def wait_for_storage_operation(
         else:
             starting_polls += 1
             if starting_polls >= launch_grace_polls:
+                # a launch that found the cancel marker returned without starting anything
+                await _raise_if_cancelled(ssh_client, files)
                 detail = await _tail_operation_log(ssh_client, files.log, files.helper)
                 await _remove_operation_artifacts(ssh_client, files)
                 raise StorageOperationLaunchError(
                     f"storage operation runner did not start: {detail}"
                 )
         await asyncio.sleep(poll_interval_seconds)
+
+
+async def _raise_if_cancelled(ssh_client: asyncssh.SSHClientConnection, files: StorageOperationFiles) -> None:
+    if await _remote_file_exists(ssh_client, files.cancel):
+        await _remove_operation_artifacts(ssh_client, files)
+        raise StorageOperationCancelled("storage operation was cancelled")
 
 
 async def _operation_state(
