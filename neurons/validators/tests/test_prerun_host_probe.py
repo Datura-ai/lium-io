@@ -61,6 +61,7 @@ from services.prerun_host_probe import (
     PrerunHostProbe,
     PrerunHostProbeParseError,
     ProbedVolume,
+    image_label_command,
     parse_prerun_host_probe,
     port_check_containers_command,
     prerun_host_probe_command,
@@ -1470,3 +1471,10 @@ async def test_a_delete_during_a_pulls_fallback_probe_stops_the_create_before_th
 
     assert deleted
     svc.clean_existing_containers.assert_not_awaited()
+
+
+def test_the_label_read_prints_nothing_for_an_image_with_no_config():
+    # an image with a null Config (`docker import`) made `index .Config.Labels` a template error, failing the create
+    command = image_label_command("img:1", "lium.volume_encryption.enable")
+    assert "{{with .Config}}{{index .Labels \"lium.volume_encryption.enable\"}}{{end}}" in command
+    assert ".Config.Labels" not in command

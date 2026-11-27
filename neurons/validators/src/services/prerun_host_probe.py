@@ -112,10 +112,13 @@ def port_check_containers_command(miner_hotkey: str) -> str:
 
 
 def image_label_command(docker_image: str, label: str) -> str:
-    """`docker image inspect` printing one label's value — the command `_image_has_encrypted_volume_label` runs."""
+    """`docker image inspect` printing one label's value — the command `_image_has_encrypted_volume_label` runs.
+
+    An image with no config at all (`docker import`, some registry builds) prints nothing, as one without the label
+    does: `.Config.Labels` on it is a template error, which failed the renter's create."""
     return (
         "/usr/bin/docker image inspect "
-        f"--format '{{{{index .Config.Labels \"{label}\"}}}}' "
+        f"--format '{{{{with .Config}}}}{{{{index .Labels \"{label}\"}}}}{{{{end}}}}' "
         f"{shlex.quote(docker_image)}"
     )
 
