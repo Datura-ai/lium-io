@@ -493,6 +493,20 @@ def test_a_dispatch_with_no_live_run_removes_the_stale_helper_then_hands_the_run
     assert set(seen_on_disk) <= {""}  # the launch marker at files.spec stays empty
 
 
+def test_a_launch_marker_that_cannot_be_written_aborts_the_launch_and_reports_it(node: Path) -> None:
+    runs = node / "runs"
+    _runner(node, f"open({str(runs)!r}, 'a').write('run\\n')\n")
+    files = storage_operations.StorageOperationFiles.for_operation(OPERATION_ID)
+    Path(str(files.spec)).mkdir()
+    with pytest.raises(RuntimeError):
+        _dispatch()
+    storage_operations.report_launch_failure.assert_awaited_once()
+    import time
+
+    time.sleep(0.5)
+    assert not runs.exists() and _staged(node) == []
+
+
 def test_the_runner_start_check_never_imports_from_the_working_directory(node: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """a module beside the SSH session's working directory must not stand in for one the staged runner lacks"""
     cwd = node / "cwd"

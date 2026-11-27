@@ -381,10 +381,11 @@ async def start_storage_operation(
             f"rm -f {shlex.quote(str(files.spec))} {shlex.quote(str(files.pid))} "
             f"{shlex.quote(str(files.cancel))}{terminal_cleanup}"
         )
-        # the launching shell reads the spec line, marks the launch, then leaves the wrapper running without it
+        # the launching shell reads the spec line, marks the launch, then leaves the wrapper running without it;
+        # a failed marker write aborts the launch so the restart checks never see a runner with no marker
         launcher = (
             "IFS= read -r S || exit 1; "
-            f"( umask 077; : > {shlex.quote(str(files.spec))} ); "
+            f"( umask 077; : > {shlex.quote(str(files.spec))} ) || exit 1; "
             f"( trap '' HUP; {wrapper} ) > {shlex.quote(str(files.log))} 2>&1 < /dev/null &"
         )
         await ssh_client.run(
