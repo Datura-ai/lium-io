@@ -128,9 +128,10 @@ async def record_gpu_drop(ctx: Context, missing_uuids: list[str]) -> None:
 
 
 async def _all_cards_no_verdict(ctx: Context, probe: AllCardsProbe, *, fillers_removed: bool) -> bool:
-    # Only a lost connection to the whole node (`AllCardsProbe.connection_lost`), unanswered cards the backend has a
-    # Lium workload on now, and the wall clock with every card answering say nothing about the cards, as
-    # CapabilityCheck judges them. Otherwise a timeout, a timeout again on the probe's retry (`timeout_after_retry`) or
+    # Only a lost connection to the whole node (`AllCardsProbe.connection_lost`) and unanswered cards the backend has a
+    # Lium workload on now say nothing about the cards, as CapabilityCheck judges them. A run over the wall clock with
+    # every card answering differs on purpose: CapabilityCheck fails it, while this check, which has no shadow mode,
+    # leaves it to CapabilityCheck until the wall clock is set per model (DAH-6978 follow-up). Otherwise a timeout, a timeout again on the probe's retry (`timeout_after_retry`) or
     # a run that ended without an exit status on a live connection is a verdict and fails the recheck (an 8x node's
     # GPU 0 timed out every recheck 10-16 Nov and re-listed each time).
     if not probe.per_card:
