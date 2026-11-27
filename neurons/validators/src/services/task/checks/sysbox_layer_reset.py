@@ -64,7 +64,8 @@ async def run_setup_option(ssh, script: str, command: str) -> str:
     if not lines:
         return "failed no_answer"
     verb, _, reason = lines[-1].partition(" ")
-    return f"{verb.removeprefix('layer_reset_')} {reason}".strip()
+    # the host writes this line (a failed install adds its step and stderr): printable ASCII only, bounded
+    return re.sub(r"[^\x20-\x7e]", "?", f"{verb.removeprefix('layer_reset_')} {reason}".strip())[:200]
 
 
 class SysboxLayerResetCheck:
