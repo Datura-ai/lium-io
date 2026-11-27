@@ -157,6 +157,18 @@ async def test_a_host_the_install_does_not_reach_warns_and_keeps_its_score(conte
 
 
 @pytest.mark.asyncio
+async def test_a_failed_install_keeps_its_step_and_why_printable_and_bounded(context_factory, mode):
+    mode("all")
+    stdout = "layer_reset_failed enable Failed to enable unit: \x1b[31mread-only\x00 file system" + " x" * 200 + "\n"
+
+    result = await _run(context_factory, {"sysbox_layer_reset_version": 0}, _ssh(stdout))
+
+    install = result.event.what_we_saw["install"]
+    assert install.startswith("failed enable Failed to enable unit: ?[31mread-only? file system")
+    assert len(install) == 200 and all(" " <= c <= "~" for c in install)
+
+
+@pytest.mark.asyncio
 async def test_an_ssh_error_in_the_install_never_fails_the_check(context_factory, mode):
     mode("all")
     ssh = SimpleNamespace(run=AsyncMock(side_effect=OSError("connection lost")))
