@@ -111,14 +111,19 @@ def port_check_containers_command(miner_hotkey: str) -> str:
     )
 
 
+# printed by `image_label_command` for an image whose config is missing or null: its labels are unknown, not absent
+IMAGE_CONFIG_MISSING = "lium-image-config-missing"
+
+
 def image_label_command(docker_image: str, label: str) -> str:
     """`docker image inspect` printing one label's value — the command `_image_has_encrypted_volume_label` runs.
 
-    An image with no config at all (`docker import`, some registry builds) prints nothing, as one without the label
-    does: `.Config.Labels` on it is a template error, which failed the renter's create."""
+    A config without the label prints nothing (encryption off). A missing or null config (a half-finished pull)
+    prints IMAGE_CONFIG_MISSING instead of the template error `.Config.Labels` gave on it, so the caller can tell
+    an unreadable label from an absent one."""
     return (
         "/usr/bin/docker image inspect "
-        f"--format '{{{{with .Config}}}}{{{{index .Labels \"{label}\"}}}}{{{{end}}}}' "
+        f"--format '{{{{with .Config}}}}{{{{index .Labels \"{label}\"}}}}{{{{else}}}}{IMAGE_CONFIG_MISSING}{{{{end}}}}' "
         f"{shlex.quote(docker_image)}"
     )
 

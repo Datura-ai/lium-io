@@ -136,6 +136,7 @@ from services.prerun_host_probe import (
     DOCKER_MOUNTED_VOLUME_NAMES_CMD,
     DOCKER_PS_ALL_NAMES_IDS_CMD,
     DOCKER_VOLUME_LS_NAME_DRIVER_CMD,
+    IMAGE_CONFIG_MISSING,
     PrerunHostProbe,
     image_label_command,
     parse_container_listing,
@@ -7515,7 +7516,8 @@ class DockerService:
         *,
         host_probe: PrerunHostProbe | None = None,
     ) -> bool:
-        if host_probe is not None and host_probe.image_label_value is not None:
+        # a probe that saw no image config may predate the pull's end: read again now, once
+        if host_probe is not None and host_probe.image_label_value not in (None, IMAGE_CONFIG_MISSING):
             return host_probe.image_label_value == "1"
         result = await ssh_client.run(
             image_label_command(docker_image, _ENCRYPTED_VOLUME_IMAGE_LABEL),
@@ -7528,7 +7530,14 @@ class DockerService:
                 "docker image inspect failed for volume-encryption label "
                 f"(exit_status={result.exit_status}): stderr={stderr!r} stdout={stdout!r}"
             )
-        return (result.stdout or "").strip() == "1"
+        value = (result.stdout or "").strip()
+        if value == IMAGE_CONFIG_MISSING:
+            # never read as "label absent": that would start an encrypted-volume rental unencrypted
+            raise RuntimeError(
+                "the image on the node has no image config (an incomplete pull), so its volume-encryption "
+                "label cannot be read; the create is refused rather than started on an unencrypted volume"
+            )
+        return value == "1"
 
     async def _encrypted_local_volume_name(
         self,

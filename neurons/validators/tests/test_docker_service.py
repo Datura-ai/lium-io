@@ -10,6 +10,7 @@ import os
 import shutil
 import stat
 import subprocess
+from types import SimpleNamespace
 import sys
 import tempfile
 import time
@@ -28,7 +29,7 @@ from services.attestation_service import AttestationError
 from services.image_flatten import FLATTEN_NO_DISK_RENTER_SENTENCE, ImageFlattenNoDisk
 import services.image_flatten as image_flatten_module
 from services.cvm_quote_broker import DSTACK_GUEST_SOCKET_PATH, QUOTE_BROKER_SOCKET_PATH
-from services.prerun_host_probe import PrerunHostProbe
+from services.prerun_host_probe import IMAGE_CONFIG_MISSING, PrerunHostProbe
 from services.docker_service import (
     CONTAINER_STOP_GRACE_SECONDS,
     FILLER_CONTAINER_STOP_GRACE_SECONDS,
@@ -8466,6 +8467,29 @@ async def test_image_has_encrypted_volume_label(docker_service):
     )
     with pytest.raises(RuntimeError, match="docker image inspect failed"):
         await docker_service._image_has_encrypted_volume_label(ssh_client, "any/image:tag")
+
+
+@pytest.mark.asyncio
+async def test_an_image_with_no_config_refuses_the_create_and_never_reads_as_unlabelled(docker_service):
+    # DAH-7272: a half-finished pull left an image record with a null Config; "label absent" would mean unencrypted
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(return_value=_make_ssh_command_result(stdout=f"{IMAGE_CONFIG_MISSING}\n"))
+    with pytest.raises(RuntimeError, match="no image config"):
+        await docker_service._image_has_encrypted_volume_label(ssh_client, "any/image:tag")
+
+
+@pytest.mark.asyncio
+async def test_a_probe_that_saw_no_image_config_is_read_again_once(docker_service):
+    # the probe may run before the pull ends: the live read decides
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(return_value=_make_ssh_command_result(stdout="1\n"))
+    probe = SimpleNamespace(image_label_value=IMAGE_CONFIG_MISSING)
+    assert await docker_service._image_has_encrypted_volume_label(ssh_client, "any/image:tag", host_probe=probe)
+    ssh_client.run.assert_awaited_once()
+
+    ssh_client.run = AsyncMock(return_value=_make_ssh_command_result(stdout=f"{IMAGE_CONFIG_MISSING}\n"))
+    with pytest.raises(RuntimeError, match="no image config"):
+        await docker_service._image_has_encrypted_volume_label(ssh_client, "any/image:tag", host_probe=probe)
 
 
 def _bootstrap_restore_spec() -> BootstrapRestoreSpec:
