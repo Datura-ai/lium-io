@@ -504,7 +504,8 @@ class SshPubKeyRemoved(PodContainerResponse):
 class FailedContainerRequest(PodContainerResponse):
     message_type: ValidatorMessageType = ValidatorMessageType.FailedRequest
     # the failed request's command_id, echoed for an AddSshPublicKeyRequest, (since lium-io#2028) a
-    # ContainerCreateRequest and a ContainerDeleteOnNodeLeftRequest; empty otherwise and from older validators
+    # ContainerCreateRequest and (DAH-7216) a ContainerDeleteRequest, incl. a ContainerDeleteOnNodeLeftRequest; empty
+    # otherwise and from older validators
     command_id: str = ""
     error_type: FailedContainerErrorTypes = FailedContainerErrorTypes.ContainerCreationFailed
     error_code: FailedContainerErrorCodes | None = None
