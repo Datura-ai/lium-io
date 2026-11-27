@@ -1,6 +1,9 @@
 """DAH-7118: a node whose only change during the cycle was a Lium filler starting keeps its last pass instead of
 losing the cycle to the rental-change rule (DAH-6564)."""
 
+from dataclasses import replace
+from unittest.mock import AsyncMock
+
 import pytest
 
 from core.config import settings
@@ -12,10 +15,12 @@ from services.executor_rollout import (
     carry_rental_change_passes,
     log_would_credit,
     remember_rented_scored_results,
+    rollout_grace_reason,
     withhold_rental_change_verdicts,
 )
 from services.redis_service import last_scored_result_key, last_scored_result_vouch_key
-from test_executor_rollout_grace import _scored
+from services.task.messages import ExecutorImageMessages
+from test_executor_rollout_grace import J0, _FakeRedis, _open_window, _scored, _tracker, _validator_process
 from test_rental_change_withheld import GPU_USAGE, MINER, NODE, _fail, _listed
 from test_rented_host_gpu_fault_reset import _redis_service
 
@@ -140,6 +145,39 @@ async def test_a_pass_vouched_for_only_by_a_reset_carry_is_withheld():
     failed = _fail(GPU_USAGE)
 
     assert await _carry([failed], start, end, service) == [failed]
+
+
+@pytest.mark.asyncio
+async def test_a_result_the_rollout_window_withholds_is_not_credited_and_its_pass_stays_unspent():
+    # review 6089251564: sync reads the cycle-end window before the carry, so a push seen only at cycle end is here
+    service = _redis_service()
+    await _previous_cycle(service, _idle_pass())
+    outdated = _fail(ExecutorImageMessages.OUTDATED.reason)
+    window = replace(_open_window(), opened_job_block=BLOCK)
+
+    cycle = {MINER: [outdated]}
+    await carry_rental_change_passes(cycle, service, *_filler_started(), {MINER: None}, set(), window, job_block=BLOCK)
+
+    assert cycle[MINER] == [outdated]
+    assert rollout_grace_reason(outdated, window, BLOCK)  # so withhold_rollout_verdicts takes it out of scoring
+    # the same cycle without the window credits it: the pass was not spent
+    [credited] = await _carry([_fail(GPU_USAGE)], *_filler_started(), service)
+    assert credited.carried_for_rental_change
+
+
+@pytest.mark.asyncio
+async def test_the_withhold_uses_the_window_sync_read_at_cycle_end_without_a_second_registry_read():
+    validator_process = _validator_process(_tracker(_FakeRedis()))
+    validator_process.fetch_executor_digest_or_none = AsyncMock()
+    validator_process.record_withheld_verdicts = AsyncMock()
+    outdated = _fail(ExecutorImageMessages.OUTDATED.reason)
+
+    standing, withheld = await validator_process.withhold_verdicts_for_rollout(
+        {MINER: [outdated]}, J0, "batch-1", _open_window(), window_read_at_end=True
+    )
+
+    assert standing == {MINER: []} and [w.result for w in withheld] == [outdated]
+    validator_process.fetch_executor_digest_or_none.assert_not_awaited()
 
 
 @pytest.mark.asyncio
