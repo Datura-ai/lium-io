@@ -82,6 +82,8 @@ class CapabilityCheck:
                 due_card = await _full_check_due_card(ctx)
                 if due_card is not None:
                     stopped_filler = await _stop_filler_for_full_check(ctx)
+            elif not mismatches and _filler_matmul_sample_due(ctx, _filler_cycle_index(ctx)):
+                stopped_filler = await _stop_filler_for_count_proof(ctx)
         if filler_container and not stopped_filler:
             what_filler: dict = {"filler_container": filler_container}
             cycle = _filler_cycle_index(ctx)
@@ -191,7 +193,7 @@ class CapabilityCheck:
             logged = {"no_numbers_cards": no_numbers} if no_numbers else {}
             if stopped_filler:
                 logged["stopped_fillers_for_full_check"] = stopped_filler
-                if due_card not in measured_cards and not mismatches:
+                if due_card is not None and due_card not in measured_cards and not mismatches:
                     # the full check proved other cards (card 0 with all-cards off): the card whose sample failed
                     # is judged now, while its filler is stopped
                     due_sample: dict = {"vram_budget_mb": settings.FILLER_MATMUL_SAMPLE_VRAM_MB, "reason": "full_check_due_card"}
@@ -592,6 +594,23 @@ async def _judge_due_card(
     if read_ok:
         await _store_gpu_model_verdict(ctx, stored, GPU_MODEL_NO_VERDICT_TTL_SECONDS, measured_ok)
     return mismatches
+
+
+async def _stop_filler_for_count_proof(ctx: Context) -> list[str]:
+    """While a filler runs, the node never gets the all-cards work proof, the only check that every card it reports
+    answers, so a node can list more cards than it has. On the node's sample turn (once a day per node) Lium's filler
+    stops and the full check runs on the idle cards instead of the one-card sample; the default job places a filler
+    again afterwards. Only with all-cards enforcement on: otherwise the proof decides nothing and the stop would cost
+    filler time for nothing. Another owner's filler is not ours to stop: that node keeps its sample.
+    Returns the stopped filler names, or [] when the filler path runs as before."""
+    rented_data = ctx.state.rented_data
+    if (
+        settings.DRY_RUN
+        or not allcards_enforced()
+        or rented_data.get_default_job_owner(ctx.executor.uuid) != DEFAULT_JOB_OWNER_LIUM
+    ):
+        return []
+    return await remove_lium_fillers(ctx, rented_data.get_filler_containers(ctx.executor.uuid))
 
 
 async def _stop_filler_for_full_check(ctx: Context) -> list[str]:
