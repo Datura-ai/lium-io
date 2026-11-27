@@ -37,6 +37,7 @@ from protocol.vc_protocol.compute_requests import (
     RentedPod,
 )
 
+from protocol.vc_protocol.validator_requests import ContainerState
 from tests.test_gpu_fault_probe_check import FakeRunner, probe_stdout
 from tests.test_post_rental_gpu_recheck import FakeValidation, _all_cards
 from tests.helpers import (
@@ -113,15 +114,17 @@ def _ctx(
 class _DockerHost:
     """The host's `docker inspect` of the pods' containers: each given `gpus` (None = cannot be read)."""
 
-    def __init__(self, gpus, names):
-        self.gpus, self.names, self.calls = gpus, names, []
+    def __init__(self, gpus, names, status="running"):
+        self.gpus, self.names, self.status, self.calls = gpus, names, status, []
 
     async def run(self, cmd, timeout=None):
         self.calls.append(cmd)
         if self.gpus is None:
             raise OSError("ssh lost")
         request = [{"Driver": "nvidia", "DeviceIDs": list(self.gpus), "Capabilities": [["gpu"]]}]
-        return SimpleNamespace(stdout="".join(f'"/{n}" {json.dumps(request)}\n' for n in self.names))
+        return SimpleNamespace(
+            stdout="".join(f'"/{n}" "{self.status}" {json.dumps(request)}\n' for n in self.names)
+        )
 
 
 async def _cycle(context_factory, redis, **kwargs):
@@ -719,6 +722,65 @@ async def test_a_container_docker_no_longer_has_is_no_verdict_and_keeps_dockers_
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [("exited", ContainerState.EXITED), ("dead", ContainerState.EXITED), ("running", ContainerState.RUNNING)],
+)
+async def test_a_pod_left_on_the_old_cards_reports_its_container_state(context_factory, status, expected):
+    """DAH-7308: the reboot onto the new cards failed and the cycle stops here before the rented-pod
+    check, so no container state reached the backend and its REBOOT_FAILED retry (which needs a fresh exited or
+    absent reading) never came due. The docker read this check already makes reports it."""
+    ctx = _ctx(context_factory, FakeRedis(), listed=OTHER_CARDS, pods=(4,), pod_gpus=UUIDS)
+    ctx.ssh.status = status
+
+    result = await GpuLossHoldCheck().run(ctx)
+
+    assert result.event.event == Msg.POD_GPUS_GONE.event
+    assert [(s.pod_id, s.container_state) for s in result.updates["state"].pod_states] == [
+        (_pod(1, 4).pod_id, expected)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_pod_whose_container_docker_no_longer_has_reports_it_absent(context_factory):
+    ctx = _ctx(context_factory, FakeRedis(), listed=OTHER_CARDS, pods=(4,))
+
+    async def run(cmd, timeout=None):
+        return SimpleNamespace(stdout="", exit_status=1, stderr="Error: No such object: container_pod1\n")
+
+    ctx.ssh.run = run
+
+    result = await GpuLossHoldCheck().run(ctx)
+
+    assert result.event.reason_code == Msg.POD_UNREAD.reason
+    assert [s.container_state for s in result.updates["state"].pod_states] == [ContainerState.ABSENT]
+
+
+@pytest.mark.asyncio
+async def test_a_pod_the_ssh_read_missed_reports_no_container_state(context_factory):
+    ctx = _ctx(context_factory, FakeRedis(), listed=OTHER_CARDS, pods=(4,))
+    ctx.ssh.gpus = None
+
+    result = await GpuLossHoldCheck().run(ctx)
+
+    assert "state" not in result.updates
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["paused", "restarting", "removing"])
+async def test_a_paused_or_restarting_pod_is_no_exited_reading(context_factory, status):
+    """lio#2524 review: a paused or restarting container is not down, so it must not reach the backend as exited
+    (that is the reading the REBOOT_FAILED retry reboots on). Nothing is reported for it."""
+    ctx = _ctx(context_factory, FakeRedis(), listed=OTHER_CARDS, pods=(4,), pod_gpus=UUIDS)
+    ctx.ssh.status = status
+
+    result = await GpuLossHoldCheck().run(ctx)
+
+    assert result.event.event == Msg.POD_GPUS_GONE.event
+    assert "state" not in result.updates
+
+
+@pytest.mark.asyncio
 async def test_a_pod_on_the_old_cards_is_gpu_lost_even_when_another_pods_container_is_unread(context_factory):
     ctx = _ctx(context_factory, FakeRedis(), listed=OTHER_CARDS, pods=(4,), pod_gpus=UUIDS)
     ctx.ssh.names = ["container_pod1"]  # a second pod's container is not in docker's answer
@@ -738,7 +800,7 @@ async def test_a_pod_given_every_gpu_is_served_by_the_new_cards(context_factory)
     all_gpus = [{"Driver": "nvidia", "Count": -1, "Capabilities": [["gpu"]]}]
 
     async def run(cmd, timeout=None):
-        return SimpleNamespace(stdout=f'"/container_pod1" {json.dumps(all_gpus)}\n')
+        return SimpleNamespace(stdout=f'"/container_pod1" "running" {json.dumps(all_gpus)}\n')
 
     ctx.ssh.run = run
 
