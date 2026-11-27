@@ -102,6 +102,8 @@ async def test_a_lium_filler_started_on_a_rented_node_credits_its_vouched_pass()
             id="mixed",
         ),
         pytest.param(_listed(), _owned(_listed(pods={NODE: ["p1"]}, fillers={NODE: ["filler_a"]}), "lium"), id="pod-and-filler"),
+        # the node-wide owner names the newest run only: two added fillers may be one provider job and one Lium job
+        pytest.param(_listed(), _owned(_listed(fillers={NODE: ["filler_a", "filler_b"]}), "lium"), id="two-fillers"),
     ],
 )
 @pytest.mark.asyncio

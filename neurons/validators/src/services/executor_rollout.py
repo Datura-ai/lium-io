@@ -951,10 +951,12 @@ def _carried_row(
 def _only_lium_filler_started(
     result: JobResult, before: frozenset[str], after: frozenset[str], at_end: RentedExecutorsResponse
 ) -> bool:
-    """DAH-7118: the node went from no filler to fillers the backend owns as Lium's, and nothing else changed. A diff
-    proves occupancy changed, not who changed it: only an added, positively Lium filler explains the failure.
-    shortcut: 0 -> Lium fillers only (the node-wide default_job_owner), until the backend names each Lium filler."""
-    if not before <= after or any(not entry.startswith("filler:") for entry in after - before):
+    """DAH-7118: the node went from no filler to exactly one filler the backend owns as Lium's, and nothing else
+    changed. A diff proves occupancy changed, not who changed it: only an added, positively Lium filler explains the
+    failure. The node-wide default_job_owner names the newest run only, so it vouches for one added filler, never two.
+    shortcut: 0 -> 1 Lium filler only, until the backend names each Lium filler (DAH-7117)."""
+    added = after - before
+    if not before <= after or len(added) != 1 or not next(iter(added)).startswith("filler:"):
         return False
     if any(entry.startswith("filler:") for entry in before):
         return False
