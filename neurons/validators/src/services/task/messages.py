@@ -1112,7 +1112,9 @@ class SysboxLayerResetMessages:
         impact="Proceed; score not changed",
         remediation=(
             "Run `sudo bash nvidia_docker_sysbox_setup.sh --remove-layer-reset` from lium-io neurons/executor on the "
-            "host: it removes lium-sysbox-layer-reset.service and Docker's drop-in for it, and restarts nothing."
+            "host: it removes lium-sysbox-layer-reset.service and Docker's drop-in for it, and restarts nothing. If it "
+            "reports recovery_needed, a cut-off reset left setuid bits to restore: with Docker stopped, run "
+            "`sudo python3 -I /usr/local/sbin/lium-sysbox-layer-reset --replay-only`, then remove again."
         ),
     )
     UNKNOWN = MessageTemplate(

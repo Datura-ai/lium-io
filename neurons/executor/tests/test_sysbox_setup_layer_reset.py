@@ -36,6 +36,7 @@ def _install(root) -> None:
         + _function("systemd_quote")
         + _function("systemd_env")
         + _function("layer_reset_step")
+        + _function("layer_reset_program")
         + _function("shift_sysbox_layers_back_at_boot")
         + "shift_sysbox_layers_back_at_boot\n"
     )
@@ -129,6 +130,7 @@ def _install_on_a_live_host(root, enable_fails: bool) -> subprocess.CompletedPro
         + _function("systemd_quote")
         + _function("systemd_env")
         + _function("layer_reset_step")
+        + _function("layer_reset_program")
         + _function("shift_sysbox_layers_back_at_boot")
         + "shift_sysbox_layers_back_at_boot\n"
     )
@@ -214,6 +216,7 @@ def _install_mode_answer(root, fail: str = "", why: str = "boom") -> str:
         + _function("systemd_quote")
         + _function("systemd_env")
         + _function("layer_reset_step")
+        + _function("layer_reset_program")
         + _function("shift_sysbox_layers_back_at_boot")
         + "case --install-layer-reset in\n    --install-layer-reset)\n" + branch + "        ;;\nesac\n"
     )
@@ -267,6 +270,7 @@ def _remove_on_a_live_host(root, disable_fails: bool = False) -> subprocess.Comp
     script = (
         f'host_path() {{ echo "{root}$1"; }}\n'
         + f'systemctl() {{ echo "$*" >> "{log}"; [ "$1" = disable ] && {"return 1" if disable_fails else "return 0"}; return 0; }}\n'
+        + _function("layer_reset_program")
         + _function("remove_layer_reset")
         + "remove_layer_reset\n"
     )
@@ -297,6 +301,56 @@ def test_a_failed_disable_still_leaves_docker_independent_of_the_reset(tmp_path)
     assert not (tmp_path / "etc/systemd/system/docker.service.d/lium-sysbox-layer-reset.conf").exists()
     # the unit stays, so the scrape still reports it and the validator tries again
     assert (tmp_path / "etc/systemd/system/lium-sysbox-layer-reset.service").exists()
+
+
+def test_remove_with_a_pending_journal_keeps_the_program_that_replays_it(tmp_path):
+    # a reset cut off after a chown left setuid bits only the program restores
+    assert _install_on_a_live_host(tmp_path, enable_fails=False).returncode == 0
+    journal = tmp_path / "var/lib/lium-sysbox-layer-reset/pending.jsonl"
+    journal.parent.mkdir(parents=True)
+    journal.write_text(json.dumps({"p": "/x", "m": 0o4755, "c": None}) + "\n")
+    (tmp_path / "systemctl.log").unlink()
+
+    result = _remove_on_a_live_host(tmp_path)
+
+    assert result.returncode == 3
+    assert not (tmp_path / "etc/systemd/system/docker.service.d/lium-sysbox-layer-reset.conf").exists()
+    assert (tmp_path / "usr/local/sbin/lium-sysbox-layer-reset").exists()
+    assert (tmp_path / "etc/systemd/system/lium-sysbox-layer-reset.service").exists()  # scraped, so the validator retries
+    assert (tmp_path / "systemctl.log").read_text() == "disable lium-sysbox-layer-reset.service\ndaemon-reload\n"
+    assert journal.exists()
+
+
+def test_remove_with_a_pending_journal_leaves_a_program_that_can_replay_it(tmp_path):
+    # an older program (version 2 or 3) has no --replay-only and returns early once Docker ran this boot
+    assert _install_on_a_live_host(tmp_path, enable_fails=False).returncode == 0
+    program = tmp_path / "usr/local/sbin/lium-sysbox-layer-reset"
+    program.write_text('#!/usr/bin/python3 -I\nprint("Docker already ran this boot; nothing to reset")\n')
+    sudo = tmp_path / "sudo"
+    sudo.write_text("")
+    sudo.chmod(0o755)
+    journal = tmp_path / "var/lib/lium-sysbox-layer-reset/pending.jsonl"
+    journal.parent.mkdir(parents=True)
+    journal.write_text(json.dumps({"p": os.path.realpath(sudo), "m": 0o4755, "c": None}) + "\n")
+    (tmp_path / "run").mkdir()
+    (tmp_path / "run/lium-docker-started").touch()  # Docker ran this boot, stopped for the recovery
+
+    assert _remove_on_a_live_host(tmp_path).returncode == 3
+    result = _run(tmp_path, "--replay-only")  # the step the recovery_needed warning names
+
+    assert result.returncode == 0, result.stderr
+    assert stat.S_IMODE(os.lstat(sudo).st_mode) == 0o4755
+    assert not journal.exists()
+
+
+@pytest.mark.parametrize("rc, answer", [
+    (0, "layer_reset_removed"), (3, "layer_reset_failed recovery_needed"), (1, "layer_reset_failed remove"),
+])
+def test_remove_layer_reset_mode_answers_each_result_under_set_e(rc, answer):
+    branch = re.search(r"^    --remove-layer-reset\)\n(.*?^        ;;)$", open(SCRIPT).read(), re.S | re.M).group(1)
+    script = f"set -e\nid() {{ echo 0; }}\nremove_layer_reset() {{ return {rc}; }}\ncase x in\n    x)\n{branch}\nesac\n"
+    result = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=60)
+    assert (result.returncode, result.stdout) == (0, answer + "\n"), result.stderr
 
 
 def test_remove_on_a_host_without_the_reset_is_a_no_op(tmp_path):
@@ -505,6 +559,7 @@ def _fake_fs(tmp_path):
         O_RDONLY=os.O_RDONLY,
         sync=lambda: None,
         remove=os.remove,
+        replace=os.replace,
         lstat=lambda p: SimpleNamespace(st_uid=fs.owners[p], st_gid=fs.owners[p], st_mode=fs.modes[p]),
         lchown=lchown,
         chmod=lambda p, m: fs.modes.__setitem__(p, stat.S_IFMT(fs.modes[p]) | m),
@@ -922,3 +977,123 @@ def test_the_reset_waits_for_the_disk_dockers_data_root_is_on(tmp_path, data_roo
     quoted = re.search(r'^RequiresMountsFor="((?:[^"\\]|\\.)*)"$', unit, re.M).group(1)
     assert re.sub(r"\\(.)", r"\1", quoted).replace("%%", "%") == expected
     assert unit.index("RequiresMountsFor=") < unit.index("[Service]")
+
+
+def test_replay_only_restores_a_kept_journal_and_shifts_no_layer(tmp_path, monkeypatch):
+    reset, fs = _fake_fs(tmp_path)
+    sudo = str(fs.upper / "sudo")
+    fs.modes[sudo] = stat.S_IFREG | 0o755
+    os.makedirs(os.path.dirname(reset["JOURNAL"]), exist_ok=True)
+    with open(reset["JOURNAL"], "w") as f:
+        f.write(json.dumps({"p": sudo, "m": 0o4755, "c": None}) + "\n")
+    os.makedirs(os.path.dirname(reset["STARTED"]), exist_ok=True)
+    open(reset["STARTED"], "w").close()  # Docker ran this boot (stopped for the recovery)
+    owners = dict(fs.owners)
+    monkeypatch.setattr(sys, "argv", ["lium-sysbox-layer-reset", "--replay-only"])
+    reset["main"]()
+    assert stat.S_IMODE(fs.modes[sudo]) == 0o4755
+    assert not os.path.exists(reset["JOURNAL"])
+    assert fs.owners == owners
+
+
+@pytest.mark.parametrize("docker_up", [False, True])
+@pytest.mark.parametrize("flags", [["--dry-run", "--replay-only"], ["--replay-only", "--dry-run"]])
+def test_a_dry_run_replay_only_restores_nothing_and_keeps_the_journal(tmp_path, monkeypatch, flags, docker_up):
+    reset, fs = _fake_fs(tmp_path)
+    sudo = str(fs.upper / "sudo")
+    fs.modes[sudo] = stat.S_IFREG | 0o755
+    os.makedirs(os.path.dirname(reset["JOURNAL"]), exist_ok=True)
+    with open(reset["JOURNAL"], "w") as f:
+        f.write(json.dumps({"p": sudo, "m": 0o4755, "c": None}) + "\n")
+    reset.update(DRY=True, docker_running=lambda: docker_up)
+    monkeypatch.setattr(sys, "argv", ["lium-sysbox-layer-reset", *flags])
+    reset["main"]()
+    assert stat.S_IMODE(fs.modes[sudo]) == 0o755
+    assert os.path.exists(reset["JOURNAL"])
+
+
+def _started(tmp_path, when):
+    (tmp_path / "var/lib/docker/containers" / ("a" * 64) / "config.v2.json").write_text(
+        json.dumps({"State": {"StartedAt": when}}))
+
+
+def _cut_at(reset, n):
+    real, calls = reset["os"].lchown, []
+
+    def lchown(*a):
+        if len(calls) == n:
+            raise InterruptedError()  # the unit's start timeout
+        calls.append(a[0])
+        return real(*a)
+
+    reset["os"].lchown = lchown
+    with pytest.raises(InterruptedError):
+        reset["main"]()
+    reset["os"].lchown = real
+
+
+def _lstats(reset):
+    seen, real = [], reset["os"].lstat
+    reset["os"].lstat = lambda p: (seen.append(p), real(p))[1]
+    return seen
+
+
+def test_a_walk_cut_off_by_the_timeout_resumes_where_it_stopped(tmp_path):
+    reset, fs = _fake_fs(tmp_path)
+    reset["BATCH"] = 1
+    _started(tmp_path, "2026-11-24T10:00:00Z")
+    _cut_at(reset, 3)
+    seen = _lstats(reset)
+    reset["main"]()
+    entries = [p for p in fs.modes if p != str(fs.upper)]
+    assert len([p for p in seen if p != str(fs.upper)]) == len(entries) - 3  # the 3 done ones are not visited again
+    assert fs.owners == {p: 1000 if p.endswith("renterfile") else 0 for p in fs.modes}
+    assert not list(Path(reset["JOURNAL"]).parent.glob("walk-*"))
+
+
+@pytest.mark.parametrize("change", ["pod_started", "listing_changed", "no_start_time"])
+def test_a_layer_that_may_have_changed_since_the_cut_off_is_walked_whole(tmp_path, change):
+    reset, fs = _fake_fs(tmp_path)
+    reset["BATCH"] = 1
+    _started(tmp_path, "2026-11-24T10:00:00Z")
+    _cut_at(reset, 3)
+    if change == "pod_started":
+        _started(tmp_path, "2026-11-24T10:20:00Z")  # Docker ran the pod after the timeout
+    elif change == "listing_changed":
+        point = next(Path(reset["JOURNAL"]).parent.glob("walk-*"))
+        point.write_text(json.dumps({**json.loads(point.read_text()), "last": "/elsewhere"}))
+    else:
+        (tmp_path / "var/lib/docker/containers" / ("a" * 64) / "config.v2.json").unlink()
+    seen = _lstats(reset)
+    reset["main"]()
+    assert set(fs.modes) <= set(seen)
+    assert fs.owners == {p: 1000 if p.endswith("renterfile") else 0 for p in fs.modes}
+
+
+def test_a_first_batch_with_nothing_journaled_still_saves_its_point(tmp_path):
+    # no setuid file or capability in the layer: no journal ever makes the reset's state directory
+    reset, fs = _fake_fs(tmp_path)
+    reset["BATCH"] = 1
+    _started(tmp_path, "2026-11-24T10:00:00Z")
+    for path in fs.modes:
+        fs.modes[path] &= ~(stat.S_ISUID | stat.S_ISGID)
+        fs.xattrs[path].pop("security.capability", None)
+    reset["main"]()
+    assert fs.owners == {p: 1000 if p.endswith("renterfile") else 0 for p in fs.modes}
+
+
+def test_a_batch_is_on_disk_before_its_point_says_it_is_done(tmp_path):
+    reset, fs = _fake_fs(tmp_path)
+    reset["BATCH"] = 1
+    _started(tmp_path, "2026-11-24T10:00:00Z")
+    for path in fs.modes:  # no journal, so no journal sync either
+        fs.modes[path] &= ~(stat.S_ISUID | stat.S_ISGID)
+        fs.xattrs[path].pop("security.capability", None)
+    events = []
+    real_chown, real_replace = reset["os"].lchown, reset["os"].replace
+    reset["os"].lchown = lambda *a: (events.append("chown"), real_chown(*a))[1]
+    reset["os"].sync = lambda: events.append("sync")
+    reset["os"].replace = lambda *a: (events.append("replace"), real_replace(*a))[1]
+    reset["main"]()
+    first = events.index("replace")
+    assert events[:first].count("chown") == 1 and events[first - 1] == "sync"
