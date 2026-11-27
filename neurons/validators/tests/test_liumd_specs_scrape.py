@@ -3,15 +3,19 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
+import logging
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 from helpers import build_context_config, build_services, build_state, make_context
 from services.liumd_exec_client import LiumdRefusal
 from services.local_verify_client import LocalVerifyAnswer, LocalVerifyUnavailable
+from services.nvidia_devices import KernelGpuView
 from services.task import liumd_shadow
-from services.task.checks import machine_spec_scrape
+from services.task.checks import gpu_identity, machine_spec_scrape
 from services.task.checks.machine_spec_scrape import MachineSpecScrapeCheck, normalize_liumd_specs
 from services.task.messages import MachineSpecMessages as Msg
 from test_machine_spec_scrape_check import (
@@ -29,6 +33,88 @@ LIUMD_SPECS = {
             {"name": "NVIDIA A10", "uuid": "GPU-1", "capacity": 24576},
             {"name": "NVIDIA A10", "uuid": "GPU-2", "capacity": 24576},
         ],
+    },
+    "gpu_identity": {
+        "cards": [
+            {
+                "index": 0,
+                "uuid": "GPU-1",
+                "pci": "0000:31:00.0",
+                "model": "NVIDIA A10",
+                "vram_mb": 24576,
+                "driver": "595.112.07",
+                "dev_node_present": True,
+                "minor": 0,
+                "sources": {
+                    "nvml": {
+                        "status": "agree",
+                        "uuid": "GPU-1",
+                        "pci": "0000:31:00.0",
+                        "model": "NVIDIA A10",
+                        "vram_mb": 24576,
+                        "error": None,
+                    },
+                    "proc": {
+                        "status": "ok",
+                        "uuid": "GPU-1",
+                        "pci": "0000:31:00.0",
+                        "model": "NVIDIA A10",
+                        "irq": "0",
+                    },
+                    "sysfs": {
+                        "status": "ok",
+                        "vendor": "0x10de",
+                        "device": "0x2236",
+                        "class": None,
+                        "subsystem_vendor": "0x10de",
+                        "subsystem_device": "0x145f",
+                        "link_speed": "16.0 GT/s PCIe",
+                        "link_width": "16",
+                    },
+                },
+                "mismatches": [],
+            },
+            {
+                "index": 1,
+                "uuid": "GPU-2",
+                "pci": "0000:32:00.0",
+                "model": "NVIDIA A10",
+                "vram_mb": 24576,
+                "driver": "595.112.07",
+                "dev_node_present": True,
+                "minor": 1,
+                "sources": {
+                    "nvml": {
+                        "status": "agree",
+                        "uuid": "GPU-2",
+                        "pci": "0000:32:00.0",
+                        "model": "NVIDIA A10",
+                        "vram_mb": 24576,
+                        "error": None,
+                    },
+                    "proc": {
+                        "status": "ok",
+                        "uuid": "GPU-2",
+                        "pci": "0000:32:00.0",
+                        "model": "NVIDIA A10",
+                        "irq": "0",
+                    },
+                    "sysfs": {
+                        "status": "ok",
+                        "vendor": "0x10de",
+                        "device": "0x2236",
+                        "class": None,
+                        "subsystem_vendor": "0x10de",
+                        "subsystem_device": "0x145f",
+                        "link_speed": "16.0 GT/s PCIe",
+                        "link_width": "16",
+                    },
+                },
+                "mismatches": [],
+            },
+        ],
+        "nvidia_module_present": True,
+        "proc_driver_present": True,
     },
     "gpu_processes": [],
     "sysbox_runtime": True,
@@ -50,8 +136,9 @@ def _answer(specs):
     )
 
 
-def _ctx(runner):
+def _ctx(runner, *, ssh=None):
     return make_context(
+        ssh=ssh,
         services=build_services(ssh=DummySSHService(decrypted_data=RAW_SPECS)),
         config=build_context_config(
             machine_scrape_source="scrape source",
@@ -291,3 +378,245 @@ def test_normalization_maps_the_liumd_contract_without_mutating_the_snapshot():
     assert normalized["os"] == "Ubuntu 24.04 LTS"
     assert "vloopback_check" not in normalized
     assert raw == snapshot
+
+
+def _with_identity(mutation=None):
+    specs = copy.deepcopy(LIUMD_SPECS)
+    if mutation is not None:
+        mutation(specs["gpu_identity"])
+    return specs
+
+
+@pytest.mark.asyncio
+async def test_shadow_logs_a_mismatch_and_passes(monkeypatch, caplog):
+    _liumd_on(monkeypatch)
+    monkeypatch.setattr(machine_spec_scrape.settings, "VALIDATOR_LIUMD_EVIDENCE_MODE", "shadow")
+    specs = _with_identity(lambda identity: identity["cards"][1].update(uuid="GPU-1"))
+    _start_reading(monkeypatch, _answer(specs))
+    runner = DummySSHCommandRunner(result=make_command_result(success=False))
+
+    with caplog.at_level(logging.WARNING, logger=gpu_identity.__name__):
+        result = await MachineSpecScrapeCheck().run(_ctx(runner))
+
+    assert result.passed is True
+    [line] = [r for r in caplog.records if r.getMessage() == gpu_identity.GPU_IDENTITY_EVENT]
+    extra = line.msg.extra
+    assert extra["mode"] == "shadow" and extra["would_fail"] is True
+    assert "duplicate_uuid" in extra["reasons"]
+    assert any("duplicate uuid" in d for d in extra["details"])
+    assert extra["claimed_count"] == extra["evidence_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_shadow_logs_missing_identity_and_passes(monkeypatch, caplog):
+    _liumd_on(monkeypatch)
+    monkeypatch.setattr(machine_spec_scrape.settings, "VALIDATOR_LIUMD_EVIDENCE_MODE", "shadow")
+    specs = _with_identity()
+    specs.pop("gpu_identity")
+    _start_reading(monkeypatch, _answer(specs))
+    runner = DummySSHCommandRunner(result=make_command_result(success=False))
+
+    with caplog.at_level(logging.WARNING, logger=gpu_identity.__name__):
+        result = await MachineSpecScrapeCheck().run(_ctx(runner))
+
+    assert result.passed is True
+    [line] = [r for r in caplog.records if r.getMessage() == gpu_identity.GPU_IDENTITY_EVENT]
+    assert line.msg.extra["reasons"] == ["identity_missing"]
+    assert line.msg.extra["would_fail"] is True
+
+
+@pytest.mark.asyncio
+async def test_enforce_passes_a_clean_identity_and_drops_the_block(monkeypatch):
+    _liumd_on(monkeypatch)
+    monkeypatch.setattr(machine_spec_scrape.settings, "VALIDATOR_LIUMD_EVIDENCE_MODE", "enforce")
+    specs = _with_identity()
+    specs["gpu_identity"]["wall_clock_ms"] = 1
+    specs["gpu_identity"]["first_result_spread_ms"] = 999_999
+    specs["gpu_identity"]["cards"][0]["tflops"] = 0.01
+    _start_reading(monkeypatch, _answer(specs))
+    runner = DummySSHCommandRunner(result=make_command_result(success=False))
+
+    result = await MachineSpecScrapeCheck().run(_ctx(runner))
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.SCRAPE_OK.reason
+    assert "gpu_identity" not in result.updates["state"].specs
+    assert result.updates["state"].gpu_identity["cards"]
+
+
+@pytest.mark.asyncio
+async def test_enforce_fails_a_duplicate_card(monkeypatch):
+    _liumd_on(monkeypatch)
+    monkeypatch.setattr(machine_spec_scrape.settings, "VALIDATOR_LIUMD_EVIDENCE_MODE", "enforce")
+    specs = _with_identity(lambda identity: identity["cards"][1].update(pci="0000:31:00.0"))
+    _start_reading(monkeypatch, _answer(specs))
+    runner = DummySSHCommandRunner(result=make_command_result(success=False))
+
+    result = await MachineSpecScrapeCheck().run(_ctx(runner))
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.GPU_IDENTITY_MISMATCH.reason
+    assert "duplicate_pci" in result.event.what_we_saw["reasons"]
+    assert result.event.what_we_saw["delivery"] == "liumd"
+    assert MachineSpecScrapeCheck.fatal is True
+
+
+@pytest.mark.asyncio
+async def test_enforce_fails_when_the_binary_sends_no_identity_block(monkeypatch):
+    _liumd_on(monkeypatch)
+    monkeypatch.setattr(machine_spec_scrape.settings, "VALIDATOR_LIUMD_EVIDENCE_MODE", "enforce")
+    specs = _with_identity()
+    specs.pop("gpu_identity")
+    _start_reading(monkeypatch, _answer(specs))
+    runner = DummySSHCommandRunner(result=make_command_result(success=False))
+
+    result = await MachineSpecScrapeCheck().run(_ctx(runner))
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.GPU_IDENTITY_MISMATCH.reason
+    assert result.event.what_we_saw["reasons"] == ["identity_missing"]
+
+
+@pytest.mark.asyncio
+async def test_enforce_refuses_the_python_fallback(monkeypatch):
+    _liumd_on(monkeypatch)
+    monkeypatch.setattr(machine_spec_scrape.settings, "VALIDATOR_LIUMD_EVIDENCE_MODE", "enforce")
+    _start_reading(monkeypatch, LocalVerifyUnavailable("not_supported", "exit 127: no liumd"))
+    runner = DummySSHCommandRunner(result=make_command_result(success=True, stdout=FERNET_TOKEN))
+
+    result = await MachineSpecScrapeCheck().run(_ctx(runner))
+
+    assert result.passed is False
+    assert result.event.what_we_saw["delivery"] == "liumd"
+    assert result.event.what_we_saw["liumd_fallback_refused"] == "not_supported"
+    assert runner.calls == []
+
+
+def _kernel_view(*uuids):
+    async def read_view(ssh, *, host_view=False):
+        return KernelGpuView(uuids=None if host_view is False else list(uuids), foreign_mounts=[])
+
+    return read_view
+
+
+@pytest.mark.asyncio
+async def test_an_identity_without_the_driver_procfs_passes_on_the_host_kernel_view(monkeypatch):
+    _liumd_on(monkeypatch)
+    monkeypatch.setattr(machine_spec_scrape.settings, "VALIDATOR_LIUMD_EVIDENCE_MODE", "enforce")
+    specs = copy.deepcopy(LIUMD_SPECS)
+    specs["gpu_identity"]["proc_driver_present"] = False
+    for card in specs["gpu_identity"]["cards"]:
+        card["sources"]["proc"] = None
+        card["minor"] = None
+        card["dev_node_present"] = False
+    _start_reading(monkeypatch, _answer(specs))
+    monkeypatch.setattr(machine_spec_scrape, "read_kernel_gpu_view", _kernel_view("GPU-1", "GPU-2"))
+    runner = DummySSHCommandRunner(result=make_command_result(success=False))
+
+    result = await MachineSpecScrapeCheck().run(_ctx(runner, ssh=AsyncMock()))
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.SCRAPE_OK.reason
+
+
+@pytest.mark.asyncio
+async def test_a_card_only_the_kernel_names_passes_enforce(monkeypatch):
+    _liumd_on(monkeypatch)
+    monkeypatch.setattr(machine_spec_scrape.settings, "VALIDATOR_LIUMD_EVIDENCE_MODE", "enforce")
+    specs = copy.deepcopy(LIUMD_SPECS)
+    extra = copy.deepcopy(specs["gpu_identity"]["cards"][1])
+    extra.update(uuid="GPU-3", pci="0000:33:00.0", minor=2)
+    extra["sources"]["nvml"] = None
+    extra["sources"]["proc"].update(uuid="GPU-3", pci="0000:33:00.0")
+    specs["gpu_identity"]["cards"].append(extra)
+    _start_reading(monkeypatch, _answer(specs))
+    monkeypatch.setattr(
+        machine_spec_scrape, "read_kernel_gpu_view", _kernel_view("GPU-1", "GPU-2", "GPU-3")
+    )
+    runner = DummySSHCommandRunner(result=make_command_result(success=False))
+
+    result = await MachineSpecScrapeCheck().run(_ctx(runner, ssh=AsyncMock()))
+
+    assert result.passed is True
+
+
+JUNK_DOCUMENTS = {
+    "count": lambda specs: specs["gpu"].update(count="2"),
+    "uuid": lambda specs: specs["gpu"]["details"][0].update(uuid=7),
+    "identity": lambda specs: specs.update(gpu_identity="junk"),
+    "cards": lambda specs: specs["gpu_identity"].update(cards="junk"),
+    "sources": lambda specs: specs["gpu_identity"]["cards"][0].update(sources="junk"),
+}
+
+
+@pytest.mark.parametrize("mode", ["shadow", "enforce"])
+@pytest.mark.parametrize("name", list(JUNK_DOCUMENTS))
+@pytest.mark.asyncio
+async def test_a_junk_document_is_a_result_not_an_exception(monkeypatch, name, mode):
+    _liumd_on(monkeypatch)
+    monkeypatch.setattr(machine_spec_scrape.settings, "VALIDATOR_LIUMD_EVIDENCE_MODE", mode)
+    specs = copy.deepcopy(LIUMD_SPECS)
+    JUNK_DOCUMENTS[name](specs)
+    _start_reading(monkeypatch, _answer(specs))
+    runner = DummySSHCommandRunner(result=make_command_result(success=False))
+
+    await MachineSpecScrapeCheck().run(_ctx(runner))
+
+
+@pytest.mark.asyncio
+async def test_a_non_text_gpu_name_does_not_abort_a_shadow_run(monkeypatch):
+    _liumd_on(monkeypatch)
+    monkeypatch.setattr(machine_spec_scrape.settings, "VALIDATOR_LIUMD_EVIDENCE_MODE", "shadow")
+    specs = copy.deepcopy(LIUMD_SPECS)
+    specs["gpu"]["details"][0]["name"] = 7
+    _start_reading(monkeypatch, _answer(specs))
+    runner = DummySSHCommandRunner(result=make_command_result(success=False))
+
+    result = await MachineSpecScrapeCheck().run(_ctx(runner))
+
+    assert result.passed is True
+
+
+@pytest.mark.asyncio
+async def test_identity_kernel_reads_the_host_only_in_enforce(monkeypatch):
+    calls = []
+    empty = KernelGpuView(uuids=None, foreign_mounts=[])
+
+    async def views(ctx):
+        calls.append("cycle")
+        return machine_spec_scrape.KernelGpuViews(
+            KernelGpuView(
+                uuids=["GPU-a"],
+                foreign_mounts=[],
+                minors={"GPU-a": 0},
+                pcis={"GPU-a": "0000:31:00.0"},
+            ),
+            "container",
+            empty,
+            None,
+        )
+
+    async def host(ssh, *, host_view=False):
+        calls.append("host")
+        return KernelGpuView(
+            uuids=["GPU-a", "GPU-b"],
+            foreign_mounts=[],
+            minors={"GPU-a": 0, "GPU-b": 1},
+            pcis={"GPU-a": "0000:31:00.0", "GPU-b": "0000:32:00.0"},
+        )
+
+    monkeypatch.setattr(machine_spec_scrape, "kernel_gpu_view_with_source", views)
+    monkeypatch.setattr(machine_spec_scrape, "read_kernel_gpu_view", host)
+    ctx = SimpleNamespace(ssh=object())
+    cards = [{"uuid": "GPU-a"}, {"uuid": "GPU-b"}]
+
+    monkeypatch.setattr(machine_spec_scrape.settings, "VALIDATOR_LIUMD_EVIDENCE_MODE", "shadow")
+    uuids, _ = await machine_spec_scrape._identity_kernel_uuids(ctx, cards)
+    assert calls == ["cycle"]
+    assert uuids == ["GPU-a"]
+
+    calls.clear()
+    monkeypatch.setattr(machine_spec_scrape.settings, "VALIDATOR_LIUMD_EVIDENCE_MODE", "enforce")
+    uuids, _ = await machine_spec_scrape._identity_kernel_uuids(ctx, cards)
+    assert calls == ["cycle", "host"]
+    assert uuids == ["GPU-a", "GPU-b"]

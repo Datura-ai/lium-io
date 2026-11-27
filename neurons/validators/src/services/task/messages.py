@@ -258,6 +258,21 @@ class MachineSpecMessages:
         category="env",
         impact="Proceed",
     )
+    # DAH-2834: the scrape's own NVML, driver procfs and PCI sysfs descriptions of the cards do
+    # not agree. A fact, not a timing measurement.
+    GPU_IDENTITY_MISMATCH = MessageTemplate(
+        event="Machine specs hardware identity mismatch",
+        reason="GPU_IDENTITY_MISMATCH",
+        severity="error",
+        category="env",
+        impact="Validation halted — GPU unverified",
+        remediation=(
+            "The node's NVML, driver procfs and PCI sysfs do not describe the same cards: a card is"
+            " duplicated, its kernel device is missing, or a source names a different UUID, bus or"
+            " model. Check `nvidia-smi -L`, /proc/driver/nvidia/gpus and /sys/bus/pci/devices on"
+            " the host, remove any overlay, then reboot or reinstall the driver."
+        ),
+    )
     SCRAPE_PARSE_FAILED = MessageTemplate(
         event="Machine specs parse/decrypt failed",
         reason="SCRAPE_PARSE_FAILED",

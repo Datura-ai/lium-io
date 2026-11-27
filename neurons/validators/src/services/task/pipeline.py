@@ -205,6 +205,9 @@ class ContextState:
     # mounts that are not procfs at or under /proc/driver/nvidia/gpus ("<mount point> <fstype>");
     # non-empty = the kernel list above was withheld because it was read through them
     kernel_gpu_foreign_mounts: list[str] = field(default_factory=list)
+    # the same read's per-card facts for the scrape's gpu_identity block; None = unreadable/not read
+    kernel_gpu_minors: dict[str, int] | None = None
+    kernel_gpu_pcis: dict[str, str] | None = None
     # which view the list above came from: "host_pid1_root" or "container" (DAH-7076)
     kernel_gpu_view_source: str = "container"
     # with the host's list: the container view's own list and foreign mounts (a stale bind after a reset);
@@ -214,6 +217,9 @@ class ContextState:
     # with the host's list: the same read's list of every card on the host (a shared host has other executors' cards);
     # the subset-container check (DAH-6273) and the identity evidence use it, never the bans or specs
     host_all_kernel_gpu_uuids: list[str] | None = None
+    # the machine scrape's gpu_identity block (liumd), kept for HardwareIdentityCheck; None when
+    # the scrape had none (Python fallback or an older liumd)
+    gpu_identity: dict | None = None
     verified_port_count: int = 0
     # verified_port_count is out of the ports probed this cycle (at most BATCH_PORT_VERIFICATION_SIZE,
     # the lowest free ones), never the declared range: declared - probed were not probed at all,

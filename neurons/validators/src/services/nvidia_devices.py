@@ -157,7 +157,9 @@ def _emit_kernel_xml_disagreement(
 KERNEL_GPU_UUID_READ_TIMEOUT_SECONDS = 15
 
 
-def _proc_gpu_info_cmd(root: str = "", *, own_cards: bool = False) -> str:
+def _proc_gpu_info_cmd(
+    root: str = "", *, own_cards: bool = False, with_pci: bool = False
+) -> str:
     # own_cards (DAH-7076): read `root`'s entry for each card under the container's own
     # /proc/driver/nvidia/gpus (its runtime binds, by PCI bus id), so a host shared by several
     # executors lists only this executor's cards. The bind's name stays when its target is stale.
@@ -166,15 +168,17 @@ def _proc_gpu_info_cmd(root: str = "", *, own_cards: bool = False) -> str:
         if own_cards
         else f"for f in {root}/proc/driver/nvidia/gpus/*/information; do "
     )
+    fmt, args = ("%s, %s, %s\\n", "uuid, minor, pci") if with_pci else ("%s, %s\\n", "uuid, minor")
     return (
         loop + '[ -r "$f" ] || continue; '
-        "awk -F: '"
+        "awk -F: -v info=\"$f\" '"
+        'BEGIN { n = split(info, parts, "/"); pci = parts[n-1] } '
         '$1 == "GPU UUID" { uuid = $2 } '
         '$1 == "Device Minor" { minor = $2 } '
         "END { "
         'gsub(/^[[:space:]]+|[[:space:]]+$/, "", uuid); '
         'gsub(/^[[:space:]]+|[[:space:]]+$/, "", minor); '
-        'if (uuid != "" && minor != "") printf "%s, %s\\n", uuid, minor; '
+        f'if (uuid != "" && minor != "") printf "{fmt}", {args}; '
         "}' \"$f\"; "
         "done 2>/dev/null"
     )
@@ -429,13 +433,14 @@ def kernel_gpu_view_cmd(*, host_view: bool = False) -> str:
         f"stat -c '%n|%F' {glob} 2>/dev/null; "
         f"echo {KERNEL_GPU_VIEW_SEPARATOR}; "
         + (
-            f"{_proc_gpu_info_cmd(root, own_cards=True)}; echo {HOST_ALL_CARDS_SEPARATOR}; {_proc_gpu_info_cmd(root)}; "
+            f"{_proc_gpu_info_cmd(root, own_cards=True, with_pci=True)}; echo {HOST_ALL_CARDS_SEPARATOR}; "
+            f"{_proc_gpu_info_cmd(root, with_pci=True)}; "
             f"echo {HOST_CONTAINER_MOUNTS_SEPARATOR}; grep -F ' /proc/driver/nvidia' /proc/self/mountinfo 2>/dev/null; "
             f"echo {HOST_CONTAINER_FILES_SEPARATOR}; stat -f -c '%n %T' {PROC_GPU_INFO_GLOB} 2>/dev/null; "
             f"stat -c '%n|%F' {PROC_GPU_INFO_GLOB} 2>/dev/null; "
             f'for d in {PROC_NVIDIA_GPUS_PATH}/*; do [ -e "$d" ] && echo "$d/information"; done'
             if host_view
-            else _proc_gpu_info_cmd(root)
+            else _proc_gpu_info_cmd(root, with_pci=True)
         )
     )
 
@@ -456,6 +461,9 @@ class KernelGpuView(NamedTuple):
 
     uuids: list[str] | None  # None = unreadable, empty, or read through a foreign mount
     foreign_mounts: list[str]  # "<path> <fstype>" per mount or file on the gpus path that is not procfs
+    # Lower-cased UUID -> kernel device minor and PCI bus id, when the same read carried them.
+    minors: dict[str, int] | None = None
+    pcis: dict[str, str] | None = None
 
 
 def foreign_mounts_over_proc_nvidia_gpus(
@@ -633,14 +641,22 @@ async def _read_kernel_gpu_views(
     procfs_rows = [line for line in file_fs.splitlines() if line.strip().endswith(" proc")]
     views = []
     for lines in (own_lines, all_lines):
-        uuids = list(_parse_uuid_minor_csv(lines))
+        minors, pcis = _parse_uuid_minor_pci_csv(lines)
+        uuids = list(minors)
         if len(procfs_rows) < len(uuids):
             logger.warning(
                 _m("%s had no procfs evidence for every card; withheld", {"executor_peer": _ssh_peer(ssh)}),
                 what,
             )
             return _both(KernelGpuView(uuids=None, foreign_mounts=[]))
-        views.append(KernelGpuView(uuids=uuids or None, foreign_mounts=[]))
+        views.append(
+            KernelGpuView(
+                uuids=uuids or None,
+                foreign_mounts=[],
+                minors=minors or None,
+                pcis=pcis or None,
+            )
+        )
     return views[0], views[1]
 
 
@@ -758,6 +774,23 @@ def _parse_uuid_minor_csv(stdout: str) -> dict[str, int]:
         except ValueError:
             continue
     return uuid_to_minor
+
+
+def _parse_uuid_minor_pci_csv(stdout: str) -> tuple[dict[str, int], dict[str, str]]:
+    """`uuid, minor, pci` rows from the kernel view command; a row without a valid minor is dropped."""
+    minors: dict[str, int] = {}
+    pcis: dict[str, str] = {}
+    for line in _stdout_lines(stdout):
+        parts = [part.strip() for part in line.split(",")]
+        if len(parts) < 2 or not parts[0]:
+            continue
+        try:
+            minors[parts[0]] = int(parts[1])
+        except ValueError:
+            continue
+        if len(parts) >= 3 and parts[2]:
+            pcis[parts[0]] = parts[2].lower()
+    return minors, pcis
 
 
 def _parse_nvidia_smi_xml_minor_map(stdout: str) -> dict[str, int]:

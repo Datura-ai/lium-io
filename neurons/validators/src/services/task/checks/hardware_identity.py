@@ -6,6 +6,7 @@ import json
 import logging
 import re
 
+from core.config import settings
 from services.nvidia_devices import read_kernel_gpu_view
 
 from ..messages import HardwareIdentityMessages as Msg, render_message
@@ -16,6 +17,7 @@ from .banned_provider import (
     kernel_gpu_view_with_source,
     reported_gpu_uuids,
 )
+from .gpu_identity import CARDS_MAX, dev_node_missing
 
 logger = logging.getLogger(__name__)
 
@@ -97,6 +99,65 @@ def dmi_overlay_findings(mountinfo: str, file_fs: str) -> list[str]:
 def gpu_sources_disagree(reported: list[str], kernel: list[str] | None) -> bool:
     """NVML (the scrape) names a card the kernel's procfs list does not; unknown when the kernel list is unreadable."""
     return kernel is not None and not set(reported) <= set(kernel)
+
+
+def gpu_identity_kernel_findings(
+    cards: list[dict],
+    kernel: list[str] | None,
+    minors: dict[str, int] | None,
+    pcis: dict[str, str] | None,
+) -> tuple[list[str], list[str]]:
+    """The scrape's per-card identity against the validator's own container kernel read.
+
+    Both reads are in the executor container, so this is a consistency check, not a host proof.
+    A mismatch means the scrape's sources and the validator's procfs read do not describe the
+    same cards. Returns the stable reason codes and the operator-only detail lines.
+    """
+    found: list[str] = []
+    details: list[str] = []
+
+    def add(reason: str, detail: str) -> None:
+        if reason not in found:
+            found.append(reason)
+        detail = detail[:240]
+        if detail not in details:
+            details.append(detail)
+
+    for index, card in enumerate(cards):
+        uuid = card.get("uuid")
+        pci = card.get("pci")
+        label = f"card {index} {uuid or '<no uuid>'} {pci or '<no pci>'}"
+        if not isinstance(uuid, str) or not uuid:
+            add("identity_uuid_missing", f"{label}: no uuid")
+            continue
+        if kernel is not None and uuid not in kernel:
+            add(
+                "identity_uuid_not_in_container_kernel",
+                f"{label}: not in kernel {kernel}",
+            )
+            continue
+        kernel_minor = minors.get(uuid) if minors is not None else None
+        card_minor = card.get("minor")
+        if kernel_minor is not None and card_minor is not None and kernel_minor != card_minor:
+            add(
+                "identity_minor_mismatch",
+                f"{label}: block minor {card_minor}, kernel minor {kernel_minor}",
+            )
+        kernel_pci = pcis.get(uuid) if pcis is not None else None
+        if (
+            kernel_pci
+            and isinstance(pci, str)
+            and pci
+            and kernel_pci != pci.lower()
+        ):
+            add(
+                "identity_pci_mismatch",
+                f"{label}: block pci {pci}, kernel pci {kernel_pci}",
+            )
+        minor = dev_node_missing(card)
+        if minor is not None:
+            add("identity_dev_node_missing", f"{label}: /dev/nvidia{minor} missing")
+    return found, details[:32]
 
 
 def digest(values: list[str]) -> str:
@@ -181,7 +242,14 @@ class HardwareIdentityCheck:
 
     async def run(self, ctx: Context) -> CheckResult:
         reported = sorted(set(reported_gpu_uuids(ctx)))
-        (kernel_uuids, _), source, _, host_all = await kernel_gpu_view_with_source(ctx)
+        identity = ctx.state.gpu_identity or {}
+        raw_cards = identity.get("cards")
+        identity_cards = [
+            card for card in (raw_cards[:CARDS_MAX] if isinstance(raw_cards, list) else [])
+            if isinstance(card, dict)
+        ]
+        view, source, _container, host_all = await kernel_gpu_view_with_source(ctx)
+        kernel_uuids = view.uuids
         kernel = sorted(set(kernel_uuids)) if kernel_uuids is not None else None
         gpus = kernel or reported
 
@@ -220,7 +288,8 @@ class HardwareIdentityCheck:
             host_kernel = sorted(set(host_all)) if host_all else None
         elif gpu_sources_disagree(reported, kernel) and ctx.ssh is not None:
             # a container handed some of the host's cards lists only those; the host's own list is the full one
-            host_uuids, _ = await read_kernel_gpu_view(ctx.ssh, host_view=True)
+            host_view = await read_kernel_gpu_view(ctx.ssh, host_view=True)
+            host_uuids = host_view.uuids
             host_kernel = sorted(set(host_uuids)) if host_uuids else None
 
         findings = []
@@ -228,6 +297,18 @@ class HardwareIdentityCheck:
             findings.append("dmi_overlaid")
         if gpu_sources_disagree(reported, host_kernel or kernel):
             findings.append("gpu_sources_disagree")
+        identity_findings, identity_details = gpu_identity_kernel_findings(
+            identity_cards, kernel, view.minors, view.pcis
+        )
+        if identity_findings:
+            logger.warning(
+                "liumd gpu_identity container kernel cross-check: reasons=%s details=%s",
+                identity_findings,
+                identity_details,
+                extra=ctx.default_extra,
+            )
+            if settings.VALIDATOR_LIUMD_EVIDENCE_MODE == "enforce":
+                findings.extend(identity_findings)
         if dmi_identity_drifted(previous, gpus, dmi_identity, boot_id):
             findings.append("dmi_changed_under_same_gpus")
 
@@ -242,6 +323,8 @@ class HardwareIdentityCheck:
             "host_kernel_gpu_uuids": host_kernel,
             "reported_gpu_uuids": reported,
             "dmi_overlays": overlays,
+            "identity_findings": identity_findings,
+            "identity_mode": settings.VALIDATOR_LIUMD_EVIDENCE_MODE,
             "findings": findings,
         }
         if not findings:

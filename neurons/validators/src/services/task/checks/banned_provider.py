@@ -56,7 +56,12 @@ async def kernel_gpu_view_with_source(ctx: Context) -> KernelGpuViews:
     """
     state = ctx.state
     if state.kernel_gpu_uuids_read_attempted:
-        view = KernelGpuView(state.kernel_gpu_uuids, state.kernel_gpu_foreign_mounts)
+        view = KernelGpuView(
+            state.kernel_gpu_uuids,
+            state.kernel_gpu_foreign_mounts,
+            state.kernel_gpu_minors,
+            state.kernel_gpu_pcis,
+        )
         container = KernelGpuView(state.container_kernel_gpu_uuids, state.container_kernel_gpu_foreign_mounts)
         return KernelGpuViews(view, state.kernel_gpu_view_source, container, state.host_all_kernel_gpu_uuids)
     if ctx.ssh is None:
@@ -102,7 +107,8 @@ class BannedProviderCheck:
         rented_data = ctx.state.rented_data
         gpu_uuids = reported_gpu_uuids(ctx)
         # DAH-2662: match bans against the kernel's GPU list too (shapes: kernel_gpu_view)
-        (kernel_uuids, foreign_mounts), source, container, host_all = await kernel_gpu_view_with_source(ctx)
+        view, source, container, host_all = await kernel_gpu_view_with_source(ctx)
+        kernel_uuids, foreign_mounts = view.uuids, view.foreign_mounts
         is_banned = bool(
             rented_data
             and rented_data.is_provider_banned(
@@ -142,6 +148,8 @@ class BannedProviderCheck:
                 kernel_gpu_uuids=kernel_uuids,
                 kernel_gpu_uuids_read_attempted=True,
                 kernel_gpu_foreign_mounts=foreign_mounts,
+                kernel_gpu_minors=view.minors,
+                kernel_gpu_pcis=view.pcis,
                 kernel_gpu_view_source=source,
                 container_kernel_gpu_uuids=container.uuids,
                 container_kernel_gpu_foreign_mounts=container.foreign_mounts,

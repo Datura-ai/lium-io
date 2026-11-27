@@ -456,9 +456,10 @@ async def _compare(
             }
         if not isinstance(facts_answer, LocalVerifyAnswer):
             facts_answer = answer
-        return _judged(
+        record = _judged(
             ctx, answer, today, steps, matmul_challenge, verifyx_challenge, extra, facts_answer
         )
+        return record
     finally:
         if matmul_challenge is not None:
             matmul_challenge.close()
