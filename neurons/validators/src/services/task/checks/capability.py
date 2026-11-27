@@ -66,7 +66,7 @@ class CapabilityCheck:
     fatal = True
 
     async def _filler_sample(
-        self, ctx: Context, specs, filler_container, seen: bool, mismatches: list[GpuModelMismatch]
+        self, ctx: Context, specs: dict, filler_container: str, seen: bool, mismatches: list[GpuModelMismatch]
     ) -> CheckResult:
         """A node held by a filler is judged by a small matmul sample beside it, not the full check."""
         what_filler: dict = {"filler_container": filler_container}
@@ -104,7 +104,7 @@ class CapabilityCheck:
                 # a broken card answers the same way every time and an interrupted sample comes back
                 # empty: neither is a verdict, so the full check gets one with Lium's filler stopped; a filler
                 # not ours to stop keeps the once-a-day pace
-                if _lium_filler(ctx):
+                if _lium_owns_the_filler(ctx):
                     await _mark_full_check_due(ctx, card)
                 else:
                     await _store_gpu_model_verdict(ctx, mismatches, GPU_MODEL_NO_VERDICT_TTL_SECONDS)
@@ -629,7 +629,7 @@ async def _judge_due_card(
     return mismatches
 
 
-def _lium_filler(ctx: Context) -> bool:
+def _lium_owns_the_filler(ctx: Context) -> bool:
     rented_data = ctx.state.rented_data
     return rented_data is not None and rented_data.get_default_job_owner(ctx.executor.uuid) == DEFAULT_JOB_OWNER_LIUM
 
@@ -650,7 +650,7 @@ async def _stop_filler_when_full_check_due(ctx: Context) -> _FullCheckStop:
     stopped every cycle. Another owner's filler is not ours to stop: its node keeps being sampled.
     """
     due_card = await _full_check_due_card(ctx)
-    if due_card is None or settings.DRY_RUN or not _lium_filler(ctx):
+    if due_card is None or settings.DRY_RUN or not _lium_owns_the_filler(ctx):
         return _FullCheckStop()
     rented_data = ctx.state.rented_data
     removed = await remove_lium_fillers(ctx, rented_data.get_filler_containers(ctx.executor.uuid))
