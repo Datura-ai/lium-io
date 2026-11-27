@@ -95,6 +95,12 @@ class FakeRedis:
     async def set(self, key, value):
         self.kv[key] = value
 
+    async def hset(self, key, field, value):
+        self.kv[f"{key}:{field}"] = value
+
+    async def hget(self, key, field):
+        return self.kv.get(f"{key}:{field}")
+
 
 def _jwt(claims: dict) -> str:
     def seg(obj):
@@ -668,8 +674,8 @@ async def test_g5_ratcheted_executor_omitting_quote_can_be_torn_down_on_its_pinn
     pinned = object()
     monkeypatch.setattr(asyncssh, "import_known_hosts", lambda value: pinned)
     redis = FakeRedis()
-    await redis.sadd(TDX_ATTESTED_EXECUTOR_SET, "test-executor")
     service = AttestationService(redis_service=redis)
+    await service._record_attested_executor(_make_executor())
     executor = _make_executor(tdx_quote=None)
 
     # Act
@@ -678,6 +684,40 @@ async def test_g5_ratcheted_executor_omitting_quote_can_be_torn_down_on_its_pinn
     # Assert — the host key stays pinned and nothing is claimed as attested
     assert host_policy.known_hosts is pinned
     assert host_policy.attestation_digest is None
+
+
+@pytest.mark.parametrize("address", ["203.0.113.7", "executor.example"], ids=["ip-addressed", "hostname"])
+async def test_g5_quote_less_teardown_refuses_a_host_key_other_than_the_attested_one(monkeypatch, address):
+    # Arrange — attested with one key, now no quote and another key (an IP node has no registered key to catch it)
+    monkeypatch.setattr(settings, "TDX_VERIFIER_URL", "https://verifier.example/verify")
+    import asyncssh
+
+    monkeypatch.setattr(asyncssh, "import_known_hosts", lambda value: object())
+    redis = FakeRedis()
+    service = AttestationService(redis_service=redis)
+    await service._record_attested_executor(_make_executor(address=address))
+    replaced = _make_executor(
+        address=address, tdx_quote=None, ssh_host_key="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOtherKey other@host"
+    )
+
+    # Act / Assert — fail closed
+    with pytest.raises(AttestationError, match="omitted its TDX quote"):
+        await service.prepare_host_policy(replaced, teardown=True, check_registered_key=False)
+
+
+async def test_g5_quote_less_teardown_without_a_recorded_host_key_fails_closed(monkeypatch):
+    # Arrange — ratcheted before host keys were kept: nothing earlier-trusted to compare with
+    monkeypatch.setattr(settings, "TDX_VERIFIER_URL", "https://verifier.example/verify")
+    import asyncssh
+
+    monkeypatch.setattr(asyncssh, "import_known_hosts", lambda value: object())
+    redis = FakeRedis()
+    await redis.sadd(TDX_ATTESTED_EXECUTOR_SET, "test-executor")
+    service = AttestationService(redis_service=redis)
+
+    # Act / Assert
+    with pytest.raises(AttestationError, match="omitted its TDX quote"):
+        await service.prepare_host_policy(_make_executor(tdx_quote=None), teardown=True)
 
 
 async def test_g5_ratcheted_executor_without_a_host_key_fails_closed_even_on_teardown(monkeypatch):

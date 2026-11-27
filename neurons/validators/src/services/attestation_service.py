@@ -16,7 +16,7 @@ from fastapi import Depends
 from core.config import settings
 from core.utils import _m, get_extra_info
 from services.const import TDX_WHITELIST
-from services.node_host import reports_registered_host_key
+from services.node_host import host_key_body, reports_registered_host_key
 from services.redis_service import RedisService
 
 logger = logging.getLogger(__name__)
@@ -26,6 +26,12 @@ logger = logging.getLogger(__name__)
 # as a bypass attempt (fail-closed), not as a
 # bare-metal node.
 TDX_ATTESTED_EXECUTOR_SET = "tdx_attested_executors"
+# executor uuid -> the host keys ("<type> <base64>", one per line) its last verified quote came with
+TDX_ATTESTED_HOST_KEYS = "tdx_attested_host_keys"
+
+
+def _host_key_bodies(openssh_lines: str | None) -> set[str]:
+    return {host_key_body(line) for line in (openssh_lines or "").splitlines()} - {""}
 
 
 class AttestationError(RuntimeError):
@@ -603,11 +609,16 @@ class AttestationService:
         return attestation_digest, tee_type
 
     async def _record_attested_executor(self, executor: ExecutorSSHInfo) -> None:
-        """Ratchet: remember that this executor is a CVM (minimal-G5)."""
+        """Ratchet: remember that this executor is a CVM (minimal-G5), and the host keys it was attested with."""
         if self.redis_service is None:
             return
         try:
             await self.redis_service.sadd(TDX_ATTESTED_EXECUTOR_SET, str(executor.uuid))
+            attested_keys = _host_key_bodies(executor.ssh_host_key)
+            if attested_keys:
+                await self.redis_service.hset(
+                    TDX_ATTESTED_HOST_KEYS, str(executor.uuid), "\n".join(sorted(attested_keys))
+                )
         except Exception as exc:
             logger.warning(_m(
                 "Failed to record attested executor in ratchet set",
@@ -631,8 +642,13 @@ class AttestationService:
                 extra=get_extra_info({"executor_uuid": executor.uuid, "error": str(exc)}),
             ))
             return
-        if is_ratcheted and teardown and self._build_known_hosts(executor) is not None:
-            # stopping or deleting a rental needs only the pinned host key, never unpinned SSH
+        if (
+            is_ratcheted
+            and teardown
+            and await self._reports_attested_host_key(executor)
+            and self._build_known_hosts(executor) is not None
+        ):
+            # stopping or deleting a rental needs only the host key the node was attested with, never unpinned SSH
             logger.warning(_m(
                 "Previously attested executor omitted its TDX quote; host-key-only teardown",
                 extra=get_extra_info({"executor_uuid": executor.uuid, "reason": "quote_omitted_teardown"}),
@@ -651,6 +667,23 @@ class AttestationService:
                 f"Executor {executor.address}:{executor.port} previously attested as a CVM "
                 "but omitted its TDX quote (fail-closed)"
             )
+
+    async def _reports_attested_host_key(self, executor: ExecutorSSHInfo) -> bool:
+        """Every host key the node reports now is one it was attested with (`_record_attested_executor`). No stored
+        key (recorded before keys were kept) or an unreadable one is False: the quote-less teardown fails closed."""
+        reported = _host_key_bodies(executor.ssh_host_key)
+        try:
+            stored = await self.redis_service.hget(TDX_ATTESTED_HOST_KEYS, str(executor.uuid))
+        except Exception as exc:
+            logger.warning(_m(
+                "Failed to read the attested host keys",
+                extra=get_extra_info({"executor_uuid": executor.uuid, "error": str(exc)}),
+            ))
+            return False
+        if isinstance(stored, bytes):
+            stored = stored.decode()
+        attested = _host_key_bodies(stored)
+        return bool(reported) and bool(attested) and reported <= attested
 
     def _build_known_hosts(
         self,
