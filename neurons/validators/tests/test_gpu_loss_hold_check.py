@@ -723,7 +723,8 @@ async def test_a_container_docker_no_longer_has_is_no_verdict_and_keeps_dockers_
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("status", "expected"), [("exited", ContainerState.EXITED), ("running", ContainerState.RUNNING)]
+    ("status", "expected"),
+    [("exited", ContainerState.EXITED), ("dead", ContainerState.EXITED), ("running", ContainerState.RUNNING)],
 )
 async def test_a_pod_left_on_the_old_cards_reports_its_container_state(context_factory, status, expected):
     """DAH-7308: the reboot onto the new cards failed and the cycle stops here before the rented-pod
@@ -762,6 +763,20 @@ async def test_a_pod_the_ssh_read_missed_reports_no_container_state(context_fact
 
     result = await GpuLossHoldCheck().run(ctx)
 
+    assert "state" not in result.updates
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["paused", "restarting", "removing"])
+async def test_a_paused_or_restarting_pod_is_no_exited_reading(context_factory, status):
+    """lio#2524 review: a paused or restarting container is not down, so it must not reach the backend as exited
+    (that is the reading the REBOOT_FAILED retry reboots on). Nothing is reported for it."""
+    ctx = _ctx(context_factory, FakeRedis(), listed=OTHER_CARDS, pods=(4,), pod_gpus=UUIDS)
+    ctx.ssh.status = status
+
+    result = await GpuLossHoldCheck().run(ctx)
+
+    assert result.event.event == Msg.POD_GPUS_GONE.event
     assert "state" not in result.updates
 
 

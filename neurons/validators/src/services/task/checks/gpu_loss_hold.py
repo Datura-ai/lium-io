@@ -77,6 +77,10 @@ def _with_pod_states(result: CheckResult, ctx: Context, pod_states: list[PodCont
     state = replace(ctx.state, pod_states=[*ctx.state.pod_states, *pod_states])
     return result.model_copy(update={"updates": {**result.updates, "state": state}})
 
+# docker statuses of a container that is down; paused, restarting and removing are docker still acting on a live
+# container (the rented-pod check's `docker ps` lists them as up), so they are not an exited reading
+_STOPPED_STATUSES = frozenset({"exited", "dead", "created"})
+
 GPU_LOSS_HOLD_KEY_PREFIX = "gpu_loss_hold"
 # A weak first sighting waits this long for the next cycle (15 min apart) to confirm it.
 GPU_LOSS_CONFIRM_SECONDS = 45 * 60
@@ -319,8 +323,10 @@ class GpuLossHoldCheck:
         pod_states = []
         for pod in pods:
             name = pod.container_name
-            if name in status:
-                seen = ContainerState.RUNNING if status[name] == "running" else ContainerState.EXITED
+            if status.get(name) == "running":
+                seen = ContainerState.RUNNING
+            elif status.get(name) in _STOPPED_STATUSES:
+                seen = ContainerState.EXITED
             elif name and f"No such object: {name}" in stderr:
                 seen = ContainerState.ABSENT
             else:
