@@ -245,3 +245,22 @@ async def test_a_customer_create_fails_as_the_nodes_when_the_host_refuses_a_reco
     assert _probe_failed_stamps(service) == [
         (f"rental_probe_failed:{result.executor_id}", f"{STEP_CONTAINER_START}:gpu_power_restore")
     ]
+
+
+@pytest.mark.asyncio
+async def test_a_run_spec_error_after_a_passed_power_restore_is_not_held_as_the_restore(monkeypatch):
+    record = GpuPowerRestoreRecord(gpu_uuid="GPU-test", watts=400, pod_id="filler", executor_id="ex", capped_at=0.0)
+
+    async def redis_get(key):
+        return record.model_dump_json() if key == "gpu_power_restore:GPU-test" else None
+
+    service = _customer_create(monkeypatch, redis_get=redis_get, pl_exit=0)
+    monkeypatch.setattr(
+        service, "_build_rental_container_run_spec", Mock(side_effect=ValueError("Unsafe cache volume name: 'x'"))
+    )
+
+    result = await _run(service, _payload(workload_kind=WorkloadKind.CUSTOMER_RENTAL))
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.failure_step == "container_run_spec"
+    assert _probe_failed_stamps(service) == []

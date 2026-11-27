@@ -11968,6 +11968,7 @@ class DockerService:
                         except GpuPowerRestoreStateError:
                             current_step = "gpu_power_restore_state"  # our Redis, not the host's fault
                             raise
+                        current_step = "container_run_spec"  # a later error is not the restore's
 
                 # DAH-1524: build_gpu_flags issues 2-3 serial SSH probes (proc minor
                 # map, shared nodes, and a slow nvidia-smi -q -x fallback). Profile it

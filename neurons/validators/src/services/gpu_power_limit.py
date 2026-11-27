@@ -414,7 +414,7 @@ async def _read_back_power_state(ssh: asyncssh.SSHClientConnection, uuid: str) -
     return _parse_power_readback_csv(str(result.stdout))
 
 
-async def _accept_if_already_at(
+async def _succeed_if_gpu_already_at_target_watts(
     ssh: asyncssh.SSHClientConnection, uuid: str, watts: int, failed: PowerLimitSetOutcome
 ) -> PowerLimitSetOutcome:
     """A failed ``-pl`` on a GPU that already shows the target is not a failed set: the limit the
@@ -440,11 +440,11 @@ async def _set_power_limit(
     except asyncssh.ChannelOpenError:
         raise
     except Exception as exc:
-        return await _accept_if_already_at(
+        return await _succeed_if_gpu_already_at_target_watts(
             ssh, uuid, watts, PowerLimitSetOutcome(failure=f"nvidia-smi -pl errored: {exc}", persistence_enabled=None)
         )
     if result.exit_status != 0:
-        return await _accept_if_already_at(
+        return await _succeed_if_gpu_already_at_target_watts(
             ssh,
             uuid,
             watts,
@@ -949,11 +949,11 @@ async def _restore_records(
     concurrency: int = POWER_LIMIT_SET_CONCURRENCY,
     *,
     require_complete: bool = False,
-    require_host_restored: bool = False,
+    require_recorded_gpus_restored: bool = False,
 ) -> int:
     """Apply each record with ``nvidia-smi -pl``; delete a record ONLY after its restore succeeded
     (a failed restore keeps it for the safety nets to retry). Returns the restored count.
-    ``require_host_restored`` raises only when the host refused a restore, never on a failed delete.
+    ``require_recorded_gpus_restored`` raises only when the host refused a restore, never on a failed delete.
 
     The records are restored side by side (``concurrency`` at a time; a GPU whose
     session the host refused is retried alone): each GPU is its own device, and the delete that
@@ -993,7 +993,7 @@ async def _restore_records(
     restored = await _set_side_by_side("restore", records, restore_one, log_extra, concurrency=concurrency)
     if require_complete and clear_failed:
         raise GpuPowerRestoreStateError("GPU power restore records could not be cleared")
-    if require_host_restored and host_failed:
+    if require_recorded_gpus_restored and host_failed:
         raise RuntimeError("GPU power restoration incomplete")
     return restored
 
@@ -1059,7 +1059,7 @@ async def restore_tracked_gpu_power_limits(
         return 0
     restored = await _restore_records(
         ssh, redis, read_result.records, state_by_uuid, log_extra, concurrency,
-        require_complete=require_complete, require_host_restored=require_recorded_gpus_restored,
+        require_complete=require_complete, require_recorded_gpus_restored=require_recorded_gpus_restored,
     )
     if require_complete and restored != len(read_result.records):
         raise RuntimeError("GPU power restoration incomplete")
@@ -1094,7 +1094,7 @@ async def restore_all_host_gpu_power_limits(
         return 0
     return await _restore_records(
         ssh, redis, read_result.records, state_by_uuid, log_extra, concurrency,
-        require_host_restored=require_recorded_gpus_restored,
+        require_recorded_gpus_restored=require_recorded_gpus_restored,
     )
 
 
