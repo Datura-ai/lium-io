@@ -203,7 +203,8 @@ def _install_mode_answer(root, fail: str = "", why: str = "boom") -> str:
     branch = re.search(r"^    --install-layer-reset\)\n(.*?)^        ;;$", open(SCRIPT).read(), re.S | re.M).group(1)
     log = root / "systemctl.log"
     script = (
-        f'host_path() {{ echo "{root}$1"; }}\nid() {{ echo 0; }}\ncommand() {{ [ "$1" = -v ] && return 0; builtin command "$@"; }}\n'
+        f'host_path() {{ echo "{root}$1"; }}\nid() {{ echo 0; }}\n'
+        + 'command() { [ "$1" = -v ] && { [ "$FAIL:$2" != no-systemd:systemctl ]; return; }; builtin command "$@"; }\n'
         + f"docker() {{ return 1; }}\nFAIL={fail!r}\nWHY={why!r}\n"
         + f'systemctl() {{ echo "$1" >> "{log}"; case "$FAIL:$1:$(grep -c . "{log}")" in '
         + "daemon-reload:daemon-reload:3|enable:enable:*|last-daemon-reload:daemon-reload:5) "
@@ -260,6 +261,12 @@ def test_a_failed_install_reason_is_one_printable_bounded_line(tmp_path):
 
 def test_a_working_install_still_answers_its_version(tmp_path):
     assert _install_mode_answer(tmp_path) == f"layer_reset_installed {_layer_reset_version()}\n"
+
+
+def test_a_host_without_systemd_is_skipped_and_nothing_is_written(tmp_path):
+    # 27 Nov, 8 Sysbox hosts of one provider: no systemctl, so every check wrote the files and failed at daemon-reload
+    assert _install_mode_answer(tmp_path, fail="no-systemd") == "layer_reset_skipped no_systemd\n"
+    assert not any(tmp_path.iterdir())
 
 
 def _remove_on_a_live_host(root, disable_fails: bool = False) -> subprocess.CompletedProcess:
