@@ -180,7 +180,7 @@ class HardwareIdentityCheck:
 
     A finding fails the node. An unreadable host, SSH error or Redis outage decides nothing. A drift back to an
     identity already seen under the same GPUs is two machines answering for one node: it holds the node for
-    HW_ID_TTL_SECONDS, whatever the checks in between read (node 7be61cf6 switched machines for one check a few
+    HW_ID_TTL_SECONDS, whatever the checks in between read (a node that switched machines for one check a few
     times a day and passed every check in between).
     """
 
