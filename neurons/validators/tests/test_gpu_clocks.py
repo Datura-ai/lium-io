@@ -422,7 +422,8 @@ async def test_an_answered_failed_or_not_found_application_or_memory_reset_keeps
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("app_mem_exit", [None, 137], ids=["no-line", "killed"])
+# review (lio#2499): uutils timeout (Ubuntu 26.04) exits 124 where GNU `timeout -s KILL` exits 137
+@pytest.mark.parametrize("app_mem_exit", [None, 137, 124], ids=["no-line", "killed-gnu", "killed-uutils"])
 @pytest.mark.parametrize("rgc_exit", [0, 3, 4])
 @pytest.mark.parametrize("recorded", [False, True])
 async def test_an_application_or_memory_reset_that_gave_no_answer_refuses_the_create_only_on_a_recorded_gpu(
@@ -472,6 +473,8 @@ async def test_a_lost_answers_read_back_is_bounded_to_10_seconds():
         (6, 6, "rgc_ok=0 rgc_failed=2 rgc_no_answer=0 app_mem_ok=0 app_mem_unsupported=0 app_mem_not_found=0", 4),
         # killed by the host's timeout: no verdict
         (137, 137, "rgc_ok=0 rgc_failed=0 rgc_no_answer=2 app_mem_ok=0 app_mem_unsupported=0 app_mem_not_found=0", 4),
+        # the same kill under uutils timeout (review lio#2499)
+        (124, 124, "rgc_ok=0 rgc_failed=0 rgc_no_answer=2 app_mem_ok=0 app_mem_unsupported=0 app_mem_not_found=0", 4),
         # prod 25 Nov (8x H200): the whole call gave no answer
         (None, None, "rgc_ok=0 rgc_failed=0 rgc_no_answer=2 app_mem_ok=0 app_mem_unsupported=0 app_mem_not_found=0", 4),
     ],
@@ -487,10 +490,11 @@ async def test_every_create_reset_logs_one_outcome_line(rgc_exit, app_mem_exit, 
 
 
 @pytest.mark.asyncio
-async def test_a_gpu_whose_rgc_was_killed_has_no_verdict_and_refuses_the_create_only_with_a_record():
+@pytest.mark.parametrize("killed_exit", [137, 124], ids=["gnu", "uutils"])
+async def test_a_gpu_whose_rgc_was_killed_has_no_verdict_and_refuses_the_create_only_with_a_record(killed_exit):
     """A -rgc killed on the host gave no verdict: a recorded GPU may still hold our lowered clocks, so it refuses the
-    create and keeps its record; an unrecorded one is logged only (review 6076421144)."""
-    host, redis = FakeHost(rgc_exit=137), FakeRedis()
+    create and keeps its record; an unrecorded one is logged only (review 6076421144). GNU and uutils timeout alike."""
+    host, redis = FakeHost(rgc_exit=killed_exit), FakeRedis()
     assert await reset_leftover_clock_locks(host, redis, [U[0], U[1]]) == []
     redis.store[f"gpu_clock_lock:{U[0]}"] = json.dumps({"pod_id": "old"})
     assert await reset_leftover_clock_locks(host, redis, [U[0], U[1]]) == [U[0]]

@@ -53,13 +53,15 @@ _RESET_CALL_TIMEOUT_SECONDS = (1 + len(_APP_MEM_FLAGS)) * PER_RESET_TIMEOUT_SECO
 # 3 = "not supported": a GPU without application or memory clock control
 _APP_MEM_RESET_OK_EXITS = {"0", "3"}
 # 6 = NVML "not found" (no such clock setting); only when the same GPU's -rgc reset it or refused it as having no clock
-# control (0, 3, 4), so the GPU itself was found and reachable. Any other -rgc exit (15 "fell off the bus", 6, 137, none)
-# leaves the GPU itself in doubt, so a 6 there is a failed reset (review). Ada GeForce answers 6 to -rac/-rmc on every
-# GPU (application clocks exist on Maxwell GeForce only, nvidia-smi docs)
+# control (0, 3, 4), so the GPU itself was found and reachable. Any other -rgc exit (15 "fell off the bus", 6, killed,
+# none) leaves the GPU itself in doubt, so a 6 there is a failed reset (review). Ada GeForce answers 6 to -rac/-rmc on
+# every GPU (application clocks exist on Maxwell GeForce only, nvidia-smi docs)
 _APP_MEM_NOT_FOUND_EXIT = "6"
 _RGC_GPU_PRESENT_EXITS = {"0", "3", "4"}
-# 137: the host's timeout killed that nvidia-smi, so it gave no verdict
-_KILLED_EXIT = "137"
+# the host's timeout killed that nvidia-smi, so it gave no verdict. Its exit depends on the timeout flavour: GNU
+# `timeout -s KILL` exits 137 (128 + SIGKILL), uutils timeout (Ubuntu 26.04) exits 124 (review lio#2499); nvidia-smi
+# itself never exits either
+_KILLED_EXITS = {"124", "137"}
 CLOCK_LOCK_POD_KEY_PREFIX = "gpu_clock_lock_pod:"
 
 
@@ -146,7 +148,7 @@ def _reset_command(uuids: list[str], pod_gpu_uuids: set[str] | None, results: st
     -rac/-rmc batch outlasted the runner's budget, so the call gave no answer at all and no GPU had a verdict (prod
     25 Nov). The kill is per nvidia-smi and nothing wraps the batch: uutils timeout (Ubuntu 26.04) signals only its
     direct child and GNU timeout gives each inner timeout its own process group, so an outer kill left resets running
-    (lio#2362). `wait` returns only once every reset has exited. A killed reset echoes 137. Each line goes to stdout
+    (lio#2362). `wait` returns only once every reset has exited. A killed reset echoes 137 or 124. Each line goes to stdout
     and is appended to the host file `results` (tee -a) the moment its reset ends, so a call that answers never depends
     on the file (a host whose /tmp cannot be written still answers, review); if the call overruns the runner's budget
     (its answer lost), the GPUs that answered are read back from the file and only the others are unknown. The file
@@ -171,7 +173,7 @@ def _app_mem_outcome(code: str, rgc_exit: str | None) -> str:
         return "ok" if code == "0" else "unsupported"
     if code == _APP_MEM_NOT_FOUND_EXIT and rgc_exit in _RGC_GPU_PRESENT_EXITS:
         return "not_found"
-    return "no_answer" if code in ("unknown", _KILLED_EXIT) else "failed"
+    return "no_answer" if code == "unknown" or code in _KILLED_EXITS else "failed"
 
 
 def _app_mem_outcomes(uuids: list[str], lines: list[list[str]]) -> dict[tuple[str, str], tuple[str, str]]:
@@ -300,7 +302,7 @@ async def _reset_gpu_clocks(
         stdout += "\n" + ((await _run(runner, f"cat {results} 2>/dev/null; rm -f {results}", timeout=10)).stdout or "")
     lines = [line.split() for line in stdout.splitlines()]
     # the -rgc lines (a -rac/-rmc line has 3 fields); a killed -rgc gave no verdict, as a lost answer
-    exits = {p[0]: p[1] for p in lines if len(p) == 2 and p[1] != _KILLED_EXIT}
+    exits = {p[0]: p[1] for p in lines if len(p) == 2 and p[1] not in _KILLED_EXITS}
     failures: dict[str, str | None] = {
         uuid: None if exits.get(uuid) == "0" else _rgc_failure(exits[uuid]) if uuid in exits else _NO_ANSWER
         for uuid in uuids
