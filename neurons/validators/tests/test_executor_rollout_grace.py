@@ -14,6 +14,7 @@ import pytest
 from core.validator import Validator
 from datura.requests.miner_requests import ExecutorSSHInfo
 from services.executor_rollout import (
+    PREVIOUS_RELEASE_CURRENT_CYCLES,
     ROLLOUT_FAILURE_REASONS,
     ExecutorRolloutTracker,
     RolloutWindow,
@@ -382,49 +383,54 @@ def test_an_ssh_drop_under_the_port_probe_during_the_rollout_is_withheld() -> No
     assert rollout_grace_reason(still_on_old, _open_window(), J1) == "PORT_VERIFY_FAILED"
 
 
-# --- DAH-6560: the release just replaced reads CURRENT for 8 cycles ---------------------------
+# --- DAH-6560/DAH-6845: the release just replaced reads CURRENT for PREVIOUS_RELEASE_CURRENT_CYCLES ---------------------------
 
 NEWER = "sha256:" + "d" * 64
+G = 16  # DAH-6845: written out, so a constant set back to 8 fails the tests below
+
+
+def test_the_previous_release_reads_current_for_16_cycles() -> None:
+    assert PREVIOUS_RELEASE_CURRENT_CYCLES == G
 
 
 @pytest.mark.asyncio
-async def test_the_previous_release_reads_current_through_cycle_8_and_the_verdict_window_stays_at_2() -> None:
+async def test_the_previous_release_reads_current_through_its_grace_and_the_verdict_window_stays_at_2() -> None:
     """Regression: the OUTDATED card ended with the 2-cycle verdict window, while 4-31 nodes per release
     were still on the previous image then; withholding verdicts longer would trip the 1-hour inactive sweep."""
     tracker = _tracker(_FakeRedis())
     await tracker.observe(OLD, J0 - BPC, now=T0)
 
     seen = []
-    for cycle in range(1, 10):  # the cycle the change is seen is cycle 1
+    for cycle in range(1, G + 2):  # the cycle the change is seen is cycle 1
         window = await tracker.observe(NEW, J0 + (cycle - 1) * BPC, now=T0)
         job_block = J0 + (cycle - 1) * BPC
         seen.append((cycle, window.previous_reads_current(job_block), window.covers(job_block)))
 
-    assert seen == [(c, c <= 8, c <= 2) for c in range(1, 10)]
+    assert seen == [(c, c <= G, c <= 2) for c in range(1, G + 2)]
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("push", [3, 5])
-async def test_a_second_release_inside_the_8_cycles_gives_its_previous_release_a_fresh_grace(push) -> None:
+async def test_a_second_release_inside_the_grace_gives_its_previous_release_a_fresh_grace(push) -> None:
     tracker = _tracker(_FakeRedis())
     await tracker.observe(OLD, J0 - BPC, now=T0)
     for cycle in range(1, push):
         await tracker.observe(NEW, J0 + (cycle - 1) * BPC, now=T0)
 
     seen = []
-    for cycle in range(push, push + 9):  # NEWER is pushed in cycle `push`, its own cycle 1
+    for cycle in range(push, push + G + 1):  # NEWER is pushed in cycle `push`, its own cycle 1
         window = await tracker.observe(NEWER, J0 + (cycle - 1) * BPC, now=T0)
         job_block = J0 + (cycle - 1) * BPC
         seen.append((cycle, window.previous_digest, window.previous_reads_current(job_block), window.covers(job_block)))
 
-    # NEW, the release just replaced, reads CURRENT for 8 cycles from the push; the verdict window keeps its
+    # NEW, the release just replaced, reads CURRENT for G cycles from the push; the verdict window keeps its
     # own rules: not reopened in cycle 3 (no uncovered cycle has published yet), a fresh 2 cycles in cycle 5
     reopened = push >= 5
-    assert seen == [(c, NEW, c < push + 8, reopened and c < push + 2) for c in range(push, push + 9)]
+    assert seen == [(c, NEW, c < push + G, reopened and c < push + 2) for c in range(push, push + G + 1)]
 
 
 @pytest.mark.asyncio
-async def test_a_second_release_keeps_the_release_before_it_current_through_its_own_cycle_8() -> None:
+async def test_a_second_release_keeps_the_release_before_it_current_through_its_own_grace() -> None:
     """Regression (18 Nov): v1.188 then v1.189 two cycles apart; nodes still on v1.187 read OUTDATED in
     the cycle v1.189 was seen, because only the release just replaced kept its grace."""
     tracker = _tracker(_FakeRedis())
@@ -433,13 +439,13 @@ async def test_a_second_release_keeps_the_release_before_it_current_through_its_
     await tracker.observe(NEW, J0 + BPC, now=T0)
 
     seen = []
-    for cycle in range(3, 12):  # NEWER pushed in cycle 3
+    for cycle in range(3, G + 4):  # NEWER pushed in cycle 3
         job_block = J0 + (cycle - 1) * BPC
         window = await tracker.observe(NEWER, job_block, now=T0)
         seen.append((cycle, OLD in window.earlier_reading_current(job_block), window.previous_reads_current(job_block)))
 
-    # OLD: its own 8 cycles counted from cycle 1; NEW (now previous): 8 cycles from cycle 3
-    assert seen == [(c, c <= 8, c <= 10) for c in range(3, 12)]
+    # OLD: its own G cycles counted from cycle 1; NEW (now previous): G cycles from cycle 3
+    assert seen == [(c, c <= G, c <= G + 2) for c in range(3, G + 4)]
 
 
 @pytest.mark.asyncio
