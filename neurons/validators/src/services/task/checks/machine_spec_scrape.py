@@ -13,6 +13,7 @@ from typing import Any, Literal
 from services import executor_payload
 from services.file_encrypt_service import ORIGINAL_KEYS
 from services.gpu_spec_table import classify_gpu_model, list_sxm_on_pcie_adapter_as_pcie
+from services.nvidia_devices import read_kernel_gpu_view
 
 from core.config import settings
 from core.utils import _m, get_extra_info
@@ -45,6 +46,10 @@ FALLBACK_UPLOAD_ATTEMPTS = 1
 LIUMD_SPECS_READ_TIMEOUT_SECONDS = 180
 LIUMD_SPECS_FALLBACK_RESERVE_SECONDS = 90
 LIUMD_SPECS_MIN_READ_SECONDS = 5.0
+# reasons a container's own read cannot settle: the card list, or a card source it could not see
+_KERNEL_VIEW_REASONS = frozenset(
+    {"nvidia_module_missing", "proc_driver_missing", "proc_source_missing", "nvml_source_missing"}
+)
 
 # The scrape says only two things on stdout: a Fernet token when it worked, and a JSON object
 # with an "error" key when it ran but had nothing to report. Every Fernet token is base64url of
@@ -103,15 +108,45 @@ def normalize_liumd_specs(raw: dict[str, Any]) -> dict[str, Any]:
 
 
 def _normalize_gpu_details(gpu_details: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return [
-        {
-            **detail,
-            "name": classify_gpu_model(detail.get("name"), detail.get("capacity")),
-        }
-        if detail.get("name")
-        else detail
-        for detail in gpu_details
-    ]
+    normalized: list[dict[str, Any]] = []
+    for detail in gpu_details:
+        name = detail.get("name")
+        if isinstance(name, str) and name:
+            detail = {**detail, "name": classify_gpu_model(name, detail.get("capacity"))}
+        elif name is not None and not isinstance(name, str):
+            detail = {**detail, "name": None}
+        normalized.append(detail)
+    return normalized
+
+
+def _identity_cards(block: Any) -> list[dict[str, Any]]:
+    cards = block.get("cards") if isinstance(block, dict) else None
+    return [card for card in cards if isinstance(card, dict)] if isinstance(cards, list) else []
+
+
+async def _identity_kernel_uuids(ctx: Context, cards: list[dict[str, Any]]) -> list[str] | None:
+    """The container's own kernel card list, else the host's through PID 1's root."""
+    if ctx.ssh is None:
+        return None
+    wanted = {
+        str(card.get("uuid")).strip().lower()
+        for card in cards
+        if isinstance(card, dict) and card.get("uuid")
+    }
+    container: list[str] | None = None
+    for host_view in (False, True):
+        try:
+            view = await read_kernel_gpu_view(ctx.ssh, host_view=host_view)
+        except Exception:
+            continue
+        uuids = [uuid for uuid in view.uuids or [] if str(uuid).strip()]
+        if not uuids:
+            continue
+        if not host_view:
+            container = uuids
+        if not wanted or wanted <= {str(uuid).strip().lower() for uuid in uuids}:
+            return uuids
+    return container
 
 
 def _decrypt_payload(ctx: Context, stdout: str) -> str:
@@ -522,6 +557,16 @@ class MachineSpecScrapeCheck:
             len(raw_gpu_details),
             claimed_model=raw_gpu_details[0].get("name"),
         )
+        if _KERNEL_VIEW_REASONS & set(identity["reasons"]):
+            block = specs.get("gpu_identity")
+            kernel_uuids = await _identity_kernel_uuids(ctx, _identity_cards(block))
+            if kernel_uuids:
+                identity = evaluate_gpu_identity(
+                    block,
+                    len(raw_gpu_details),
+                    claimed_model=raw_gpu_details[0].get("name"),
+                    kernel_uuids=kernel_uuids,
+                )
         mode = settings.VALIDATOR_LIUMD_EVIDENCE_MODE
         log_gpu_identity(ctx, identity, mode)
         if enforced(mode, identity):

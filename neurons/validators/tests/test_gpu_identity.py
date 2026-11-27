@@ -95,6 +95,44 @@ def test_the_card_count_must_match_the_scrape_claim():
     assert "extra_card" in _reasons(_report(_card(0), _card(1)), 1)
 
 
+def test_a_card_only_the_kernel_names_is_the_accepted_superset():
+    block = _report(_card(0), _card(1, nvml=False))
+
+    assert _reasons(block, 1, kernel_uuids=["GPU-0", "GPU-1"]) == []
+
+
+def test_a_card_only_the_kernel_names_needs_the_kernel_read():
+    block = _report(_card(0), _card(1, nvml=False))
+
+    assert "extra_card" not in _reasons(block, 1)
+    assert "nvml_source_missing" in _reasons(block, 1)
+
+
+def test_a_card_the_kernel_does_not_name_is_still_a_missing_source():
+    block = _report(_card(0), _card(1, nvml=False))
+
+    assert "nvml_source_missing" in _reasons(block, 1, kernel_uuids=["GPU-0"])
+
+
+def test_a_container_without_the_driver_procfs_is_accepted_on_the_kernel_view():
+    block = _report(_card(proc=False), proc_driver=False)
+
+    assert {"proc_driver_missing", "proc_source_missing"} <= set(_reasons(block, 1))
+    assert _reasons(block, 1, kernel_uuids=["GPU-0"]) == []
+
+
+def test_a_masked_module_and_procfs_are_accepted_on_the_kernel_view():
+    block = _report(_card(), module=False, proc_driver=False)
+
+    assert _reasons(block, 1, kernel_uuids=["GPU-0"]) == []
+
+
+def test_a_non_text_claimed_model_is_not_an_exception():
+    judged = evaluate_gpu_identity(_report(_card()), 1, claimed_model=7)
+
+    assert judged["reasons"] == []
+
+
 def test_a_duplicate_uuid_or_pci_is_a_mismatch():
     assert "duplicate_uuid" in _reasons(
         _report(_card(0, uuid="GPU-1"), _card(1, uuid="GPU-1")), 2

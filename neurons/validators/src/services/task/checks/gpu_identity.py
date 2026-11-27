@@ -83,6 +83,7 @@ def evaluate_gpu_identity(
     claimed_count: Any,
     *,
     claimed_model: str | None = None,
+    kernel_uuids: list[str] | None = None,
 ) -> dict[str, Any]:
     """The validator's own verdict on the scrape's identity block. Defensive: junk is a mismatch,
     never an exception.
@@ -90,10 +91,22 @@ def evaluate_gpu_identity(
     `reasons` is the stable code set used by the check and the event. `details` is the
     operator log: card index, UUID, PCI and the two values that disagreed. It is never put in
     the event, so a miner cannot read our internals from the backend.
+
+    `kernel_uuids` is the validator's own kernel card list, read when the scrape's container
+    could not supply one (DAH-6273). A card it names is real whether or not the block's NVML or
+    procfs source saw it, so those missing sources are not reasons; a card it does not name is
+    the only kind that can be an extra card.
     """
     block = _as_dict(identity)
     cards_value = block.get("cards")
     claimed = _as_int(claimed_count)
+    kernel = {str(uuid).strip().lower() for uuid in kernel_uuids or [] if str(uuid).strip()}
+
+    def kernel_names(card: dict[str, Any]) -> bool:
+        uuid = _as_text(card.get("uuid"))
+        return bool(kernel) and uuid is not None and uuid.lower() in kernel
+
+    claimed_model = _as_text(claimed_model)
     judged: dict[str, Any] = {
         "present": isinstance(cards_value, list),
         "claimed_count": claimed,
@@ -112,6 +125,7 @@ def evaluate_gpu_identity(
 
     cards = [_as_dict(card) for card in cards_value if isinstance(card, dict)]
     judged["evidence_count"] = len(cards)
+    kernel_names_all = bool(kernel) and bool(cards) and all(kernel_names(card) for card in cards)
     reasons: list[str] = []
     details: list[str] = []
 
@@ -122,14 +136,15 @@ def evaluate_gpu_identity(
         if detail not in details:
             details.append(detail)
 
-    if not judged["nvidia_module_present"]:
+    if not judged["nvidia_module_present"] and not kernel_names_all:
         add("nvidia_module_missing", "nvidia kernel module is not present")
-    if not judged["proc_driver_present"]:
+    if not judged["proc_driver_present"] and not kernel_names_all:
         add("proc_driver_missing", "/proc/driver/nvidia/gpus is not readable")
     if claimed is not None and len(cards) < claimed:
         add("missing_card", f"claimed {claimed} cards, evidence has {len(cards)}")
-    if claimed is not None and len(cards) > claimed:
-        add("extra_card", f"claimed {claimed} cards, evidence has {len(cards)}")
+    nvml_cards = sum(1 for card in cards if _as_dict(_as_dict(card.get("sources")).get("nvml")))
+    if claimed is not None and nvml_cards > claimed:
+        add("extra_card", f"claimed {claimed} cards, nvml names {nvml_cards}")
     for value, indexes in _duplicate_groups(cards, "uuid"):
         add("duplicate_uuid", f"duplicate uuid {value} on cards {indexes}")
     for value, indexes in _duplicate_groups(cards, "pci"):
@@ -144,9 +159,9 @@ def evaluate_gpu_identity(
         nvml = _as_dict(sources.get("nvml"))
         proc = _as_dict(sources.get("proc"))
         sysfs = _as_dict(sources.get("sysfs"))
-        if not nvml:
+        if not nvml and not kernel_names(card):
             add("nvml_source_missing", f"{label}: nvml source missing")
-        if not proc:
+        if not proc and not kernel_names(card):
             add("proc_source_missing", f"{label}: proc source missing")
         if not sysfs:
             add("sysfs_source_missing", f"{label}: sysfs source missing")
@@ -172,7 +187,7 @@ def evaluate_gpu_identity(
                 f"{label}: /dev/nvidia{minor if minor is not None else '<minor>'} missing",
             )
         model = _as_text(card.get("model"))
-        if claimed_model and model and model.lower() != claimed_model.strip().lower():
+        if claimed_model and model and model.lower() != claimed_model.lower():
             add("claimed_model_mismatch", f"{label}: model {model!r}, claimed {claimed_model!r}")
 
     judged["reasons"] = reasons
