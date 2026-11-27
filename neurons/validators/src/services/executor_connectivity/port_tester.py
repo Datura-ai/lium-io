@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import resource
 import statistics
 import threading
 import time
@@ -18,6 +19,13 @@ logger = logging.getLogger(__name__)
 PROBE_TIMEOUT = aiohttp.ClientTimeout(sock_connect=3, sock_read=3)
 # a node's answer is "<token>:<port>"; reading more than this lets a node grow the validator's memory
 PROBE_BODY_LIMIT = 256
+# Sockets the probes may hold at once, in total and per node batch. A wave probes every node's ports together, and
+# with no bound it opened them all at once and ran the validator out of file descriptors (Errno 24, 27 Nov), which
+# failed its other sockets too. The total stays a quarter of the soft limit so the rest of the validator keeps its own.
+_FD_SOFT_LIMIT = resource.getrlimit(resource.RLIMIT_NOFILE)[0]
+MAX_PROBE_SOCKETS = 2048 if _FD_SOFT_LIMIT == resource.RLIM_INFINITY else min(2048, _FD_SOFT_LIMIT // 4)
+# one node's dropped probes hold at most this many, so the other nodes' probes still find a socket
+MAX_PROBE_SOCKETS_PER_NODE = 64
 
 
 class PortTester:
@@ -31,6 +39,9 @@ class PortTester:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._session: aiohttp.ClientSession | None = None  # touched only on the probe loop
         self._start_lock = threading.Lock()
+        # created and used on the probe loop only; a probe waits here before it opens its socket, and the probe
+        # budget (per connect and per read) starts only after that, so waiting never fails a port
+        self._sockets: asyncio.Semaphore | None = None
 
     def _probe_loop(self) -> asyncio.AbstractEventLoop:
         with self._start_lock:
@@ -49,9 +60,15 @@ class PortTester:
         return await self._on_probe_loop(self._probe(host, port, token))
 
     async def _probe(self, host: str, port: PortPair, token: str) -> bool:
+        if self._sockets is None:
+            self._sockets = asyncio.Semaphore(MAX_PROBE_SOCKETS)
+        async with self._sockets:
+            return await self._probe_unbounded(host, port, token)
+
+    async def _probe_unbounded(self, host: str, port: PortPair, token: str) -> bool:
         if self._session is None:
-            # no socket bound shared across nodes: one node's dropped probes would hold it for their whole
-            # budget and every other node's probes would queue behind them
+            # the bound is the semaphores (per node in `test_many`, in total in `_probe`): a connector limit is one
+            # queue for every node, so one node's dropped probes would hold it for their whole budget and the rest wait
             self._session = aiohttp.ClientSession(connector=public_host_connector(limit=0, force_close=True))
         url = f"http://{host}:{port.external}/"
         expected = f"{token}:{port.internal}"
@@ -88,15 +105,18 @@ class PortTester:
         """Test multiple ports concurrently."""
         durations: list[float] = []
 
-        async def timed(port: PortPair) -> bool:
-            started = time.monotonic()
-            try:
-                return await self._probe(host, port, token)
-            finally:
-                durations.append(time.monotonic() - started)
+        async def timed(node: asyncio.Semaphore, port: PortPair) -> bool:
+            # per call, not per host: several nodes can share one address
+            async with node:
+                started = time.monotonic()
+                try:
+                    return await self._probe(host, port, token)
+                finally:
+                    durations.append(time.monotonic() - started)
 
         async def probe_all() -> list[bool]:
-            return await asyncio.gather(*[timed(p) for p in ports])
+            node = asyncio.Semaphore(MAX_PROBE_SOCKETS_PER_NODE)
+            return await asyncio.gather(*[timed(node, p) for p in ports])
 
         wall_started = time.monotonic()
         results = await self._on_probe_loop(probe_all())
