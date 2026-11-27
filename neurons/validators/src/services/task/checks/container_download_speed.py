@@ -4,7 +4,6 @@ import hashlib
 import json
 import logging
 import shlex
-import statistics
 import time
 from dataclasses import asdict, dataclass, field, replace
 from typing import Any, NamedTuple
@@ -60,11 +59,6 @@ _CONTROL_TIMEOUT_SECONDS = 10
 _TAIL_CHARS = 200
 # busybox timeout's TERM/KILL exits: the fetch ran out of time, whatever it read by then is the reading
 _TIMEOUT_EXITS = frozenset({124, 143, 137})
-# DAH-6239: the listing's in-pod download figure, sent in the specs on every cycle that reads the state (the backend
-# keeps only the latest specs): the median of the last MEDIAN_OF readings' best endpoint, and when the newest was taken
-SPECS_KEY = "container_download_mbps"
-SPECS_MEASURED_AT_KEY = "container_download_measured_at"
-MEDIAN_OF = 5
 # the container could not reach the endpoint at all: a renter's pip/hf download fails the same way
 NODE_SIDE_ERRORS = frozenset({"dns_failed", "unreachable", "timeout", "connection_reset"})
 
@@ -279,8 +273,6 @@ class _State:
     # failing readings in a row taken on the rentals bridge. Only these are enforced: a default-bridge reading (a
     # node with no rental yet) restarts the count, and a state saved without the field starts from 0.
     failing_readings_on_rentals_network: int = 0
-    # (best endpoint Mbps, taken at) of the last MEDIAN_OF readings that measured an endpoint; oldest first
-    recent_best: list[tuple[float, float]] = field(default_factory=list)
 
     def next_due_at(self) -> float:
         if self.failures_in_a_row > 0:
@@ -297,7 +289,6 @@ class _State:
                 readings=[EndpointReading(**r) for r in data.get("readings") or []],
                 measured=bool(data.get("measured")),
                 failing_readings_on_rentals_network=int(data.get("failing_readings_on_rentals_network", 0)),
-                recent_best=[(float(mbps), float(at)) for mbps, at in data.get("recent_best") or []],
             )
         except (TypeError, ValueError, KeyError, AttributeError):
             return None
@@ -322,8 +313,7 @@ class ContainerDownloadSpeedCheck:
     RETRY_SECONDS after the first) are the finding: a fail (CONTAINER_DOWNLOAD_SLOW, score 0) that stands
     until a reading passes, or CONTAINER_DOWNLOAD_SLOW_OBSERVED (logged only) when a failing reading in the
     streak was not taken on the rentals network. Idle nodes only (no pod, no filler: both would share the link), once per
-    CONTAINER_DOWNLOAD_SPEED_INTERVAL_HOURS at a per-node phase. Every cycle that reads the state sends the in-pod figure
-    the listing shows (specs[SPECS_KEY], DAH-6239).
+    CONTAINER_DOWNLOAD_SPEED_INTERVAL_HOURS at a per-node phase.
     """
 
     check_id = "executor.validate.container_download_speed"
@@ -356,7 +346,7 @@ class ContainerDownloadSpeedCheck:
             state = _State(at=now - phase_offset_seconds(ctx.executor.uuid))
             await self._save(ctx, key, state)
         if now < state.next_due_at():
-            return self._with_figure(ctx, state, self._verdict(ctx, state, probed=False))
+            return self._verdict(ctx, state, probed=False)
 
         readings = await self._measure(ctx)
         judgement = await self._judge(ctx, readings)
@@ -369,19 +359,12 @@ class ContainerDownloadSpeedCheck:
             failures, failing_on_rentals = state.failures_in_a_row, state.failing_readings_on_rentals_network
         else:
             failures = failing_on_rentals = 0
-        # the listed figure is a download speed: the upload reading is not one
-        measured_mbps = [r.mbps for r in readings if r.mbps is not None and r.endpoint not in _UPLOAD_NAMES]
-        recent_best = state.recent_best
-        # the listing's figure is what a pod gets: a reading off the rentals network (the fallback) is not one
-        if measured_mbps and on_rentals:
-            recent_best = [*recent_best, (max(measured_mbps), now)][-MEDIAN_OF:]
         state = _State(
             at=now,
             failures_in_a_row=failures,
             readings=readings,
             measured=not no_verdict,
             failing_readings_on_rentals_network=failing_on_rentals,
-            recent_best=recent_best,
         )
         logger.info(
             _m(
@@ -401,19 +384,7 @@ class ContainerDownloadSpeedCheck:
             )
         )
         await self._save(ctx, key, state)
-        return self._with_figure(ctx, state, self._verdict(ctx, state, probed=True))
-
-    @staticmethod
-    def _with_figure(ctx: Context, state: _State, result: CheckResult) -> CheckResult:
-        """DAH-6239: the in-pod download figure the listing shows next to the host-side speed test."""
-        if not state.recent_best:
-            return result
-        specs = {
-            **ctx.state.specs,
-            SPECS_KEY: round(statistics.median(mbps for mbps, _ in state.recent_best), 1),
-            SPECS_MEASURED_AT_KEY: state.recent_best[-1][1],
-        }
-        return result.model_copy(update={"updates": {**result.updates, "state": replace(ctx.state, specs=specs)}})
+        return self._verdict(ctx, state, probed=True)
 
     async def _measure(self, ctx: Context) -> list[EndpointReading]:
         result = await ctx.runner.run(
@@ -497,7 +468,6 @@ class ContainerDownloadSpeedCheck:
             "readings": [asdict(r) for r in state.readings],
             "measured": state.measured,
             "failing_readings_on_rentals_network": state.failing_readings_on_rentals_network,
-            "recent_best": state.recent_best,
         }
         try:
             await ctx.services.redis.set(key, json.dumps(payload), ex=_REDIS_TTL_SECONDS)

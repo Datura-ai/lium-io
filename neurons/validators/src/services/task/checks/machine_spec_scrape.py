@@ -22,8 +22,6 @@ from ..messages import MessageTemplate, render_message
 from ..models import ValidationEvent
 from ..pipeline import CheckResult, Context
 from ..runner import SSHCommandResult
-from .container_download_speed import SPECS_KEY as IN_POD_DOWNLOAD_KEY
-from .container_download_speed import SPECS_MEASURED_AT_KEY as IN_POD_DOWNLOAD_AT_KEY
 from .gpu_loss_hold import GpuLossHoldCheck
 from .rented_gpu_drop import RentedGpuDropCheck, missing_gpus_under_reset
 from .task_time import task_seconds_left
@@ -558,9 +556,6 @@ class MachineSpecScrapeCheck:
     ) -> CheckResult:
         specs.pop("port_verify_first_miss", None)
         specs.pop("split_disk", None)
-        # the in-pod download figure is the validator's own reading (ContainerDownloadSpeedCheck), never the node's
-        specs.pop(IN_POD_DOWNLOAD_KEY, None)
-        specs.pop(IN_POD_DOWNLOAD_AT_KEY, None)
         vloopback = specs.pop("vloopback_check", None)
         gpu_info = specs.get("gpu", {}) or {}
         gpu_count = gpu_info.get("count", 0) or 0
