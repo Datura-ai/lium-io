@@ -514,6 +514,7 @@ async def _card_matmul_sample(
                 sample["no_numbers"] = True
         else:
             sample["error_kind"] = _sample_error_kind(result)
+            sample["wrong_answer"] = _probe_gave_wrong_answer(result)
     except Exception as exc:
         sample.update(passed=False, timed_out=False, error=str(exc), error_kind="validator_error")
     return found
@@ -594,7 +595,8 @@ async def _judge_due_card(
     ctx: Context, specs: dict, card: int, sample: dict, mismatches: list[GpuModelMismatch]
 ) -> list[GpuModelMismatch]:
     """Judge the card whose filler sample failed, on idle cards after the stop (DAH-6332 review). A run with no
-    verdict keeps the node on the once-a-day pace instead of the week a verdict earns."""
+    verdict keeps the node on the once-a-day pace instead of the week a verdict earns; a proven wrong answer also
+    fails it this cycle, as on card 0."""
     if card >= len((specs.get("gpu") or {}).get("details") or []):
         return mismatches  # the specs no longer list that card: the full check's verdict stands
     found = await _card_matmul_sample(ctx, specs, card, sample)
@@ -605,6 +607,8 @@ async def _judge_due_card(
     _, stored, measured_ok, read_ok = await _read_gpu_model_verdict(ctx)
     if read_ok:
         await _store_gpu_model_verdict(ctx, stored, GPU_MODEL_NO_VERDICT_TTL_SECONDS, measured_ok)
+    if sample.get("wrong_answer"):
+        return [*mismatches, work_proof_failed(specs, card)]
     return mismatches
 
 

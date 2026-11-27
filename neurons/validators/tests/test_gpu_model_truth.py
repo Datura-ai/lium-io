@@ -843,3 +843,47 @@ async def test_the_card_whose_sample_failed_is_judged_after_the_stop(context_fac
     assert result.passed is passed
     assert result.event.what_we_saw["stopped_fillers_for_full_check"] == ["filler_active"]
     assert redis.ttl[_verdict_key()] == capability.GPU_MODEL_VERDICT_TTL_SECONDS
+
+
+class _DueCardService(SamplingValidationService):
+    """Card 0 answers right in the full check; the run pinned to the due card returns `due_card`."""
+
+    def __init__(self, due_card: ValidationResult):
+        super().__init__(result=ValidationResult(success=True, metrics=REAL_H100[1]))
+        self.due_card = due_card
+
+    async def validate_gpu_model_and_process_job(self, *, gpu_uuid=None, **kwargs):
+        result = await super().validate_gpu_model_and_process_job(gpu_uuid=gpu_uuid, **kwargs)
+        return self.due_card if gpu_uuid == "GPU-1" else result
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "due_card, passed",
+    [(WRONG_UUID, False), (NO_ROOM, True), (TIMED_OUT, True), (VALIDATOR_ERROR, True)],
+    ids=["wrong_uuid", "empty_uuid", "timeout", "validator_error"],
+)
+async def test_after_the_stop_only_a_wrong_answer_from_the_due_card_fails_the_node(
+    context_factory, sample_never_due, due_card, passed
+):
+    # review: card 0 passes the full check; a wrong UUID from the marked card fails the node as on card 0
+    redis = FakeRedis()
+    service = _DueCardService(due_card)
+    ctx = context_factory(
+        services=build_services(validation=service, redis=redis),
+        state=build_state(
+            specs=TWO_H100,
+            rented_data=RentedExecutorsResponse(
+                executors={}, banned_guids=[], filler_containers_by_executor={"executor-123": "filler_active"}
+            ),
+        ),
+    )
+    await redis.set(capability._full_check_due_key(ctx), "1")
+
+    result = await CapabilityCheck().run(_lium_filler(ctx))
+
+    assert service.gpu_uuids == [None, "GPU-1"]
+    assert result.passed is passed
+    if not passed:
+        assert result.event.reason_code == Msg.GPU_WORK_PROOF_FAILED.reason
+    assert redis.ttl[_verdict_key()] == capability.GPU_MODEL_NO_VERDICT_TTL_SECONDS
