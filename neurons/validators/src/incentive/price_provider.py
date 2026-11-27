@@ -17,6 +17,7 @@ from bittensor import AsyncSubtensor  # noqa: F401  # unused here; tests/test_pr
 from core.config import settings
 from core.utils import get_logger, _m
 from clients.subtensor_client import SubtensorClient
+from services.node_host import trusted_session
 from tenacity import before_sleep_log, retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 # Default fallback values when fetch/query fails and no cache exists
@@ -32,7 +33,7 @@ class CoinbaseProvider:
     name = "Coinbase"
 
     async def get_rate(self) -> float:
-        async with aiohttp.ClientSession() as session:
+        async with trusted_session() as session:
             async with session.get(
                 "https://api.coinbase.com/v2/prices/TAO-USD/spot",
                 timeout=10,
@@ -46,7 +47,7 @@ class CoinGeckoProvider:
     name = "CoinGecko"
 
     async def get_rate(self) -> float:
-        async with aiohttp.ClientSession() as session:
+        async with trusted_session() as session:
             async with session.get(
                 "https://api.coingecko.com/api/v3/coins/bittensor",
                 timeout=10,
@@ -61,7 +62,7 @@ class CryptoCompareProvider:
     name = "CryptoCompare"
 
     async def get_rate(self) -> float:
-        async with aiohttp.ClientSession() as session:
+        async with trusted_session() as session:
             async with session.get(
                 "https://min-api.cryptocompare.com/data/price?fsym=TAO&tsyms=USD",
                 timeout=10,

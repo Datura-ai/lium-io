@@ -41,6 +41,7 @@ from datura.validator_trust import (
 )
 
 from config import WATCHTOWER_ENDPOINT_URL, WATCHTOWER_USER_AGENT
+from dial import trusted_session
 from logger import get_logger
 
 logger = get_logger(__name__)
@@ -65,7 +66,7 @@ async def _fetch_json(url: str, body: dict | None) -> dict | None:
     # no decompression: the cap counts the bytes as they arrive, so a small compressed reply cannot expand past it
     timeout = aiohttp.ClientTimeout(total=FETCH_TIMEOUT_SECONDS)
     headers = {"Accept-Encoding": "identity", "User-Agent": WATCHTOWER_USER_AGENT}
-    async with aiohttp.ClientSession(timeout=timeout, auto_decompress=False) as session:
+    async with trusted_session(timeout=timeout, auto_decompress=False) as session:
         async with session.request("GET" if body is None else "POST", url, json=body, headers=headers) as response:
             if response.status == HTTPStatus.NOT_FOUND:
                 return None

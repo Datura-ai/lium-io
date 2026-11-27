@@ -34,6 +34,7 @@ from tenacity import retry, retry_if_result, stop_after_attempt, wait_fixed
 
 from clients.validator_portal_api import portal_owner_hotkeys
 from core.utils import _m, get_extra_info
+from services.node_host import trusted_session
 
 logger = logging.getLogger(__name__)
 
@@ -106,7 +107,7 @@ class HealthCheckTimedOut(Exception):
 class BackendClient:
     """HTTP client with session pooling and validator signature headers."""
 
-    _session: ClassVar[aiohttp.ClientSession | None] = None
+    _session: ClassVar[aiohttp.ClientSession | None] = None  # type only  # noqa: TID251
     _session_lock: ClassVar[asyncio.Lock] = asyncio.Lock()
 
     # DAH-2360: writing to a stale pooled keep-alive connection fails with
@@ -130,18 +131,17 @@ class BackendClient:
         self.keypair = keypair
 
     @classmethod
-    async def get_session(cls) -> aiohttp.ClientSession:
+    async def get_session(cls) -> aiohttp.ClientSession:  # type only  # noqa: TID251
         if cls._session is None or cls._session.closed:
             async with cls._session_lock:
                 if cls._session is None or cls._session.closed:
-                    connector = aiohttp.TCPConnector(
-                        limit=100,
-                        limit_per_host=10,
-                        keepalive_timeout=cls.KEEPALIVE_TIMEOUT_SECONDS,
-                    )
-                    cls._session = aiohttp.ClientSession(
+                    cls._session = trusted_session(
+                        connector_kwargs=dict(
+                            limit=100,
+                            limit_per_host=10,
+                            keepalive_timeout=cls.KEEPALIVE_TIMEOUT_SECONDS,
+                        ),
                         timeout=aiohttp.ClientTimeout(total=None),
-                        connector=connector,
                     )
         return cls._session
 

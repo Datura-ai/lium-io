@@ -32,6 +32,7 @@ import xxhash
 from Crypto.Hash import keccak
 
 from core.config import settings, shared_client
+from services.node_host import trusted_session
 
 RPC_URLS = {
     "local": "http://127.0.0.1:9944",
@@ -167,7 +168,7 @@ async def _read_bounded(response: aiohttp.ClientResponse, limit: int) -> bytes:
 async def _post_batch(batch: list[dict[str, Any]]) -> list[dict[str, Any]]:
     url = settings.SUBTENSOR_EVM_RPC_URL or RPC_URLS[settings.BITTENSOR_NETWORK]
     timeout = aiohttp.ClientTimeout(total=settings.COLLATERAL_STATUS_TIMEOUT_SECONDS)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
+    async with trusted_session(timeout=timeout) as session:
         async with session.post(url, json=batch) as response:
             response.raise_for_status()
             body = await _read_bounded(response, MAX_RPC_ANSWER_BYTES)

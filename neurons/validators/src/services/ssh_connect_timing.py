@@ -50,7 +50,7 @@ import asyncssh
 from core.config import settings
 from core.utils import _m, get_extra_info
 from payload_models.payloads import now_ms
-from services.node_host import public_host_sock
+from services.node_host import node_ssh_connect
 
 logger = logging.getLogger(__name__)
 
@@ -147,15 +147,10 @@ async def connect_with_phase_timing(
     marks: dict = {}
     host = connect_kwargs.get("host")
     t0 = now_ms()
-    # a hostname is dialled at the address it was validated against (no second lookup)
-    connect_kwargs.update(
-        await public_host_sock(host, connect_kwargs.get("port", 22), connect_kwargs.get("connect_timeout"))
-    )
-
-    # Use the `async with` form so cleanup (close + wait_closed) is identical to
-    # a plain `asyncssh.connect`. By the time `__aenter__` returns, the connect
-    # has resolved and the phase callbacks have fired, so the marks are set.
-    async with asyncssh.connect(
+    # node_ssh_connect dials a hostname at the address it was validated against (no second lookup).
+    # By the time it returns, the connect has resolved and the phase callbacks have fired, so the
+    # marks are set; leaving the `async with` closes it like a plain `asyncssh.connect`.
+    async with node_ssh_connect(
         client_factory=lambda: _PhaseTimingSSHClient(marks, log_extra, host),
         **connect_kwargs,
     ) as conn:

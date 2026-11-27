@@ -61,11 +61,24 @@ def _capped(resp) -> str | None:
     return None if len(data) > MAX_BODY else data.decode(errors="replace")
 
 
+# a copy of datura/datura/public_address.py's is_public_address: this Lambda is packaged alone, without datura;
+# tests/test_external_prober_handler.py checks that the two agree
+_NAT64_PREFIX = ipaddress.ip_network("64:ff9b::/96")
+_TUNNEL_PREFIXES = (ipaddress.ip_network("2002::/16"), ipaddress.ip_network("2001::/32"))
+
+
 def _public(host: str) -> bool:
     try:
-        return ipaddress.ip_address(host).is_global
+        ip = ipaddress.ip_address(host.strip("[]").split("%", 1)[0])
     except ValueError:
         return False
+    if ip.version == 6 and any(ip in prefix for prefix in _TUNNEL_PREFIXES):
+        return False
+    if ip.version == 6 and ip.ipv4_mapped:
+        ip = ip.ipv4_mapped
+    elif ip.version == 6 and ip in _NAT64_PREFIX:
+        ip = ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF)
+    return ip.is_global and not ip.is_multicast and not ip.is_reserved and not getattr(ip, "is_site_local", False)
 
 
 def handler(event, context):

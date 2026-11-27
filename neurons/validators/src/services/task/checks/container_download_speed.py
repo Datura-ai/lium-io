@@ -16,6 +16,7 @@ from core.docker_utils import ALPINE_HELPER_IMAGE
 from core.utils import _m, get_extra_info
 from services.redis_service import get_or_adopt_legacy
 from services.rental_docker_sdk import RENTAL_NETWORK_NAME
+from services.node_host import trusted_session
 
 from ..messages import ContainerDownloadSpeedMessages as Msg
 from ..messages import container_network_remediation, render_message
@@ -201,7 +202,7 @@ async def validator_reaches(url: str) -> bool:
     """The validator's own one-byte GET of the endpoint: if it fails too, the node's miss is not the node's."""
     try:
         timeout = aiohttp.ClientTimeout(total=_CONTROL_TIMEOUT_SECONDS)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with trusted_session(timeout=timeout) as session:
             async with session.get(url, headers={"Range": "bytes=0-0"}) as response:
                 return response.status < 400
     except Exception:  # noqa: BLE001 — any failure is "cannot reach"

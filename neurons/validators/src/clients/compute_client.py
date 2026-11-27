@@ -109,6 +109,7 @@ from services.redis_service import (
     resumed_create,
 )
 from clients.handlers.backup_handler import BackupHandler
+from services.node_host import trusted_session
 
 logger = logging.getLogger(__name__)
 
@@ -785,7 +786,7 @@ class ComputeClient:
         """Get executors uptime from compute app."""
         default_log_info = get_extra_info(self.logging_extra)
         start_time = time.time()
-        async with aiohttp.ClientSession() as session:
+        async with trusted_session() as session:
             try:
                 url = f"{self.compute_app_rest_api_uri}/executors"
                 headers = {

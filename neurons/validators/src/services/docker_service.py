@@ -117,7 +117,7 @@ from services.container_cleanup import (
     image_repository,
 )
 from services.cvm_quote_broker import ensure_quote_broker, quote_socket_pod_mount
-from services.node_host import node_owner, public_host_sock
+from services.node_host import node_owner, node_ssh_connect
 from services.default_docker_image_digest_service import fetch_docker_hub_digest
 from services.gpu_power_limit import (
     NVIDIA_SMI_TIMEOUT_SECONDS,
@@ -3600,12 +3600,10 @@ def _host_bounded_command(command: str, host_timeout: float) -> str:
 
 
 async def _ssh_connect_kwargs(executor_info: ExecutorSSHInfo, pkey: Any, known_hosts_policy: Any) -> dict:
-    # a fresh call per connection: public_host_sock pins a name to one dialled socket, which
-    # asyncssh consumes, so the kwargs of one connection cannot open another
+    # node_ssh_connect pins a name to one dialled socket per connection
     return dict(
         host=executor_info.address,
         port=executor_info.ssh_port,
-        **await public_host_sock(executor_info.address, executor_info.ssh_port),
         username=executor_info.ssh_username,
         client_keys=[pkey],
         known_hosts=known_hosts_policy,
@@ -3614,7 +3612,7 @@ async def _ssh_connect_kwargs(executor_info: ExecutorSSHInfo, pkey: Any, known_h
 
 @contextlib.asynccontextmanager
 async def _connect_own_ssh(executor_info: ExecutorSSHInfo, pkey: Any, known_hosts_policy: Any):
-    async with asyncssh.connect(**await _ssh_connect_kwargs(executor_info, pkey, known_hosts_policy)) as own_ssh:
+    async with node_ssh_connect(**await _ssh_connect_kwargs(executor_info, pkey, known_hosts_policy)) as own_ssh:
         yield own_ssh
 
 
@@ -13374,10 +13372,9 @@ class DockerService:
                     if not _is_stale_vloopback_mountpoint_error(str(exc)):
                         raise
                     stale_mount_error = exc
-                async with asyncssh.connect(
+                async with node_ssh_connect(
                     host=executor_info.address,
                     port=executor_info.ssh_port,
-                    **await public_host_sock(executor_info.address, executor_info.ssh_port),
                     username=executor_info.ssh_username,
                     client_keys=[pkey],
                     known_hosts=known_hosts_policy,
@@ -15409,7 +15406,7 @@ class DockerService:
             # the removal and its kill share ssh_client
             connect_ssh = partial(_connect_own_ssh, executor_info, pkey, known_hosts_policy)
             async with (
-                asyncssh.connect(**await _ssh_connect_kwargs(executor_info, pkey, known_hosts_policy)) as ssh_client,
+                node_ssh_connect(**await _ssh_connect_kwargs(executor_info, pkey, known_hosts_policy)) as ssh_client,
                 self.rental_docker_client_factory.connect(
                     executor_info=executor_info,
                     private_key=private_key,
@@ -15667,10 +15664,9 @@ class DockerService:
             )
 
         try:
-            async with asyncssh.connect(
+            async with node_ssh_connect(
                 host=executor_info.address,
                 port=executor_info.ssh_port,
-                **await public_host_sock(executor_info.address, executor_info.ssh_port),
                 username=executor_info.ssh_username,
                 client_keys=[pkey],
                 known_hosts=known_hosts_policy,
@@ -15887,10 +15883,9 @@ class DockerService:
         )
         report: _PodGpuReport | None = None
         try:
-            async with asyncssh.connect(
+            async with node_ssh_connect(
                 host=executor_info.address,
                 port=executor_info.ssh_port,
-                **await public_host_sock(executor_info.address, executor_info.ssh_port),
                 username=executor_info.ssh_username,
                 client_keys=[pkey],
                 known_hosts=known_hosts_policy,

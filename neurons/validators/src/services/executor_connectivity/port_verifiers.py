@@ -4,7 +4,6 @@ import random
 import uuid
 from dataclasses import dataclass, field
 
-import aiohttp
 from asyncssh import SSHClientConnection
 
 from core.docker_utils import bound_host_port
@@ -15,7 +14,7 @@ from services.executor_connectivity.external_probe import ExternalPortProbe
 from services.executor_connectivity.models import BatchResult, ContainerStartResult, PortPair
 from services.executor_connectivity.netcat_script import NetcatScript
 from services.executor_connectivity.port_tester import PortTester
-from services.node_host import public_host_connector
+from services.node_host import node_session
 
 logger = logging.getLogger(__name__)
 
@@ -263,7 +262,7 @@ class BatchVerifier:
                     extra=get_extra_info(log_ctx),
                 )
             )
-            async with aiohttp.ClientSession(connector=public_host_connector(limit=0)) as session:
+            async with node_session(connector_kwargs={"limit": 0}) as session:
                 missed_pending = missed_start is not None
 
                 def missed_ready() -> list[PortPair]:
@@ -378,7 +377,7 @@ class BatchVerifier:
             remaining = [p for p in sample if p not in (reached or [])]
             if not remaining:
                 return reached, []
-            async with aiohttp.ClientSession(connector=public_host_connector(limit=0)) as session:
+            async with node_session(connector_kwargs={"limit": 0}) as session:
                 first_round, _ = await self.port_tester.test_many(session, host, remaining, token, log_ctx)
             return reached, first_round
         finally:
@@ -416,7 +415,7 @@ class FallbackVerifier:
 
         successful, failed = [], []
 
-        async with aiohttp.ClientSession(connector=public_host_connector()) as session:
+        async with node_session() as session:
             for idx, port in enumerate(ports_to_test, 1):
                 token = uuid.uuid4().hex
                 name = f"port_test_seq_{token[:8]}"
@@ -612,7 +611,7 @@ class SemiBatchVerifier:
                 return ok, [*bad, *(port for port in ports if port.internal == busy)]
 
             started = True
-            async with aiohttp.ClientSession(connector=public_host_connector(limit=0)) as session:
+            async with node_session(connector_kwargs={"limit": 0}) as session:
                 return await self.port_tester.test_many(session, host, ports, token, log_ctx)
 
         except Exception as e:

@@ -53,3 +53,35 @@ ignore = [
 "test/**" = ["D", "F403", "F405"]
 # vendored NVML bindings: `from ctypes import *` is how the upstream pynvml module is written
 "neurons/validators/src/miner_jobs/machine_scrape.py" = ["F403", "F405"]
+# the dial helper modules open connections for everyone else (see banned-api below)
+"neurons/validators/src/services/node_host.py" = ["TID251"]
+"neurons/miners/src/services/node_address.py" = ["TID251"]
+"neurons/executor/src/services/dial.py" = ["TID251"]
+"watchtower/src/dial.py" = ["TID251"]
+# copied onto a node and run there, not on a Lium host
+"neurons/validators/src/miner_jobs/**" = ["TID251"]
+# tests build sessions and fake dials directly
+"**/tests/**" = ["TID251"]
+
+# One way to open a connection: a raw constructor outside the dial helper modules is refused, so every call site
+# chooses between an address from our own settings and one an outsider supplies (public only, pinned, no redirects).
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+"aiohttp.ClientSession".msg = "use a dial helper: trusted_session() or the node session (validator services/node_host.py, miner services/node_address.py, executor services/dial.py, watchtower dial.py)"
+"aiohttp.client.ClientSession".msg = "use a dial helper (see aiohttp.ClientSession)"
+"aiohttp.connector.TCPConnector".msg = "use a dial helper (see aiohttp.TCPConnector)"
+"aiohttp.TCPConnector".msg = "use a dial helper (validator services/node_host.py, miner services/node_address.py)"
+"httpx.Client".msg = "use a dial helper (validator services/node_host.py, miner services/node_address.py)"
+"httpx.AsyncClient".msg = "use a dial helper (validator services/node_host.py, miner services/node_address.py)"
+"requests.get".msg = "use a dial helper (trusted_get in executor services/dial.py or watchtower dial.py)"
+"requests.post".msg = "use a dial helper (executor services/dial.py, watchtower dial.py)"
+"requests.put".msg = "use a dial helper (executor services/dial.py, watchtower dial.py)"
+"requests.delete".msg = "use a dial helper (executor services/dial.py, watchtower dial.py)"
+"requests.patch".msg = "use a dial helper (executor services/dial.py, watchtower dial.py)"
+"requests.head".msg = "use a dial helper (executor services/dial.py, watchtower dial.py)"
+"requests.request".msg = "use a dial helper (executor services/dial.py, watchtower dial.py)"
+"requests.Session".msg = "use a dial helper (executor services/dial.py, watchtower dial.py)"
+"requests.session".msg = "use a dial helper (executor services/dial.py, watchtower dial.py)"
+"asyncssh.connect".msg = "use node_ssh_connect (validator services/node_host.py)"
+"asyncio.open_connection".msg = "use open_public_connection (validator services/node_host.py)"
+"socket.create_connection".msg = "use a dial helper (validator services/node_host.py)"
+"paramiko.SSHClient".msg = "dial through a socket from the validator's services/node_host.py (resolve_node_host, dial_validated)"

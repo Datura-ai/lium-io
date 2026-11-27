@@ -32,7 +32,7 @@ from services.redis_service import (
 )
 
 from ...const import MIN_POD_PORT_COUNT, POD_CONTAINER_PREFIX
-from ...node_host import open_public_connection, public_host_sock
+from ...node_host import node_ssh_connect, open_public_connection
 from ..availability import failed_check_event
 from ..messages import NO_OUTBOUND_INTERNET_REMEDIATION, OutboundInternetMessages
 from ..messages import RentalProbeMessages as Msg
@@ -1698,10 +1698,9 @@ async def _login_and_list_gpus(
     while True:
         login.login_attempts += 1
         try:
-            conn = await asyncssh.connect(
+            conn = await node_ssh_connect(
                 host=host,
                 port=port,
-                **await public_host_sock(host, port, _SSH_LOGIN_TIMEOUT_SECONDS),
                 username="root",
                 client_keys=[pkey],
                 known_hosts=None,

@@ -152,7 +152,7 @@ async def _read_capped(response: aiohttp.ClientResponse, limit: int = MAX_EXECUT
     return bytes(body)
 
 
-async def _executor_own_hotkey(session: aiohttp.ClientSession, executor: Executor, deadline: float) -> str | None:
+async def _executor_own_hotkey(session: aiohttp.ClientSession, executor: Executor, deadline: float) -> str | None:  # type only  # noqa: TID251
     """The miner hotkey the executor says it is set up for (its public /miner-identity), None when it does not answer.
 
     Not trusted for anything but picking which owner signature to relay: the executor checks that signature against its

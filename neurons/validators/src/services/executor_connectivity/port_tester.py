@@ -21,7 +21,7 @@ PROBE_BODY_LIMIT = 256
 class PortTester:
     """Tests port connectivity via HTTP. Stateless and easily mockable."""
 
-    async def test_one(self, session: aiohttp.ClientSession, host: str, port: PortPair, token: str) -> bool:
+    async def test_one(self, session: aiohttp.ClientSession, host: str, port: PortPair, token: str) -> bool:  # type only  # noqa: TID251
         """Test single port connectivity via HTTP."""
         url = f"http://{host}:{port.external}/"
         expected = f"{token}:{port.internal}"
@@ -50,7 +50,7 @@ class PortTester:
 
     async def test_many(
         self,
-        session: aiohttp.ClientSession,
+        session: aiohttp.ClientSession,  # type only  # noqa: TID251
         host: str,
         ports: list[PortPair],
         token: str,

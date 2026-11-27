@@ -45,7 +45,7 @@ from datura.requests.validator_requests import (
 # when it is built — a name only the type checker sees leaves every cycle unbuildable
 # (test_rented_machine_check.test_context_annotations_resolve_at_runtime).
 from services.matrix_validation_service import ValidationResult
-from services.node_host import public_host_connector
+from services.node_host import node_session, trusted_session
 from services.verifyx_validation_service import VerifyXResponse
 
 # One definition for both sides (datura, #1339): the executor's payloads/verify.py and
@@ -267,11 +267,6 @@ def _wire_port(value: Any) -> int | None:
     return value if 1 <= value <= 65535 else None
 
 
-def _node_session(**kwargs) -> aiohttp.ClientSession:
-    # the executor's address may be a hostname: it is dialled only at an address checked to be public
-    return aiohttp.ClientSession(connector=public_host_connector(), **kwargs)
-
-
 class LocalVerifyClient:
     """`GET /version` over the executor's API port (`executor_info.port`, where the miner and the
     backend already talk to it), then `POST /verify` through a direct-tcpip channel of the
@@ -281,7 +276,7 @@ class LocalVerifyClient:
         self.keypair = keypair
         self.timeout_s = timeout_s
         self.connect_timeout_s = connect_timeout_s
-        self._session_factory = session_factory or _node_session
+        self._session_factory = session_factory or node_session
 
     @staticmethod
     def base_url(executor_info) -> str:
@@ -347,7 +342,7 @@ class LocalVerifyClient:
             raise LocalVerifyUnavailable("transport", f"tunnel: {type(exc).__name__}: {exc}")
         try:
             # our own loopback end of the SSH tunnel, not the node's address: no node-address check applies
-            async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with trusted_session(timeout=timeout) as session:
                 async with session.post(
                     f"http://{TUNNEL_LISTEN_HOST}:{listener.get_port()}/verify",
                     json=signed,

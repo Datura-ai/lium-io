@@ -13,12 +13,12 @@ import time
 from collections.abc import Callable
 from http import HTTPStatus
 
-import requests
 from cryptography.hazmat.primitives.serialization import load_ssh_public_key
 from pydantic import BaseModel
 
 from core.config import VALIDATOR_SSH_SOURCES, settings
 from dependencies.auth import match_validator_hotkey
+from services.dial import trusted_get
 
 logger = logging.getLogger(__name__)
 
@@ -144,7 +144,7 @@ class SignedSshSources:
             return
         url = settings.COMPUTE_REST_API_URL.rstrip("/") + "/watchtower/ssh-sources"
         try:
-            response = requests.get(url, timeout=SSH_SOURCES_TIMEOUT_SECONDS)
+            response = trusted_get(url, timeout=SSH_SOURCES_TIMEOUT_SECONDS)
             if response.status_code == HTTPStatus.NOT_FOUND:
                 # the backend has no list (endpoint reverted): unpin, as a node that never got one
                 self._sources = ""

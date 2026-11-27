@@ -46,7 +46,7 @@ async def test_install_jupyter_passes_the_pods_volume_encryption(monkeypatch, st
 
     monkeypatch.setattr(docker_service_module.asyncssh, "connect", fake_connect)
     monkeypatch.setattr(docker_service_module.asyncssh, "import_private_key", lambda _: "pkey")
-    monkeypatch.setattr(docker_service_module, "public_host_sock", fake_sock)
+    monkeypatch.setattr("services.node_host.public_host_sock", fake_sock)
     service = _InstallJupyterService(state)
     payload = InstallJupyterServerRequest(
         miner_hotkey="hk",

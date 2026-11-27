@@ -801,7 +801,7 @@ async def _run_reset(service, backend=None, **connect):
     executor_info = MagicMock(address="203.0.113.5", ssh_port=22, tdx_quote=None)
     with patch("services.docker_service.asyncssh.import_private_key"), \
             patch("services.docker_service.require_rental_docker_ssh_host_key"), \
-            patch("services.docker_service.public_host_sock", AsyncMock(return_value={})), \
+            patch("services.node_host.public_host_sock", AsyncMock(return_value={})), \
             patch("services.docker_service.asyncssh.connect", **connect):
         return await _reset_service(service, backend).reset_pod_gpus(payload, executor_info, MagicMock(), "encrypted")
 

@@ -13,6 +13,7 @@ from uuid import UUID
 
 import aiohttp
 import asyncssh
+from services.node_host import trusted_session
 
 from services import executor_payload
 
@@ -767,7 +768,7 @@ async def _report_operation_status(
     for attempt in range(attempts):
         try:
             timeout = aiohttp.ClientTimeout(total=10)
-            async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with trusted_session(timeout=timeout) as session:
                 async with session.put(
                     url,
                     json=payload,

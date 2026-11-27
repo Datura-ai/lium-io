@@ -15,6 +15,7 @@ import aiohttp
 from services.liumd_exec_client import liumd_paths_sh
 
 from core.config import settings
+from services.node_host import trusted_session
 
 ARCH_KEYS = {"x86_64": "x86_64", "amd64": "x86_64", "aarch64": "aarch64", "arm64": "aarch64"}
 TARGET_ARCH = {"x86_64": "x86_64", "aarch64": "aarch64"}
@@ -83,7 +84,7 @@ async def _read_version(ctx: Any) -> LiumdVersion:
 async def _fetch_manifest(url: str, timeout: float) -> tuple[dict[str, Any] | None, str | None]:
     try:
         client_timeout = aiohttp.ClientTimeout(total=timeout)
-        async with aiohttp.ClientSession(timeout=client_timeout) as session:
+        async with trusted_session(timeout=client_timeout) as session:
             async with session.get(url, allow_redirects=False) as response:
                 if response.status != 200:
                     return None, f"manifest fetch status {response.status}"

@@ -7,6 +7,7 @@ import aiohttp
 
 from core.config import settings
 from core.utils import _m, get_extra_info
+from services.node_address import trusted_session
 from protocol.miner_request import AuthenticateRequest
 
 logger = logging.getLogger(__name__)
@@ -165,7 +166,7 @@ class MinerPortalAPI:
         }
 
         timeout = aiohttp.ClientTimeout(total=BULK_FETCH_TIMEOUT_SECONDS)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with trusted_session(timeout=timeout) as session:
             async with session.get(api_url, headers=headers) as resp:
                 if resp.status != 200:
                     text = await resp.text()

@@ -1905,7 +1905,7 @@ def _build_rental_ssh_http_adapter_class(
 
             logging.getLogger("paramiko").setLevel(logging.WARNING)
             parsed_base_url = urllib.parse.urlparse(base_url)
-            self.ssh_client = paramiko.SSHClient()
+            self.ssh_client = paramiko.SSHClient()  # dials the socket dial_validated opened  # noqa: TID251
             self.ssh_params = {
                 "hostname": parsed_base_url.hostname,
                 "port": parsed_base_url.port,

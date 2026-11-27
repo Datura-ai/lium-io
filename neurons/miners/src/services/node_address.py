@@ -1,12 +1,19 @@
-"""HTTP to a node's registered address, never into the miner's own network.
+"""The miner's dial helpers: every outbound HTTP request is made through one of two.
+
+- `trusted_session()`: an address from the miner's own settings (the backend, the portal, a configured hook).
+- `executor_session()`: a node's registered address, below.
+
+ruff (TID251, root pyproject.toml) refuses the raw constructors anywhere else, so a new call site picks one.
+
+HTTP to a node's registered address, never into the miner's own network.
 
 A node's address is set by whoever registered the node. A name may resolve to a loopback, private or
 cloud-metadata address (or change between lookups), which would make the miner send its requests to
 services next to itself. Every miner request to a node goes through `executor_session()`: a name is
 resolved once per connection, refused unless every address it resolves to is public, and the
 connection is made to those resolved addresses (no second lookup). Redirects are never followed, so a
-node cannot send the request on to another address. Same rule as the validator's
-neurons/validators/src/services/node_host.py.
+node cannot send the request on to another address. The public-address rule is datura's
+`is_public_address`, the same one the validator applies.
 
 An IP literal never reaches the resolver (aiohttp dials it directly), so a central miner checks every
 request's host before it is sent: the addresses it dials come from the portal snapshot, which strangers
@@ -20,11 +27,11 @@ import socket
 import aiohttp
 from aiohttp.abc import AbstractResolver, ResolveResult
 from aiohttp.resolver import DefaultResolver
+from datura.public_address import carried_ipv4, is_public_address as _is_public_address
 
 from core.config import settings
 
 
-NAT64_PREFIX = ipaddress.ip_network("64:ff9b::/96")  # RFC 6052 well-known prefix: the IPv4 address in the last 32 bits
 ALLOWED_PRIVATE_NETWORKS = tuple(
     ipaddress.ip_network(n.strip()) for n in settings.NODE_ADDRESS_ALLOWED_NETWORKS.split(",") if n.strip()
 )
@@ -35,21 +42,17 @@ class NonPublicNodeAddress(aiohttp.ClientConnectionError):
 
 
 def is_public_address(address: str) -> bool:
-    ip = ipaddress.ip_address(address.split("%", 1)[0])  # a scoped IPv6 link-local carries %iface
-    # judged as the IPv4 address it carries: Python before 3.13 calls ::ffff:127.0.0.1 global
-    ip = getattr(ip, "ipv4_mapped", None) or ip
-    # a DNS64 answer (what an IPv6-only host gets for a public A record) is judged as the IPv4 address it carries
-    if ip.version == 6 and ip in NAT64_PREFIX:
-        ip = ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF)
-    # a dev stack (a /temp-dev copy) names its own private network, where its nodes sit by design; unset in production
+    """datura's public-address rule, plus the private network a dev stack names (DAH-7120; unset in production)."""
+    try:
+        ip = ipaddress.ip_address(address.strip("[]").split("%", 1)[0])
+    except ValueError:
+        return False
+    ip = carried_ipv4(ip) or ip  # a mapped or NAT64 form of an allowed IPv4 is allowed too, as on main
     if any(ip in network for network in ALLOWED_PRIVATE_NETWORKS) and ip.is_private and not (
         ip.is_loopback or ip.is_link_local or ip.is_unspecified
     ):
         return True
-    # Python counts global-scope multicast, IPv6 site-local (fec0::/10) and other reserved ranges as global
-    return (
-        ip.is_global and not ip.is_multicast and not ip.is_reserved and not getattr(ip, "is_site_local", False)
-    )
+    return _is_public_address(address)
 
 
 def _is_ip_literal(host: str) -> bool:
@@ -84,13 +87,25 @@ class PublicOnlyResolver(AbstractResolver):
 
 
 def executor_session(**kwargs) -> aiohttp.ClientSession:
-    """A session for requests to nodes; pass allow_redirects=False on each request (aiohttp has no session default).
+    """A session for requests to nodes; a redirect ends the request instead of being followed.
     In central mode every request's IP-literal host is checked before anything is sent."""
     trace_configs = []
     if settings.CENTRAL_MODE:
         literal_check = aiohttp.TraceConfig()
         literal_check.on_request_start.append(_refuse_non_public_literal)
         trace_configs.append(literal_check)
+    redirect_check = aiohttp.TraceConfig()
+    redirect_check.on_request_redirect.append(_refuse_redirect)
+    trace_configs.append(redirect_check)
     return aiohttp.ClientSession(
         connector=aiohttp.TCPConnector(resolver=PublicOnlyResolver()), trace_configs=trace_configs, **kwargs
     )
+
+
+async def _refuse_redirect(_session, _context, params: aiohttp.TraceRequestRedirectParams) -> None:
+    raise aiohttp.ClientConnectionError(f"{params.url} answered with a redirect, which is not followed")
+
+
+def trusted_session(**kwargs) -> aiohttp.ClientSession:
+    """A session for an address from the miner's own settings. Never for a node's address: use `executor_session`."""
+    return aiohttp.ClientSession(**kwargs)

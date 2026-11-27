@@ -21,6 +21,7 @@ import re
 import aiohttp
 
 from core.config import settings
+from services.node_host import trusted_session
 
 logger = logging.getLogger(__name__)
 
@@ -73,7 +74,7 @@ def _shared_config_image_refs() -> tuple[str, ...]:
 
 
 async def fetch_registry_digest(
-    session: aiohttp.ClientSession, image_ref: str, accept: str = _MANIFEST_ACCEPT
+    session: aiohttp.ClientSession, image_ref: str, accept: str = _MANIFEST_ACCEPT  # type only  # noqa: TID251
 ) -> str | None:
     """Return the registry manifest digest for ``repository:tag``, or None on any error."""
     repository, _, tag = image_ref.partition(":")
@@ -118,7 +119,7 @@ async def fetch_default_image_digests() -> dict[str, str]:
     image_refs = _shared_config_image_refs()
     digests: dict[str, str] = {}
     timeout = aiohttp.ClientTimeout(total=30)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
+    async with trusted_session(timeout=timeout) as session:
         for image_ref in image_refs:
             digest = await fetch_registry_digest(session, image_ref)
             if digest:
@@ -157,7 +158,7 @@ async def fetch_docker_hub_digest(image: str) -> str | None:
         repository = f"library/{repository}"
     # one bound for the token request and the HEAD together; aiohttp's `total` bounds each request alone
     try:
-        async with asyncio.timeout(_RENT_PATH_DIGEST_TIMEOUT_SECONDS), aiohttp.ClientSession() as session:
+        async with asyncio.timeout(_RENT_PATH_DIGEST_TIMEOUT_SECONDS), trusted_session() as session:
             return await fetch_registry_digest(session, f"{repository}:{tag}")
     except TimeoutError:
         logger.warning(
@@ -169,7 +170,7 @@ async def fetch_docker_hub_digest(image: str) -> str | None:
 async def fetch_executor_image_digest() -> str | None:
     ref = settings.EXECUTOR_IMAGE_REF
     timeout = aiohttp.ClientTimeout(total=30)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
+    async with trusted_session(timeout=timeout) as session:
         return await fetch_registry_digest(session, ref, accept=_EXECUTOR_MANIFEST_ACCEPT)
 
 
@@ -189,7 +190,7 @@ async def executor_build_published(digest: str | None) -> bool | None:
         return cached[0]
     repository = settings.EXECUTOR_IMAGE_REF.partition(":")[0]
     try:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
+        async with trusted_session(timeout=aiohttp.ClientTimeout(total=15)) as session:
             async with session.get(
                 _REGISTRY_AUTH_URL,
                 params={"service": "registry.docker.io", "scope": f"repository:{repository}:pull"},

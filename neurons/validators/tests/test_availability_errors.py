@@ -232,6 +232,8 @@ async def test_a_node_hostname_that_fails_the_preflight_hides_the_node(
     monkeypatch.setattr("socket.getaddrinfo", fake_getaddrinfo)
     dialled = AsyncMock(side_effect=AssertionError("the preflight must stop the dial"))
     monkeypatch.setattr("services.interactive_shell_service.asyncssh.connect", dialled)
+    # the job's key is a placeholder; the shell reads it before the dial helper runs the preflight
+    monkeypatch.setattr("services.interactive_shell_service.asyncssh.import_private_key", MagicMock())
     miner, executor = _a_job_for("node-9")
     executor = executor.model_copy(update={"address": "gpu-node1.example.net"})
 

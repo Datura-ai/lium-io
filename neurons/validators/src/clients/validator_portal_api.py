@@ -11,6 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 
 from core.config import settings
 from core.utils import _m, get_extra_info
+from services.node_host import trusted_session
 
 
 logger = logging.getLogger(__name__)
@@ -142,7 +143,7 @@ class ValidatorPortalAPI:
         # aiohttp's timer uses the event loop, so short timeouts fire during synchronous
         # bittensor/subtensor calls elsewhere in this process.
         timeout = aiohttp.ClientTimeout(total=60)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with trusted_session(timeout=timeout) as session:
             async with session.get(url, headers=headers) as response:
                 if response.status != 200:
                     response_body = await response.text()
@@ -236,7 +237,7 @@ class ValidatorPortalAPI:
                 "signature": f"0x{keypair.sign(portal_miner_auth_blob(keypair.ss58_address, timestamp)).hex()}",
             }
             timeout = aiohttp.ClientTimeout(total=30)
-            async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with trusted_session(timeout=timeout) as session:
                 async with session.get(url, headers=headers) as response:
                     if response.status != 200:
                         logger.error(
@@ -285,7 +286,7 @@ class ValidatorPortalAPI:
                 "signature": f"0x{keypair.sign(portal_miner_auth_blob(keypair.ss58_address, timestamp)).hex()}",
             }
             # runs beside the tick (ExpressLane), so a slow portal delays only this read
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
+            async with trusted_session(timeout=aiohttp.ClientTimeout(total=30)) as session:
                 async with session.get(url, headers=headers) as response:
                     if response.status != 200:
                         raise ValueError(f"status {response.status}")

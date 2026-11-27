@@ -15,6 +15,7 @@ import aiohttp
 
 from core.config import settings
 from core.utils import _m, get_extra_info, get_logger
+from services.node_host import trusted_session
 
 logger = get_logger(__name__)
 
@@ -42,7 +43,7 @@ class ReferralFeedClient:
         url = settings.get_referral_feed_url()
         try:
             timeout = aiohttp.ClientTimeout(total=_FEED_TIMEOUT_SECONDS)
-            async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with trusted_session(timeout=timeout) as session:
                 async with session.get(url) as response:
                     response.raise_for_status()
                     body = await response.json()

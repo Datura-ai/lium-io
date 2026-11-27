@@ -3,6 +3,7 @@
 import ipaddress
 import socket
 
+import aiohttp
 import pytest
 from aiohttp import web
 
@@ -55,6 +56,12 @@ def test_a_dev_stack_admits_only_its_own_private_network(monkeypatch):
     assert is_public_address("10.20.30.40")  # secret-scan: allow
     assert not is_public_address("10.21.0.1") and not is_public_address("192.168.7.7")  # secret-scan: allow
     assert not is_public_address("127.0.0.1") and not is_public_address("169.254.169.254")
+
+
+@pytest.mark.parametrize("address", ["::ffff:10.20.30.40", "64:ff9b::a14:1e28"])  # secret-scan: allow
+def test_a_dev_stack_admits_the_mapped_and_nat64_forms_of_its_network(monkeypatch, address):
+    monkeypatch.setattr(node_address, "ALLOWED_PRIVATE_NETWORKS", (ipaddress.ip_network("10.20.0.0/16"),))  # secret-scan: allow
+    assert is_public_address(address)
 
 
 def test_public_addresses_are_public():
@@ -127,6 +134,9 @@ async def test_a_redirect_from_the_node_is_not_followed(monkeypatch):
             # an IP literal is dialled as given (the node registry only takes public ones)
             async with session.post(f"http://127.0.0.1:{node_port}/upload_ssh_key", json={}, allow_redirects=False) as response:
                 assert response.status == 307
+            # a request that does not pass allow_redirects=False still ends at the redirect
+            with pytest.raises(aiohttp.ClientConnectionError, match="redirect"):
+                await session.post(f"http://127.0.0.1:{node_port}/upload_ssh_key", json={})
         assert inside == []
     finally:
         for runner in runners:
