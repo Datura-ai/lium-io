@@ -21,6 +21,8 @@ RUN pdm lock --check
 RUN pdm install --prod
 
 COPY . .
+# the signed liumd manifest vendored with this code: its release is the refresh's code floor (MIN_RELEASE)
+COPY --from=liumd manifest.json* liumd-vendored/
 # the scripts the validator writes onto an executor and runs there (src/services/executor_payload.py), taken from the
 # executor sources at build (src/ of the executor_setup context): what runs on a node never comes from a path the node reports
 COPY --from=executor_setup src/ src/executor_payloads/

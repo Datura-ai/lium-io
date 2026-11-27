@@ -210,6 +210,20 @@ async def _facts_only(ctx: Context, client_factory: Callable[[Context, float], A
         refresh = await ensure_liumd_binary(ctx, budget_seconds=budget)
     if refresh is None:
         return answer
+    if refresh.refused:
+        # not a network miss: the published manifest failed its signature or would roll liumd back. The node is not
+        # at fault, so it keeps its local binary; with none there is nothing to run
+        logger.error(
+            _m(
+                "liumd manifest REFUSED; nothing installed, keeping the local binary",
+                extra=get_extra_info(
+                    {**ctx.default_extra, "detail": refresh.detail[:300], "alert": "liumd_manifest_refused"}
+                ),
+            )
+        )
+        if settings.VALIDATOR_LIUMD_SPECS and not refresh.build_sha:
+            return LocalVerifyUnavailable("binary_refresh_failed", refresh.detail[:DETAIL_MAX_CHARS])
+        return answer
     if refresh.skipped:
         logger.warning(
             _m(

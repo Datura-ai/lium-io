@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 from unittest.mock import AsyncMock
 
 import pytest
 from helpers import build_context_config, build_services, build_state, make_context
+from services.liumd_binary_refresh import LiumdRefresh
 from services.liumd_exec_client import LiumdRefusal
 from services.local_verify_client import LocalVerifyAnswer, LocalVerifyUnavailable
 from services.task import liumd_shadow
@@ -291,3 +293,31 @@ def test_normalization_maps_the_liumd_contract_without_mutating_the_snapshot():
     assert normalized["os"] == "Ubuntu 24.04 LTS"
     assert "vloopback_check" not in normalized
     assert raw == snapshot
+
+
+@pytest.mark.parametrize("local", ["old-build", ""])
+@pytest.mark.asyncio
+async def test_a_refused_manifest_is_reported_as_a_refusal_and_keeps_the_local_binary(monkeypatch, caplog, local):
+    """A bad signature or an older release is not the node's fault: it logs its own error (not 'using the local
+    binary' like a network miss), and the read goes on with the node's binary; with none there is nothing to run."""
+    _liumd_on(monkeypatch)
+    monkeypatch.setattr(liumd_shadow.settings, "LIUMD_BINARY_REFRESH_ENABLED", True)
+    answer = dataclasses.replace(_answer(LIUMD_SPECS), build_sha=local)
+
+    async def refused(ctx, build_sha, target, *, budget_seconds=None):
+        return LiumdRefresh(False, build_sha or None, "manifest refused: release 1.2.2 is below 1.2.3", refused=True)
+
+    monkeypatch.setattr(liumd_shadow, "refresh_liumd_from_answer", refused)
+    client = AsyncMock()
+    client.run.return_value = answer
+
+    with caplog.at_level("ERROR"):
+        result = await liumd_shadow._facts_only(_ctx(DummySSHCommandRunner()), lambda ctx, budget: client)
+
+    assert any("liumd manifest REFUSED" in r.getMessage() and r.levelname == "ERROR" for r in caplog.records)
+    assert not any("using the local binary" in r.getMessage() and "REFUSED" not in r.getMessage() for r in caplog.records)
+    assert client.run.await_count == 1
+    if local:
+        assert result is answer
+    else:
+        assert isinstance(result, LocalVerifyUnavailable) and result.reason == "binary_refresh_failed"
