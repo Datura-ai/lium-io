@@ -9,6 +9,7 @@ import pytest
 
 from neurons.validators.src.services.matrix_validation_service import AllCardsProbe, ValidationResult
 from neurons.validators.src.services.redis_service import RENTAL_PROBE_OK_PREFIX
+from neurons.validators.src.services.task.checks import rental_probe
 from neurons.validators.src.services.task.checks.capability import CapabilityCheck
 from neurons.validators.src.services.task.checks.gpu_fingerprint import GpuFingerprintCheck
 from neurons.validators.src.services.task.checks.spec_change import SpecChangeCheck
@@ -121,3 +122,18 @@ async def test_an_unenforced_all_cards_refusal_drops_the_probe_pass(card_refused
     # the run itself still passes: unenforced, the all-cards run fails no node
     assert result.passed
     assert (STAMP not in services.redis.store) is card_refused
+
+
+@pytest.mark.asyncio
+async def test_a_dry_run_leaves_the_live_probe_pass(monkeypatch, context_factory):
+    # a dry-run validator shares Redis with the live one
+    monkeypatch.setattr(rental_probe.settings, "DRY_RUN", True)
+    services = _services()
+    ctx = context_factory(
+        services=services,
+        config=build_context_config(),
+        state=build_state(gpu_model_count="NVIDIA RTX A6000:8"),
+        verified={"spec": "NVIDIA GeForce RTX 4090:8"},
+    )
+    await SpecChangeCheck().run(ctx)
+    assert STAMP in services.redis.store

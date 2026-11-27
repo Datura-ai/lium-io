@@ -993,6 +993,9 @@ async def require_probe_pass(ctx: Context, why: str) -> None:
     machine it is now, which confirms every listed card as a CUDA device of its model. The probe runs on the
     next idle cycle, this one too when the probe check is still ahead. A rented node is left alone as before.
     """
+    # A dry run shares Redis with the live validator, so it leaves the live pass alone.
+    if settings.DRY_RUN:
+        return
     try:
         await ctx.services.redis.delete(f"{_REDIS_LAST_OK_PREFIX}:{ctx.executor.uuid}")
     except Exception:

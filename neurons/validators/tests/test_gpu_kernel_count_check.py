@@ -21,8 +21,11 @@ from services.nvidia_devices import (
     HOST_PID1_ROOT,
     KERNEL_GPU_FS_SEPARATOR,
     KERNEL_GPU_VIEW_CMD,
+    HOST_ALL_CARDS_SEPARATOR,
+    HOST_CONTAINER_FILES_SEPARATOR,
+    HOST_CONTAINER_MOUNTS_SEPARATOR,
     KERNEL_GPU_VIEW_SEPARATOR,
-    PROC_GPU_INFO_CMD,
+    HOST_PROC_GPU_INFO_CMD,
 )
 
 from neurons.validators.src.services.task.availability import (
@@ -55,8 +58,9 @@ class _Sink:
         pass
 
 
-def _host_stdout(uuids, *, mounts=(), fstype="proc", kind="regular empty file"):
-    """What HOST_KERNEL_GPU_VIEW_CMD prints: PID 1's mounts, the stat rows, then the UUID rows."""
+def _host_stdout(uuids, *, own=None, mounts=(), fstype="proc", kind="regular empty file", container_mounts=()):
+    """What HOST_KERNEL_GPU_VIEW_CMD prints: PID 1's mounts, the stat rows, the UUID rows of this executor's cards
+    (`own`, default every card), the host's whole list, then the container's own mounts (no file rows)."""
     files = [
         f"{HOST_PID1_ROOT}/proc/driver/nvidia/gpus/0000:00:{i + 7:02x}.0/information"
         for i in range(len(uuids))
@@ -68,7 +72,15 @@ def _host_stdout(uuids, *, mounts=(), fstype="proc", kind="regular empty file"):
             *(f"{path} {fstype}" for path in files),
             *(f"{path}|{kind}" for path in files),
             KERNEL_GPU_VIEW_SEPARATOR,
+            *(
+                f"{gpu_uuid}, {uuids.index(gpu_uuid)}"
+                for gpu_uuid in (uuids if own is None else own)
+            ),
+            HOST_ALL_CARDS_SEPARATOR,
             *(f"{gpu_uuid}, {i}" for i, gpu_uuid in enumerate(uuids)),
+            HOST_CONTAINER_MOUNTS_SEPARATOR,
+            *container_mounts,
+            HOST_CONTAINER_FILES_SEPARATOR,
         ]
     )
 
@@ -91,7 +103,7 @@ def _ctx(
     specs = {"gpu": {"count": len(reported) if count is None else count}}
 
     async def run(command, *args, **kwargs):
-        if command == PROC_GPU_INFO_CMD and attachable is not None:
+        if command == HOST_PROC_GPU_INFO_CMD and attachable is not None:
             rows = "\n".join(f"{gpu_uuid}, {i}" for i, gpu_uuid in enumerate(attachable))
             return SimpleNamespace(exit_status=0, stdout=rows, stderr="")
         if command != HOST_KERNEL_GPU_VIEW_CMD:
@@ -235,9 +247,17 @@ CONTAINER_MOUNTS_OF_ONE_CARD = (
 def test_container_read_is_the_same_command_and_the_host_read_goes_through_pid_1():
     assert "/proc/1/" not in KERNEL_GPU_VIEW_CMD
     assert "/proc/self/mountinfo" in KERNEL_GPU_VIEW_CMD
-    assert HOST_KERNEL_GPU_VIEW_CMD == KERNEL_GPU_VIEW_CMD.replace(
+    head, _, rows = HOST_KERNEL_GPU_VIEW_CMD.partition(HOST_ALL_CARDS_SEPARATOR)
+    rows, _, container = rows.partition(f"; echo {HOST_CONTAINER_MOUNTS_SEPARATOR}")
+    # r510: the container's own evidence for the names that pick this executor's cards, read in the same command
+    assert "/proc/self/mountinfo" in container and "/proc/1/" not in container
+    container_head = KERNEL_GPU_VIEW_CMD.replace(
         "/proc/self/mountinfo", "/proc/1/mountinfo"
     ).replace("/proc/driver/nvidia/gpus/*", "/proc/1/root/proc/driver/nvidia/gpus/*")
+    # this executor's cards: PID 1's entry at each name under the container's own gpus path, then the whole list
+    assert 'for d in /proc/driver/nvidia/gpus/*; do f="/proc/1/root$d/information"' in head
+    assert rows.removeprefix("; ") == container_head.rpartition(KERNEL_GPU_VIEW_SEPARATOR + "; ")[2]
+    assert head.startswith(container_head.rpartition(KERNEL_GPU_VIEW_SEPARATOR)[0])
 
 
 @pytest.mark.asyncio
@@ -834,3 +854,150 @@ async def test_an_unattachable_card_still_fails_when_the_host_list_covers_every_
     assert result.passed is False
     assert result.event.reason_code == Msg.UNATTACHABLE.reason
     assert result.event.what_we_saw["unattachable_uuids"] == [REAL[3]]
+
+
+@pytest.mark.asyncio
+async def test_a_stale_bind_after_a_gpu_reset_with_every_card_on_the_host_passes(context_factory, check_enabled):
+    # DAH-7076, node fc1b5612: a renter reset re-created the card's host entry, the executor's own bind
+    # went stale (a foreign mount), and the lookup through PID 1's root still finds every card
+    ctx = _behind_a_foreign_mount(
+        _ctx(context_factory, reported=REAL[:4], kernel=None, host=_host_stdout(REAL[:4]), attachable=REAL[:4])
+    )
+
+    result = await GpuKernelCountCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.what_we_saw["kernel_verdict"] == "match_host_view"
+    # the stale bind is still reported as found
+    assert result.event.what_we_saw["kernel_gpu_foreign_mounts"] == ctx.state.kernel_gpu_foreign_mounts
+    assert "gpu_kernel_count_passed" not in result.updates
+
+
+@pytest.mark.asyncio
+async def test_an_unattachable_card_marks_its_own_score_flag(context_factory, check_enabled):
+    ctx = _behind_a_foreign_mount(_ctx(context_factory, reported=REAL[:4], kernel=None, attachable=REAL[:3]))
+
+    result = await GpuKernelCountCheck().run(ctx)
+
+    assert result.updates == {"gpu_kernel_count_passed": False, "gpu_kernel_unattachable": True}
+
+
+@pytest.mark.asyncio
+async def test_a_short_host_list_stands_and_the_host_is_not_read_again(context_factory, check_enabled):
+    # DAH-7076 review: one host inventory per cycle; a later read listing every card must not override it
+    # host list short, container list full: main's host-view verdict, failing only behind the setting
+    ctx = _host_sourced(
+        _ctx(context_factory, reported=REAL[:2], kernel=REAL[:1], host=_host_stdout(REAL[:2])), container=REAL[:2]
+    )
+
+    result = await GpuKernelCountCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.COUNT_MISMATCH_HOST_SHADOW.reason
+    assert result.event.what_we_saw["kernel_verdict"] == "count_lower_host_view"
+    assert result.event.what_we_saw["kernel_view_source"] == "host_pid1_root"
+    assert result.event.what_we_saw["would_fail"] is True
+    ctx.ssh.run.assert_not_awaited()
+
+
+def _host_sourced(ctx: Context, *, container) -> Context:
+    state = replace(ctx.state, kernel_gpu_view_source="host_pid1_root", container_kernel_gpu_uuids=container)
+    return ctx.model_copy(update={"state": state})
+
+
+@pytest.mark.asyncio
+async def test_a_short_host_list_with_a_short_container_list_fails_as_on_main(context_factory, check_enabled):
+    # the enforcement setting stays off: main fails a short container list the host does not cover
+    ctx = _host_sourced(
+        _ctx(context_factory, reported=REAL[:2], kernel=REAL[:1], host=_host_stdout(REAL[:2])), container=REAL[:1]
+    )
+
+    result = await GpuKernelCountCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.updates == {"gpu_kernel_count_passed": False}
+    assert result.event.reason_code == Msg.COUNT_MISMATCH.reason
+    what = result.event.what_we_saw
+    assert what["kernel_verdict"] == "count_lower"
+    assert what["kernel_view_source"] == "host_pid1_root"
+    assert what["container_kernel_gpu_count"] == 1
+    ctx.ssh.run.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_short_list_read_from_the_host_first_fails_when_enforced(
+    context_factory, check_enabled, host_fallback_enforced
+):
+    ctx = _ctx(context_factory, reported=REAL[:2], kernel=REAL[:1], host=_host_stdout(REAL[:2]))
+    ctx = ctx.model_copy(update={"state": replace(ctx.state, kernel_gpu_view_source="host_pid1_root")})
+
+    result = await GpuKernelCountCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.updates == {"gpu_kernel_count_passed": False}
+    assert result.event.reason_code == Msg.COUNT_MISMATCH.reason
+    assert result.event.what_we_saw["kernel_verdict"] == "count_lower_host_view"
+
+
+STALE_CONTAINER_MOUNT = "/proc/driver/nvidia/gpus/0000:03:00.0 proc:/driver/nvidia/gpus/0000:03:00.0//deleted"
+
+
+def _host_short_container_withheld(context_factory, attachable):
+    ctx = _ctx(context_factory, reported=REAL[:2], kernel=REAL[:1], attachable=attachable)
+    state = replace(
+        ctx.state,
+        kernel_gpu_view_source="host_pid1_root",
+        container_kernel_gpu_uuids=None,
+        container_kernel_gpu_foreign_mounts=[STALE_CONTAINER_MOUNT],
+    )
+    return ctx.model_copy(update={"state": state})
+
+
+@pytest.mark.asyncio
+async def test_a_short_host_list_with_a_withheld_container_list_keeps_the_unattachable_verdict(
+    context_factory, check_enabled
+):
+    # DAH-5519 as on main: the container list behind a foreign mount, a card the create step cannot attach fails
+    ctx = _host_short_container_withheld(context_factory, attachable=REAL[:1])
+
+    result = await GpuKernelCountCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.updates == {"gpu_kernel_count_passed": False, "gpu_kernel_unattachable": True}
+    what = result.event.what_we_saw
+    assert what["kernel_verdict"] == "unattachable"
+    assert what["unattachable_uuids"] == [REAL[1]]
+    assert what["kernel_view_source"] == "host_pid1_root"
+
+
+@pytest.mark.asyncio
+async def test_a_short_host_list_with_a_withheld_container_list_and_every_card_attachable_is_gated(
+    context_factory, check_enabled
+):
+    ctx = _host_short_container_withheld(context_factory, attachable=REAL[:2])
+
+    result = await GpuKernelCountCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.what_we_saw["kernel_verdict"] == "count_lower_host_view"
+
+
+@pytest.mark.asyncio
+async def test_a_container_handed_a_subset_is_judged_against_the_same_reads_whole_host_list(
+    context_factory, check_enabled
+):
+    # this executor's cards (one) are short of the two reported, the same host read lists both: main's
+    # DAH-6273 verdict for a container handed a subset of the host's cards, without a second read
+    ctx = _host_sourced(
+        _ctx(context_factory, reported=REAL[:2], kernel=REAL[:1]), container=REAL[:1]
+    )
+    ctx = ctx.model_copy(update={"state": replace(ctx.state, host_all_kernel_gpu_uuids=REAL[:2])})
+
+    result = await GpuKernelCountCheck().run(ctx)
+
+    assert result.passed is True
+    what = result.event.what_we_saw
+    assert what["kernel_verdict"] == "match_host_view"
+    assert what["host_kernel_gpu_count"] == 2
+    assert what["container_kernel_gpu_count"] == 1
+    ctx.ssh.run.assert_not_awaited()

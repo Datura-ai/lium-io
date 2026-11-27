@@ -169,6 +169,7 @@ UUID_MISMATCH_ERROR_PREFIX = "UUID mismatch"
 # CUDA's messages for a card that is there but held by another workload: its memory (cudaErrorMemoryAllocation) or,
 # in EXCLUSIVE_PROCESS compute mode, the whole card (cudaErrorDevicesUnavailable). Lowercase.
 GPU_HELD_BY_ANOTHER_WORKLOAD_MARKERS = ("out of memory", "busy or unavailable")
+ALL_CARDS_FAILED_ERROR_PREFIX = "All-cards GPU work-proof failed"
 
 # Whose clock `ValidationResult.elapsed_seconds` is: the validator's around the SSH run, or the
 # executor's own word for the step when the answer came through the local transport.
@@ -207,6 +208,8 @@ class ValidationResult:
     # The all-cards work-proof found a claimed card the node could not run it on (AllCardsProbe.card_refused),
     # whether or not that run was enforced.
     all_cards_card_refused: bool = False
+    # The all-cards work-proof failed and at least one card gave a wrong answer (DAH-6332).
+    all_cards_wrong_answer: bool = False
 
     def __bool__(self) -> bool:
         """Allow using ValidationResult in boolean context for backward compatibility."""
@@ -885,8 +888,9 @@ class ValidationService:
             ):
                 return ValidationResult(
                     success=False,
-                    error_message=f"All-cards GPU work-proof failed: {all_cards.failure_reason}",
+                    error_message=f"{ALL_CARDS_FAILED_ERROR_PREFIX}: {all_cards.failure_reason}",
                     all_cards_no_answer=all_cards.no_card_answered,
+                    all_cards_wrong_answer=any(c.get("reason") == "wrong_answer" for c in all_cards.per_card),
                 )
 
         # Per-call verifier object: its key MUST survive the SSH round-trip so we can

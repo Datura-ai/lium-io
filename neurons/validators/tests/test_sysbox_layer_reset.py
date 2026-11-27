@@ -141,6 +141,7 @@ async def test_dry_run_installs_nothing(context_factory, mode):
     "stdout",
     [
         "layer_reset_skipped no_python3\n",
+        "layer_reset_skipped no_systemd\n",
         "layer_reset_failed install\n",
         "layer_reset_failed nsenter_failed\n",
         "layer_reset_installed 1\n",  # an older script answered: not this validator's version
@@ -154,6 +155,18 @@ async def test_a_host_the_install_does_not_reach_warns_and_keeps_its_score(conte
 
     assert (result.passed, result.event.reason_code, result.event.severity) == (True, Msg.INSTALL_FAILED.reason, "warning")
     assert "--install-layer-reset" in Msg.INSTALL_FAILED.remediation
+
+
+@pytest.mark.asyncio
+async def test_a_failed_install_keeps_its_step_and_why_printable_and_bounded(context_factory, mode):
+    mode("all")
+    stdout = "layer_reset_failed enable Failed to enable unit: \x1b[31mread-only\x00 file system" + " x" * 200 + "\n"
+
+    result = await _run(context_factory, {"sysbox_layer_reset_version": 0}, _ssh(stdout))
+
+    install = result.event.what_we_saw["install"]
+    assert install.startswith("failed enable Failed to enable unit: ?[31mread-only? file system")
+    assert len(install) == 200 and all(" " <= c <= "~" for c in install)
 
 
 @pytest.mark.asyncio

@@ -203,6 +203,17 @@ async def test_check_executor_health_sends_loopback_plugin_only_when_given(clien
 
 
 @pytest.mark.asyncio
+async def test_check_executor_health_sends_the_host_port_only_when_given(client):
+    # DAH-6946: the host port a mapped outside port is forwarded to
+    with patch.object(client, "_signed_request", AsyncMock(return_value=None)) as post:
+        await client.check_executor_health("1.2.3.4", 8001, "hotkey", 5892)
+        await client.check_executor_health("1.2.3.4", 8001, "hotkey", 5892, host_port=41002)
+
+    assert "host_port" not in post.await_args_list[0].kwargs["json_data"]
+    assert post.await_args_list[1].kwargs["json_data"]["host_port"] == 41002
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("nonce", [None, "4c545331" + "00" * 28])
 async def test_check_executor_health_sends_owner_hotkeys_with_the_dated_nonce_it_was_given(client, nonce):
     """The backend signs owner hotkeys only with a dated nonce, so the health check sends the owner hotkeys next to the
@@ -701,3 +712,16 @@ async def test_check_executor_health_sends_the_portals_owner_hotkeys_for_the_lis
     owned, other = (call.kwargs["json_data"] for call in signed.await_args_list)
     assert owned["owner_hotkeys"] == ["5OwnerA", "5OwnerB"]
     assert "owner_hotkeys" not in other
+
+
+@pytest.mark.asyncio
+async def test_a_rented_list_read_carries_the_time_this_validator_asked_not_a_wire_value(client):
+    """DAH-7071: the container cleanup measures a filler's age against the moment this validator asked."""
+    answer = RentedExecutorsResponse.model_validate({"executors": {}, "read_at": 1.0})
+    with (
+        patch.object(backend_client_module.time, "time", return_value=123.0),
+        patch.object(client, "_signed_request", AsyncMock(return_value=answer)),
+    ):
+        rented = await client.get_rented_executors_now()
+
+    assert rented.read_at == 123.0
