@@ -211,6 +211,9 @@ class RentedExecutorsResponse(BaseModel):
     # executor_id → "miner" | "lium"; absent = no default job. Parsed leniently as str for
     # forward-compatibility (a future owner value must not break parsing of the whole response).
     default_job_owner_by_executor: dict[str, str] = {}
+    # DAH-7117: executor_id → the filler container names (of all_filler_containers_by_executor) Lium started, never
+    # the provider's default job. Additive with an empty default: an older backend names none, read as "not known".
+    lium_filler_containers_by_executor: dict[str, list[str]] = {}
     # executor_id → specs to force-pass against. Present only for executors carrying a pod flagged
     # as a special manual (bare-metal) rental. Defaults to empty so an older backend that omits the
     # field force-passes nobody (fail-closed) rather than everybody.

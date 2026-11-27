@@ -5369,6 +5369,17 @@
           "title": "Gpu Splitting Config",
           "type": "object"
         },
+        "lium_filler_containers_by_executor": {
+          "additionalProperties": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "default": {},
+          "title": "Lium Filler Containers By Executor",
+          "type": "object"
+        },
         "maintenance_executor_ids": {
           "default": [],
           "items": {
