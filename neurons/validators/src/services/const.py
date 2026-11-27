@@ -387,15 +387,15 @@ ENGY_CACHE_COMPLETE_SHARE = 0.98
 class CacheCharge(StrEnum):
     """How a launch charges an existing cache of a kind against free disk.
 
-    Applied by DockerService._cache_missing_gb_resetting_oversize.
+    Applied by DockerService._cache_missing_gb.
     """
 
     # its own size is unknown: the whole set when it is empty (the reclaim's wipe leaves it so), else nothing
     WHOLE_WHEN_EMPTY = "whole_when_empty"
     # a partial download: what it still lacks of its size, nothing once ENGY_CACHE_COMPLETE_SHARE of it is held
     REST_OF_DOWNLOAD = "rest_of_download"
-    # the run fills it up to its size: what it can still grow by; one over its size is removed and charged whole
-    REST_OF_SIZE = "rest_of_size"
+    # its whole size was taken from the disk when it was created: an existing one costs nothing
+    PREALLOCATED = "preallocated"
 
 
 @dataclass(frozen=True)
@@ -412,6 +412,9 @@ class CacheKind:
     charge: CacheCharge
     # du failed: charged its whole size (it may be empty), else nothing (mounting what exists costs nothing)
     unmeasured_charged_whole: bool
+    # a loop-backed volume of exactly its size (vloopback, preallocated): the run cannot write more, and the disk
+    # it takes never changes after its creation. Else a plain volume that grows with its files.
+    loop_backed: bool
     # the rental listing counts its disk as free, so a rental evicts it first, until the listing floor fits too
     listed_as_free: bool
     # the disk-tight reclaim takes it beside a live filler once no container mounts it (its run is gone)
@@ -423,6 +426,8 @@ class CacheKind:
     swept_by_launches_of: frozenset[str]
 
 
+# The loopback plugin backs a volume with one file and ext4 caps a file at 16 TiB.
+LOOP_VOLUME_MAX_GB = 16 * 1024 - 1
 # the backend's whole job cache name (build_job_cache_volume), its size (the provider's limit) in group 1
 JOB_CACHE_VOLUME_NAME = re.compile(rf"^{JOB_CACHE_VOLUME_PREFIX}(\d+)gb_[0-9a-f]{{12}}$")
 
@@ -434,6 +439,7 @@ CACHE_KINDS: tuple[CacheKind, ...] = (
         size_in_name=None,
         charge=CacheCharge.WHOLE_WHEN_EMPTY,
         unmeasured_charged_whole=True,
+        loop_backed=False,
         listed_as_free=False,
         reclaimed_beside_filler_when_unmounted=False,
         download_temporaries_swept=True,
@@ -448,6 +454,7 @@ CACHE_KINDS: tuple[CacheKind, ...] = (
         size_in_name=re.compile(rf"^{ENGY_CACHE_VOLUME_PREFIX}hf_(\d+)gb_"),
         charge=CacheCharge.REST_OF_DOWNLOAD,
         unmeasured_charged_whole=False,
+        loop_backed=False,
         listed_as_free=True,
         reclaimed_beside_filler_when_unmounted=False,
         download_temporaries_swept=True,
@@ -459,8 +466,9 @@ CACHE_KINDS: tuple[CacheKind, ...] = (
         name=JOB_CACHE_VOLUME_NAME,
         fixed_size_gb=None,
         size_in_name=JOB_CACHE_VOLUME_NAME,
-        charge=CacheCharge.REST_OF_SIZE,
-        unmeasured_charged_whole=True,
+        charge=CacheCharge.PREALLOCATED,
+        unmeasured_charged_whole=False,
+        loop_backed=True,
         listed_as_free=True,
         reclaimed_beside_filler_when_unmounted=True,
         download_temporaries_swept=False,
@@ -490,15 +498,28 @@ def is_cache_volume_name(name: str, prefixes: tuple[str, ...]) -> bool:
     return kind is not None and kind.prefix in prefixes
 
 
+def is_loop_backed_cache(name: str) -> bool:
+    """A cache volume of a kind created as a loop-backed volume of its size (CacheKind.loop_backed)."""
+    kind = cache_kind(name)
+    return kind is not None and kind.loop_backed
+
+
 def cache_size_gb(name: str) -> float:
-    """A cache volume's size in GB; inf when its kind carries the size in the name and this name has none."""
+    """A cache volume's size in GB; inf (never afforded) when its kind carries the size in the name and this name
+    has none, or when no loop-backed volume can have that size."""
     kind = cache_kind(name)
     if kind is None:
         return math.inf
     if kind.fixed_size_gb is not None:
         return kind.fixed_size_gb
     match = kind.size_in_name.match(name) if kind.size_in_name else None
-    return int(match.group(1)) if match else math.inf
+    if match is None:
+        return math.inf
+    size_gb = int(match.group(1))
+    # 0 would make a plain volume with no limit (create_local_volume)
+    if kind.loop_backed and not 1 <= size_gb <= LOOP_VOLUME_MAX_GB:
+        return math.inf
+    return size_gb
 FILLER_CONTAINER_GRACE_MINUTES = 15
 # DAH-2757: how long after a rental closes a BROKEN pod's container still counts as ours. The
 # container lives until the sweep above collects it, so the bound follows that grace with one cycle

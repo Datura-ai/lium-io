@@ -21,6 +21,7 @@ from services.container_cleanup import (
     idle_filler_images_removal_command,
 )
 from services.docker_service import (
+    FILLER_VOLUME_LABELS,
     DockerService,
     RentalDiskFit,
     _clamp_rental_volume_to_free_disk,
@@ -985,7 +986,11 @@ def test_the_idle_filler_image_removal_takes_every_filler_image_but_pearl_miner(
         ("dphn_cache_m1_r2", 40, CacheCharge.WHOLE_WHEN_EMPTY),
         ("engy_cache_hf_1600gb_kimi", 1600, CacheCharge.REST_OF_DOWNLOAD),
         ("engy_cache_kimi", math.inf, CacheCharge.REST_OF_DOWNLOAD),  # no size in the name: never afforded
-        ("job_cache_200gb_0123456789ab", 200, CacheCharge.REST_OF_SIZE),
+        ("job_cache_200gb_0123456789ab", 200, CacheCharge.PREALLOCATED),
+        ("job_cache_16383gb_0123456789ab", 16383, CacheCharge.PREALLOCATED),
+        # no loop volume has these sizes (0 would be a plain volume with no limit): never afforded
+        ("job_cache_0gb_0123456789ab", math.inf, CacheCharge.PREALLOCATED),
+        ("job_cache_16384gb_0123456789ab", math.inf, CacheCharge.PREALLOCATED),
     ],
 )
 def test_each_cache_kind_reads_its_size_and_charge_from_one_table(name, size_gb, charge):
@@ -996,6 +1001,7 @@ def test_the_per_kind_rules_come_from_the_table():
     assert cache_prefixes(lambda kind: kind.listed_as_free) == ("engy_cache_", "job_cache_")
     assert cache_prefixes(lambda kind: kind.reclaimed_beside_filler_when_unmounted) == ("job_cache_",)
     assert cache_prefixes(lambda kind: kind.download_temporaries_swept) == ("dphn_cache_", "engy_cache_")
+    assert cache_prefixes(lambda kind: kind.loop_backed) == ("job_cache_",)
     # a provider's own volume that only starts with the prefix is no cache of ours
     assert cache_kind("job_cache_mine") is None
 
@@ -1011,34 +1017,24 @@ def _job_with_cache() -> ContainerCreateRequest:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("held_gb", "free_gb", "granted"),
-    [
-        (150, 5000, True),  # charged the 50 GB it can still grow by
-        (150, 10, False),  # the 50 GB it can still grow by does not fit
-        (0, 300, False),  # an empty (wiped) cache is charged its whole 200 GB, over the free-disk share
-    ],
-)
-async def test_a_job_cache_within_its_size_is_charged_what_it_can_still_grow_by(
-    docker_service, held_gb, free_gb, granted
-):
-    ssh_client = DuHostSshClient([_JOB_CACHE], free_gb=free_gb, du_stdout=_kb(held_gb))
+async def test_an_existing_job_cache_costs_nothing_and_is_not_measured(docker_service):
+    # its whole size left the free disk when it was created, so even a full one on a tight disk is mounted
+    ssh_client = DuHostSshClient([_JOB_CACHE], free_gb=10, du_stdout=_kb(250))
+    payload = _job_with_cache()
 
-    affordable = await docker_service.select_affordable_cache_volumes(ssh_client, _job_with_cache(), {})
-
-    assert bool(affordable) is granted
+    assert await docker_service.select_affordable_cache_volumes(ssh_client, payload, {}) == payload.cache_volumes
+    assert not any("du -sk" in command for command in ssh_client.commands)
     assert _removed_volumes(ssh_client) == []
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("free_gb", "granted"), [(5000, True), (300, False)])
-async def test_an_unmeasured_job_cache_is_charged_its_whole_size(docker_service, free_gb, granted):
-    # du failed: what it holds is unknown, so it is charged like a new one, as an unmeasured Dolphin cache is
-    ssh_client = DuHostSshClient([_JOB_CACHE], free_gb=free_gb, du_stdout="")
+@pytest.mark.parametrize("name", ["job_cache_0gb_0123456789ab", "job_cache_16384gb_0123456789ab"])
+@pytest.mark.parametrize("listed", [True, False])
+async def test_a_job_cache_of_a_size_no_loop_volume_can_have_is_never_granted(docker_service, name, listed):
+    payload = _make_payload(workload_kind=WorkloadKind.FILLER, cache_volumes=[CacheVolume(name=name, target="/cache")])
+    ssh_client = DuHostSshClient([name] if listed else [], free_gb=10**6, du_stdout="")
 
-    affordable = await docker_service.select_affordable_cache_volumes(ssh_client, _job_with_cache(), {})
-
-    assert bool(affordable) is granted
+    assert await docker_service.select_affordable_cache_volumes(ssh_client, payload, {}) == []
 
 
 @pytest.mark.asyncio
@@ -1046,7 +1042,8 @@ async def test_an_unmeasured_job_cache_is_charged_its_whole_size(docker_service,
     ("free_gb", "cache_gb", "volume_limit_gb", "granted"),
     [
         (1000, 150, 400, True),
-        (600, 150, 400, False),  # within 30% of free disk, but download + run volume leave under the listing floor
+        (600, 150, 400, False),  # within 30% of free disk, but cache + run volume leave under the listing floor
+        (1000, 400, 400, False),  # over 30% of free disk
     ],
 )
 async def test_a_new_job_cache_needs_the_free_disk_floor_like_every_filler_cache(
@@ -1062,37 +1059,84 @@ async def test_a_new_job_cache_needs_the_free_disk_floor_like_every_filler_cache
     assert bool(affordable) is granted
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize(("free_gb", "granted"), [(5000, True), (300, False)])
-async def test_a_job_cache_over_its_size_is_removed_and_charged_as_a_new_one(docker_service, free_gb, granted):
-    ssh_client = DuHostSshClient([_JOB_CACHE], free_gb=free_gb, du_stdout=_kb(250))
+class VolumeDriverSshClient(FakeSshClient):
+    """`docker volume inspect -f '{{.Driver}}'` answers with the volume's driver; None: no such volume."""
 
-    affordable = await docker_service.select_affordable_cache_volumes(ssh_client, _job_with_cache(), {})
-
-    assert any("volume rm" in command and _JOB_CACHE in command for command in ssh_client.commands)
-    assert bool(affordable) is granted
-
-
-class RefusingDuHostSshClient(DuHostSshClient):
-    """docker refuses the `volume rm` (exit 1)."""
+    def __init__(self, driver: str | None):
+        super().__init__([])
+        self._driver = driver
 
     async def run(self, command: str, *args, **kwargs):
-        if "volume rm" in command:
+        if "volume inspect" in command:
             self.commands.append(command)
-            return SimpleNamespace(exit_status=1, stdout="", stderr="volume is in use")
+            if self._driver is None:
+                return SimpleNamespace(exit_status=1, stdout="", stderr="Error: No such volume")
+            return SimpleNamespace(exit_status=0, stdout=f"{self._driver}\n", stderr="")
         return await super().run(command, *args, **kwargs)
 
 
+def _volume_creating(docker_service, monkeypatch, create_volume: AsyncMock) -> Mock:
+    monkeypatch.setattr(docker_service, "_pick_loopback_driver_for_new_volume", AsyncMock(return_value="vloopback"))
+    monkeypatch.setattr(docker_service, "stream_log", AsyncMock())
+    return Mock(create_volume=create_volume)
+
+
 @pytest.mark.asyncio
-@pytest.mark.parametrize("free_gb", [10, 5000])
-async def test_a_job_cache_over_its_size_that_docker_cannot_remove_is_not_mounted(docker_service, free_gb):
-    # taiberium (lio#2249): mounted as is, it is charged nothing and keeps growing; the run goes without it
-    ssh_client = RefusingDuHostSshClient([_JOB_CACHE], free_gb=free_gb, du_stdout=_kb(250))
+async def test_a_missing_job_cache_is_created_as_a_preallocated_loop_volume_of_its_size(docker_service, monkeypatch):
+    # the run cannot write past the size: the filesystem at /cache ends there
+    docker_client = _volume_creating(docker_service, monkeypatch, AsyncMock())
+    payload = _job_with_cache()
+    wanted = list(payload.cache_volumes)
 
-    affordable = await docker_service.select_affordable_cache_volumes(ssh_client, _job_with_cache(), {})
+    await docker_service.create_missing_loop_backed_caches(VolumeDriverSshClient(None), docker_client, payload, "tag", {})
 
-    assert any("volume rm" in command and _JOB_CACHE in command for command in ssh_client.commands)
-    assert affordable == []
+    created = docker_client.create_volume.await_args.kwargs
+    assert (created["volume_name"], created["driver"]) == (_JOB_CACHE, "vloopback")
+    assert created["driver_opts"] == {"size": "200g"}  # no sparse: the disk is taken now
+    assert created["labels"] == FILLER_VOLUME_LABELS  # the scrape lists a labelled volume as free disk
+    assert payload.cache_volumes == wanted
+
+
+@pytest.mark.asyncio
+async def test_a_job_cache_the_node_cannot_create_is_dropped_and_the_run_goes_on(docker_service, monkeypatch):
+    # never mounted by name then: docker would create a plain volume with no limit
+    docker_client = _volume_creating(docker_service, monkeypatch, AsyncMock(side_effect=RuntimeError("timed out")))
+    dolphin = CacheVolume(name="dphn_cache_hf_x", target="/root/.cache/huggingface")
+    payload = _job_with_cache()
+    payload.cache_volumes.append(dolphin)
+
+    await docker_service.create_missing_loop_backed_caches(VolumeDriverSshClient(None), docker_client, payload, "tag", {})
+
+    assert payload.cache_volumes == [dolphin]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("driver", "kept"), [("vloopback", True), ("vloopback:latest", True), ("local", False)])
+async def test_an_existing_job_cache_is_mounted_only_when_it_is_a_loop_volume(docker_service, monkeypatch, driver, kept):
+    docker_client = _volume_creating(docker_service, monkeypatch, AsyncMock())
+    payload = _job_with_cache()
+
+    await docker_service.create_missing_loop_backed_caches(
+        VolumeDriverSshClient(driver), docker_client, payload, "tag", {}
+    )
+
+    assert bool(payload.cache_volumes) is kept
+    docker_client.create_volume.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_only_a_fillers_loop_backed_caches_are_created(docker_service, monkeypatch):
+    docker_client = _volume_creating(docker_service, monkeypatch, AsyncMock())
+    payload = _make_payload(
+        workload_kind=WorkloadKind.FILLER,
+        cache_volumes=[CacheVolume(name="dphn_cache_hf_x", target="/root/.cache/huggingface")],
+    )
+    ssh_client = VolumeDriverSshClient(None)
+
+    await docker_service.create_missing_loop_backed_caches(ssh_client, docker_client, payload, "tag", {})
+
+    assert len(payload.cache_volumes) == 1 and ssh_client.commands == []
+    docker_client.create_volume.assert_not_awaited()
 
 
 class CacheDuHostSshClient(RemovingHostSshClient):
@@ -1144,6 +1188,35 @@ async def test_the_caches_stay_when_removing_them_cannot_make_the_rental_fit(
         assert not any("image rm" in command for command in ssh_client.commands)  # nor the idle filler images
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("free_gb", "removed"), [(2150, [_JOB_CACHE]), (2100, [])])
+async def test_a_rental_counts_a_job_cache_at_its_whole_size_without_measuring_it(
+    docker_service, monkeypatch, free_gb, removed
+):
+    # an empty job cache still holds its 200 GB of disk: 2350 GB once it goes fits the 2320 GB volume, 2300 GB not
+    ssh_client = CacheDuHostSshClient([_JOB_CACHE, "volume_pod"], free_gb=free_gb, cache_gb=[0])
+    rental = _whole_node_rental(monkeypatch, docker_service)
+
+    assert await docker_service.reclaim_dphn_cache_for_rental(ssh_client, rental, {}) is bool(removed)
+    assert _removed_volumes(ssh_client) == removed
+    assert not any("du -sk" in command for command in ssh_client.commands)
+
+
+@pytest.mark.asyncio
+async def test_a_job_cache_a_killed_job_still_holds_is_removed_again_not_wiped(docker_service, monkeypatch):
+    # unlinking files inside a loop volume frees no host disk: only the removal does, once the job has exited
+    ssh_client = RemovingHostSshClient([_JOB_CACHE, _KIMI, "volume_pod"], free_gb=500)
+    rental = _whole_node_rental(monkeypatch, docker_service)
+
+    await docker_service.reclaim_dphn_cache_for_rental(ssh_client, rental, {}, killed_fillers=["filler_x"])
+
+    job_removal = next(c for c in ssh_client.commands if f"volume rm {_JOB_CACHE}" in c)
+    engy_removal = next(c for c in ssh_client.commands if f"volume rm {_KIMI}" in c)
+    assert "rm -rf" in engy_removal
+    assert "rm -rf" not in job_removal
+    assert f"ps -aq --filter volume={_JOB_CACHE}" in job_removal and "sleep" in job_removal
+
+
 class HangingDuHostSshClient(RemovingHostSshClient):
     async def run(self, command: str, *args, **kwargs):
         if "du -sk" in command:
@@ -1163,11 +1236,11 @@ async def test_a_hung_size_read_does_not_stall_the_create(docker_service, monkey
 
 @pytest.mark.asyncio
 async def test_only_the_requested_caches_are_measured_not_every_cache_on_the_host(docker_service):
-    # Measuring resets an oversize cache, so a cache this launch did not ask for must not be measured.
+    # `du` in a helper container is slow: a cache this launch did not ask for is not measured.
     requested = "engy_cache_hf_1561gb_kimi-k3-1a2b3c4d"
     other = "engy_cache_hf_1561gb_kimi-k3-9f8e7d6c"
     docker_service._find_cache_volumes_to_sweep = AsyncMock(return_value=[requested, other])
-    docker_service._cache_missing_gb_resetting_oversize = AsyncMock(return_value=0.0)
+    docker_service._cache_missing_gb = AsyncMock(return_value=0.0)
     payload = _make_payload(
         workload_kind=WorkloadKind.FILLER,
         cache_volumes=[CacheVolume(name=requested, target="/root/.cache/huggingface")],
@@ -1176,4 +1249,4 @@ async def test_only_the_requested_caches_are_measured_not_every_cache_on_the_hos
     assert await docker_service.select_affordable_cache_volumes(HostSshClient([], free_gb=100), payload, {}) == (
         payload.cache_volumes
     )
-    assert [call.args[1] for call in docker_service._cache_missing_gb_resetting_oversize.await_args_list] == [requested]
+    assert [call.args[1] for call in docker_service._cache_missing_gb.await_args_list] == [requested]

@@ -93,6 +93,8 @@ from services.const import (
     cache_prefixes,
     cache_size_gb,
     is_cache_volume_name,
+    is_loop_backed_cache,
+    LOOP_VOLUME_MAX_GB,
     unparked_name,
     KEPT_UNMOUNTED_PREFIX,
     LIUM_POD_ID_LABEL,
@@ -600,6 +602,8 @@ _HOST_READ_TIMEOUT_SECONDS = 15
 CACHE_VOLUME_REMOVE_TIMEOUT_SECONDS = 600
 # the helper's `du` has `timeout 60`; this bounds the whole size read, `docker rm -f` included
 CACHE_SIZE_READ_TIMEOUT_SECONDS = 90
+# a killed filler lets go of its loop-backed cache within seconds; past this the rental's volume is clamped
+_LOOP_CACHE_REMOVE_ATTEMPTS = 30
 _KIB_PER_GIB = 1024 * 1024
 _LOCAL_VOLUME_TIMEOUT_THRESHOLD_GB = 100
 _LOCAL_VOLUME_TIMEOUT_BASE_SEC = 30
@@ -770,8 +774,7 @@ def _best_effort_delete_step(log: _BoundLog, step: str, **fields: Any) -> Iterat
 _FRESH_SIZING_OVERHEAD_GB = 20   # reserved for system/docker overhead when reconstructing the pool
 _FRESH_SIZING_HEADROOM_GB = 10   # min free space left on the fs after volume allocation
 _FRESH_SIZING_GB_BYTES = 1024 ** 3
-# The loopback plugin backs a volume with one sparse file and ext4 caps a file at 16 TiB.
-_FRESH_SIZING_MAX_VOLUME_GB = 16 * 1024 - 1
+_FRESH_SIZING_MAX_VOLUME_GB = LOOP_VOLUME_MAX_GB
 _VOLUME_SIZE_OPTION_RE = re.compile(r"(\d+(?:\.\d+)?)\s*([kmgt]?)b?", re.IGNORECASE)
 _VOLUME_SIZE_SUFFIX_MULTIPLIERS = {
     "": 1,
@@ -6815,7 +6818,9 @@ class DockerService:
         A filler this create just killed can still be exiting and mount its cache, so dockerd refuses the
         `volume rm` (prod 4 Nov, 8x B300 Engy and Dolphin): the cache's files are then unlinked on the host
         (_wipe_volume_cmd), only while every container mounting it is one of ``killed_fillers``; the empty volume
-        is swept later, and a filler asking for it again is charged the whole download (_cache_missing_gb_resetting_oversize).
+        is swept later, and a filler asking for it again is charged the whole download (_cache_missing_gb).
+        A loop-backed cache (DAH-6406) holds its disk in its backing file, so a wipe frees nothing: its removal
+        is tried again until the killed filler has let go of it.
         Only for CUSTOMER_RENTAL, and best-effort — a failure here must never break the rent.
         """
         if payload.workload_kind != WorkloadKind.CUSTOMER_RENTAL or not payload.volume_limit_gb:
@@ -6929,6 +6934,14 @@ class DockerService:
             def volume_remove(name: str) -> str:
                 if not killed:
                     return DockerCommand.volume_remove(name)
+                if is_loop_backed_cache(name):
+                    # refused while a container still holds it: again each second until none does
+                    return (
+                        f"for attempt in $(seq {_LOOP_CACHE_REMOVE_ATTEMPTS}); do "
+                        f"/usr/bin/docker volume rm {shlex.quote(name)} 2>/dev/null && break; "
+                        f'[ -n "$(/usr/bin/docker ps -aq --filter volume={shlex.quote(name)})" ] || break; '
+                        "sleep 1; done; true"
+                    )
                 return (
                     f"/usr/bin/docker volume rm {shlex.quote(name)} 2>/dev/null || "
                     f"( ( {_wipe_volume_cmd(name, *killed)} ) && "
@@ -7056,9 +7069,9 @@ class DockerService:
             )
         )
         # DAH-5192: a partial checkpoint (an interrupted download) is not "present": what it still lacks is charged.
-        # Only the requested names: `existing` holds every job cache on the host, and measuring resets an oversize one.
+        # Only the requested names: `existing` holds every job cache on the host.
         missing_gb: dict[str, float] = {
-            name: await self._cache_missing_gb_resetting_oversize(ssh_client, name, default_extra)
+            name: await self._cache_missing_gb(ssh_client, name, default_extra)
             for name in requested_names
             if name in existing
         }
@@ -7124,7 +7137,9 @@ class DockerService:
         self, ssh_client: asyncssh.SSHClientConnection, volume_names: list[str], keep_image: str | None = None
     ) -> float | None:
         """GB the cache volumes (one `du` in a helper container) and the idle filler images hold together; None when
-        it cannot be read."""
+        it cannot be read. A loop-backed cache holds its whole size whatever is in it, so it is not measured."""
+        loop_backed_gb: float = sum(cache_size_gb(name) for name in volume_names if is_loop_backed_cache(name))
+        volume_names = [name for name in volume_names if not is_loop_backed_cache(name)]
         mounts = " ".join(f"-v {shlex.quote(name)}:/cache/{index}:ro" for index, name in enumerate(volume_names))
         paths = " ".join(f"/cache/{index}" for index in range(len(volume_names)))
         try:
@@ -7135,6 +7150,9 @@ class DockerService:
                         f"{REMOVE_CACHE_SWEEP_CONTAINER}; timeout 60 /usr/bin/docker run --rm "
                         f"--name {CACHE_SWEEP_CONTAINER_NAME} {mounts} {ALPINE_HELPER_IMAGE} du -sk {paths}; "
                         f"{REMOVE_CACHE_SWEEP_CONTAINER}"
+                        # no path would make `du` measure the helper's own directory
+                        if volume_names
+                        else "true"
                     ),
                     ssh_client.run(idle_filler_images_size_command(keep_image)),
                 ),
@@ -7150,13 +7168,69 @@ class DockerService:
         image_bytes = [line.strip() for line in (images.stdout or "").splitlines() if line.strip()]
         if images.exit_status != 0 or not all(size.isdigit() for size in image_bytes):
             return None
-        return (sum(int(kb) for kb in sizes_kb) * 1024 + sum(int(size) for size in image_bytes)) / 1024**3
+        return loop_backed_gb + (sum(int(kb) for kb in sizes_kb) * 1024 + sum(int(size) for size in image_bytes)) / 1024**3
 
-    async def _cache_missing_gb_resetting_oversize(
+    async def create_missing_loop_backed_caches(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        docker_client: RentalDockerSdkClient,
+        payload: ContainerCreateRequest,
+        log_tag: str,
+        default_extra: dict,
+        host_probe: VolumeHostProbe | None = None,
+    ) -> None:
+        """DAH-6406: create each granted loop-backed cache (CacheKind.loop_backed) the node does not have yet.
+
+        A preallocated vloopback volume of the size in its name, as a rental's volume: the run cannot write more
+        than that, and the node's free disk does not change after this. A cache that cannot be created, or whose
+        name is taken by a volume of another driver, is dropped from the payload and the run goes on without
+        it: mounted by name, docker would create a plain volume with no limit.
+        """
+        if payload.workload_kind != WorkloadKind.FILLER or not payload.cache_volumes:
+            return
+        usable: list[CacheVolume] = []
+        for cache_volume in payload.cache_volumes:
+            name: str = cache_volume.name
+            if not is_loop_backed_cache(name):
+                usable.append(cache_volume)
+                continue
+            try:
+                inspected = await ssh_client.run(
+                    f"/usr/bin/docker volume inspect -f '{{{{.Driver}}}}' {shlex.quote(name)}"
+                )
+                if inspected.exit_status == 0:
+                    driver: str = (inspected.stdout or "").strip()
+                    if not _is_vloopback_driver(driver):
+                        raise RuntimeError(f"a volume of this name exists on driver {driver!r}")
+                else:
+                    await self.create_local_volume(
+                        ssh_client=ssh_client,
+                        docker_client=docker_client,
+                        local_volume=name,
+                        log_tag=log_tag,
+                        log_text=f"Creating cache volume {name}",
+                        log_extra=default_extra,
+                        # 1..LOOP_VOLUME_MAX_GB: any other size is never granted (cache_size_gb)
+                        limit=int(cache_size_gb(name)),
+                        host_probe=host_probe,
+                        labels=FILLER_VOLUME_LABELS,
+                    )
+                usable.append(cache_volume)
+            except (asyncio.CancelledError, SshSessionMayStillBeTakenError):
+                raise
+            except Exception as exc:
+                logger.warning(
+                    _m(
+                        "Cache volume is not usable; the run starts without it",
+                        extra=get_extra_info({**default_extra, "volume": name, "error": str(exc)}),
+                    ),
+                )
+        payload.cache_volumes = usable
+
+    async def _cache_missing_gb(
         self, ssh_client: asyncssh.SSHClientConnection, volume_name: str, default_extra: dict
     ) -> float:
         """GB an existing cache still costs a launch, by its kind's CacheCharge (CACHE_KINDS); 0 when unknown.
-        A REST_OF_SIZE cache over its size is removed here and charged whole.
 
         Measured in a helper container that mounts the volume by name (the SSH session lands inside the executor
         container, where the volume's host path does not exist). A checkpoint is a few hundred large files, so
@@ -7164,6 +7238,9 @@ class DockerService:
         """
         kind = cache_kind(volume_name)
         size_gb: float = cache_size_gb(volume_name)
+        if kind is not None and kind.charge is CacheCharge.PREALLOCATED:
+            # a size no loop volume can have is never mounted
+            return math.inf if math.isinf(size_gb) else 0
         if kind is None or math.isinf(size_gb):
             return 0
         unmeasured_missing_gb: float = size_gb if kind.unmeasured_charged_whole else 0
@@ -7190,23 +7267,6 @@ class DockerService:
                     return 0
                 logger.info(_m("Cache is a partial download; the run resumes it", extra=get_extra_info(extra)))
                 return size_gb - held_gb
-            case CacheCharge.REST_OF_SIZE:
-                if held_gb <= size_gb:
-                    return size_gb - held_gb
-                # over its size: removed so the run starts it empty, and charged whole like a new one; when docker
-                # cannot remove it, never afforded (math.inf), so the run goes without it instead of growing it further
-                try:
-                    removed = await ssh_client.run(DockerCommand.volume_remove_strict(volume_name))
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    return math.inf
-                if removed.exit_status != 0:
-                    return math.inf
-                logger.info(
-                    _m("Cache was over its size; removed so the run starts it empty", extra=get_extra_info(extra))
-                )
-                return size_gb
 
     @staticmethod
     def _cache_volume_families(volume_names: list[str]) -> tuple[str, ...]:
@@ -11725,10 +11785,10 @@ class DockerService:
                             f"{payload.bootstrap_restore.backup_engine}; the provider must update "
                             "the executor image"
                         )
+                volume_probe: VolumeHostProbe | None = None
                 if not local_volume:
                     # DAH-3240: one round trip for the host facts the sizing and the create need
                     # (a failed probe → None → the per-command path below).
-                    volume_probe: VolumeHostProbe | None = None
                     locked_df_avail_bytes: int | None = None
                     locked_df_error: Exception | None = None
                     if measures_host:
@@ -11827,12 +11887,16 @@ class DockerService:
                         labels=FILLER_VOLUME_LABELS if payload.workload_kind == WorkloadKind.FILLER else None,
                     )
                     created_local_volume = True
-
                     # DAH-1524: profile local volume sizing + creation on its own;
                     # otherwise this SSH-bound time hides inside the broad
                     # "container creation" bucket and looks like `docker run`.
                     profilers.append(ProfilerStep.since(ProfilerStepName.DOCKER_VOLUME_CREATION, prev_timestamp))
                     prev_timestamp = now_ms()
+
+                # also on a re-create: a cache volume docker has to make itself is a plain one with no limit
+                await self.create_missing_loop_backed_caches(
+                    ssh_client, docker_client, payload, log_tag, default_extra, volume_probe
+                )
 
                 external_volume_name = None
                 if payload.bootstrap_restore and not use_encrypted_volume:
