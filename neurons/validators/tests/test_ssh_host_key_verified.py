@@ -52,8 +52,8 @@ async def _run(
 ) -> JobResult:
     executor = ExecutorSSHInfo(
         uuid="node-9", address="10.0.0.5", port=8080, ssh_username="root", ssh_port=2200,
-        python_path="/usr/bin/python3", root_dir="/root/app", ssh_host_key=ssh_host_key,
-    )
+        python_path="/usr/bin/python3", root_dir="/root/app",
+    ).model_copy(update={"ssh_host_key": ssh_host_key})  # past the format rule, as the refusal test needs
     miner = MinerJobRequestPayload(
         job_batch_id="batch-1", miner_hotkey="5Miner", miner_coldkey="5Cold",
         miner_address="10.0.0.5", miner_port=8080, executors=[],

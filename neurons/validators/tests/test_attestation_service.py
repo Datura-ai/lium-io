@@ -114,10 +114,11 @@ async def test_attestation_service_accepts_fixture_quote(monkeypatch, address, e
 
 
 def _executor_reporting(ssh_host_key: str | None) -> ExecutorSSHInfo:
+    # model_copy skips the field's format rule, which refuses the two-line value the refusal test needs
     return ExecutorSSHInfo(
         uuid="test-executor", address="192.0.2.10", port=2222, ssh_username="exec-user", ssh_port=2222,
-        python_path="/usr/bin/python", root_dir="/opt/executor", ssh_host_key=ssh_host_key,
-    )
+        python_path="/usr/bin/python", root_dir="/opt/executor",
+    ).model_copy(update={"ssh_host_key": ssh_host_key})
 
 
 @pytest.mark.asyncio
