@@ -350,17 +350,15 @@ async def start_storage_operation(
             )
         stage_dir = _staged_directory(staged.stdout)
 
-        async with ssh_client.start_sftp_client() as sftp:
-            async with sftp.open(str(files.spec), "w") as remote_spec:
-                await remote_spec.write(
-                    json.dumps({**spec, "detach": True}, separators=(",", ":"), sort_keys=True)
-                )
-            await sftp.chmod(str(files.spec), 0o600)
-
+        # The spec (repository keys, restic password, reporter token) never touches the executor's disk: it reaches
+        # the launching shell on stdin and the runner through a pipe from that shell's memory. printf is a builtin
+        # and S is never exported, so it is in no argv or environ either. files.spec stays as an empty marker of the
+        # launch, which the restart checks above read.
+        spec_line = json.dumps({**spec, "detach": True}, separators=(",", ":"), sort_keys=True)
         # -E -s: the runner imports only the staged files and the standard library
         runner = (
-            f'{shlex.quote(python_path)} -E -s "$D"/{executor_payload.STORAGE[0]} '
-            f"--spec {shlex.quote(str(files.spec))} --cancel-file {shlex.quote(str(files.cancel))}"
+            f'printf \'%s\\n\' "$S" | {shlex.quote(python_path)} -E -s "$D"/{executor_payload.STORAGE[0]} '
+            f"--spec - --cancel-file {shlex.quote(str(files.cancel))}"
         )
         terminal_cleanup = (
             ""
@@ -383,11 +381,17 @@ async def start_storage_operation(
             f"rm -f {shlex.quote(str(files.spec))} {shlex.quote(str(files.pid))} "
             f"{shlex.quote(str(files.cancel))}{terminal_cleanup}"
         )
-        launch_command = (
-            f"D={shlex.quote(stage_dir)} nohup /bin/sh -c {shlex.quote(wrapper)} "
-            f"> {shlex.quote(str(files.log))} 2>&1 < /dev/null &"
+        # the launching shell reads the spec line, marks the launch, then leaves the wrapper running without it
+        launcher = (
+            "IFS= read -r S || exit 1; "
+            f"( umask 077; : > {shlex.quote(str(files.spec))} ); "
+            f"( trap '' HUP; {wrapper} ) > {shlex.quote(str(files.log))} 2>&1 < /dev/null &"
         )
-        await ssh_client.run(launch_command, check=True)
+        await ssh_client.run(
+            f"D={shlex.quote(stage_dir)} /bin/sh -c {shlex.quote(launcher)}",
+            check=True,
+            input=spec_line + "\n",
+        )
         return files
     except Exception as error:
         if stage_dir is not None:
@@ -551,7 +555,7 @@ async def cancel_storage_operation(
     spec = await _held_reporter_spec(redis, operation_id)
     helper = shlex.quote(files.helper)
     legacy_runner = shlex.quote(
-        f"[-]-spec {files.spec}"
+        f"[-]-cancel-file {files.cancel}"
     )  # "[-]" keeps pgrep from matching this shell
     # Targets are named, never a stored PID (the executor shares the host's PID namespace, so a stale PID
     # could be an unrelated process). SIGTERM to the helper: its storage_runner.py stops restic and reports CANCELLED.
@@ -605,8 +609,9 @@ async def _runner_alive(
     ssh_client: asyncssh.SSHClientConnection,
     files: StorageOperationFiles,
 ) -> bool:
-    # "[-]-spec" keeps pgrep from matching this command's own shell
-    runner_pattern = f"[-]-spec {files.spec}"
+    # "[-]-cancel-file" keeps pgrep from matching this command's own shell; the cancel path names this operation
+    # for runners launched with a spec file (older validators) and with the spec on stdin alike
+    runner_pattern = f"[-]-cancel-file {files.cancel}"
     # an executor before the wrapper helper (a running wrapper helper already reads as RUNNING)
     result = await ssh_client.run(
         f"pgrep -f -- {shlex.quote(runner_pattern)} >/dev/null",

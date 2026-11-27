@@ -2,9 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import signal
-import stat
 import time
 import sys
 from collections.abc import Mapping
@@ -126,7 +124,7 @@ def _parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         "--spec",
         default="-",
-        help="operation JSON file with mode 0600, or '-' to read JSON from stdin",
+        help="'-': read the operation JSON from stdin (the only source)",
     )
     parser.add_argument(
         "--cancel-file",
@@ -143,24 +141,10 @@ def _parse_arguments() -> argparse.Namespace:
 
 
 def _load_operation(spec_path: str) -> Mapping[str, object]:
-    if spec_path == "-":
-        return _parse_object(sys.stdin.read())
-
-    path = Path(spec_path)
-    mode = stat.S_IMODE(path.stat().st_mode)
-    if mode & 0o077:
-        raise OperationSpecError(f"operation spec must not be group/world accessible: {oct(mode)}")
-    text = path.read_text()
-    path.unlink(missing_ok=True)
-    payload = _parse_object(text)
-    # the repository credentials must not outlive the read on the provider's disk; the validator's cancel
-    # still reports through the operation's own reporter, so only that is written back (DAH-6463)
-    reporter = payload.get("reporter")
-    if isinstance(reporter, Mapping):
-        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(descriptor, "w") as kept:
-            json.dump({"reporter": reporter}, kept)
-    return payload
+    # the spec carries the repository credentials, so it only ever arrives on stdin, never as a file on the node
+    if spec_path != "-":
+        raise OperationSpecError("operation spec must be read from stdin (--spec -)")
+    return _parse_object(sys.stdin.read())
 
 
 def _parse_object(value: str) -> Mapping[str, object]:

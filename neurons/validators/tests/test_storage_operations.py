@@ -1,5 +1,4 @@
 import json
-import os
 import subprocess
 import sys
 import textwrap
@@ -43,7 +42,7 @@ def _local_ssh(fake_docker: Path) -> SimpleNamespace:
 
 
 def _legacy_runner(tmp_path: Path) -> subprocess.Popen:
-    # an executor before the wrapper helper: its runner is a local process named by its spec path
+    # an executor before the wrapper helper: its runner is a local process named by its cancel-file path
     return subprocess.Popen(
         [
             sys.executable,
@@ -51,6 +50,8 @@ def _legacy_runner(tmp_path: Path) -> subprocess.Popen:
             "import time; time.sleep(60)",
             "--spec",
             str(tmp_path / f"{OPERATION_ID}.json"),
+            "--cancel-file",
+            str(tmp_path / f"{OPERATION_ID}.cancel"),
         ]
     )
 
@@ -273,8 +274,9 @@ async def test_a_repeated_dispatch_never_starts_a_second_runner(monkeypatch: pyt
     )
     assert files == storage_operations.StorageOperationFiles.for_operation(OPERATION_ID)
     probe = next(c for c in commands if c.startswith("pgrep -f"))
-    assert f"[-]-spec {files.spec}" in probe
-    assert not any("docker rm -f" in c or "nohup" in c for c in commands)  # never a second wrapper, the helper stays
+    assert f"[-]-cancel-file {files.cancel}" in probe
+    # never a second wrapper, the helper stays
+    assert not any("docker rm -f" in c or "IFS= read -r S" in c for c in commands)
 
 
 @pytest.fixture
@@ -307,35 +309,8 @@ async def _run_locally(command: str, check: bool = False, input: str | None = No
     return SimpleNamespace(exit_status=done.returncode, stdout=done.stdout, stderr=done.stderr)
 
 
-class _LocalSFTP:
-    """The spec upload's SFTP, on the local disk."""
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *exc):
-        return False
-
-    def open(self, path: str, mode: str):
-        class _File:
-            async def __aenter__(self):
-                self.f = open(path, mode)
-                return self
-
-            async def __aexit__(self, *exc):
-                self.f.close()
-
-            async def write(self, data):
-                self.f.write(data)
-
-        return _File()
-
-    async def chmod(self, path: str, mode: int):
-        os.chmod(path, mode)
-
-
 def _node_client(run=None) -> SimpleNamespace:
-    return SimpleNamespace(run=run or _run_locally, start_sftp_client=_LocalSFTP)
+    return SimpleNamespace(run=run or _run_locally, start_sftp_client=None)
 
 
 def _dispatch(spec: dict | None = None, retain: bool = False) -> storage_operations.StorageOperationFiles:
@@ -489,30 +464,33 @@ def test_a_runner_that_cannot_start_fails_the_dispatch_while_it_can_report(node:
     assert not Path(str(files.spec)).exists() and _staged(node) == []
 
 
-def test_a_dispatch_with_no_live_run_removes_the_stale_helper_then_writes_the_spec_then_starts_the_runner(
+def test_a_dispatch_with_no_live_run_removes_the_stale_helper_then_hands_the_runner_its_spec_on_stdin_only(
     node: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # the spec carries the repository credentials: it reaches the runner through the launch's stdin, never a file
     import asyncio as aio
+    import json
 
     runs = node / "runs"
-    _runner(node, f"open({str(runs)!r}, 'a').write('run\\n')\n")
+    _runner(node, f"import sys\nopen({str(runs)!r}, 'a').write(sys.stdin.read())\n")
     steps: list[str] = []
+    seen_on_disk: list[str] = []
 
     async def run(command: str, check: bool = False, input: str | None = None) -> SimpleNamespace:
-        steps.extend(s for s, hit in (("helper", "docker rm -f" in command), ("launch", "nohup" in command)) if hit)
-        return await _run_locally(command, check, input)
+        steps.extend(s for s, hit in (("helper", "docker rm -f" in command), ("launch", "IFS= read -r S" in command)) if hit)
+        result = await _run_locally(command, check, input)
+        seen_on_disk.extend(p.read_text() for p in node.glob("*.json"))
+        return result
 
-    class _Recording(_LocalSFTP):
-        def open(self, path: str, mode: str):
-            steps.append("spec")
-            return super().open(path, mode)
-
+    spec = {"engine": "restic", "repository": {"password": "restic-test"}}
     aio.run(storage_operations.start_storage_operation(
-        SimpleNamespace(run=run, start_sftp_client=_Recording), sys.executable, OPERATION_ID, {"engine": "restic"},
+        SimpleNamespace(run=run, start_sftp_client=None), sys.executable, OPERATION_ID, spec,
         retain_terminal_artifacts=False,
     ))
     _wait_for(runs)
-    assert steps == ["helper", "spec", "launch"]
+    assert steps == ["helper", "launch"]
+    assert json.loads(runs.read_text()) == {**spec, "detach": True}
+    assert set(seen_on_disk) <= {""}  # the launch marker at files.spec stays empty
 
 
 def test_the_runner_start_check_never_imports_from_the_working_directory(node: Path, monkeypatch: pytest.MonkeyPatch) -> None:
