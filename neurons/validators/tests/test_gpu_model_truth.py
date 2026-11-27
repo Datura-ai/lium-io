@@ -260,8 +260,8 @@ WRONG_UUID = ValidationResult(
     "full_check, passed, verdict_ttl",
     [
         (ValidationResult(success=True, metrics=REAL_H100[1]), True, "week"),
-        (WRONG_ANSWER, False, "day"),
-        (WRONG_UUID, False, "day"),
+        (WRONG_ANSWER, False, "week"),
+        (WRONG_UUID, False, "week"),
         (NO_ROOM, True, "day"),
         (TIMED_OUT, True, "day"),
         (VALIDATOR_ERROR, True, "day"),
@@ -287,10 +287,11 @@ async def test_after_the_filler_stop_only_a_wrong_answer_fails_the_node(
         capability.GPU_MODEL_VERDICT_TTL_SECONDS if verdict_ttl == "week" else capability.GPU_MODEL_NO_VERDICT_TTL_SECONDS
     )
 
-    # the filler is back: the node is judged (or waits a day), so it is neither stopped nor sampled again
+    # the filler is back: the node is judged (or waits a day), so it is neither stopped nor sampled again;
+    # a proven wrong answer stands
     ctx, service = _filler_ctx(context_factory, redis, None, success=False, failure=WRONG_ANSWER)
     result = await CapabilityCheck().run(_lium_filler(ctx))
-    assert result.passed is True
+    assert result.passed is passed
     assert service.budgets == []
     assert "stopped_fillers_for_full_check" not in result.event.what_we_saw
 
@@ -886,4 +887,109 @@ async def test_after_the_stop_only_a_wrong_answer_from_the_due_card_fails_the_no
     assert result.passed is passed
     if not passed:
         assert result.event.reason_code == Msg.GPU_WORK_PROOF_FAILED.reason
-    assert redis.ttl[_verdict_key()] == capability.GPU_MODEL_NO_VERDICT_TTL_SECONDS
+    assert redis.ttl[_verdict_key()] == (
+        capability.GPU_MODEL_NO_VERDICT_TTL_SECONDS if passed else capability.GPU_MODEL_VERDICT_TTL_SECONDS
+    )
+
+
+def _two_card_filler_ctx(context_factory, redis, service):
+    state = build_state(
+        specs=TWO_H100,
+        rented_data=RentedExecutorsResponse(
+            executors={}, banned_guids=[], filler_containers_by_executor={"executor-123": "filler_active"}
+        ),
+    )
+    return _lium_filler(context_factory(services=build_services(validation=service, redis=redis), state=state))
+
+
+def _stored_kinds(redis) -> list[tuple[int, str]]:
+    return [(m["card_index"], m["kind"]) for m in json.loads(redis.store[_verdict_key()])["mismatches"]]
+
+
+RIGHT_ANSWER = ValidationResult(success=True, metrics=REAL_H100[1])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("all_cards", [False, True], ids=["all_cards_off", "all_cards_on"])
+@pytest.mark.parametrize("card", [0, 1], ids=["card_0", "due_card"])
+@pytest.mark.parametrize("retry", [RIGHT_ANSWER, NO_ROOM, WRONG_UUID], ids=["passes", "no_answer", "wrong_uuid"])
+async def test_a_wrong_uuid_after_the_stop_fails_the_node_every_cycle_until_a_daily_full_check_passes(
+    context_factory, sample_never_due, monkeypatch, all_cards, card, retry
+):
+    # review: the empty day entry stored at the stop passed the node, filler and all, for a day
+    monkeypatch.setattr(capability.settings, "MATMUL_ALLCARDS_CHECK_ENABLED", all_cards)
+    monkeypatch.setattr(capability.settings, "MATMUL_ALLCARDS_ENFORCEMENT_ENABLED", all_cards)
+    redis = FakeRedis()
+
+    def service_answering(answer: ValidationResult):
+        return _DueCardService(answer) if card else SamplingValidationService(result=answer)
+
+    ctx = _two_card_filler_ctx(context_factory, redis, service_answering(WRONG_UUID))
+    await redis.set(capability._full_check_due_key(ctx), str(card))
+    result = await CapabilityCheck().run(ctx)
+    assert result.passed is False
+    assert result.event.what_we_saw["stopped_fillers_for_full_check"] == ["filler_active"]
+    assert _stored_kinds(redis) == [(card, "full_check_failed")]
+
+    for _ in range(3):  # the filler is back: the node fails, and the filler is neither stopped nor sampled
+        service = service_answering(RIGHT_ANSWER)
+        ctx = _two_card_filler_ctx(context_factory, redis, service)
+        result = await CapabilityCheck().run(ctx)
+        assert result.passed is False
+        assert result.event.reason_code == Msg.GPU_WORK_PROOF_FAILED.reason
+        assert service.budgets == []
+        ctx.ssh.run.assert_not_awaited()
+
+    del redis.store[capability._full_check_wait_key(ctx)]  # a day later: the full check runs again, once
+    ctx = _two_card_filler_ctx(context_factory, redis, service_answering(retry))
+    result = await CapabilityCheck().run(ctx)
+    assert result.event.what_we_saw["stopped_fillers_for_full_check"] == ["filler_active"]
+    assert result.passed is retry.success
+    assert redis.ttl[_verdict_key()] == capability.GPU_MODEL_VERDICT_TTL_SECONDS
+    assert redis.ttl[capability._full_check_wait_key(ctx)] == capability.GPU_MODEL_NO_VERDICT_TTL_SECONDS
+
+    # only a full check that passes clears it
+    service = service_answering(RIGHT_ANSWER)
+    ctx = _two_card_filler_ctx(context_factory, redis, service)
+    result = await CapabilityCheck().run(ctx)
+    assert result.passed is retry.success
+    assert service.budgets == []
+    ctx.ssh.run.assert_not_awaited()
+    assert bool(_stored_kinds(redis)) is not retry.success
+
+
+@pytest.mark.asyncio
+async def test_no_answer_after_the_stop_passes_and_the_node_is_sampled_again_a_day_later(context_factory, sample_never_due):
+    redis = FakeRedis()
+    ctx = _two_card_filler_ctx(context_factory, redis, SamplingValidationService(result=NO_ROOM))
+    await redis.set(capability._full_check_due_key(ctx), "0")
+    assert (await CapabilityCheck().run(ctx)).passed is True
+    assert _stored_kinds(redis) == []
+
+    ctx = _two_card_filler_ctx(context_factory, redis, SamplingValidationService(result=WRONG_UUID))
+    assert (await CapabilityCheck().run(ctx)).passed is True  # the day entry: no stop, no sample
+    ctx.ssh.run.assert_not_awaited()
+
+    del redis.store[_verdict_key()]  # a day later the entry is gone: sampled again, then the full check is due
+    service = SamplingValidationService(result=WRONG_UUID)
+    ctx = _two_card_filler_ctx(context_factory, redis, service)
+    assert (await CapabilityCheck().run(ctx)).passed is True
+    assert service.budgets == [capability.settings.FILLER_MATMUL_SAMPLE_VRAM_MB]
+    assert capability._full_check_due_key(ctx) in redis.store
+
+
+@pytest.mark.asyncio
+async def test_a_full_check_on_idle_cards_clears_a_stored_full_check_failure(context_factory):
+    # no filler was placed again: the normal full check runs every cycle and its pass clears the failure
+    redis = FakeRedis()
+    ctx = _two_card_filler_ctx(context_factory, redis, _DueCardService(WRONG_UUID))
+    await redis.set(capability._full_check_due_key(ctx), "1")
+    assert (await CapabilityCheck().run(ctx)).passed is False
+
+    service = _DueCardService(RIGHT_ANSWER)
+    state = build_state(specs=TWO_H100)
+    result = await CapabilityCheck().run(context_factory(services=build_services(validation=service, redis=redis), state=state))
+
+    assert service.gpu_uuids == [None, "GPU-1"]
+    assert result.passed is True
+    assert _stored_kinds(redis) == []
