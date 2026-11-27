@@ -42,8 +42,8 @@ def setup_script() -> tuple[str, int] | None:
 
 def host_may_be_rented(ctx: Context) -> bool:
     """Any pod on this executor's rented list, stopped ones too (a stopped pod is a live rental), or no list this cycle.
-    The install and the removal run `systemctl daemon-reload` and change what runs before Docker at boot, so they wait
-    for a cycle that shows the host idle."""
+    Only the removal waits for a cycle that shows the host idle; the install runs on rented hosts too, as it never
+    starts, stops or restarts anything (tests/test_sysbox_setup_layer_reset.py)."""
     rented_data = ctx.state.rented_data
     listed = rented_data.executors.get(ctx.executor.uuid) if rented_data is not None else None
     return rented_data is None or bool(listed and listed.pods)
@@ -64,7 +64,8 @@ async def run_setup_option(ssh, script: str, command: str) -> str:
     if not lines:
         return "failed no_answer"
     verb, _, reason = lines[-1].partition(" ")
-    return f"{verb.removeprefix('layer_reset_')} {reason}".strip()
+    # the host writes this line (a failed install adds its step and stderr): printable ASCII only, bounded
+    return re.sub(r"[^\x20-\x7e]", "?", f"{verb.removeprefix('layer_reset_')} {reason}".strip())[:200]
 
 
 class SysboxLayerResetCheck:
@@ -75,10 +76,11 @@ class SysboxLayerResetCheck:
     (lium-io #2276), but only the setup script installs it and providers rarely re-run that. The scrape reports the
     installed version (``specs.sysbox_layer_reset_version``: 0 none, 1 before the version line, N); below the
     shipped setup script's LAYER_RESET_VERSION this runs that script's ``--install-layer-reset`` on the host, which
-    installs the unit and Docker's drop-in only: it never runs the reset and never restarts Docker. It installs only on
-    a host with no rental (host_may_be_rented); a host rented the whole time gets it at its first idle cycle.
+    installs the unit and Docker's drop-in only: it never runs the reset, never restarts Docker or Sysbox and never
+    stops, restarts or re-creates a container. It installs on rented hosts too: they are the ones a power loss hurts,
+    and the reset only acts at the next boot, before Docker starts the pods.
     SYSBOX_LAYER_RESET_INSTALL rolls it out: off, allowlist, then all; remove (DAH-7052) runs the script's
-    ``--remove-layer-reset`` instead on every host that has the unit (same idle rule). Skipped under dry run. Non-fatal, right after
+    ``--remove-layer-reset`` instead on every host that has the unit, at an idle cycle (host_may_be_rented). Skipped under dry run. Non-fatal, right after
     the scrape. The score is not changed.
     """
 
@@ -110,7 +112,7 @@ class SysboxLayerResetCheck:
             return CheckResult(passed=True, event=render_message(template, ctx=ctx, check_id=self.check_id, what=what))
         if installed >= shipped[1]:
             return CheckResult(passed=True, event=render_message(Msg.OK, ctx=ctx, check_id=self.check_id, what=what))
-        if not (self.write and install_wanted(mode, ctx.miner_hotkey)) or host_may_be_rented(ctx):
+        if not (self.write and install_wanted(mode, ctx.miner_hotkey)):
             return CheckResult(passed=True, event=render_message(Msg.OUTDATED, ctx=ctx, check_id=self.check_id, what=what))
         what["install"] = await run_setup_option(ctx.ssh, shipped[0], INSTALL_COMMAND)
         template = Msg.INSTALLED if what["install"] == f"installed {shipped[1]}" else Msg.INSTALL_FAILED

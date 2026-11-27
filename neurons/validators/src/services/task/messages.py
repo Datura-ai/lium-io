@@ -2316,6 +2316,18 @@ class CapabilityMessages:
         ),
         remediation="No action needed.",
     )
+    # DAH-6332: the full check run with Lium's filler stopped gave no verdict
+    FULL_CHECK_INCONCLUSIVE = MessageTemplate(
+        event="GPU capability check after the filler stop gave no verdict",
+        reason="GPU_VERIFY_FULL_CHECK_INCONCLUSIVE",
+        severity="warning",
+        category="policy",
+        impact=(
+            "Score unchanged; no answer, a timeout or a validator-side error proves no GPU model mismatch. "
+            "The node is checked again in a day."
+        ),
+        remediation="No action needed.",
+    )
     VERIFY_FAILED = MessageTemplate(
         event="GPU capability verification failed",
         reason="GPU_VERIFY_FAILED",

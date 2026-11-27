@@ -58,6 +58,7 @@ class DummyBackendClient:
         miner_port: int,
         miner_hotkey: str,
         container_port: int,
+        host_port: int | None = None,
         executor_id: str | None = None,
         rental_in_progress: bool = False,
         gpu_uuids: list[str] | None = None,
@@ -72,6 +73,7 @@ class DummyBackendClient:
             "miner_port": miner_port,
             "miner_hotkey": miner_hotkey,
             "container_port": container_port,
+            "host_port": host_port,
             "executor_id": executor_id,
             "rental_in_progress": rental_in_progress,
             "gpu_uuids": gpu_uuids,
@@ -305,6 +307,7 @@ async def test_rental_verification_success():
         "miner_port": 8000,
         "miner_hotkey": "miner-hotkey",
         "container_port": 8080,  # First verified port
+        "host_port": 8080,  # no mapping pair for it: the same number
         "executor_id": "executor-123",
         "rental_in_progress": False,  # no customer rental in this state
         "gpu_uuids": [],  # this state carries no scraped gpu details
@@ -511,6 +514,26 @@ async def test_rental_verification_uses_first_verified_port():
     assert result.passed is True
     # Should use first port (9001)
     assert backend_client.called_with["container_port"] == 9001
+    assert backend_client.called_with["host_port"] == 9001
+
+
+@pytest.mark.asyncio
+async def test_rental_verification_sends_the_host_port_a_mapped_outside_port_is_forwarded_to():
+    # DAH-6946: RENTING_PORT_MAPPINGS [[41002, 5892], [41003, 5893]] - the router forwards 5892 to host port 41002
+    backend_client = DummyBackendClient(response=ExecutorHealthCheckResponse(success=True, error=None, details={}))
+    services = build_services(backend=backend_client, container_cleanup=ContainerCleanup())
+    state = build_state(
+        specs={"verified_ports": [5892, 5893]}, verified_port_pairs=[(41002, 5892), (41003, 5893)]
+    )
+
+    from tests.helpers import make_context
+    ctx = make_context(services=services, state=state)
+
+    with patch("neurons.validators.src.services.task.checks.rental_verification.settings"):
+        result = await RentalVerificationCheck().run(ctx)
+
+    assert result.passed is True
+    assert (backend_client.called_with["container_port"], backend_client.called_with["host_port"]) == (5892, 41002)
 
 
 # ---------------------------------------------------------------------------
