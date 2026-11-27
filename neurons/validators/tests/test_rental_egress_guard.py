@@ -1237,9 +1237,10 @@ def test_the_rules_are_back_before_dockerd_starts_a_container_after_a_reboot(tmp
     dropin = (root / rental_egress_guard.BOOT_DROPIN.lstrip("/")).read_text()
     unit = (root / rental_egress_guard.BOOT_UNIT.lstrip("/")).read_text()
     name = rental_egress_guard.BOOT_UNIT.rsplit("/", 1)[1]
-    # no "-": a boot copy that fails fails its unit, and Requires= with After= keeps dockerd from starting
+    # After= holds dockerd until the copy ends; Wants=, so a copy that gives up still lets Docker start
     assert f"ExecStart=/bin/sh {rental_egress_guard.BOOT_SCRIPT}" in unit.splitlines()
-    assert {f"Requires={name}", f"After={name}"} <= set(dropin.splitlines())
+    assert {f"Wants={name}", f"After={name}"} <= set(dropin.splitlines())
+    assert f"Requires={name}" not in dropin.splitlines()
     assert (state / "reloads").read_text().split() == ["x"]  # reloaded once, not on every apply
 
     # the reboot: no chain survives, dockerd has not run yet; the drop-in's script alone restores the rules
@@ -1258,18 +1259,16 @@ def test_the_rules_are_back_before_dockerd_starts_a_container_after_a_reboot(tmp
 
 
 def test_a_boot_copy_holds_the_docker_start_until_the_rules_are_back(tmp_path):
-    """The boot copy's failure is not ignored by systemd: dockerd, which restarts rental containers on its own, does
-    not start until the rules are back. It waits inside the one start, so a firewall write that fails for a while
-    uses none of Docker's start limit, and Docker starts once the write succeeds."""
+    """dockerd, which restarts rental containers on its own, does not start until the rules are back: a firewall write
+    that fails for a while is tried again inside the one start, and Docker starts once the write succeeds."""
     state, root, env = _modelled_host(tmp_path, docker_user=True)
     applied = subprocess.run(
         ["sh", "-c", link_local_drop_script("br-0123456789ab", [], str(root))], env=env, capture_output=True, text=True
     )
     assert applied.returncode == 0, applied.stderr
     unit = (root / rental_egress_guard.BOOT_UNIT.lstrip("/")).read_text()
-    [line] = [x for x in unit.splitlines() if x.startswith("ExecStart=")]
-    assert not line.startswith("ExecStart=-")
-    assert "TimeoutStartSec=infinity" in unit.splitlines()  # no start timeout cuts the wait short
+    # sergej-bot review at 90713e30: the start timeout ends a copy stuck in one call, after the script's own wait
+    assert f"TimeoutStartSec={rental_egress_guard.BOOT_WAIT_SECONDS + 60}" in unit.splitlines()
     # a host firewall's start flushes the ruleset: the boot copy writes the rules after it, not in parallel
     assert f"After={rental_egress_guard.BOOT_AFTER}" in unit.splitlines()
     assert "firewalld.service" in rental_egress_guard.BOOT_AFTER.split()
@@ -1295,6 +1294,36 @@ def test_a_boot_copy_holds_the_docker_start_until_the_rules_are_back(tmp_path):
         restoring.kill()
     [(_, rules)] = _jumps_and_rules(state)
     assert rules == [f"-i br-0123456789ab -d {LINK_LOCAL_CIDR} -p {p} ! --dport 53 -j DROP" for p in ("tcp", "udp")]
+    assert not (root / rental_egress_guard.BOOT_LATE.lstrip("/")).exists()
+
+
+def test_a_boot_copy_that_cannot_put_the_rules_back_gives_up_and_the_next_apply_reports_it(tmp_path):
+    """sergej-bot review at 90713e30: with no iptables after an OS update the copy never succeeds. It gives up after
+    its wait, so Docker (Wants=) starts and the validator can reach the host; the mark it leaves is reported by the
+    next apply that puts the rules back, and cleared."""
+    state, root, env = _modelled_host(tmp_path, docker_user=True)
+    script = link_local_drop_script("br-0123456789ab", [], str(root))
+    assert subprocess.run(["sh", "-c", script], env=env, capture_output=True, text=True).returncode == 0
+    iptables = tmp_path / "bin" / "iptables"
+    working = iptables.read_text()
+    iptables.write_text("#!/bin/sh\nexit 127\n")
+    late = root / rental_egress_guard.BOOT_LATE.lstrip("/")
+
+    gave_up = subprocess.run(
+        ["sh", str(root / rental_egress_guard.BOOT_SCRIPT.lstrip("/"))],
+        env={**env, "LIUM_EGRESS_BOOT_WAIT": "2"},
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+
+    assert gave_up.returncode != 0
+    assert late.exists()
+    iptables.write_text(working)
+    reapplied = subprocess.run(["sh", "-c", script], env=env, capture_output=True, text=True)
+    assert reapplied.returncode == 0, reapplied.stderr
+    assert rental_egress_guard.BOOT_LATE_LINE in reapplied.stdout.splitlines()
+    assert not late.exists()
 
 
 def test_a_docker_start_after_the_last_rental_ended_restores_no_rules(tmp_path):

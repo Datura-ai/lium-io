@@ -96,6 +96,11 @@ HOST_ROOT = "/proc/1/root"
 BOOT_SCRIPT = "/etc/lium/rental-egress-boot.sh"
 BOOT_DROPIN = "/etc/systemd/system/docker.service.d/lium-rental-egress.conf"
 BOOT_UNIT = "/etc/systemd/system/lium-rental-egress-boot.service"
+# Present from a Docker start whose boot copy has not put the rules back until the next apply, which reports it
+BOOT_LATE = "/etc/lium/rental-egress-boot-late"
+# How long a Docker start waits for the boot copy before it starts without the rules
+BOOT_WAIT_SECONDS = 300
+BOOT_LATE_LINE = "rules not back when docker started"
 _ABSENT_NETWORK = re.compile(r"no such network|network \S+ not found", re.IGNORECASE)
 _ABSENT_CONTAINER = re.compile(r"no such (object|container)", re.IGNORECASE)
 
@@ -277,10 +282,24 @@ def link_local_drop_script(bridge: str | None, legacy_bridges: list[str], host_r
         ("old-releases", _DETACH_OLD_JUMPS),
     ]
     lines = _steps(steps)
-    # the same rules, run by systemd on the host before dockerd starts any container after a reboot. Tried again
-    # until they apply, inside the one start: a failing firewall write holds dockerd without using up its start limit
-    boot = "until ( " + "; ".join(["HOST_NS=", *lines, "exit 0"]) + " ); do sleep 1; done; exit 0"
-    return "; ".join([*lines, f"step boot-restore; {_boot_restore(boot, host_root)}", "exit 0"])
+    # the same rules, run by systemd on the host before dockerd starts any container after a reboot. Tried again for
+    # BOOT_WAIT_SECONDS: rules that can never apply (no iptables) must not keep Docker, and so the validator, off the
+    # host. The mark next to the script stays from the start until they apply, so a late or timed-out copy is reported
+    late = '"${0%/*}/' + BOOT_LATE.rsplit("/", 1)[1] + '"'
+    boot = (
+        f"{{ : > {late}; }} 2>/dev/null; E=$(( $(date +%s) + ${{LIUM_EGRESS_BOOT_WAIT:-{BOOT_WAIT_SECONDS}}} )); "
+        "until ( " + "; ".join(["HOST_NS=", *lines, "exit 0"]) + ' ); do [ "$(date +%s)" -lt "$E" ] || exit 1; '
+        f"sleep 1; done; rm -f {late}; exit 0"
+    )
+    mark = shlex.quote(host_root + BOOT_LATE)
+    return "; ".join(
+        [
+            *lines,
+            f"step boot-late; if [ -f {mark} ]; then echo '{BOOT_LATE_LINE}'; rm -f {mark}; fi",
+            f"step boot-restore; {_boot_restore(boot, host_root)}",
+            "exit 0",
+        ]
+    )
 
 
 NO_BOOT_UNIT = "boot restore not installed: no systemd docker.service"
@@ -294,16 +313,17 @@ def _boot_restore(boot: str, host_root: str) -> str:
     dirs = " ".join(shlex.quote(host_root + path.rsplit("/", 1)[0]) for path in (BOOT_SCRIPT, BOOT_DROPIN))
     name = BOOT_UNIT.rsplit("/", 1)[1]
     # printf makes the newlines, so the command stays on one line
-    # dockerd restarts rental containers itself (unless-stopped), past the validator's pre-start guard: Requires= with
-    # After= keeps dockerd from starting until the boot copy has put the rules back, and a boot copy that fails stops
-    # it. The wait has no deadline on this unit only, so Docker's own start timeout and the provider's settings stay.
+    # dockerd restarts rental containers itself (unless-stopped), past the validator's pre-start guard: After= keeps
+    # dockerd from starting until the boot copy has put the rules back or given up. Wants=, not Requires=: a copy that
+    # fails or times out must still let Docker start, or the validator can never reach the host to repair it. The
+    # start timeout is on this unit only, so Docker's own and the provider's settings stay.
     # No RemainAfterExit: the copy runs again on every Docker start, as before. After= the host firewall services
     # Docker itself orders after: their start flushes the ruleset, so the copy must write the rules after they load
     unit = shlex.quote(
         f"[Unit]\\nDescription=Lium rental egress rules\\nAfter={BOOT_AFTER}\\n"
-        f"[Service]\\nType=oneshot\\nTimeoutStartSec=infinity\\nExecStart=/bin/sh {BOOT_SCRIPT}\\n"
+        f"[Service]\\nType=oneshot\\nTimeoutStartSec={BOOT_WAIT_SECONDS + 60}\\nExecStart=/bin/sh {BOOT_SCRIPT}\\n"
     )
-    hook = shlex.quote(f"[Unit]\\nRequires={name}\\nAfter={name}\\n")
+    hook = shlex.quote(f"[Unit]\\nWants={name}\\nAfter={name}\\n")
     need = "$HOST_NS systemctl show -p NeedDaemonReload --value"
     return (
         f"if [ ! -d {shlex.quote(host_root + '/run/systemd/system')} ]; then echo '{NO_BOOT_UNIT}'; "
@@ -334,7 +354,7 @@ def _boot_clear(host_root: str) -> str:
     the rules of a rental that has ended."""
     script = shlex.quote(host_root + BOOT_SCRIPT)
     return (
-        f"if [ -f {script} ]; then printf 'exit 0\\n' > {script}.tmp && mv -f {script}.tmp {script} || "
+        f"rm -f {shlex.quote(host_root + BOOT_LATE)}; if [ -f {script} ]; then printf 'exit 0\\n' > {script}.tmp && mv -f {script}.tmp {script} || "
         "{ echo 'boot rules not cleared' >&2; exit 4; }; fi"
     )
 
@@ -636,6 +656,10 @@ async def apply_rental_egress_guard(
         logger.warning(_m("Rental egress guard: rules not restored before dockerd after a reboot", extra={"why": boot}))
         if guarded is not None:
             guarded["boot_restore"] = boot
+    if BOOT_LATE_LINE in (result.stdout or "").splitlines():
+        logger.warning(_m("Rental egress guard: Docker started before the boot copy put the rules back"))
+        if guarded is not None:
+            guarded["boot_late"] = True
     if left := [line for line in (result.stdout or "").splitlines() if line.startswith("old jump")]:
         logger.warning(_m("Rental egress guard: an old release's jump was not detached", extra={"jumps": left}))
         if guarded is not None:
