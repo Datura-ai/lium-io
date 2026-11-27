@@ -23,7 +23,7 @@ async def test_semi_batch_fails_a_chunk_that_does_not_answer_in_time(mocker):
     runner.run = mocker.AsyncMock(side_effect=slow_then_ok)
     runner.cleanup = mocker.AsyncMock()
     port_tester = mocker.Mock()
-    port_tester.test_many = mocker.AsyncMock(side_effect=lambda _h, chunk, *_a: (chunk, []))
+    port_tester.test_many = mocker.AsyncMock(side_effect=lambda _s, _h, chunk, *_a: (chunk, []))
     verifier = SemiBatchVerifier(port_tester, runner)
     mocker.patch.object(SemiBatchVerifier, "CHUNK_TIMEOUT_SEC", 0.1)
 
@@ -41,7 +41,7 @@ async def test_semi_batch_publishes_a_mapped_port_on_the_host_port_the_router_fo
     runner.run = mocker.AsyncMock(return_value=CONTAINER_STARTED)
     runner.cleanup = mocker.AsyncMock()
     port_tester = mocker.Mock()
-    port_tester.test_many = mocker.AsyncMock(side_effect=lambda _h, chunk, *_a: (chunk, []))
+    port_tester.test_many = mocker.AsyncMock(side_effect=lambda _s, _h, chunk, *_a: (chunk, []))
 
     await SemiBatchVerifier(port_tester, runner).verify(ports, ssh_client=mocker.Mock(), host="1.2.3.4")
 
@@ -69,7 +69,7 @@ async def test_semi_batch_one_busy_host_port_fails_only_itself(mocker):
     runner.run = mocker.AsyncMock(side_effect=run)
     runner.cleanup = mocker.AsyncMock()
     port_tester = mocker.Mock()
-    port_tester.test_many = mocker.AsyncMock(side_effect=lambda _h, chunk, *_a: (chunk, []))
+    port_tester.test_many = mocker.AsyncMock(side_effect=lambda _s, _h, chunk, *_a: (chunk, []))
 
     successful, failed = await SemiBatchVerifier(port_tester, runner).verify(
         ports, ssh_client=mocker.Mock(), host="1.2.3.4"
@@ -282,7 +282,7 @@ async def test_batch_reprobes_missed_ports_once_when_most_fail(mocker):
     ports = [PortPair(9000 + i, 9000 + i) for i in range(10)]
     calls = []
 
-    def late_listeners(_h, probed, *_a):
+    def late_listeners(_s, _h, probed, *_a):
         calls.append(list(probed))
         return (probed[:1], probed[1:]) if len(calls) == 1 else (probed, [])
 
@@ -298,7 +298,7 @@ async def test_batch_reprobes_missed_ports_once_when_most_fail(mocker):
 @pytest.mark.asyncio
 async def test_batch_does_not_reprobe_when_most_ports_pass(mocker):
     ports = [PortPair(9000 + i, 9000 + i) for i in range(10)]
-    verifier, port_tester = _batch_verifier(mocker, lambda _h, probed, *_a: (probed[:8], probed[8:]))
+    verifier, port_tester = _batch_verifier(mocker, lambda _s, _h, probed, *_a: (probed[:8], probed[8:]))
 
     result = await verifier.verify(ports, ssh_client=mocker.Mock(), host="1.2.3.4")
 
@@ -314,7 +314,7 @@ async def test_batch_late_bind_with_enforced_outside_prober_is_not_externally_bl
     ports = [PortPair(9000 + i, 9000 + i) for i in range(10)]
     calls = []
 
-    def late_listeners(_h, probed, *_a):
+    def late_listeners(_s, _h, probed, *_a):
         calls.append(list(probed))
         return (probed[:1], probed[1:]) if len(calls) == 1 else (probed, [])
 
@@ -336,7 +336,7 @@ async def test_batch_reprobes_two_of_three_below_the_port_floor(mocker):
     ports = [PortPair(9000 + i, 9000 + i) for i in range(3)]
     calls = []
 
-    def late_listeners(_h, probed, *_a):
+    def late_listeners(_s, _h, probed, *_a):
         calls.append(list(probed))
         return (probed[:2], probed[2:]) if len(calls) == 1 else (probed, [])
 
@@ -353,7 +353,7 @@ async def test_batch_reprobe_gives_up_after_its_budget(mocker):
     from services.executor_connectivity.port_verifiers import BatchVerifier
 
     ports = [PortPair(9000 + i, 9000 + i) for i in range(3)]
-    verifier, port_tester = _batch_verifier(mocker, lambda _h, probed, *_a: ([], probed))
+    verifier, port_tester = _batch_verifier(mocker, lambda _s, _h, probed, *_a: ([], probed))
 
     result = await verifier.verify(ports, ssh_client=mocker.Mock(), host="1.2.3.4")
 
@@ -372,7 +372,7 @@ async def test_batch_reprobes_late_host_listeners_when_only_the_published_sample
     mocker.patch("services.executor_connectivity.port_verifiers.random.sample", lambda ps, k: ps[:k])
     calls = []
 
-    def late_listeners(_h, probed, *_a):
+    def late_listeners(_s, _h, probed, *_a):
         calls.append(list(probed))
         return ([], probed) if len(calls) == 1 else (probed, [])
 
@@ -395,7 +395,7 @@ async def test_batch_caps_the_reprobe_when_only_the_published_sample_answers(moc
     external = mocker.Mock()
     external.reached = mocker.AsyncMock(return_value=ports[:3])
     mocker.patch("services.executor_connectivity.port_verifiers.random.sample", lambda ps, k: ps[:k])
-    verifier, port_tester = _batch_verifier(mocker, lambda _h, probed, *_a: ([], probed), external)
+    verifier, port_tester = _batch_verifier(mocker, lambda _s, _h, probed, *_a: ([], probed), external)
 
     result = await verifier.verify(ports, ssh_client=mocker.Mock(), host="1.2.3.4")
 
@@ -411,7 +411,7 @@ async def test_batch_runs_attempt_2_when_the_deadline_fires_below_min_ports(mock
 
     ports = [PortPair(9000 + i, 9000 + i) for i in range(10)]
 
-    async def one_then_past_the_deadline(_h, probed, *_a):
+    async def one_then_past_the_deadline(_s, _h, probed, *_a):
         if port_tester.test_many.await_count > 1:
             await asyncio.sleep(5)
         return probed[:1], probed[1:]
@@ -429,7 +429,7 @@ async def test_batch_reprobes_past_the_floor_up_to_the_ports_a_split_node_needs(
     ports = [PortPair(9000 + i, 9000 + i) for i in range(24)]
     calls = []
 
-    def late_listeners(_h, probed, *_a):
+    def late_listeners(_s, _h, probed, *_a):
         calls.append(list(probed))
         return (probed[:20], probed[20:]) if len(calls) == 1 else (probed, [])
 
@@ -449,7 +449,7 @@ async def test_batch_is_start_hung_only_when_every_attempt_times_out_inside_the_
     async def hang(*_args):
         await asyncio.sleep(5)
 
-    verifier, _ = _batch_verifier(mocker, lambda _h, probed, *_a: ([], probed))
+    verifier, _ = _batch_verifier(mocker, lambda _s, _h, probed, *_a: ([], probed))
     verifier.runner.run.side_effect = hang
     mocker.patch.object(BatchVerifier, "ATTEMPT_TIMEOUT_SEC", 0.1)
     mocker.patch.object(BatchVerifier, "HUNG_START_MIN_SEC", 0.05)
@@ -464,7 +464,7 @@ async def test_batch_is_start_hung_only_when_every_attempt_times_out_inside_the_
 async def test_batch_is_not_start_hung_when_the_container_started_and_the_ports_timed_out(mocker):
     from services.executor_connectivity.port_verifiers import BatchVerifier
 
-    async def slow_ports(_h, probed, *_a):
+    async def slow_ports(_s, _h, probed, *_a):
         await asyncio.sleep(5)
 
     verifier, _ = _batch_verifier(mocker, slow_ports)
@@ -487,7 +487,7 @@ async def test_batch_is_not_start_hung_when_a_slow_outside_start_left_the_batch_
 
     external = mocker.Mock()
     external.reached = mocker.AsyncMock(return_value=None)
-    verifier, _ = _batch_verifier(mocker, lambda _h, probed, *_a: ([], probed), external)
+    verifier, _ = _batch_verifier(mocker, lambda _s, _h, probed, *_a: ([], probed), external)
     verifier.runner.run.side_effect = slow_then_hang
     mocker.patch.object(BatchVerifier, "ATTEMPT_TIMEOUT_SEC", 0.1)
     mocker.patch.object(BatchVerifier, "HUNG_START_MIN_SEC", 0.05)
@@ -522,7 +522,7 @@ async def test_batch_keeps_verified_ports_when_cleanup_passes_the_attempt_timeou
     from services.executor_connectivity.port_verifiers import BatchVerifier
 
     ports = [PortPair(9000 + i, 9000 + i) for i in range(10)]
-    verifier, _ = _batch_verifier(mocker, lambda _h, probed, *_a: (probed[:7], probed[7:]))
+    verifier, _ = _batch_verifier(mocker, lambda _s, _h, probed, *_a: (probed[:7], probed[7:]))
     cleanup_calls = []
 
     async def slow_cleanup(*_args):
