@@ -5,10 +5,12 @@ import pytest
 
 from core.config import settings
 from core.validator import settle_cycle_results, specs_to_publish
+from incentive import rental_price
 from services.executor_rollout import (
     RENTAL_CHANGE_STATE_KEY,
     RolloutWindow,
     carry_rental_change_passes,
+    log_would_credit,
     remember_rented_scored_results,
     withhold_rental_change_verdicts,
 )
@@ -184,8 +186,25 @@ async def test_the_flag_off_changes_nothing_and_consumes_nothing(monkeypatch, ca
     end = _owned(_listed(pods={NODE: ["p1"]}, fillers={NODE: ["filler_a"]}, pod_fields={"gpu_count": 8}), "lium")
     failed = _fail(GPU_USAGE)
 
-    with caplog.at_level("INFO"):
-        assert await _carry([failed], start, end, service) == [failed]
+    cycle = {MINER: [failed]}
+    would_credit = await carry_rental_change_passes(
+        cycle, service, start, end, {MINER: None}, set(), NO_ROLLOUT, job_block=BLOCK
+    )
 
-    assert "would credit" in caplog.text
+    assert cycle[MINER] == [failed]
     assert await service.get(last_scored_result_vouch_key(MINER, NODE)) is not None
+    # the row the enabled run would put in place of the failure, scored once the cycle is scored
+    [(hotkey, credited, _extra)] = would_credit
+    assert hotkey == MINER and credited.carried_for_rental_change and credited.is_rented
+
+    async def scored(config, redis, snapshot, miner_hotkey, row):
+        assert (snapshot, miner_hotkey, row) == ("snap", MINER, credited)
+        return row.model_copy(update={"incentive": 0.25})
+
+    monkeypatch.setattr(rental_price, "score_added_result", scored)
+    with caplog.at_level("INFO"):
+        await log_would_credit(would_credit, None, service, "snap")
+        await log_would_credit(would_credit, None, service, None)
+
+    logged = [r for r in caplog.records if "would credit" in r.getMessage()]
+    assert [r.msg.extra["would_add_incentive"] for r in logged] == [0.25, None]

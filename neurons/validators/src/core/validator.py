@@ -28,6 +28,7 @@ from services.executor_rollout import (
     RolloutWindow,
     WithheldVerdict,
     carry_rental_change_passes,
+    log_would_credit,
     carry_renter_gpu_reset_results,
     has_renter_gpu_reset_holds,
     remember_rented_scored_results,
@@ -699,7 +700,7 @@ class Validator:
                     )
                     # DAH-7118: after the reset carry, before duplicates and GPU counts are settled
                     tally = self.miner_service.outage_tally
-                    await carry_rental_change_passes(
+                    would_credit = await carry_rental_change_passes(
                         all_job_results,
                         self.redis_service,
                         rented_executors,
@@ -768,6 +769,7 @@ class Validator:
                     await incentive.calculate_mining_scores()
 
                     snapshot = incentive.get_snapshot()
+                    await log_would_credit(would_credit, self.incentive, self.redis_service, snapshot)
                     if snapshot is not None:
                         estimates_started_at = time.perf_counter()
                         try:

@@ -973,16 +973,18 @@ async def carry_rental_change_passes(
     rollout_window: RolloutWindow,
     *,
     job_block: int,
-) -> None:
+) -> list[tuple[str, JobResult, dict]]:
     """DAH-7118: a failure `withhold_rental_change_verdicts` would withhold, on a node whose only change during the
     cycle was a Lium filler starting, takes the node's pass of the cycle right before (rented: the vouched Redis copy;
     idle: `_take_idle_pass`), in place, before duplicates and GPU counts are settled. Lium started the filler; the
     provider does not lose the cycle for it. A rollout or session-lost hold comes first, and the rental-change cap
     still applies (a credit counts toward it). The pass must be a real one (not a carry), with the same rental state
     (`rental_state_unchanged`), used once: the credited row is never kept or vouched for again. Anything else is
-    withheld as before. RENTAL_CHANGE_CARRY_ENABLED off: logs "would credit" and consumes nothing."""
+    withheld as before. RENTAL_CHANGE_CARRY_ENABLED off: consumes nothing and returns the rows it would credit, for
+    `log_would_credit` to score once the cycle is scored."""
+    would_credit: list[tuple[str, JobResult, dict]] = []
     if rented_at_start is None or rented_at_end is None or not has_rental_change_candidates(job_results):
-        return
+        return would_credit
     try:
         state = {
             (field.decode() if isinstance(field, bytes) else field): json.loads(raw)
@@ -990,7 +992,7 @@ async def carry_rental_change_passes(
         }
     except Exception as exc:
         logger.warning(_m("Rental-change credit: state unreadable; every such cycle is withheld", extra={"error": str(exc)}))
-        return
+        return would_credit
     enabled = settings.RENTAL_CHANGE_CARRY_ENABLED
     for miner_hotkey, results in job_results.items():
         for index, failed in enumerate(results):
@@ -1028,10 +1030,7 @@ async def carry_rental_change_passes(
                 "carried_score": previous.score,
                 "started": sorted(change[1] - change[0]),
             }
-            if not enabled:
-                logger.info(_m("Rental-change credit: would credit the last pass (RENTAL_CHANGE_CARRY_ENABLED off)", extra=extra))
-                continue
-            results[index] = _carried_row(
+            credited = _carried_row(
                 previous,
                 failed,
                 rented_at_end,
@@ -1044,7 +1043,35 @@ async def carry_rental_change_passes(
                 is_in_maintenance=failed.is_in_maintenance,
                 rented_gpu_count=previous.rented_gpu_count,
             )
+            if not enabled:
+                would_credit.append((miner_hotkey, credited, extra))
+                continue
+            results[index] = credited
             logger.info(_m("Score carried: only a Lium filler started on the node during the cycle", extra=extra))
+    return would_credit
+
+
+async def log_would_credit(
+    would_credit: list[tuple[str, JobResult, dict]], incentive_config, redis_service: RedisService, snapshot
+) -> None:
+    """DAH-7118, flag off: log each row the credit would add with the reward it would earn, scored as the enabled run
+    scores it (same pipeline, this cycle's snapshot plus the row). No snapshot (not the rental-price incentive): the
+    log carries no reward."""
+    from incentive.rental_price import score_added_result
+
+    for miner_hotkey, credited, extra in would_credit:
+        reward = None
+        if snapshot is not None:
+            try:
+                reward = (await score_added_result(incentive_config, redis_service, snapshot, miner_hotkey, credited)).incentive
+            except Exception as exc:
+                logger.warning(_m("Rental-change credit: would-credit reward not scored", extra={**extra, "error": str(exc)}))
+        logger.info(
+            _m(
+                "Rental-change credit: would credit the last pass (RENTAL_CHANGE_CARRY_ENABLED off)",
+                extra={**extra, "would_add_incentive": reward},
+            )
+        )
 
 
 def _banned_now(

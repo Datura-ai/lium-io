@@ -1732,13 +1732,6 @@ class RentalPriceIncentive(DefaultIncentive):
                 eligible_for_rental_share=False,
             )
 
-        # Build per-model totals including the hypothetical executor.
-        # DefaultIncentive.calculate_executor_score needs this per `JobResult.gpu_model`.
-        base_total_map = self._seed_snapshot.mining.total_gpu_model_count_map or {}
-        total_map_with_hypo = dict(base_total_map)
-        total_map_with_hypo[gpu_model] = total_map_with_hypo.get(gpu_model, 0) + gpu_count
-        self.total_gpu_model_count_map = total_map_with_hypo
-
         # No filler_revenue_per_gpu_hour: the estimate pays the bucket rate and never a floor top-up,
         # while the seeded unbucketed cost still carries the live cycle's spot pay and top-ups.
         fake_result = JobResult(
@@ -1767,9 +1760,7 @@ class RentalPriceIncentive(DefaultIncentive):
             nvidia_driver_version=settings.MIN_NVIDIA_DRIVER_VERSION,
         )
 
-        await self._pre_process_job_result("estimate", fake_result)
-        await self._on_finish_pre_process()
-        await self._post_process_job_result("estimate", fake_result)
+        await self.score_added_result("estimate", fake_result)
 
         return RentalPriceEstimate(
             gpu_model=gpu_model,
@@ -1796,6 +1787,19 @@ class RentalPriceIncentive(DefaultIncentive):
             burn_share=fake_result.burn_share,
             total_rental_cost=fake_result.total_rental_cost,
         )
+
+    async def score_added_result(self, hotkey: str, result: JobResult) -> JobResult:
+        """Score `result` in place as one more result of this instance's snapshot cycle, through the same 3 stages as
+        real scoring, with per-model totals that include it (DefaultIncentive normalizes per `JobResult.gpu_model`)."""
+        if self._seed_snapshot is None:
+            raise ValueError("score_added_result requires RentalPriceIncentive initialized with snapshot=")
+        total_map_with_added = dict(self._seed_snapshot.mining.total_gpu_model_count_map or {})
+        total_map_with_added[result.gpu_model] = total_map_with_added.get(result.gpu_model, 0) + result.gpu_count
+        self.total_gpu_model_count_map = total_map_with_added
+        await self._pre_process_job_result(hotkey, result)
+        await self._on_finish_pre_process()
+        await self._post_process_job_result(hotkey, result)
+        return result
 
     async def _calculate_rental_share(self, total_rental_cost: float) -> float:
         """Calculate rental emission share (X).
@@ -1930,6 +1934,33 @@ async def estimate_executor(
         snapshot=snapshot,
     )
     return await estimator.estimate_executor(params=params)
+
+
+async def score_added_result(
+    config: IncentiveConfig,
+    redis_service: RedisService,
+    snapshot: RentalPriceSnapshot,
+    hotkey: str,
+    result: JobResult,
+) -> JobResult:
+    """A scored copy of `result` as one more result of the snapshot's cycle (DAH-7118 would-credit reward). Exact when
+    no other result of its GPU model scored in the cycle.
+    shortcut: same-model results keep the mining score they had at the model's old GPU total, so the reward is off by
+    about the row's share of that model's GPUs (under 1% at fleet size); and a partly rented split node is scored
+    whole. Upgrade to a full re-score of the cycle if the credit is ever sized from this log alone."""
+    added = result.model_copy(deep=True)
+    excluded = hotkey in settings.get_scoring_excluded_hotkeys() or (
+        hotkey in settings.get_idle_incentive_excluded_hotkeys() and not added.is_rented
+    )
+    added.is_hotkey_excluded_from_scoring = excluded
+    estimator = RentalPriceIncentive(
+        config,
+        redis_service,
+        jobs_results={},
+        total_gpu_model_count_map=snapshot.mining.total_gpu_model_count_map or {},
+        snapshot=snapshot,
+    )
+    return await estimator.score_added_result(hotkey, added)
 
 
 async def precompute_all_estimates(
