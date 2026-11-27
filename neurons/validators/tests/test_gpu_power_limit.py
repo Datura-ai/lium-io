@@ -236,6 +236,29 @@ async def test_a_whole_node_customer_create_with_an_unreadable_host_fails_as_the
     assert await restore_all_host_gpu_power_limits(ssh, redis) == 0
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("whole_node", [False, True])
+@pytest.mark.parametrize("redis_failure", ["get", "delete"])
+async def test_a_customer_create_goes_on_when_our_redis_fails(whole_node, redis_failure, caplog):
+    # prod: 19 'No connection available' reads in 14 days; our Redis is no verdict on the rent
+    redis = FakeRedis({_restore_key("GPU-a"): _record("GPU-a", 400)})
+    setattr(redis, redis_failure, AsyncMock(side_effect=ConnectionError("No connection available")))
+
+    async def run(command, **kwargs):
+        if command == POWER_STATE_CMD:
+            return FakeRun(stdout="GPU-a, 320, 400, 100, 400\n")
+        return FakeRun(stdout="400, Enabled\n")
+
+    ssh = AsyncMock(run=AsyncMock(side_effect=run))
+    with caplog.at_level("WARNING"):
+        if whole_node:
+            await restore_all_host_gpu_power_limits(ssh, redis, require_recorded_gpus_restored=True)
+        else:
+            await restore_tracked_gpu_power_limits(ssh, redis, ["GPU-a"], require_recorded_gpus_restored=True)
+    if redis_failure == "get":
+        assert any("could not be read" in r.getMessage() and r.levelname == "WARNING" for r in caplog.records)
+
+
 @pytest.mark.parametrize("gpu_uuids", [["GPU-0"], []])
 @pytest.mark.parametrize("record_rental_start", [True, False])
 @pytest.mark.asyncio
