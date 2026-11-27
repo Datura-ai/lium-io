@@ -46,7 +46,9 @@ A Lium filler does not always load the held card (25 Nov, 8c7d58d6: a filler ran
 while it runs no reading can clear the card. When the held cards read idle under Lium's own filler, the check stops
 that filler once per hold (``gpu_thermal_hold_filler_stopped:<hotkey>:<executor uuid>`` keeps the hold's start) and
 runs the load in the same cycle; the backend places a filler again after 30 minutes or more. Another owner's filler
-is not ours to stop.
+is not ours to stop. A listed filler with no running container (stopped by this check, or gone on its own) loads
+nothing: the load runs, and each held cycle reports it missing so the backend closes its run, as
+RentalVerificationCheck would on a cycle this hold does not end.
 
 The event names the cause from the driver's own reason bits, never "heat" for a slowdown the driver does not call
 thermal: HW_SLOWDOWN (0x8) is also raised by a power brake from the power supply (0x80 then says so) or a power
@@ -83,7 +85,7 @@ from .gpu_fault_probe import PROBE_SECONDS, PROBE_TIMEOUT_SECONDS, probe_source
 from .machine_spec_scrape import MachineSpecScrapeCheck, scrape_gpu_details
 from .rental_owner import rental_of_this_node
 from .rented_gpu_drop import GPU_DROP_REDIS_ERRORS
-from .sshd_bootstrap import remove_own_lium_fillers
+from .sshd_bootstrap import remove_own_lium_fillers, running_fillers_reporting_gone
 from .task_time import task_seconds_left
 
 logger = logging.getLogger(__name__)
@@ -309,11 +311,16 @@ class GpuThermalThrottleCheck:
         # the load needs its whole sequence; a cycle without it leaves the hold to the next one (or the TTL)
         probe_wanted = held and not collapsed and not rented and task_seconds_left(ctx) >= _load_probe_seconds(ctx)
         stopped_fillers: list[str] = []
-        if probe_wanted and get_filler_only_container(ctx):
+        # a listed filler whose container is gone loads nothing; it is reported so the backend closes its run, since
+        # this hold ends the cycle before RentalVerificationCheck would report it
+        running_fillers = (
+            await running_fillers_reporting_gone(ctx) if probe_wanted and get_filler_only_container(ctx) else []
+        )
+        if running_fillers:
             stopped_fillers = await self._stop_filler_beside_idle_held_cards(ctx, held, since)
         if (
             probe_wanted
-            and (stopped_fillers or not get_filler_only_container(ctx))
+            and (stopped_fillers or not running_fillers)
             and task_seconds_left(ctx) >= _load_probe_seconds(ctx)  # again after a stop
         ):
             readings = await self._load_probe(ctx)

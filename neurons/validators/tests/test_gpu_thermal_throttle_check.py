@@ -765,15 +765,21 @@ async def test_no_load_without_a_hold_or_under_a_rental(context_factory):
 # --------------------------------------------------------------------------------------------------
 @pytest.fixture
 def filler(monkeypatch):
-    """A filler-only node; `stops` records each stop, `removes` is what the stop removes (Lium's own filler)."""
-    state = SimpleNamespace(stops=0, removes=["filler_a"])
+    """A filler-only node; `stops` records each stop, `removes` is what the stop removes (Lium's own filler),
+    `running` the listed fillers whose container runs (`gone_reports` counts the cycles that reported the others)."""
+    state = SimpleNamespace(stops=0, removes=["filler_a"], running=["filler_a"], gone_reports=0)
 
     async def remove_own_lium_fillers(ctx):
         state.stops += 1
         return list(state.removes)
 
+    async def running_fillers_reporting_gone(ctx):
+        state.gone_reports += state.running != ["filler_a"]
+        return list(state.running)
+
     monkeypatch.setattr(gpu_thermal_throttle, "get_filler_only_container", lambda ctx: "filler_a")
     monkeypatch.setattr(gpu_thermal_throttle, "remove_own_lium_fillers", remove_own_lium_fillers)
+    monkeypatch.setattr(gpu_thermal_throttle, "running_fillers_reporting_gone", running_fillers_reporting_gone)
     return state
 
 
@@ -803,6 +809,52 @@ async def test_the_filler_is_stopped_once_per_hold_not_every_cycle(context_facto
     # the filler is back on later cycles (still listed): no load beside it
     assert [runner.scraped_under_load for runner in runners] == [[True], [], []]
     assert all(r.event.what_we_saw["held_gpu_uuids"] == ["GPU-aaaa"] for r in results)
+
+
+@pytest.mark.asyncio
+async def test_a_stopped_filler_still_listed_is_reported_gone_and_the_load_runs_each_held_cycle(context_factory, filler):
+    redis = FakeRedis()
+    await run(context_factory, COLLAPSED_ROW, redis=redis)
+    runners = [LoadRunner(h100(graphics_speed=1350, clocks_event_reasons=SW_THERMAL)) for _ in range(3)]
+
+    await run(context_factory, IDLE_ROW, redis=redis, runner=runners[0])
+    filler.running = []  # the backend still lists the run, its container is gone
+    results = [await run(context_factory, IDLE_ROW, redis=redis, runner=runner) for runner in runners[1:]]
+
+    assert filler.stops == 1 and filler.gone_reports == 2
+    assert [runner.scraped_under_load for runner in runners] == [[True], [True], [True]]
+    assert all("stopped_fillers" not in r.event.what_we_saw["load_probe"] for r in results)
+
+
+@pytest.mark.asyncio
+async def test_each_listed_filler_with_no_running_container_is_reported_missing():
+    from services.task.checks import sshd_bootstrap
+
+    class Ssh:
+        async def run(self, command, timeout=None):
+            if "filler_down" in command:
+                raise OSError("ssh dropped")
+            return SimpleNamespace(exit_status=0, stdout="filler_up\n" if "filler_up" in command else "")
+
+    reported = []
+
+    async def get_filler_run_active(run_id, *, container_missing=False):
+        reported.append((run_id, container_missing))
+
+    names = ["filler_up", "filler_gone", "filler_down"]
+    ctx = SimpleNamespace(
+        ssh=Ssh(),
+        executor=SimpleNamespace(uuid="node"),
+        state=SimpleNamespace(rented_data=SimpleNamespace(get_filler_containers=lambda uuid: names)),
+        services=SimpleNamespace(backend=SimpleNamespace(get_filler_run_active=get_filler_run_active)),
+    )
+
+    running = await sshd_bootstrap.running_fillers_reporting_gone(ctx)
+
+    # an unreadable state counts as running and is never reported
+    assert running == ["filler_up", "filler_down"]
+    gone = "filler_gone".removeprefix(sshd_bootstrap.FILLER_CONTAINER_PREFIX)
+    assert reported == [(gone, True)]
 
 
 @pytest.mark.asyncio
