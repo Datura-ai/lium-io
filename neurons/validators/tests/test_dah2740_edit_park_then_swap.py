@@ -42,7 +42,7 @@ from helpers import no_host_start_lock, shared_pod_start_stop_lock
 def svc():
     # the same service test_deploy_optimizations builds; a local fixture rather than an import, which
     # pyflakes reads as a name every `svc` parameter below redefines (F811)
-    service = DockerService(ssh_service=Mock(), redis_service=Mock(mget=AsyncMock(side_effect=lambda keys: [None] * len(keys)), set=AsyncMock(), write_atomically=AsyncMock(), get_rented_machine=AsyncMock(return_value=None), rented_machines_synced=AsyncMock(return_value=True)), attestation_service=Mock())
+    service = DockerService(ssh_service=Mock(), redis_service=Mock(mget=AsyncMock(side_effect=lambda keys: [None] * len(keys)), get=AsyncMock(return_value=None), set=AsyncMock(), write_atomically=AsyncMock(), get_rented_machine=AsyncMock(return_value=None), rented_machines_synced=AsyncMock(return_value=True)), attestation_service=Mock())
     service.redis_service.pod_start_stop_lock = shared_pod_start_stop_lock({})
     service._hold_pod_start_host_lock = no_host_start_lock
     # the pre-run kernel.pid_max read is mandatory and the SSH doubles here do not model /proc

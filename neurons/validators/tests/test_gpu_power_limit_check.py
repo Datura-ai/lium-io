@@ -527,6 +527,8 @@ async def test_an_unreadable_power_limit_under_a_lium_filler_passes(context_fact
         ("lium", 280, 280),  # Pearl over an 80 % tier host limit
         ("lium", None, None),  # no restore record: no field, the backend keeps today's verdict
         (None, 280, None),  # no filler: the live limit is the host's, no field
+        ("miner", 315, 315),  # DAH-5861: the provider's own 80 % job over a 90 % host limit
+        ("miner", None, None),
     ],
 )
 @pytest.mark.asyncio
@@ -534,7 +536,7 @@ async def test_the_host_limit_under_our_pearl_cap_reaches_the_specs(
     context_factory, read_records_mock, owner, recorded_watts, expected_host
 ) -> None:
     # lio#1924 r4477687011: the badge judges the limit the renter gets back, not Pearl's live cap
-    live = 245 if owner else 280
+    live = 245 if owner == "lium" else 280
     state = _state(current_limit=live, default_limit=350, default_job_owner=owner)
     state = ContextState(**{**state.__dict__, "specs": {"gpu": {"details": [dict(d) for d in state.gpu_details]}}})
     if recorded_watts is not None:
@@ -548,6 +550,68 @@ async def test_the_host_limit_under_our_pearl_cap_reaches_the_specs(
     (detail,) = specs["gpu"]["details"]
     assert detail.get("power_host_limit") == expected_host
     assert detail["power_limit"] == live  # Pearl's guard still reads the live cap
+
+
+@pytest.mark.parametrize(
+    ("recorded_watts", "passed", "kept_tier"),
+    [
+        (245, False, None),  # a 70 % host limit under the provider's 80 % cap fails the floor
+        (350, True, None),  # a stock host limit keeps no 80 % tier reading for the rental start
+        (280, True, "0.8"),  # an 80 % host limit keeps its tier
+    ],
+)
+@pytest.mark.asyncio
+async def test_under_the_providers_own_cap_the_floor_and_tier_judge_the_recorded_host_limit(
+    context_factory, read_records_mock, recorded_watts, passed, kept_tier
+) -> None:
+    # DAH-5861: the provider's 80 % Default Job cap (280 of 350 W) is lifted before any rental
+    redis = FakeRedis()
+    read_records_mock.return_value = _read_result(
+        _restore_record().model_copy(update={"watts": recorded_watts})
+    )
+    ctx = context_factory(
+        state=_state(current_limit=280, default_limit=350, default_job_owner="miner"),
+        services=build_services(redis=redis),
+    )
+
+    result = await GpuPowerLimitCheck().run(ctx)
+
+    assert result.passed is passed
+    assert redis.store.get(scored_tier_ratio_key(_EXECUTOR_UUID, "GPU-abc")) == kept_tier
+
+
+@pytest.mark.parametrize(("record_boot", "passed"), [("boot-before", True), ("boot-now", False), (None, False)])
+@pytest.mark.asyncio
+async def test_under_the_providers_own_cap_a_host_limit_recorded_before_a_reboot_is_not_judged(
+    context_factory, read_records_mock, record_boot, passed
+) -> None:
+    # the reboot reset the host to stock, so the 70 % limit recorded in the earlier boot must not fail it
+    read_records_mock.return_value = _read_result(
+        _restore_record().model_copy(update={"watts": 245, "boot_id": record_boot})
+    )
+    state = _state(current_limit=280, default_limit=350, default_job_owner="miner")
+    state = ContextState(**{**state.__dict__, "specs": {"boot_id": "boot-now"}})
+
+    result = await GpuPowerLimitCheck().run(context_factory(state=state))
+
+    assert result.passed is passed
+
+
+@pytest.mark.asyncio
+async def test_a_low_recorded_host_limit_under_the_providers_own_job_says_to_stop_the_job_first(
+    context_factory, read_records_mock
+) -> None:
+    read_records_mock.return_value = _read_result(_restore_record().model_copy(update={"watts": 105}))
+    ctx = context_factory(state=_state(current_limit=280, default_limit=350, default_job_owner="miner"))
+
+    result = await GpuPowerLimitCheck().run(ctx)
+
+    # the shown limit is the recorded one, not the live cap the provider sees in nvidia-smi
+    assert result.event.remediation.startswith("GPU 0: 105 W limit, default 350 W (30%).")
+    assert result.event.remediation.endswith(
+        "Under your own Default Job this is your host's limit recorded before the job's cap: stop the job,"
+        " then raise it."
+    )
 
 
 @pytest.mark.asyncio

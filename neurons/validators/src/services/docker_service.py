@@ -1280,11 +1280,9 @@ def volume_step_detail(exc: BaseException) -> str | None:
     return text[:VOLUME_STEP_DETAIL_MAX_CHARS]
 
 
-# A create that fails here failed on the node itself: its storage refused the volume, or a GPU it
-# advertises is gone. Such a failure stands like a failed rental probe, so the node scores 0 until a
-# probe on it passes instead of going to the next renter. docker_run is left out: runc echoes the
-# renter's command in its start error, so no text there is the node's alone.
-_HOST_FAULT_CREATE_STEPS = frozenset({"volume_creation", "gpu_flags"})
+# These steps fail on the node itself; docker_run is left out, as runc echoes the renter's
+# command in its start error.
+_HOST_FAULT_CREATE_STEPS = frozenset({"volume_creation", "gpu_flags", "gpu_power_restore"})
 # rental_probe.STEP_CONTAINER_START: the stamp reads as that probe step failing at the create step
 _RENTAL_PROBE_CONTAINER_START_STEP = "container_start"
 
@@ -10416,7 +10414,9 @@ class DockerService:
         # GPUs of a pod that brings no power cap of its own (a customer, an uncapped filler)
         # DAH-2356 safety net: restore any leftover pre-cap records BEFORE a container
         # without its own cap starts, so a customer (or an uncapped filler) never
-        # inherits a reduced limit. Best-effort, never blocks the rental.
+        # inherits a reduced limit. The customer create's last call (record_rental_start) is strict:
+        # a provider's own cap is 80 % or more, so the floor raise below would leave a failed restore
+        # standing under the renter (DAH-5861). Earlier and filler calls stay best-effort.
         if payload.gpu_uuids:
             await restore_tracked_gpu_power_limits(
                 ssh_client,
@@ -10425,6 +10425,7 @@ class DockerService:
                 log_extra=default_extra,
                 host_probe=host_probe,
                 concurrency=concurrency,
+                require_recorded_gpus_restored=record_rental_start,
             )
         else:
             # empty gpu_uuids = whole-node container (--gpus all) → check every host GPU
@@ -10434,6 +10435,7 @@ class DockerService:
                 log_extra=default_extra,
                 host_probe=host_probe,
                 concurrency=concurrency,
+                require_recorded_gpus_restored=record_rental_start,
             )
         # State-free last-resort net: if a pre-cap record was lost, the record-based
         # restore above did nothing — lift anything still below the check's floor back
@@ -11970,6 +11972,7 @@ class DockerService:
                         except GpuPowerRestoreStateError:
                             current_step = "gpu_power_restore_state"  # our Redis, not the host's fault
                             raise
+                        current_step = "container_run_spec"  # a later error is not the restore's
 
                 # DAH-1524: build_gpu_flags issues 2-3 serial SSH probes (proc minor
                 # map, shared nodes, and a slow nvidia-smi -q -x fallback). Profile it

@@ -414,6 +414,17 @@ async def _read_back_power_state(ssh: asyncssh.SSHClientConnection, uuid: str) -
     return _parse_power_readback_csv(str(result.stdout))
 
 
+async def _succeed_if_gpu_already_at_target_watts(
+    ssh: asyncssh.SSHClientConnection, uuid: str, watts: int, failed: PowerLimitSetOutcome
+) -> PowerLimitSetOutcome:
+    """A failed ``-pl`` on a GPU that already shows the target is not a failed set: the limit the
+    caller wants is in place (a strict restore must not fail the rent over it)."""
+    readback = await _read_back_power_state(ssh, uuid)
+    if readback.watts == watts:
+        return PowerLimitSetOutcome(failure=None, persistence_enabled=readback.persistence_enabled)
+    return failed
+
+
 async def _set_power_limit(
     ssh: asyncssh.SSHClientConnection,
     uuid: str,
@@ -429,12 +440,19 @@ async def _set_power_limit(
     except asyncssh.ChannelOpenError:
         raise
     except Exception as exc:
-        return PowerLimitSetOutcome(failure=f"nvidia-smi -pl errored: {exc}", persistence_enabled=None)
+        return await _succeed_if_gpu_already_at_target_watts(
+            ssh, uuid, watts, PowerLimitSetOutcome(failure=f"nvidia-smi -pl errored: {exc}", persistence_enabled=None)
+        )
     if result.exit_status != 0:
-        return PowerLimitSetOutcome(
-            failure=f"nvidia-smi -pl failed: exit={result.exit_status}, stderr={result.stderr!r}",
-            persistence_enabled=None,
-            host_refused=True,
+        return await _succeed_if_gpu_already_at_target_watts(
+            ssh,
+            uuid,
+            watts,
+            PowerLimitSetOutcome(
+                failure=f"nvidia-smi -pl failed: exit={result.exit_status}, stderr={result.stderr!r}",
+                persistence_enabled=None,
+                host_refused=True,
+            ),
         )
     readback = await _read_back_power_state(ssh, uuid)
     if readback.watts is None:
@@ -931,18 +949,44 @@ async def _restore_records(
     concurrency: int = POWER_LIMIT_SET_CONCURRENCY,
     *,
     require_complete: bool = False,
+    require_recorded_gpus_restored: bool = False,
 ) -> int:
     """Apply each record with ``nvidia-smi -pl``; delete a record ONLY after its restore succeeded
     (a failed restore keeps it for the safety nets to retry). Returns the restored count.
+    ``require_recorded_gpus_restored`` raises only when the host refused a restore, never on a failed delete.
 
     The records are restored side by side (``concurrency`` at a time; a GPU whose
     session the host refused is retried alone): each GPU is its own device, and the delete that
     calls this holds the customer's rent until it answers."""
 
     clear_failed = False
+    host_failed = False
+
+    # a reboot put the host back at its own boot limit: a record from an earlier boot no longer says what the host
+    # allows, and setting it would leave the next renter on that limit (lio#2238 review), so it is cleared unapplied
+    cleared_stale = 0
+    host_boot_id = await _read_host_boot_id(ssh) if any(record.boot_id for record in records) else None
+    if host_boot_id:
+        current: list[GpuPowerRestoreRecord] = []
+        for record in records:
+            if record.boot_id in (None, host_boot_id):
+                current.append(record)
+                continue
+            try:
+                await redis.delete(_restore_key(record.gpu_uuid))
+                cleared_stale += 1
+            except Exception as exc:
+                clear_failed = True
+                _log(
+                    logging.ERROR,
+                    f"gpu power restore: could not clear {record.gpu_uuid}'s record from an earlier boot: {exc}",
+                    {"gpu_uuid": record.gpu_uuid},
+                    log_extra,
+                )
+        records = current
 
     async def restore_one(record: GpuPowerRestoreRecord, setter: _Setter) -> bool:
-        nonlocal clear_failed
+        nonlocal clear_failed, host_failed
         state = state_by_uuid.get(record.gpu_uuid)
         watts_before = state.current_watts if state else None
         if record.capped_to_watts is not None:
@@ -953,6 +997,7 @@ async def _restore_records(
             ssh, "restore", record.executor_id, record.gpu_uuid, watts_before, record.watts, log_extra
         )
         if restore_outcome.failure is not None:
+            host_failed = True
             return False
         try:
             await redis.delete(_restore_key(record.gpu_uuid))
@@ -971,7 +1016,19 @@ async def _restore_records(
     restored = await _set_side_by_side("restore", records, restore_one, log_extra, concurrency=concurrency)
     if require_complete and clear_failed:
         raise GpuPowerRestoreStateError("GPU power restore records could not be cleared")
-    return restored
+    if require_recorded_gpus_restored and host_failed:
+        raise RuntimeError("GPU power restoration incomplete")
+    return restored + cleared_stale
+
+
+def _warn_unread_records_for_rental(read_result: GpuPowerRestoreReadResult, log_extra: dict[str, object] | None) -> None:
+    if read_result.read_failed:
+        _log(
+            logging.WARNING,
+            "gpu power restore: records could not be read before a rental; the live floor raise covers the rent",
+            {},
+            log_extra,
+        )
 
 
 async def restore_tracked_gpu_power_limits(
@@ -983,16 +1040,22 @@ async def restore_tracked_gpu_power_limits(
     host_probe: PrerunHostProbe | None = None,
     concurrency: int = POWER_LIMIT_SET_CONCURRENCY,
     require_complete: bool = False,
+    require_recorded_gpus_restored: bool = False,
 ) -> int:
     """Restore the frozen pre-cap limit of every tracked GPU among ``gpu_uuids``.
 
     Best-effort by default; returns the number of records restored and cleared.
     ``require_complete`` raises on unreadable records or any restore not confirmed and cleared, and
     on a GPU without a record that the host does not show at 80 % of its default limit or more.
+    ``require_recorded_gpus_restored`` (a customer create) raises only when the host refuses a recorded
+    GPU's restore. Our Redis failing is no verdict on the rent: unread records are left to the
+    caller's live floor raise, as is a record-less GPU.
     """
     read_result = await read_gpu_power_restore_records(
         redis, gpu_uuids, log_extra, require_complete=require_complete
     )
+    if require_recorded_gpus_restored:
+        _warn_unread_records_for_rental(read_result, log_extra)
     # A GPU of the index whose record is gone was restored already, e.g. by the customer create's own
     # restore before its `docker run`; strict callers confirm that on the GPU itself.
     check_missing = require_complete and bool(read_result.missing)
@@ -1019,7 +1082,7 @@ async def restore_tracked_gpu_power_limits(
         return 0
     restored = await _restore_records(
         ssh, redis, read_result.records, state_by_uuid, log_extra, concurrency,
-        require_complete=require_complete,
+        require_complete=require_complete, require_recorded_gpus_restored=require_recorded_gpus_restored,
     )
     if require_complete and restored != len(read_result.records):
         raise RuntimeError("GPU power restoration incomplete")
@@ -1033,18 +1096,29 @@ async def restore_all_host_gpu_power_limits(
     *,
     host_probe: PrerunHostProbe | None = None,
     concurrency: int = POWER_LIMIT_SET_CONCURRENCY,
+    require_recorded_gpus_restored: bool = False,
 ) -> int:
     """Enumerate the host's GPUs over SSH and restore every tracked one — for whole-node containers
-    whose payload names no gpu_uuids. Best-effort; returns the restored count."""
+    whose payload names no gpu_uuids. Best-effort unless ``require_recorded_gpus_restored`` (a customer create), which
+    raises when the host cannot list its GPUs or refuses a recorded GPU's restore (our Redis failing
+    does not); returns the restored count."""
     try:
         state_by_uuid = await _query_power_state(ssh, host_probe=host_probe)
     except Exception as exc:
+        if require_recorded_gpus_restored:
+            # the host's nvidia-smi: the create fails as the node's and the renter is moved
+            raise RuntimeError(f"GPU power state could not be read to restore before a rental: {exc!r}") from exc
         _log(logging.ERROR, f"gpu power restore: state query failed: {exc}; will retry later", {}, log_extra)
         return 0
     read_result = await read_gpu_power_restore_records(redis, list(state_by_uuid), log_extra)
+    if require_recorded_gpus_restored:
+        _warn_unread_records_for_rental(read_result, log_extra)
     if not read_result.records:
         return 0
-    return await _restore_records(ssh, redis, read_result.records, state_by_uuid, log_extra, concurrency)
+    return await _restore_records(
+        ssh, redis, read_result.records, state_by_uuid, log_extra, concurrency,
+        require_recorded_gpus_restored=require_recorded_gpus_restored,
+    )
 
 
 async def raise_low_power_limits_to_default(

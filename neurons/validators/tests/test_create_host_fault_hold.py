@@ -1,3 +1,4 @@
+import logging
 from unittest.mock import AsyncMock, Mock
 
 import docker.errors
@@ -7,8 +8,11 @@ import urllib3
 
 from services.rental_docker_sdk import RentalDockerOperationError, RentalDockerTransportDropped
 
+from payload_models.payloads import ContainerCreated, FailedContainerRequest, WorkloadKind
 from services.docker_service import DockerService, is_host_fault_create_failure
+from services.gpu_power_limit import POWER_STATE_CMD, GpuPowerRestoreRecord
 from services.task.checks.rental_probe import STEP_CONTAINER_START
+from test_deploy_optimizations import _patch_happy, _payload, _run, _ssh_client, _ssh_result
 
 EXECUTOR_UUID = "0b7c1e1e-8f43-4c3e-9f0e-2f4a1c9d5e11"
 
@@ -26,6 +30,10 @@ def _service() -> tuple[DockerService, Mock]:
     [
         ("volume_creation", True),
         ("gpu_flags", True),
+        # the host's nvidia-smi would not give a GPU its power back before the renter's container
+        ("gpu_power_restore", True),
+        # our own Redis could not confirm the restore state: not the node's fault
+        ("gpu_power_restore_state", False),
         # runc echoes the renter's command, so a docker run error can carry any text the renter chose
         ("docker_run", False),
         ("docker_pull", False),
@@ -177,3 +185,82 @@ async def test_a_typed_drop_past_the_connect_is_stamped(error):
     await service.hold_node_until_probe_passes(EXECUTOR_UUID, "add_public_keys", {}, error=error)
 
     redis_service.set.assert_awaited_once()
+
+
+def _customer_create(monkeypatch, *, redis_get, pl_exit: int):
+    """A customer create on a host whose GPU-test reads 320 of 400 W; `nvidia-smi -pl` exits `pl_exit`."""
+    service = DockerService(ssh_service=Mock(), redis_service=Mock(get=AsyncMock(side_effect=redis_get), mget=AsyncMock(side_effect=lambda keys: [None] * len(keys)), set=AsyncMock(), delete=AsyncMock(), write_atomically=AsyncMock(), get_rented_machine=AsyncMock(return_value=None), rented_machines_synced=AsyncMock(return_value=True)), attestation_service=Mock())
+    ssh_client = _ssh_client(inspect_exit=0)
+    _patch_happy(service, monkeypatch, ssh_client)
+    default_run = ssh_client.run.side_effect
+
+    def run(cmd, *args, **kwargs):
+        if cmd == POWER_STATE_CMD:
+            return _ssh_result(stdout="GPU-test, 320, 400, 100, 400\n")
+        if " -pl " in cmd:
+            return _ssh_result(exit_status=pl_exit)
+        if "--query-gpu=power.limit,persistence_mode" in cmd:
+            return _ssh_result(stdout=f"{320 if pl_exit else 400}, Enabled\n")
+        return default_run(cmd, *args, **kwargs)
+
+    ssh_client.run.side_effect = run
+    return service
+
+
+def _probe_failed_stamps(service: DockerService) -> list[tuple]:
+    return [c.args for c in service.redis_service.set.await_args_list if str(c.args[0]).startswith("rental_probe_failed:")]
+
+
+@pytest.mark.asyncio
+async def test_a_customer_create_goes_on_when_our_redis_cannot_read_the_power_restore_records(monkeypatch, caplog):
+    # prod: 19 'No connection available' reads in 14 days; the renter must not lose the rent over our Redis
+    async def redis_get(key):
+        if key.startswith("gpu_power_restore:"):
+            raise ConnectionError("No connection available")
+        return None
+
+    service = _customer_create(monkeypatch, redis_get=redis_get, pl_exit=0)
+
+    with caplog.at_level(logging.WARNING):
+        result = await _run(service, _payload(workload_kind=WorkloadKind.CUSTOMER_RENTAL))
+
+    assert isinstance(result, ContainerCreated)
+    assert _probe_failed_stamps(service) == []
+    assert any("records could not be read before a rental" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_a_customer_create_fails_as_the_nodes_when_the_host_refuses_a_recorded_restore(monkeypatch):
+    record = GpuPowerRestoreRecord(gpu_uuid="GPU-test", watts=400, pod_id="filler", executor_id="ex", capped_at=0.0)
+
+    async def redis_get(key):
+        return record.model_dump_json() if key == "gpu_power_restore:GPU-test" else None
+
+    service = _customer_create(monkeypatch, redis_get=redis_get, pl_exit=1)
+
+    result = await _run(service, _payload(workload_kind=WorkloadKind.CUSTOMER_RENTAL))
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.failure_step == "gpu_power_restore"
+    assert _probe_failed_stamps(service) == [
+        (f"rental_probe_failed:{result.executor_id}", f"{STEP_CONTAINER_START}:gpu_power_restore")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_run_spec_error_after_a_passed_power_restore_is_not_held_as_the_restore(monkeypatch):
+    record = GpuPowerRestoreRecord(gpu_uuid="GPU-test", watts=400, pod_id="filler", executor_id="ex", capped_at=0.0)
+
+    async def redis_get(key):
+        return record.model_dump_json() if key == "gpu_power_restore:GPU-test" else None
+
+    service = _customer_create(monkeypatch, redis_get=redis_get, pl_exit=0)
+    monkeypatch.setattr(
+        service, "_build_rental_container_run_spec", Mock(side_effect=ValueError("Unsafe cache volume name: 'x'"))
+    )
+
+    result = await _run(service, _payload(workload_kind=WorkloadKind.CUSTOMER_RENTAL))
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.failure_step == "container_run_spec"
+    assert _probe_failed_stamps(service) == []

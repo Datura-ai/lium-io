@@ -43,6 +43,7 @@ from payload_models.payloads import (
     FailedContainerErrorCodes,
     FailedContainerErrorTypes,
     FailedContainerRequest,
+    WorkloadKind,
 )
 from protocol.vc_protocol.compute_requests import (
     DefaultDockerImage,
@@ -924,6 +925,8 @@ async def test_create_payload_is_what_a_renter_gets():
     )
     assert [(p.internal_port, p.external_port) for p in payload.available_ports] == PORT_PAIRS
     assert payload.pod_mapping == [] and payload.active_container_names == []
+    # a customer create's strict GPU power restore: a node held at gpu_power_restore clears only when it works
+    assert payload.workload_kind is WorkloadKind.CUSTOMER_RENTAL
     assert len(payload.user_public_keys) == 1 and payload.user_public_keys[0].startswith(
         "ssh-ed25519 "
     )
@@ -1054,6 +1057,22 @@ async def test_a_create_that_cannot_open_its_ssh_session_is_inconclusive():
     assert result.passed is True
     assert result.event.reason_code == Msg.INCONCLUSIVE.reason
     assert not redis.stamped() and redis.standing_failure() is None
+
+
+@pytest.mark.asyncio
+async def test_a_create_that_fails_on_the_validators_power_restore_state_is_inconclusive_and_still_cleans_up():
+    # Regression: a failure of our own Redis holding the GPU power restore records zeroed the node (DAH-5861)
+    ctx, docker, redis = make_probe_context(
+        docker=FakeDocker(create_result=create_failed("gpu_power_restore_state"))
+    )
+    with probe_settings(), renter_path():
+        result = await RentalProbeCheck().run(ctx)
+    assert result.passed is True
+    assert result.event.reason_code == Msg.INCONCLUSIVE.reason
+    assert not redis.stamped()
+    # the create had reached the host, so the settle still removes the pod by name
+    shell_commands = [call.args[0] for call in ctx.ssh.run.call_args_list]
+    assert any("docker rm" in cmd for cmd in shell_commands)
 
 
 @pytest.mark.asyncio
@@ -1854,6 +1873,32 @@ async def test_a_filler_node_is_probed_beside_its_filler():
     assert result.passed and result.event.reason_code == Msg.PROBE_OK.reason
     assert docker.create_options == [{"beside_fillers": True, "synthetic_probe": True}]
     assert redis.stamped()
+
+
+@pytest.mark.asyncio
+async def test_a_power_restore_hold_clears_on_a_probe_beside_a_filler():
+    """DAH-5861 review (taiberium): the backend keeps a Lium filler on a held node, so a hold that waited for a
+    probe without one kept the node at score 0 for good."""
+    fillers = rented_data(fillers=1)
+    ctx, docker, redis = make_probe_context(rented=fillers, rented_now=fillers)
+    redis.store[f"rental_probe_failed:{EXECUTOR.uuid}"] = f"{STEP_CONTAINER_START}:gpu_power_restore"
+    with probe_settings(), renter_path():
+        result = await RentalProbeCheck().run(ctx)
+
+    assert result.passed is True and docker.create_options == [{"beside_fillers": True, "synthetic_probe": True}]
+    assert redis.standing_failure() is None
+
+
+@pytest.mark.asyncio
+async def test_a_power_restore_hold_clears_on_a_probe_without_a_filler():
+    redis = FakeRedis()
+    redis.store[f"rental_probe_failed:{EXECUTOR.uuid}"] = f"{STEP_CONTAINER_START}:gpu_power_restore"
+    ctx, docker, _ = make_probe_context(redis=redis)
+    with probe_settings(), renter_path():
+        result = await RentalProbeCheck().run(ctx)
+
+    assert result.passed is True and docker.create_options == [{"beside_fillers": False, "synthetic_probe": True}]
+    assert redis.standing_failure() is None
 
 
 @pytest.mark.asyncio

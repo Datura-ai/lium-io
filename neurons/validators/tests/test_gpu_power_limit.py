@@ -15,7 +15,9 @@ from neurons.validators.src.services.gpu_power_limit import (
     _pod_index_key,
     _restore_key,
     apply_filler_gpu_power_limits,
+    restore_all_host_gpu_power_limits,
     restore_filler_pod_gpu_power_limits,
+    restore_tracked_gpu_power_limits,
 )
 from payload_models.payloads import GpuPowerLimit
 
@@ -97,6 +99,8 @@ async def test_strict_pod_restore_requires_every_record_to_be_restored(failure):
                 raise TimeoutError("hung")
             if failure != "partial" or "GPU-b" in command:
                 return FakeRun(exit_status=1)
+        if failure in ("timeout", "nonzero") or (failure == "partial" and "GPU-b" in command):
+            return FakeRun(stdout="100, Enabled\n")  # the failed -pl left the cap in place
         return FakeRun(stdout="400, Enabled\n" if "GPU-a" in command else "250, Enabled\n")
     ssh = AsyncMock(run=AsyncMock(side_effect=run))
     # Act: strict caller cannot succeed with an unknown or remaining cap.
@@ -149,6 +153,157 @@ async def test_strict_pod_restore_with_an_unreadable_host_is_the_hosts_failure()
     with pytest.raises(RuntimeError) as caught:
         await restore_filler_pod_gpu_power_limits(ssh, redis, POD_ID, require_complete=True)
     assert type(caught.value) is RuntimeError  # not GpuPowerRestoreStateError (platform state)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("whole_node", [False, True])
+@pytest.mark.parametrize("strict", [True, False])
+async def test_a_customer_create_never_starts_on_a_cap_whose_restore_failed(whole_node, strict):
+    # lp#2830 review (taiberium 17 Nov): a provider's own job caps at 80 % or more, so the create's floor
+    # raise leaves it. GPU-a holds such a cap (320 of 400 W) and its restore is refused by the host.
+    redis = FakeRedis({_restore_key("GPU-a"): _record("GPU-a", 400)})
+
+    async def run(command, **kwargs):
+        if command == POWER_STATE_CMD:
+            return FakeRun(stdout="GPU-a, 320, 400, 100, 400\nGPU-b, 200, 250, 100, 250\n")
+        return FakeRun(exit_status=1)
+
+    ssh = AsyncMock(run=AsyncMock(side_effect=run))
+
+    async def restore():
+        if whole_node:
+            return await restore_all_host_gpu_power_limits(ssh, redis, require_recorded_gpus_restored=strict)
+        return await restore_tracked_gpu_power_limits(ssh, redis, ["GPU-a", "GPU-b"], require_recorded_gpus_restored=strict)
+
+    if strict:
+        # the host's fault: the create fails and the renter is moved; the record stays for the retry
+        with pytest.raises(RuntimeError) as caught:
+            await restore()
+        assert type(caught.value) is RuntimeError
+    else:
+        assert await restore() == 0  # fillers and the early restore stay best-effort
+    assert _restore_key("GPU-a") in redis.store
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pl_failure", ["nonzero", "timeout"])
+async def test_a_failed_restore_set_on_a_gpu_already_at_the_recorded_limit_is_a_restore(pl_failure):
+    # lio#2238 review (taiberium 23 Nov): -pl fails but GPU-a already shows its recorded 400 W.
+    redis = FakeRedis({_restore_key("GPU-a"): _record("GPU-a", 400)})
+
+    async def run(command, **kwargs):
+        if command == POWER_STATE_CMD:
+            return FakeRun(stdout="GPU-a, 400, 400, 100, 400\n")
+        if " -pl " in command:
+            if pl_failure == "timeout":
+                raise TimeoutError("hung")
+            return FakeRun(exit_status=1)
+        return FakeRun(stdout="400, Enabled\n")
+
+    ssh = AsyncMock(run=AsyncMock(side_effect=run))
+    # Act / Assert: the strict restore succeeds and clears the record instead of failing the rent.
+    assert await restore_tracked_gpu_power_limits(ssh, redis, ["GPU-a"], require_recorded_gpus_restored=True) == 1
+    assert _restore_key("GPU-a") not in redis.store
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("whole_node", [False, True])
+async def test_a_customer_create_restores_and_leaves_record_less_gpus_to_the_floor_raise(whole_node):
+    # GPU-b has no record and sits at 80 %: the strict restore does not judge it (the live floor raise does)
+    redis = FakeRedis({_restore_key("GPU-a"): _record("GPU-a", 400)})
+
+    async def run(command, **kwargs):
+        if command == POWER_STATE_CMD:
+            return FakeRun(stdout="GPU-a, 320, 400, 100, 400\nGPU-b, 200, 250, 100, 250\n")
+        return FakeRun(stdout="400, Enabled\n")
+
+    ssh = AsyncMock(run=AsyncMock(side_effect=run))
+    if whole_node:
+        restored = await restore_all_host_gpu_power_limits(ssh, redis, require_recorded_gpus_restored=True)
+    else:
+        restored = await restore_tracked_gpu_power_limits(ssh, redis, ["GPU-a", "GPU-b"], require_recorded_gpus_restored=True)
+    assert restored == 1
+    assert not redis.store
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("whole_node", [False, True])
+async def test_a_customer_create_clears_a_record_from_an_earlier_boot_without_setting_it(whole_node):
+    # lio#2238 review (taiberium 27 Nov): the host rebooted since GPU-a's record, so its 300 W is not the host's now
+    stale = GpuPowerRestoreRecord(
+        gpu_uuid="GPU-a", watts=300, pod_id=POD_ID, executor_id="executor-1", capped_at=time.time(), boot_id="boot-old"
+    ).model_dump_json()
+    redis = FakeRedis({_restore_key("GPU-a"): stale})
+    commands: list[str] = []
+
+    async def run(command, **kwargs):
+        commands.append(command)
+        if command == POWER_STATE_CMD:
+            return FakeRun(stdout="GPU-a, 400, 400, 100, 400\n")
+        if "boot_id" in command:
+            return FakeRun(stdout="boot-new\n")
+        return FakeRun(stdout="300, Enabled\n")
+
+    ssh = AsyncMock(run=AsyncMock(side_effect=run))
+    if whole_node:
+        restored = await restore_all_host_gpu_power_limits(ssh, redis, require_recorded_gpus_restored=True)
+    else:
+        restored = await restore_tracked_gpu_power_limits(ssh, redis, ["GPU-a"], require_recorded_gpus_restored=True)
+    assert restored == 1
+    assert not redis.store
+    assert not any(" -pl " in command for command in commands)
+
+
+@pytest.mark.asyncio
+async def test_a_whole_node_customer_create_with_an_unreadable_host_fails_as_the_nodes():
+    redis = FakeRedis({_restore_key("GPU-a"): _record("GPU-a", 400)})
+    ssh = AsyncMock(run=AsyncMock(side_effect=TimeoutError()))
+    with pytest.raises(RuntimeError) as caught:
+        await restore_all_host_gpu_power_limits(ssh, redis, require_recorded_gpus_restored=True)
+    assert type(caught.value) is RuntimeError
+    assert await restore_all_host_gpu_power_limits(ssh, redis) == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("whole_node", [False, True])
+@pytest.mark.parametrize("redis_failure", ["get", "delete"])
+async def test_a_customer_create_goes_on_when_our_redis_fails(whole_node, redis_failure, caplog):
+    # prod: 19 'No connection available' reads in 14 days; our Redis is no verdict on the rent
+    redis = FakeRedis({_restore_key("GPU-a"): _record("GPU-a", 400)})
+    setattr(redis, redis_failure, AsyncMock(side_effect=ConnectionError("No connection available")))
+
+    async def run(command, **kwargs):
+        if command == POWER_STATE_CMD:
+            return FakeRun(stdout="GPU-a, 320, 400, 100, 400\n")
+        return FakeRun(stdout="400, Enabled\n")
+
+    ssh = AsyncMock(run=AsyncMock(side_effect=run))
+    with caplog.at_level("WARNING"):
+        if whole_node:
+            await restore_all_host_gpu_power_limits(ssh, redis, require_recorded_gpus_restored=True)
+        else:
+            await restore_tracked_gpu_power_limits(ssh, redis, ["GPU-a"], require_recorded_gpus_restored=True)
+    if redis_failure == "get":
+        assert any("could not be read" in r.getMessage() and r.levelname == "WARNING" for r in caplog.records)
+
+
+@pytest.mark.parametrize("gpu_uuids", [["GPU-0"], []])
+@pytest.mark.parametrize("record_rental_start", [True, False])
+@pytest.mark.asyncio
+async def test_only_the_customer_creates_last_restore_is_strict(monkeypatch, gpu_uuids, record_rental_start) -> None:
+    import services.docker_service as ds
+
+    tracked, whole = AsyncMock(), AsyncMock()
+    monkeypatch.setattr(ds, "restore_tracked_gpu_power_limits", tracked)
+    monkeypatch.setattr(ds, "restore_all_host_gpu_power_limits", whole)
+    monkeypatch.setattr(ds, "raise_low_power_limits_to_default", AsyncMock(return_value=0))
+    monkeypatch.setattr(ds.DockerService, "_pod_existed_before_create", AsyncMock(return_value=False))
+    payload = SimpleNamespace(gpu_uuids=gpu_uuids, executor_id="ex-1", pod_id="pod-1")
+    await ds.DockerService._restore_gpu_power_for_uncapped_pod(
+        SimpleNamespace(redis_service=object()), AsyncMock(), payload, None, {}, record_rental_start=record_rental_start
+    )
+    restore_mock = tracked if gpu_uuids else whole
+    assert restore_mock.await_args.kwargs["require_recorded_gpus_restored"] is record_rental_start
 
 
 @pytest.mark.asyncio
@@ -536,7 +691,7 @@ async def test_apply_tells_a_host_refusal_from_our_own_error(failure, expected):
             if failure == "timeout":
                 raise TimeoutError("hung")
             return FakeRun(exit_status=1 if failure == "nonzero" else 0)
-        return FakeRun(stdout=f"{400 if failure == 'not_stuck' else 200}, Enabled\n")
+        return FakeRun(stdout=f"{200 if failure in (None, 'redis') else 400}, Enabled\n")
 
     ssh = AsyncMock(run=AsyncMock(side_effect=run))
     # Act / Assert: only the host's own refusal reads HOST_REFUSED.
