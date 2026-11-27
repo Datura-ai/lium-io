@@ -22,7 +22,7 @@ def _client(server: FakeServer) -> ComputeClient:
     client.miner_service = MagicMock()
     client.miner_service.redis_service.redis = FakeRedis(server=server)
     client.in_flight_drivers = set()
-    client.reply_in_send = False
+    client.is_reply_being_sent = False
     client._lead_lock = None
     client._lead_task = None
     client.message_queue = compute_client.OutgoingMessages()
@@ -281,7 +281,7 @@ async def test_the_drain_waits_for_a_reply_being_sent(tmp_path, monkeypatch) -> 
 async def test_a_driver_started_while_a_reply_is_sent_is_waited_for() -> None:
     """The drain checks the drivers again after the replies: one a command starts during a reply's send runs too."""
     client = _client(FakeServer())
-    client.reply_in_send = True
+    client.is_reply_being_sent = True
     ran = []
 
     async def driver() -> None:
@@ -290,7 +290,7 @@ async def test_a_driver_started_while_a_reply_is_sent_is_waited_for() -> None:
 
     def reply_sent_and_command_arrived() -> None:
         client.track_in_flight_driver(asyncio.create_task(driver()))
-        client.reply_in_send = False
+        client.is_reply_being_sent = False
 
     asyncio.get_running_loop().call_later(0.2, reply_sent_and_command_arrived)
 

@@ -215,7 +215,7 @@ class ComputeClient:
         # the drivers not yet done, which a rollout's SIGTERM lets finish
         self.in_flight_drivers: set[asyncio.Task] = set()
         # a reply popped from the queue whose send has not ended
-        self.reply_in_send = False
+        self.is_reply_being_sent = False
         # set by take_connector_lead; a SIGTERM before it has no lead to release
         self._lead_lock: aioredis.lock.Lock | None = None
         self._lead_task: asyncio.Task | None = None
@@ -712,7 +712,7 @@ class ComputeClient:
 
                 if log_to_send:
                     try:
-                        self.reply_in_send = True
+                        self.is_reply_being_sent = True
                         await self.send_model(log_to_send)
                         if getattr(log_to_send, "failure_step", None) == CREATE_CUT_OFF_BY_RESTART_STEP:
                             # kept until now so a second restart before the send reports it again;
@@ -748,7 +748,7 @@ class ComputeClient:
                             )
                         )
                     finally:
-                        self.reply_in_send = False
+                        self.is_reply_being_sent = False
             else:
                 self.message_queue.appended.clear()
                 await self.message_queue.appended.wait()
@@ -1477,7 +1477,7 @@ class ComputeClient:
             work = self.in_flight_drivers | create_steps_after_reply.pending()
             if work:
                 await asyncio.wait(work, timeout=deadline - loop.time(), return_when=asyncio.FIRST_COMPLETED)
-            elif self.message_queue or self.reply_in_send:
+            elif self.message_queue or self.is_reply_being_sent:
                 await asyncio.sleep(min(0.1, deadline - loop.time()))
             else:
                 return
