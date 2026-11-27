@@ -135,6 +135,8 @@ BELOW_MODEL = "below_model"
 NOT_MEASURED = "not_measured"
 # a filler sample pinned to the card got no right answer from it (a card CUDA cannot see, or a wrong answer)
 WORK_PROOF_FAILED = "work_proof_failed"
+# the full check, run with Lium's filler stopped, got a wrong answer from the card (DAH-6332)
+FULL_CHECK_FAILED = "full_check_failed"
 
 
 @dataclass(frozen=True)
@@ -226,6 +228,12 @@ def work_proof_failed(machine_spec: Any, card_index: int) -> GpuModelMismatch:
     """A card whose pinned work-proof gave no right answer: stored like a mismatch, so the node fails on every
     cycle until a run on that card passes, not only on the cycle that sampled it (lio#2305 review)."""
     return replace(not_measured(machine_spec, card_index), kind=WORK_PROOF_FAILED)
+
+
+def full_check_failed(machine_spec: Any, card_index: int) -> GpuModelMismatch:
+    """A card that gave a wrong answer to the full check run with Lium's filler stopped: the node fails on every
+    cycle until a full check on that card passes, with all-cards enforcement on or off."""
+    return replace(not_measured(machine_spec, card_index), kind=FULL_CHECK_FAILED)
 
 
 def gpu_model_mismatches(

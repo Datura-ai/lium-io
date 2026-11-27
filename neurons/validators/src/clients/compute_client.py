@@ -1130,6 +1130,10 @@ class ComputeClient:
                 ))
                 await self._run_miner_job(job_request)
                 return
+            for reply in replies:
+                if isinstance(reply, FailedContainerRequest):
+                    # the cache key is the send it answers; a reply cached before the echo has none (DAH-7216)
+                    reply.command_id = command_id
             async with self.lock:
                 for reply in replies:
                     self.message_queue.append(reply)
@@ -1617,6 +1621,10 @@ class ComputeClient:
             response: (
                 ContainerDeleted | FailedContainerRequest
             ) = await self.miner_service.handle_container(job_request)
+            if isinstance(response, FailedContainerRequest):
+                # the backend matches a failure to the delete send it answers (a duplicated or late reply must not
+                # answer a later send, DAH-7216)
+                response.command_id = job_request.command_id
 
             logger.info(
                 _m(
