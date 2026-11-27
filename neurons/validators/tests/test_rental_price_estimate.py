@@ -10,6 +10,7 @@ from incentive.rental_price import (
     ExecutorEstimateParams,
     RentalPriceEstimate,
     RentalPriceIncentive,
+    score_added_result,
 )
 from services.task_service import JobResult
 
@@ -169,6 +170,38 @@ async def test_estimate_executor_rented_returns_tao(
 
 
 # ── snapshot seeding ──────────────────────────────────────────────────────────
+
+
+# ── DAH-7118: a would-credit row is scored as the enabled run scores it ──────
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "is_rented,split",
+    [(False, {}), (True, {}), (True, {"rented_gpu_count": 2, "supports_gpu_splitting": True, "gpu_splitting_min_count": 1})],
+    ids=["idle", "rented", "partly_rented_split"],
+)
+async def test_a_row_added_to_the_snapshot_earns_what_it_earns_inside_the_cycle(
+    rental_config, mock_redis, mock_price_provider, monkeypatch, is_rented, split
+):
+    # exact when no other result of the row's GPU model scored (see the shortcut in score_added_result)
+    others = {"miner_a": [_make_job("exec-a", "H200", 8, is_rented=True), _make_job("exec-b", "H200", 8, is_rented=False)]}
+    added = _make_job("exec-c", "H100", 8, is_rented=is_rented).model_copy(update=split)
+    monkeypatch.setattr(RentalPriceIncentive, "price_provider", mock_price_provider)
+
+    without = _make_incentive(rental_config, mock_redis, mock_price_provider, others, monkeypatch)
+    without.total_gpu_model_count_map = {"H200": 16}
+    await without.calculate_mining_scores()
+    scored = await score_added_result(rental_config, mock_redis, without.get_snapshot(), "miner_b", added)
+
+    inside = {**{k: [r.model_copy(deep=True) for r in v] for k, v in others.items()}, "miner_b": [added.model_copy(deep=True)]}
+    with_row = _make_incentive(rental_config, mock_redis, mock_price_provider, inside, monkeypatch)
+    with_row.total_gpu_model_count_map = {"H200": 16, "H100": 8}
+    await with_row.calculate_mining_scores()
+
+    assert scored.incentive and scored.incentive > 0
+    assert scored.incentive == pytest.approx(inside["miner_b"][0].incentive)
+    assert added.incentive is None  # the caller's row is never scored in place
 
 
 # ── DAH-2528: estimate follows the occupancy-aware bucket fallback ───────────

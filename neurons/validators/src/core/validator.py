@@ -27,6 +27,8 @@ from services.executor_rollout import (
     ExecutorRolloutTracker,
     RolloutWindow,
     WithheldVerdict,
+    carry_rental_change_passes,
+    log_would_credit,
     carry_renter_gpu_reset_results,
     has_renter_gpu_reset_holds,
     remember_rented_scored_results,
@@ -140,11 +142,13 @@ def settle_cycle_results(
 
 def specs_to_publish(results: list[JobResult]) -> list[JobResult]:
     """All but a zeroed duplicate under the keeper's own executor UUID (that backend row hears the keeper) and a
-    result carried over a renter GPU reset (the backend keeps the row it has)."""
+    result carried over a renter GPU reset or a Lium filler start (the backend keeps the row it has)."""
     return [
         result
         for result in results
-        if not result.duplicate_shares_kept_row and not result.carried_for_renter_gpu_reset
+        if not result.duplicate_shares_kept_row
+        and not result.carried_for_renter_gpu_reset
+        and not result.carried_for_rental_change
     ]
 
 
@@ -694,6 +698,23 @@ class Validator:
                     await self.carry_scores_over_renter_gpu_resets(
                         all_job_results, rented_executors, miner_coldkeys, rented_at_end, job_block=job_block
                     )
+                    # DAH-3405: the registry read once more at cycle end, so a push landing mid-cycle opens the window on
+                    # this cycle's results; the carry and the withhold both see that one window (review 6089251564)
+                    rollout_window = await self.observe_executor_rollout(
+                        await self.fetch_executor_digest_or_none(), job_block, fallback=rollout_window
+                    )
+                    # DAH-7118: after the reset carry, before duplicates and GPU counts are settled
+                    tally = self.miner_service.outage_tally
+                    would_credit = await carry_rental_change_passes(
+                        all_job_results,
+                        self.redis_service,
+                        rented_executors,
+                        rented_at_end,
+                        miner_coldkeys,
+                        tally.published_early if tally else set(),
+                        rollout_window,
+                        job_block=job_block,
+                    )
                     total_gpu_model_count_map = settle_cycle_results(
                         all_job_results,
                         {**self.default_extra, "job_batch_id": job_batch_id},
@@ -724,7 +745,13 @@ class Validator:
                     )
 
                     all_job_results, withheld_results = await self.withhold_verdicts_for_rollout(
-                        all_job_results, job_block, job_batch_id, rollout_window, rented_executors, rented_at_end
+                        all_job_results,
+                        job_block,
+                        job_batch_id,
+                        rollout_window,
+                        rented_executors,
+                        rented_at_end,
+                        window_read_at_end=True,
                     )
                     await remember_rented_scored_results(all_job_results, self.redis_service, job_block=job_block)
 
@@ -736,7 +763,11 @@ class Validator:
                     self.active_hotkeys = {
                         miner_hotkey
                         for miner_hotkey, results in all_job_results.items()
-                        if any(result.is_successful or result.duplicate_kept_by for result in results)
+                        # DAH-7118: a credited pass alone does not keep the miner active, as a withheld cycle would not
+                        if any(
+                            (result.is_successful and not result.carried_for_rental_change) or result.duplicate_kept_by
+                            for result in results
+                        )
                     } | session_kept_hotkeys(withheld_results)
 
                     incentive = IncentiveFactory.create(
@@ -749,6 +780,7 @@ class Validator:
                     await incentive.calculate_mining_scores()
 
                     snapshot = incentive.get_snapshot()
+                    await log_would_credit(would_credit, self.incentive, self.redis_service, snapshot)
                     if snapshot is not None:
                         estimates_started_at = time.perf_counter()
                         try:
@@ -1650,15 +1682,21 @@ class Validator:
         window_at_cycle_start: RolloutWindow,
         rented_at_start: RentedExecutorsResponse | None = None,
         rented_at_end: RentedExecutorsResponse | None = None,
+        window_read_at_end: bool = False,
     ) -> tuple[dict[str, list[JobResult]], list[WithheldVerdict]]:
         """DAH-3405: at cycle end, take the results the rollout explains out of the cycle.
 
         The push that recreates the fleet's containers can land in the middle of a cycle (11 Sep
         07:50Z did), so the registry is read once more here and the window opens on THIS cycle's
-        results, before scoring and publishing see them.
+        results, before scoring and publishing see them. With `window_read_at_end` the caller already made that
+        read (before the rental-change carry, which must see the same window) and passes its window in.
         """
-        window = await self.observe_executor_rollout(
-            await self.fetch_executor_digest_or_none(), job_block, fallback=window_at_cycle_start
+        window = (
+            window_at_cycle_start
+            if window_read_at_end
+            else await self.observe_executor_rollout(
+                await self.fetch_executor_digest_or_none(), job_block, fallback=window_at_cycle_start
+            )
         )
         standing, withheld_results = withhold_rollout_verdicts(all_job_results, window, job_block)
         await self.record_withheld_verdicts(window, withheld_results, job_batch_id, job_block)
