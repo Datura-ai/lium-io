@@ -125,6 +125,27 @@ async def test_an_unenforced_all_cards_refusal_drops_the_probe_pass(card_refused
 
 
 @pytest.mark.asyncio
+async def test_a_repeated_refusal_keeps_the_probe_interval(monkeypatch, context_factory):
+    """Review of lio#2515: unenforced, the same card is refused every cycle. The first refusal revokes the pass and
+    the probe re-earns it; a repeat within the interval must not revoke it again (a probe container every cycle
+    instead of every RENTAL_PROBE_INTERVAL_HOURS). After the interval a refusal revokes once more."""
+    services = _services(validation=_Validation(True))
+    ctx = context_factory(services=services, config=build_context_config(), state=build_state(specs={"gpu": {"count": 2}}))
+    await CapabilityCheck().run(ctx)
+    assert services.redis.store[STAMP] == rental_probe._PASS_REVOKED_VALUE
+    refusal_key = f"{rental_probe._REDIS_CARD_REFUSAL_REVOKED_PREFIX}:executor-123"
+    assert services.redis.ttl[refusal_key] == rental_probe.settings.RENTAL_PROBE_INTERVAL_HOURS * 3600
+
+    services.redis.store[STAMP] = "1764240000"  # the probe passed on this machine
+    await CapabilityCheck().run(ctx)
+    assert services.redis.store[STAMP] == "1764240000"
+
+    del services.redis.store[refusal_key]  # the interval ran out
+    await CapabilityCheck().run(ctx)
+    assert services.redis.store[STAMP] == rental_probe._PASS_REVOKED_VALUE
+
+
+@pytest.mark.asyncio
 async def test_a_dry_run_leaves_the_live_probe_pass(monkeypatch, context_factory):
     # a dry-run validator shares Redis with the live one
     monkeypatch.setattr(rental_probe.settings, "DRY_RUN", True)

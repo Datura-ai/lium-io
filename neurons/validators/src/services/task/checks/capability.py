@@ -33,7 +33,7 @@ from .gpu_model_truth import (
     work_proof_failed,
 )
 from .matmul_speed_log import log_matmul_speed
-from .rental_probe import has_standing_failure, require_probe_pass
+from .rental_probe import has_standing_failure, require_probe_pass_for_card_refusal
 from .rental_owner import uuid_listed_under_another_miner, rental_of_this_node
 from .sshd_bootstrap import remove_lium_fillers
 
@@ -214,7 +214,7 @@ class CapabilityCheck:
                 )
             if getattr(result, "all_cards_card_refused", False):
                 # unenforced, the all-cards run does not fail the node; the probe that relists it checks each card
-                await require_probe_pass(ctx, "a claimed card could not run the all-cards work-proof")
+                await require_probe_pass_for_card_refusal(ctx, "a claimed card could not run the all-cards work-proof")
             what: dict = {"metrics": result.metrics, "transport": transport, **logged}
             if sizing:
                 what["first_pass_vram_budget_mb"] = sizing["vram_budget_mb"]

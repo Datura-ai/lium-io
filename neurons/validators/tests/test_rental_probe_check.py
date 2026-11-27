@@ -2039,6 +2039,22 @@ async def test_a_revoked_pass_hides_the_node_even_when_the_validator_cannot_prob
 
 
 @pytest.mark.asyncio
+async def test_a_revoked_pass_with_no_image_listed_for_the_gpu_does_not_hide_the_node_for_good():
+    """Review of lio#2515: the backend answers that it lists no default renter image for this GPU and driver, so
+    no probe can ever run to end the revocation. Holding the node would hide it for good, with nothing the
+    provider can do: the probe check does not hold it, and the revocation stays for when an image is listed."""
+    redis = FakeRedis(last_ok=module._PASS_REVOKED_VALUE)
+    ctx, docker, _ = make_probe_context(redis=redis)
+    ctx.services.backend.get_default_docker_image.return_value = []
+    with probe_settings():
+        result = await RentalProbeCheck().run(ctx)
+    assert result.passed and result.event.reason_code == Msg.SKIPPED.reason
+    assert result.event.what_we_saw["reason"] == "no default renter image for this GPU and driver"
+    assert result.extra_events == [] and docker.create_calls == []
+    assert redis.store[f"{module._REDIS_LAST_OK_PREFIX}:{ctx.executor.uuid}"] == module._PASS_REVOKED_VALUE
+
+
+@pytest.mark.asyncio
 async def test_a_node_with_a_pass_on_record_keeps_a_cycle_without_a_verdict_unpenalised():
     ctx, _, _ = make_probe_context(redis=FakeRedis(last_ok=time.time() - 7 * 3600), images=())
     with probe_settings():
