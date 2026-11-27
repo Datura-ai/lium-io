@@ -703,8 +703,11 @@ def main():
     Main loop: run watchtower permanently.
     """
     if not settings.WATCHTOWER_ENABLED:
-        logger.info("Watchtower is disabled (WATCHTOWER_ENABLED=False)")
-        return
+        # The container runs with restart policy unless-stopped, so an exit here is restarted at once, over and over.
+        # A disabled updater stays up and does nothing until it is stopped.
+        logger.info("Watchtower is disabled (WATCHTOWER_ENABLED=False); idle until stopped")
+        while True:
+            time.sleep(3600)
 
     validator_trust.load()
 
