@@ -52,9 +52,12 @@ _APP_MEM_FLAGS = ("-rac", "-rmc")
 _RESET_CALL_TIMEOUT_SECONDS = (1 + len(_APP_MEM_FLAGS)) * PER_RESET_TIMEOUT_SECONDS + 10
 # 3 = "not supported": a GPU without application or memory clock control
 _APP_MEM_RESET_OK_EXITS = {"0", "3"}
-# 6 = NVML "not found" (no such clock setting); only when the same GPU answered its -rgc, so the GPU itself was found.
-# Ada GeForce answers it to -rac/-rmc on every GPU (application clocks exist on Maxwell GeForce only, nvidia-smi docs)
+# 6 = NVML "not found" (no such clock setting); only when the same GPU's -rgc reset it or refused it as having no clock
+# control (0, 3, 4), so the GPU itself was found and reachable. Any other -rgc exit (15 "fell off the bus", 6, 137, none)
+# leaves the GPU itself in doubt, so a 6 there is a failed reset (review). Ada GeForce answers 6 to -rac/-rmc on every
+# GPU (application clocks exist on Maxwell GeForce only, nvidia-smi docs)
 _APP_MEM_NOT_FOUND_EXIT = "6"
+_RGC_GPU_PRESENT_EXITS = {"0", "3", "4"}
 # 137: the host's timeout killed that nvidia-smi, so it gave no verdict
 _KILLED_EXIT = "137"
 CLOCK_LOCK_POD_KEY_PREFIX = "gpu_clock_lock_pod:"
@@ -166,7 +169,7 @@ def _reset_command(uuids: list[str], pod_gpu_uuids: set[str] | None, results: st
 def _app_mem_outcome(code: str, rgc_exit: str | None) -> str:
     if code in _APP_MEM_RESET_OK_EXITS:
         return "ok" if code == "0" else "unsupported"
-    if code == _APP_MEM_NOT_FOUND_EXIT and rgc_exit not in (None, _KILLED_EXIT, _APP_MEM_NOT_FOUND_EXIT):
+    if code == _APP_MEM_NOT_FOUND_EXIT and rgc_exit in _RGC_GPU_PRESENT_EXITS:
         return "not_found"
     return "no_answer" if code in ("unknown", _KILLED_EXIT) else "failed"
 
@@ -304,7 +307,7 @@ async def _reset_gpu_clocks(
     }
     _log_reset_outcome(purpose, pod_id, uuids, lines, failures, result)
     # a -rac/-rmc that gave no answer leaves that GPU's application or memory clocks unknown: the GPU fails closed as a
-    # no-answer -rgc does. An answered failure or not-found (exit 6 beside an answered -rgc) stays logged only
+    # no-answer -rgc does. An answered failure or not-found (exit 6 beside an -rgc exit 0/3/4) stays logged only
     for (uuid, flag), (outcome, _code) in _app_mem_outcomes(uuids, lines).items():
         if outcome == "no_answer" and (failures[uuid] is None or failures[uuid] in _NO_CLOCK_CONTROL):
             failures[uuid] = f"nvidia-smi {flag} gave no answer"

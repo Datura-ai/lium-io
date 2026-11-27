@@ -461,6 +461,13 @@ async def test_a_lost_answers_read_back_is_bounded_to_10_seconds():
         (0, 0, "rgc_ok=2 rgc_failed=0 rgc_no_answer=0 app_mem_ok=4 app_mem_unsupported=0 app_mem_not_found=0", 0),
         # prod 26 Nov (8x RTX 4090 48GB): -rac/-rmc answer 6 "not found" on a GPU whose -rgc answered: no such control
         (0, 6, "rgc_ok=2 rgc_failed=0 rgc_no_answer=0 app_mem_ok=0 app_mem_unsupported=0 app_mem_not_found=4", 0),
+        # a completed -rgc refusal (3 not supported, 4 no permission) still found the GPU: its 6s are not found too
+        (3, 6, "rgc_ok=0 rgc_failed=2 rgc_no_answer=0 app_mem_ok=0 app_mem_unsupported=0 app_mem_not_found=4", 0),
+        (4, 6, "rgc_ok=0 rgc_failed=2 rgc_no_answer=0 app_mem_ok=0 app_mem_unsupported=0 app_mem_not_found=4", 0),
+        # review (lio#2499): -rgc 15 (GPU fell off the bus) leaves the GPU in doubt: its -rac/-rmc 6s are failed resets,
+        # one warning each
+        (15, 6, "rgc_ok=0 rgc_failed=2 rgc_no_answer=0 app_mem_ok=0 app_mem_unsupported=0 app_mem_not_found=0 "
+                "app_mem_failed=4", 4),
         # a 6 beside an -rgc that also answered 6 may be the GPU itself not found: a failure
         (6, 6, "rgc_ok=0 rgc_failed=2 rgc_no_answer=0 app_mem_ok=0 app_mem_unsupported=0 app_mem_not_found=0", 4),
         # killed by the host's timeout: no verdict
