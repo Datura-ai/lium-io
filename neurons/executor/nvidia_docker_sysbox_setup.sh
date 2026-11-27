@@ -1480,11 +1480,13 @@ case "${1:-}" in
     --install-layer-reset)
         # DAH-6804: what the validator runs on Sysbox hosts whose layer reset is missing or old. Installs the unit and
         # Docker's drop-in only: never runs the reset, never restarts Docker, so running pods are not touched. One
-        # result line for the validator. Without python3 the unit's ExecStart could never work, so it installs
+        # result line for the validator. Without python3 the unit's ExecStart could never work, and without systemd
+        # nothing would ever run the unit (the install failed at its daemon-reload on every check), so it installs
         # nothing there.
         if [ "$(id -u)" != 0 ]; then echo "layer_reset_skipped not_root"
         elif [ ! -x /usr/bin/python3 ]; then echo "layer_reset_skipped no_python3"
         elif ! command -v sysbox-runc >/dev/null 2>&1; then echo "layer_reset_skipped no_sysbox"
+        elif ! command -v systemctl >/dev/null 2>&1; then echo "layer_reset_skipped no_systemd"
         else
             # the failing step and the last line it wrote to stderr: one line, printable, bounded
             err=$(mktemp) || { echo "layer_reset_failed install mktemp"; exit 0; }
