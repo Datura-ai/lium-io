@@ -176,13 +176,17 @@ async def test_estimate_executor_rented_returns_tao(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("is_rented", [False, True])
+@pytest.mark.parametrize(
+    "is_rented,split",
+    [(False, {}), (True, {}), (True, {"rented_gpu_count": 2, "supports_gpu_splitting": True, "gpu_splitting_min_count": 1})],
+    ids=["idle", "rented", "partly_rented_split"],
+)
 async def test_a_row_added_to_the_snapshot_earns_what_it_earns_inside_the_cycle(
-    rental_config, mock_redis, mock_price_provider, monkeypatch, is_rented
+    rental_config, mock_redis, mock_price_provider, monkeypatch, is_rented, split
 ):
     # exact when no other result of the row's GPU model scored (see the shortcut in score_added_result)
     others = {"miner_a": [_make_job("exec-a", "H200", 8, is_rented=True), _make_job("exec-b", "H200", 8, is_rented=False)]}
-    added = _make_job("exec-c", "H100", 8, is_rented=is_rented)
+    added = _make_job("exec-c", "H100", 8, is_rented=is_rented).model_copy(update=split)
     monkeypatch.setattr(RentalPriceIncentive, "price_provider", mock_price_provider)
 
     without = _make_incentive(rental_config, mock_redis, mock_price_provider, others, monkeypatch)

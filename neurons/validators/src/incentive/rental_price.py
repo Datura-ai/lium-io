@@ -1796,9 +1796,16 @@ class RentalPriceIncentive(DefaultIncentive):
         total_map_with_added = dict(self._seed_snapshot.mining.total_gpu_model_count_map or {})
         total_map_with_added[result.gpu_model] = total_map_with_added.get(result.gpu_model, 0) + result.gpu_count
         self.total_gpu_model_count_map = total_map_with_added
-        await self._pre_process_job_result(hotkey, result)
+        # a partly rented split node is scored as its rented and free portions, as calculate_mining_scores does
+        self.job_results = {hotkey: [result]}
+        split_portions = self._expand_partially_rented_split_results()
+        portions = list(self.job_results[hotkey])
+        for portion in portions:
+            await self._pre_process_job_result(hotkey, portion)
         await self._on_finish_pre_process()
-        await self._post_process_job_result(hotkey, result)
+        for portion in portions:
+            await self._post_process_job_result(hotkey, portion)
+        self._merge_partially_rented_split_results(split_portions)
         return result
 
     async def _calculate_rental_share(self, total_rental_cost: float) -> float:
@@ -1946,8 +1953,7 @@ async def score_added_result(
     """A scored copy of `result` as one more result of the snapshot's cycle (DAH-7118 would-credit reward). Exact when
     no other result of its GPU model scored in the cycle.
     shortcut: same-model results keep the mining score they had at the model's old GPU total, so the reward is off by
-    about the row's share of that model's GPUs (under 1% at fleet size); and a partly rented split node is scored
-    whole. Upgrade to a full re-score of the cycle if the credit is ever sized from this log alone."""
+    about the row's share of that model's GPUs (under 1% at fleet size). Upgrade to a full re-score of the cycle if the credit is ever sized from this log alone."""
     added = result.model_copy(deep=True)
     excluded = hotkey in settings.get_scoring_excluded_hotkeys() or (
         hotkey in settings.get_idle_incentive_excluded_hotkeys() and not added.is_rented
