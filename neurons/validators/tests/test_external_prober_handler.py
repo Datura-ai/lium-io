@@ -113,6 +113,7 @@ def test_a_node_that_stalls_mid_answer_is_no_answer(status):
 @pytest.mark.parametrize("size, passes", [(256, True), (257, False)])
 async def test_both_probe_paths_judge_an_answer_of_the_same_size_alike(size, passes):
     """The outside prober and the validator's own probe accept and reject exactly the same answers."""
+    import aiohttp
     from neurons.validators.src.services.executor_connectivity.models import PortPair
     from neurons.validators.src.services.executor_connectivity.port_tester import (
         PROBE_BODY_LIMIT,
@@ -136,7 +137,10 @@ async def test_both_probe_paths_judge_an_answer_of_the_same_size_alike(size, pas
     try:
         # the validator's verdict on the outside prober's answer, as in ExternalPortProbe.reached
         outside = (handler._fetch("127.0.0.1", server.server_port, 3) or "").strip() == "token:7"
-        inside = await PortTester().test_one("127.0.0.1", PortPair(internal=7, external=server.server_port), "token")
+        async with aiohttp.ClientSession() as session:
+            inside = await PortTester().test_one(
+                session, "127.0.0.1", PortPair(internal=7, external=server.server_port), "token"
+            )
     finally:
         server.shutdown()
     assert outside is passes

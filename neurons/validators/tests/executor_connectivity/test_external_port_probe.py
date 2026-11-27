@@ -29,7 +29,7 @@ def _verifier(mocker, reached):
     runner.run = mocker.AsyncMock(return_value=ContainerStartResult(ok=True, container_id="c", status="Up"))
     runner.cleanup = mocker.AsyncMock()
     port_tester = mocker.Mock()
-    port_tester.test_many = mocker.AsyncMock(side_effect=lambda host, tested, token, log_ctx=None: (tested, []))
+    port_tester.test_many = mocker.AsyncMock(side_effect=lambda session, host, tested, token, log_ctx=None: (tested, []))
     external = mocker.Mock(spec=ExternalPortProbe)
     external.reached = mocker.AsyncMock(side_effect=lambda host, sample, token: reached(sample))
     return BatchVerifier(port_tester, runner, external), port_tester
@@ -56,7 +56,7 @@ async def test_batch_counts_ports_the_outside_prober_reached_without_fetching_th
 
     assert result.external == "passed"
     assert sorted(result.successful, key=lambda p: p.internal) == PORTS
-    assert len(port_tester.test_many.call_args.args[1]) == len(PORTS) - 3
+    assert len(port_tester.test_many.call_args.args[2]) == len(PORTS) - 3
 
 
 @pytest.mark.asyncio
@@ -76,7 +76,7 @@ async def test_outside_prober_fetches_ports_published_through_docker_not_the_hos
     runner.run = mocker.AsyncMock(return_value=ContainerStartResult(ok=True, container_id="c", status="Up"))
     runner.cleanup = mocker.AsyncMock()
     port_tester = mocker.Mock()
-    port_tester.test_many = mocker.AsyncMock(side_effect=lambda host, tested, token, log_ctx=None: (tested, []))
+    port_tester.test_many = mocker.AsyncMock(side_effect=lambda session, host, tested, token, log_ctx=None: (tested, []))
     external = mocker.Mock(spec=ExternalPortProbe)
 
     async def reached(host, sample, token):
@@ -107,7 +107,7 @@ async def test_a_host_that_answers_only_published_ports_still_reaches_the_semi_b
     runner.cleanup = mocker.AsyncMock()
     port_tester = mocker.Mock()
     port_tester.test_many = mocker.AsyncMock(
-        side_effect=lambda host, tested, token, log_ctx=None: (tested, []) if tested == PORTS[:3] else ([], tested)
+        side_effect=lambda session, host, tested, token, log_ctx=None: (tested, []) if tested == PORTS[:3] else ([], tested)
     )
     external = mocker.Mock(spec=ExternalPortProbe)
     external.reached = mocker.AsyncMock(side_effect=lambda host, sample, token: sample if outside == "passed" else [])
@@ -278,7 +278,7 @@ def _parallel_verifier(mocker, reached, answer=lambda tested: (tested, [])):
     runner.run = mocker.AsyncMock(side_effect=docker_run)
     runner.cleanup = mocker.AsyncMock()
     port_tester = mocker.Mock()
-    port_tester.test_many = mocker.AsyncMock(side_effect=lambda host, tested, token, log_ctx=None: answer(tested))
+    port_tester.test_many = mocker.AsyncMock(side_effect=lambda session, host, tested, token, log_ctx=None: answer(tested))
     external = mocker.Mock(spec=ExternalPortProbe)
     external.reached = mocker.AsyncMock(side_effect=reached)
     mocker.patch("services.executor_connectivity.port_verifiers.random.sample", lambda ps, k: ps[:k])

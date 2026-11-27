@@ -1,14 +1,12 @@
 import asyncio
 import logging
 import statistics
-import threading
 import time
 
 import aiohttp
 
 from core.utils import _m, get_extra_info
 from services.executor_connectivity.models import PortPair
-from services.node_host import public_host_connector
 
 logger = logging.getLogger(__name__)
 
@@ -21,45 +19,17 @@ PROBE_BODY_LIMIT = 256
 
 
 class PortTester:
-    """Tests port connectivity via HTTP on its own event loop in a daemon thread.
+    """Tests port connectivity via HTTP. Stateless and easily mockable."""
 
-    Probes never run on the validator's loop: a wave of probe callbacks there delayed every other
-    reply on it, so Redis replies sat unread and pool checkouts ran past their wait.
-    """
-
-    def __init__(self):
-        self._loop: asyncio.AbstractEventLoop | None = None
-        self._session: aiohttp.ClientSession | None = None  # touched only on the probe loop
-        self._start_lock = threading.Lock()
-
-    def _probe_loop(self) -> asyncio.AbstractEventLoop:
-        with self._start_lock:
-            if self._loop is None:
-                loop = asyncio.new_event_loop()
-                threading.Thread(target=loop.run_forever, name="port-probes", daemon=True).start()
-                self._loop = loop
-            return self._loop
-
-    async def _on_probe_loop(self, coro):
-        # cancelling the caller (its deadline) cancels the probes on the probe loop too
-        return await asyncio.wrap_future(asyncio.run_coroutine_threadsafe(coro, self._probe_loop()))
-
-    async def test_one(self, host: str, port: PortPair, token: str) -> bool:
+    async def test_one(self, session: aiohttp.ClientSession, host: str, port: PortPair, token: str) -> bool:
         """Test single port connectivity via HTTP."""
-        return await self._on_probe_loop(self._probe(host, port, token))
-
-    async def _probe(self, host: str, port: PortPair, token: str) -> bool:
-        if self._session is None:
-            # no socket bound shared across nodes: one node's dropped probes would hold it for their whole
-            # budget and every other node's probes would queue behind them
-            self._session = aiohttp.ClientSession(connector=public_host_connector(limit=0, force_close=True))
         url = f"http://{host}:{port.external}/"
         expected = f"{token}:{port.internal}"
 
         try:
             # the node answers its own address only: a redirect would point the probe somewhere else. The answer is
             # asked for and read uncompressed, so the cap counts the bytes the node sent
-            async with self._session.get(
+            async with session.get(
                 url,
                 timeout=PROBE_TIMEOUT,
                 allow_redirects=False,
@@ -80,6 +50,7 @@ class PortTester:
 
     async def test_many(
         self,
+        session: aiohttp.ClientSession,
         host: str,
         ports: list[PortPair],
         token: str,
@@ -91,15 +62,12 @@ class PortTester:
         async def timed(port: PortPair) -> bool:
             started = time.monotonic()
             try:
-                return await self._probe(host, port, token)
+                return await self.test_one(session, host, port, token)
             finally:
                 durations.append(time.monotonic() - started)
 
-        async def probe_all() -> list[bool]:
-            return await asyncio.gather(*[timed(p) for p in ports])
-
         wall_started = time.monotonic()
-        results = await self._on_probe_loop(probe_all())
+        results = await asyncio.gather(*[timed(p) for p in ports])
         wall = time.monotonic() - wall_started
 
         successful = [p for p, ok in zip(ports, results) if ok]
