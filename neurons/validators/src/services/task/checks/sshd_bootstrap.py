@@ -230,6 +230,42 @@ class SshdBootstrapCheck:
         return None
 
 
+async def remove_own_lium_fillers(ctx: Context) -> list[str]:
+    """Remove the node's fillers when Lium's default job runs them, so a check gets idle cards; the backend places a
+    filler again later. [] under a dry run (it shares the live node) and for another owner's filler, not ours to stop.
+    Never raises."""
+    rented_data = ctx.state.rented_data
+    if (
+        settings.DRY_RUN
+        or rented_data is None
+        or rented_data.get_default_job_owner(ctx.executor.uuid) != DEFAULT_JOB_OWNER_LIUM
+    ):
+        return []
+    return await remove_lium_fillers(ctx, rented_data.get_filler_containers(ctx.executor.uuid))
+
+
+async def running_fillers_reporting_gone(ctx: Context) -> list[str]:
+    """The node's listed fillers still running. Each listed one with no running container is reported missing, so the
+    backend closes its run (DAH-2471) on a cycle a failing check ends before RentalVerificationCheck reports it. A
+    state that cannot be read counts as running. Never raises."""
+    rented_data = ctx.state.rented_data
+    running: list[str] = []
+    for name in rented_data.get_filler_containers(ctx.executor.uuid) if rented_data else []:
+        try:
+            ps = await ctx.ssh.run(DockerCommand.ps_running(name), timeout=60)
+        except Exception:
+            running.append(name)
+            continue
+        if ps.exit_status != 0 or (ps.stdout or "").strip():
+            running.append(name)
+            continue
+        with contextlib.suppress(Exception):
+            await ctx.services.backend.get_filler_run_active(
+                name.removeprefix(FILLER_CONTAINER_PREFIX), container_missing=True
+            )
+    return running
+
+
 async def remove_lium_fillers(ctx: Context, fillers: list[str]) -> list[str]:
     """`docker rm -fv` each filler, mark it ours, then report it missing so the backend closes its run.
 
