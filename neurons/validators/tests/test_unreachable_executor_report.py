@@ -231,6 +231,27 @@ def test_a_node_that_answered_with_a_stale_nonce_is_reported_as_refusing_and_nam
     assert event.what_we_saw["node_answer"] == "HTTP 401: Stale upload nonce"
 
 
+def test_a_node_address_that_answers_404_is_named_as_no_executor_there_not_a_refusal(flag_on):
+    """26 Nov: a node answered every upload with HTTP 404 and was told it "refused the validator's key", with the
+    executor's log as the place to look. The executor never answers that route 404, so its log never saw it."""
+    msg = AcceptSSHKeyRequest(
+        executors=miner_returned(LISTED),
+        known_executor_ids=[LISTED, UNREACHABLE],
+        refused_executors={UNREACHABLE: "HTTP 404: Not Found"},
+    )
+
+    [result] = build(msg, RentedExecutorsResponse(executors={}))
+
+    event = result.validation_event
+    assert result.failure_reason_code == AvailabilityErrorCode.EXECUTOR_UNREACHABLE_BY_MINER
+    assert result.score == 0
+    assert event.event == "Miner reached this node's address, but no executor answered there"
+    assert "refused" not in event.event
+    assert "docker ps" in event.remediation and "EXTERNAL_PORT" in event.remediation
+    assert "ss -ltnp" not in event.remediation
+    assert event.what_we_saw["node_answer"] == "HTTP 404: Not Found"
+
+
 def test_a_node_the_miner_did_not_hear_from_keeps_the_could_not_reach_event(flag_on):
     msg = AcceptSSHKeyRequest(
         executors=miner_returned(LISTED),
