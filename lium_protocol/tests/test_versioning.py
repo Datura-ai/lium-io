@@ -22,6 +22,7 @@ FILES = [
     f"lium_protocol/snapshots/lium_protocol.v{MAJOR}.json",
     "lium_protocol/http.py",
 ]
+VALIDATOR_PROTOCOL = "neurons/validators/validator_protocol"
 
 
 def run(repo: Path, *args: str) -> subprocess.CompletedProcess:
@@ -38,6 +39,8 @@ def repo(tmp_path: Path) -> Path:
     for name in FILES:
         (tmp_path / "lium_protocol" / name).parent.mkdir(parents=True, exist_ok=True)
         shutil.copy(PACKAGE / name, tmp_path / "lium_protocol" / name)
+    (tmp_path / VALIDATOR_PROTOCOL).parent.mkdir(parents=True)
+    shutil.copy(PACKAGE.parent / VALIDATOR_PROTOCOL, tmp_path / VALIDATOR_PROTOCOL)
     run(tmp_path, "git", "init", "-q")
     commit(tmp_path, "base")
     return tmp_path
@@ -81,6 +84,8 @@ def test_release_takes_the_highest_bump_writes_every_file_and_removes_fragments(
     assert f'name = "lium-protocol"\nversion = "{new}"' in (root / "uv.lock").read_text()
     readme = (root / "README.md").read_text()
     assert f"`PROTOCOL_VERSION` (`{new}`)" in readme
+    # the validator image's copy moves with it, or the validator test that holds them equal fails
+    assert (repo / VALIDATOR_PROTOCOL).read_text() == f"{new}\n"
     assert f"- `{new}` — `X.a` (optional). `Y` removed.\n- `1.0.0` —" in readme
     # a major release moves the snapshot to the new major's name
     assert not (repo / SNAPSHOT.format(MAJOR)).exists()
