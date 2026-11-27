@@ -119,6 +119,8 @@ class ExecutorUpdateFailed(BaseMinerPortalRequest):
     message_type: RequestType = RequestType.ExecutorUpdateFailed
     executor_id: UUID
     error: str
+    # this miner holds no node with that uuid, so the edit can never apply here
+    not_on_miner: bool = False
 
 
 class DeleteExecutorRequest(BaseMinerPortalRequest):

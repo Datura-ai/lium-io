@@ -673,6 +673,19 @@ def test_an_update_writes_only_the_fields_the_portal_sent(tmp_path, messages, ex
         assert (node.address, node.port, node.validator, node.price_per_gpu) == expected
 
 
+def test_an_update_for_a_node_not_on_this_miner_is_answered_as_such(executor_service, test_executor):
+    from protocol.miner_portal_request import ExecutorUpdateFailed, UpdateExecutorRequest
+
+    executor_service.executor_dao.find_by_uuid.return_value = None
+
+    result = executor_service.update(UpdateExecutorRequest(executor=_payload(test_executor)))
+
+    assert isinstance(result, ExecutorUpdateFailed)
+    assert result.not_on_miner is True
+    assert result.executor_id == test_executor.uuid
+    executor_service.executor_dao.session.commit.assert_not_called()
+
+
 @pytest.mark.asyncio
 async def test_central_miner_lists_each_node_with_its_registered_host_key_from_one_portal_read(executor_service):
     """DAH-5729: the host key comes from the portal read the node list came from. The snapshot expiring while the

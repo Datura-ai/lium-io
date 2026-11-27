@@ -288,6 +288,13 @@ class ExecutorService:
             # only the fields the portal sent: an address edit (DAH-2865) carries no price or validator, and must keep
             # the ones this miner has, which may be newer than the portal's
             executor = self.executor_dao.find_by_uuid(sent.uuid)
+            if executor is None:
+                logger.warning("update for executor (id=%s): not on this miner, nothing updated", str(sent.uuid))
+                return ExecutorUpdateFailed(
+                    executor_id=sent.uuid,
+                    error="executor is not on this miner",
+                    not_on_miner=True,
+                )
             for name in ("validator", "address", "port", "price_per_gpu"):
                 if name in sent.model_fields_set:
                     setattr(executor, name, getattr(sent, name))
