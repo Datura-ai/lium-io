@@ -580,6 +580,23 @@ async def test_under_the_providers_own_cap_the_floor_and_tier_judge_the_recorded
     assert redis.store.get(scored_tier_ratio_key(_EXECUTOR_UUID, "GPU-abc")) == kept_tier
 
 
+@pytest.mark.parametrize(("record_boot", "passed"), [("boot-before", True), ("boot-now", False), (None, False)])
+@pytest.mark.asyncio
+async def test_under_the_providers_own_cap_a_host_limit_recorded_before_a_reboot_is_not_judged(
+    context_factory, read_records_mock, record_boot, passed
+) -> None:
+    # the reboot reset the host to stock, so the 70 % limit recorded in the earlier boot must not fail it
+    read_records_mock.return_value = _read_result(
+        _restore_record().model_copy(update={"watts": 245, "boot_id": record_boot})
+    )
+    state = _state(current_limit=280, default_limit=350, default_job_owner="miner")
+    state = ContextState(**{**state.__dict__, "specs": {"boot_id": "boot-now"}})
+
+    result = await GpuPowerLimitCheck().run(context_factory(state=state))
+
+    assert result.passed is passed
+
+
 @pytest.mark.asyncio
 async def test_a_low_recorded_host_limit_under_the_providers_own_job_says_to_stop_the_job_first(
     context_factory, read_records_mock

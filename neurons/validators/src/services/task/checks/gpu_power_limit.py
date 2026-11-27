@@ -149,7 +149,12 @@ async def _pre_cap_host_limit_records_under_miner_job(
     if default_job_owner != DEFAULT_JOB_OWNER_MINER:
         return []
     uuids = [detail["uuid"] for detail in ctx.state.gpu_details or [] if detail.get("uuid")]
-    return await _restore_records_of_this_executor(ctx, uuids)
+    records = await _restore_records_of_this_executor(ctx, uuids)
+    # a reboot resets the host to its stock limit, so a record from an earlier boot no longer says what it allows
+    boot_id = (ctx.state.specs or {}).get("boot_id")
+    if not isinstance(boot_id, str) or not boot_id:
+        return records
+    return [record for record in records if record.boot_id in (None, boot_id)]
 
 
 async def _filler_pods_running(ctx: Context, pod_ids: set[str]) -> set[str]:
