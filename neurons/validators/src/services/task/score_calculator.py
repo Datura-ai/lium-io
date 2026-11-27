@@ -157,7 +157,11 @@ def calculate_scores(
     if not ctx.gpu_kernel_count_passed:
         actual_score = 0.0
         job_score = 0.0
-        warning_messages.append("The kernel lists fewer GPUs than the node reports")
+        warning_messages.append(
+            "A reported GPU cannot be attached to a container"
+            if ctx.gpu_kernel_unattachable
+            else "The kernel lists fewer GPUs than the node reports"
+        )
 
     # GPU model gate (DAH-6241): same mechanics; the renter's pod keeps running, the provider is not paid.
     if not ctx.gpu_model_passed:
