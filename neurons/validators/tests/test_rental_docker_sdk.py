@@ -90,6 +90,7 @@ class FakeApiClient:
         self.login_calls = []
         self.inspected_images = []
         self.missing_images = set()
+        self.configless_images = set()
         self.inspect_image_error = None
         self.repo_digests = []
         self.remote_digest = "sha256:remote"
@@ -149,7 +150,8 @@ class FakeApiClient:
             raise self.inspect_image_error
         if image in self.missing_images:
             raise ImageNotFound("missing image")
-        return {"Id": "image-id", "RepoDigests": self.repo_digests, "RepoTags": self.repo_tags}
+        config = None if image in self.configless_images else {"Labels": None}
+        return {"Id": "image-id", "RepoDigests": self.repo_digests, "RepoTags": self.repo_tags, "Config": config}
 
     def inspect_distribution(self, image, auth_config=None):
         self.distribution_calls.append({"image": image, "auth_config": auth_config})
@@ -526,6 +528,17 @@ async def test_local_image_repo_digests_reads_one_inspect_and_none_for_a_missing
     assert await client.local_image_repo_digests(image="daturaai/missing:tag") is None
     assert api_client.inspected_images == ["daturaai/pytorch:prod", "daturaai/missing:tag"]
     assert api_client.distribution_calls == []
+
+
+@pytest.mark.asyncio
+async def test_an_image_record_with_no_config_is_not_present_so_the_create_pulls_it():
+    # DAH-7272: a half-finished pull leaves a record whose Config is null; using it failed the label read
+    api_client = FakeApiClient()
+    api_client.repo_digests = ["daturaai/pytorch@sha256:abc"]
+    api_client.configless_images.add("daturaai/pytorch:prod")
+    client = RentalDockerSdkClient(api_client)
+
+    assert await client.local_image_repo_digests(image="daturaai/pytorch:prod") is None
 
 
 @pytest.mark.asyncio
