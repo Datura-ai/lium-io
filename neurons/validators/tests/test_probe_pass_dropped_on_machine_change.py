@@ -2,7 +2,7 @@
 
 The probe confirms every listed card as a CUDA device of its model, but runs once per interval. A node whose
 listed cards changed (the spec, or a re-anchored set) or whose claimed card could not run the all-cards
-work-proof loses its last pass, so it stands as never passed until a probe passes again.
+work-proof has its last pass revoked, so it is hidden until a probe passes again.
 """
 
 import pytest
@@ -43,7 +43,7 @@ async def test_a_spec_change_drops_the_probe_pass(verified_spec, new_spec, dropp
         verified={"spec": verified_spec},
     )
     await SpecChangeCheck().run(ctx)
-    assert (STAMP not in services.redis.store) is dropped
+    assert (services.redis.store.get(STAMP) == rental_probe._PASS_REVOKED_VALUE) is dropped
 
 
 @pytest.mark.parametrize(
@@ -65,7 +65,7 @@ async def test_a_re_anchored_gpu_set_drops_the_probe_pass(prev_uuids, current_uu
     )
     result = await GpuFingerprintCheck().run(ctx)
     assert result.passed
-    assert (STAMP not in services.redis.store) is dropped
+    assert (services.redis.store.get(STAMP) == rental_probe._PASS_REVOKED_VALUE) is dropped
 
 
 @pytest.mark.parametrize(
@@ -121,7 +121,7 @@ async def test_an_unenforced_all_cards_refusal_drops_the_probe_pass(card_refused
     result = await CapabilityCheck().run(ctx)
     # the run itself still passes: unenforced, the all-cards run fails no node
     assert result.passed
-    assert (STAMP not in services.redis.store) is card_refused
+    assert (services.redis.store.get(STAMP) == rental_probe._PASS_REVOKED_VALUE) is card_refused
 
 
 @pytest.mark.asyncio
@@ -136,4 +136,4 @@ async def test_a_dry_run_leaves_the_live_probe_pass(monkeypatch, context_factory
         verified={"spec": "NVIDIA GeForce RTX 4090:8"},
     )
     await SpecChangeCheck().run(ctx)
-    assert STAMP in services.redis.store
+    assert services.redis.store.get(STAMP) == "1764230400"

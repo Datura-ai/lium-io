@@ -651,20 +651,21 @@ class RentalProbeCheck:
                 what={"executor_uuid": ctx.executor.uuid, "no_verdict_this_cycle": no_verdict},
             )
             return CheckResult(passed=False, event=event, updates={"score": 0.0, "job_score": 0.0})
-        if standing is _NEVER_PASSED or standing is _PROOF_UNREADABLE:
+        unproven = standing is _NEVER_PASSED or standing is _PASS_REVOKED
+        if unproven or standing is _PROOF_UNREADABLE:
             # nothing failed, so nothing is recorded or cleared. Never passed: the reason hides the node
             # (REASONS_THAT_HIDE_AT_ONCE) until its first pass. Unreadable: no score, and the backend keeps
             # the node's stored listing state (REASONS_THAT_KEEP_STORED), so an unproven node is not listed
             # by it and a proven one is not hidden by a Redis read failure.
             event = render_message(
-                Msg.NOT_YET_PROVEN if standing is _NEVER_PASSED else Msg.PROOF_UNREADABLE,
+                Msg.NOT_YET_PROVEN if unproven else Msg.PROOF_UNREADABLE,
                 ctx=ctx,
                 check_id=self.check_id,
                 what={"executor_uuid": ctx.executor.uuid, "no_verdict_this_cycle": no_verdict},
             )
             # the hold travels with this result, not with where the run happens to end: an unproven node stays
             # hidden whatever the run reports after it (network figures included)
-            hold = failed_check_event(False, [event]) if standing is _NEVER_PASSED else None
+            hold = failed_check_event(False, [event]) if unproven else None
             return CheckResult(
                 passed=False,
                 event=event,
@@ -945,15 +946,27 @@ class _Failure:
 _NEVER_PASSED = _Failure("never_passed")
 # The stamp could not be read: whether a pass is on record is unknown, so the node is not scored on it.
 _PROOF_UNREADABLE = _Failure("proof_unreadable")
+# The last pass proves another machine (require_probe_pass): written over the stamp, so it reads as no pass for
+# the interval, and unlike _NEVER_PASSED it hides the node even when the validator cannot start a probe (review of
+# lio#2515). The next passed probe's stamp ends it.
+_PASS_REVOKED_VALUE = "revoked"
+_PASS_REVOKED = _Failure("pass_revoked")
 
 
 async def _never_passed(ctx: Context) -> _Failure | None:
     try:
-        last_ok = await _last_ok_at(ctx)
+        raw = await ctx.services.redis.get(f"{_REDIS_LAST_OK_PREFIX}:{ctx.executor.uuid}")
     except Exception:
         _read_failed(ctx, "its interval stamp in Redis")
         return _PROOF_UNREADABLE
-    return _NEVER_PASSED if last_ok is None else None
+    text = raw.decode() if isinstance(raw, bytes) else raw
+    if text == _PASS_REVOKED_VALUE:
+        return _PASS_REVOKED
+    try:
+        float(text)
+    except (TypeError, ValueError):
+        return _NEVER_PASSED
+    return None
 
 
 async def _standing_failure(ctx: Context) -> _Failure | None:
@@ -987,17 +1000,20 @@ async def has_standing_failure(ctx: Context) -> bool:
 
 
 async def require_probe_pass(ctx: Context, why: str) -> None:
-    """The machine may no longer be the one the last probe proved: drop that pass.
+    """The machine may no longer be the one the last probe proved: revoke that pass.
 
-    The node then stands as never passed (`_never_passed`): it scores nothing until a probe passes on the
-    machine it is now, which confirms every listed card as a CUDA device of its model. The probe runs on the
-    next idle cycle, this one too when the probe check is still ahead. A rented node is left alone as before.
+    The node then stands as revoked (`_PASS_REVOKED`): it scores nothing and is hidden until a probe passes on the
+    machine it is now, which confirms every listed card as a CUDA device of its model, even on a cycle the
+    validator cannot start the probe on. The probe runs on the next idle cycle, this one too when the probe check
+    is still ahead. A rented node is left alone as before.
     """
     # A dry run shares Redis with the live validator, so it leaves the live pass alone.
     if settings.DRY_RUN:
         return
     try:
-        await ctx.services.redis.delete(f"{_REDIS_LAST_OK_PREFIX}:{ctx.executor.uuid}")
+        await ctx.services.redis.set(
+            f"{_REDIS_LAST_OK_PREFIX}:{ctx.executor.uuid}", _PASS_REVOKED_VALUE, ex=_REDIS_STAMP_TTL_SECONDS
+        )
     except Exception:
         logger.warning(
             _m(f"Rental probe pass could not be dropped ({why}); the node keeps its last pass",
