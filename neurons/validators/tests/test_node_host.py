@@ -309,7 +309,7 @@ async def test_the_port_probe_does_not_follow_a_redirect(monkeypatch):
     node_hits: list = []
     node, node_port = await _local_server(node_hits, redirect_to=f"http://127.0.0.1:{target_port}/")
     try:
-        ok = await port_tester.PortTester().test_one("127.0.0.1", PortPair(internal=1, external=node_port), "token")
+        ok = await port_tester.ProbeEngine().probe("127.0.0.1", PortPair(internal=1, external=node_port), "token")
     finally:
         await node.cleanup()
         await target.cleanup()
@@ -359,7 +359,7 @@ async def _probe(port: int, monkeypatch) -> tuple[bool, list[int]]:
         return data
 
     monkeypatch.setattr(aiohttp.StreamReader, "read", counted)
-    ok = await port_tester.PortTester().test_one("127.0.0.1", PortPair(internal=7, external=port), "token")
+    ok = await port_tester.ProbeEngine().probe("127.0.0.1", PortPair(internal=7, external=port), "token")
     return ok, read
 
 

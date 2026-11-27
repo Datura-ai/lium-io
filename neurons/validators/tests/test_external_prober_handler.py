@@ -116,7 +116,7 @@ async def test_both_probe_paths_judge_an_answer_of_the_same_size_alike(size, pas
     from neurons.validators.src.services.executor_connectivity.models import PortPair
     from neurons.validators.src.services.executor_connectivity.port_tester import (
         PROBE_BODY_LIMIT,
-        PortTester,
+        ProbeEngine,
     )
 
     assert handler.MAX_BODY == PROBE_BODY_LIMIT
@@ -136,7 +136,7 @@ async def test_both_probe_paths_judge_an_answer_of_the_same_size_alike(size, pas
     try:
         # the validator's verdict on the outside prober's answer, as in ExternalPortProbe.reached
         outside = (handler._fetch("127.0.0.1", server.server_port, 3) or "").strip() == "token:7"
-        inside = await PortTester().test_one("127.0.0.1", PortPair(internal=7, external=server.server_port), "token")
+        inside = await ProbeEngine().probe("127.0.0.1", PortPair(internal=7, external=server.server_port), "token")
     finally:
         server.shutdown()
     assert outside is passes
