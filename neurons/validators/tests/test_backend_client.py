@@ -499,6 +499,15 @@ async def test_get_session_bounds_keepalive_timeout(reset_session):
         await BackendClient.close_session()
 
 
+# The backend API server's gunicorn --keep-alive (DAH-7300): it closes an idle connection after this long.
+BACKEND_SERVER_KEEP_ALIVE_SECONDS = 120
+
+
+def test_pooled_connections_idle_out_before_the_backend_closes_them():
+    # a pooled connection the server already closed fails the request before it reaches the backend
+    assert BackendClient.KEEPALIVE_TIMEOUT_SECONDS < BACKEND_SERVER_KEEP_ALIVE_SECONDS
+
+
 @pytest.mark.asyncio
 async def test_post_retries_connection_error_then_succeeds(reset_session, client):
     """DAH-2360: broken pipe on a stale pooled connection is retried, not surfaced."""
