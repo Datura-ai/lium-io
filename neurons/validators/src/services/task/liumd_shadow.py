@@ -638,6 +638,8 @@ LIVE_GPU_DETAIL_FIELDS = frozenset(
         "clocks_event_reasons",
     }
 )
+# DAH-7289: only liumd reads the PCI ids (machine_scrape is deprecated and gets no new fields)
+LIUMD_ONLY_GPU_DETAIL_FIELDS = frozenset({"pci_device_id", "pci_sub_device_id"})
 
 
 def _is_not_comparable(path: str, extra: frozenset[str] = frozenset()) -> bool:
@@ -652,7 +654,7 @@ def _is_not_comparable(path: str, extra: frozenset[str] = frozenset()) -> bool:
     parent, _, leaf = path.rpartition(".")
     if not parent.endswith("]"):
         return False
-    return leaf in LIVE_GPU_DETAIL_FIELDS and parent.startswith("gpu.details[")
+    return leaf in (LIVE_GPU_DETAIL_FIELDS | LIUMD_ONLY_GPU_DETAIL_FIELDS) and parent.startswith("gpu.details[")
 
 
 def _spec_diffs(

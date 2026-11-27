@@ -270,7 +270,15 @@ def test_normalization_maps_the_liumd_contract_without_mutating_the_snapshot():
     raw = {
         "data_gpu": {
             "gpu_count": 1,
-            "gpu_details": [{"gpu.name": "NVIDIA A10", "gpu.uuid": "GPU-1", "gpu.capacity": 24576.0}],
+            "gpu_details": [
+                {
+                    "gpu.name": "NVIDIA A10",
+                    "gpu.uuid": "GPU-1",
+                    "gpu.capacity": 24576.0,
+                    "gpu.pci_device_id": "0x223610DE",
+                    "gpu.pci_sub_device_id": None,
+                }
+            ],
         },
         "data_processes": [{"processes_pid": 7, "processes_info": "info", "processes_container_name": None}],
         "data_ram": {"ram_total": 1024.0, "ram_free": 512.0, "ram_used": 512.0, "ram_available": 900.0, "ram_utilization": 12.5},
@@ -284,7 +292,13 @@ def test_normalization_maps_the_liumd_contract_without_mutating_the_snapshot():
 
     assert "data_gpu" not in normalized
     assert normalized["gpu"]["count"] == 1
-    assert normalized["gpu"]["details"][0] == {"name": "NVIDIA A10", "uuid": "GPU-1", "capacity": 24576.0}
+    assert normalized["gpu"]["details"][0] == {
+        "name": "NVIDIA A10",
+        "uuid": "GPU-1",
+        "capacity": 24576.0,
+        "pci_device_id": "0x223610DE",
+        "pci_sub_device_id": None,
+    }
     assert normalized["gpu_processes"][0]["pid"] == 7
     assert normalized["gpu_processes"][0]["container_name"] is None
     assert normalized["ram"]["total"] == 1024.0
