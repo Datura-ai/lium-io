@@ -142,7 +142,11 @@ class GpuUsageCheck:
         return await self._judge_process_based_usage(ctx, gpu_details, gpu_processes)
 
     async def _judge_foreign_occupancy(
-        self, ctx: Context, gpu_details: list[dict], gpu_processes: list[dict]
+        self,
+        ctx: Context,
+        gpu_details: list[dict],
+        gpu_processes: list[dict],
+        late_filler_verdicts: dict[str, bool | None] | None = None,
     ) -> CheckResult | None:
         """Judge an idle card by WHO holds it, not by how hard it is being used (DAH-2735).
 
@@ -170,7 +174,9 @@ class GpuUsageCheck:
             if process.get("container_name") not in workload_containers
             and not _runs_in_the_executors_own_cgroup(process)
         ]
-        foreign_processes = await _drop_containers_the_backend_still_owns(ctx, foreign_processes)
+        foreign_processes = await _drop_containers_the_backend_still_owns(
+            ctx, foreign_processes, late_filler_verdicts or {}
+        )
 
         if foreign_processes:
             what = {
@@ -247,8 +253,11 @@ class GpuUsageCheck:
         # every process belongs to ONE OF the node's fillers, not a single expected container.
         filler_containers = set(rented_data.get_filler_containers(ctx.executor.uuid)) if rented_data else set()
         process_names = {process.get("container_name") for process in gpu_processes}
-        if rented_data:
-            filler_containers |= await _fillers_started_after_the_snapshot(ctx, process_names - filler_containers)
+        late_filler_verdicts: dict[str, bool | None] = (
+            await _fillers_started_after_the_snapshot(ctx, process_names - filler_containers) if rented_data else {}
+        )
+        # fail closed at load: a filler the backend did not answer about is not recognised here
+        filler_containers |= {name for name, is_ours in late_filler_verdicts.items() if is_ours is True}
         fillers_only = bool(filler_containers) and all(name in filler_containers for name in process_names)
         # judged at any load, also beside a rental pod: a swapped filler can hold VRAM while staying
         # under the utilization limits
@@ -269,7 +278,9 @@ class GpuUsageCheck:
             violation = {**(violation or {}), "filler_foreign_processes": foreign_in_fillers}
 
         if violation is None:
-            foreign_result = await self._judge_foreign_occupancy(ctx, gpu_details, gpu_processes)
+            foreign_result = await self._judge_foreign_occupancy(
+                ctx, gpu_details, gpu_processes, late_filler_verdicts
+            )
             if foreign_result is not None:
                 return foreign_result
 
@@ -654,7 +665,9 @@ def _carries_a_lium_prefix(process: ForeignGpuProcess) -> bool:
 
 
 async def _drop_containers_the_backend_still_owns(
-    ctx: Context, foreign_processes: list[ForeignGpuProcess]
+    ctx: Context,
+    foreign_processes: list[ForeignGpuProcess],
+    already_asked: dict[str, bool | None],
 ) -> list[ForeignGpuProcess]:
     """Ask the backend about a Lium-named container that this cycle's snapshot does not hold.
 
@@ -666,7 +679,8 @@ async def _drop_containers_the_backend_still_owns(
 
     One question per container, not per process: a single container holds as many GPU processes
     as it has workers (8 in one prod pod), and this check sits on the healthy path of every
-    executor in every cycle.
+    executor in every cycle. A name the busy-card path already asked about (`already_asked`, None
+    for no answer) reuses that answer, read fail-open here as everywhere on this idle path.
     """
     claimed_elsewhere: set[str] = _containers_claimed_by_another_executor(ctx)
     lium_named_containers: list[str] = sorted(
@@ -675,22 +689,22 @@ async def _drop_containers_the_backend_still_owns(
             for process in foreign_processes
             if _carries_a_lium_prefix(process)
             and _pod_name(process.container_name) not in claimed_elsewhere
+            and process.container_name not in already_asked
         }
     )
-    if not lium_named_containers:
-        return foreign_processes
-
-    ownership_verdicts: list[bool] = await asyncio.gather(
+    ownership_verdicts: list[bool | None] = await asyncio.gather(
         *(the_backend_still_owns(ctx, name) for name in lium_named_containers)
     )
     still_ours: set[str] = {
         name for name, is_ours in zip(lium_named_containers, ownership_verdicts) if is_ours
-    }
+    } | {name for name, is_ours in already_asked.items() if is_ours is not False}
+    if not still_ours:
+        return foreign_processes
     return [process for process in foreign_processes if process.container_name not in still_ours]
 
 
-async def _fillers_started_after_the_snapshot(ctx: Context, names: set[str | None]) -> set[str]:
-    """The filler-named containers outside this cycle's snapshot that the backend confirms as this node's live runs.
+async def _fillers_started_after_the_snapshot(ctx: Context, names: set[str | None]) -> dict[str, bool | None]:
+    """The backend's answer for each filler-named container outside this cycle's snapshot (None: no answer).
 
     DAH-2757's late-start race on a busy card: a filler the backend starts after the cycle-start
     `rented_data` read mines at full load by the time this check runs, so judged by the snapshot
@@ -702,17 +716,22 @@ async def _fillers_started_after_the_snapshot(ctx: Context, names: set[str | Non
         for name in names
         if name and name.startswith(FILLER_CONTAINER_PREFIX) and name not in claimed_elsewhere
     )
-    verdicts: list[bool] = await asyncio.gather(*(the_backend_still_owns(ctx, name) for name in late))
-    return {name for name, is_ours in zip(late, verdicts) if is_ours}
+    verdicts: list[bool | None] = await asyncio.gather(
+        *(the_backend_still_owns(ctx, name, if_unanswered=None) for name in late)
+    )
+    return dict(zip(late, verdicts))
 
 
-async def the_backend_still_owns(ctx: Context, container_name: str) -> bool:
+async def the_backend_still_owns(
+    ctx: Context, container_name: str, if_unanswered: bool | None = True
+) -> bool | None:
     """True when the backend confirms the id inside the container name as a live run of ours.
 
     Public because the provider-side load gate asks the same question about the same race.
 
     Mirrors the filler re-check in rental_verification. Fail-open on an unreachable backend
-    (a None response): an inability to measure never withholds money here.
+    (a None response): an inability to measure never withholds money here. A caller that must
+    tell "no answer" apart passes `if_unanswered`, which is returned in that case instead.
     """
     is_filler: bool = container_name.startswith(FILLER_CONTAINER_PREFIX)
     prefix: str = FILLER_CONTAINER_PREFIX if is_filler else POD_CONTAINER_PREFIX
@@ -732,7 +751,7 @@ async def the_backend_still_owns(ctx: Context, container_name: str) -> bool:
             backend_issued_id
         )
         if filler_run is None:
-            return True
+            return if_unanswered
         if not _the_answer_is_about_this_node(ctx, filler_run.executor_id):
             return False
         # `active` alone means RUNNING. The status carries the two transitional states, which is

@@ -1416,6 +1416,8 @@ async def test_a_lium_named_container_is_judged_by_the_backend(
     result = await GpuUsageCheck().run(ctx)
 
     assert result.passed is expected_pass
+    # The late-filler pass and the foreign-occupancy pass share one answer per name.
+    assert services.backend.get_filler_run_active.await_count == (1 if container_name == LATE_FILLER else 0)
 
 
 @pytest.mark.parametrize(
@@ -1425,6 +1427,8 @@ async def test_a_lium_named_container_is_judged_by_the_backend(
         (FillerRunActiveResponse(active=False, status="STARTING"), True),
         (FillerRunActiveResponse(active=False, status="STOPPED"), False),
         (FillerRunActiveResponse(active=False), False),
+        # A silent backend proves nothing about a filler-named container at full load: fail closed.
+        (None, False),
     ],
 )
 @pytest.mark.asyncio
