@@ -58,9 +58,11 @@ from services.prerun_host_probe import (
     DOCKER_MOUNTED_VOLUME_NAMES_CMD,
     DOCKER_PS_ALL_NAMES_IDS_CMD,
     DOCKER_VOLUME_LS_NAME_DRIVER_CMD,
+    IMAGE_CONFIG_MISSING,
     PrerunHostProbe,
     PrerunHostProbeParseError,
     ProbedVolume,
+    image_label_command,
     parse_prerun_host_probe,
     port_check_containers_command,
     prerun_host_probe_command,
@@ -1470,3 +1472,13 @@ async def test_a_delete_during_a_pulls_fallback_probe_stops_the_create_before_th
 
     assert deleted
     svc.clean_existing_containers.assert_not_awaited()
+
+
+def test_the_label_read_names_a_missing_image_config_instead_of_failing_the_template():
+    # a null Config (a half-finished pull) made `index .Config.Labels` a template error; it must not read as "no label"
+    command = image_label_command("img:1", "lium.volume_encryption.enable")
+    assert (
+        "{{with .Config}}{{index .Labels \"lium.volume_encryption.enable\"}}"
+        f"{{{{else}}}}{IMAGE_CONFIG_MISSING}{{{{end}}}}"
+    ) in command
+    assert ".Config.Labels" not in command

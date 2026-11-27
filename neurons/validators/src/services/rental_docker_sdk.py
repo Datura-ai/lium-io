@@ -582,7 +582,8 @@ class RentalDockerSdkClient:
         return True
 
     async def local_image_repo_digests(self, *, image: str) -> tuple[str, ...] | None:
-        """The local image's RepoDigests (`repo@sha256:…`); None when the image is not on the host."""
+        """The local image's RepoDigests (`repo@sha256:…`); None when the image is not on the host, or is only
+        a record with no image config (a half-finished pull), so the create pulls it instead of using it."""
         try:
             local_image = await _in_docker_thread(self._api_client.inspect_image, image)
         except Exception as exc:
@@ -591,6 +592,8 @@ class RentalDockerSdkClient:
             raise RentalDockerOperationError(
                 _wrap_error_message("Docker SDK inspect image failed", exc)
             ) from exc
+        if local_image.get("Config") is None:
+            return None
         return tuple(local_image.get("RepoDigests") or ())
 
     async def image_default_command(self, *, image: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
