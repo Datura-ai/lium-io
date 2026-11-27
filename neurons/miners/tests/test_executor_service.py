@@ -678,10 +678,11 @@ def test_an_update_for_a_node_not_on_this_miner_is_answered_as_such(executor_ser
 
     executor_service.executor_dao.find_by_uuid.return_value = None
 
-    result = executor_service.update(UpdateExecutorRequest(executor=_payload(test_executor)))
+    result = executor_service.update(UpdateExecutorRequest(executor=_payload(test_executor), edit_id="edit-1"))
 
     assert isinstance(result, ExecutorUpdateFailed)
     assert result.not_on_miner is True
+    assert result.edit_id == "edit-1"
     assert result.executor_id == test_executor.uuid
     executor_service.executor_dao.session.commit.assert_not_called()
 

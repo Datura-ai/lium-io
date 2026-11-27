@@ -294,6 +294,7 @@ class ExecutorService:
                     executor_id=sent.uuid,
                     error="executor is not on this miner",
                     not_on_miner=True,
+                    edit_id=payload.edit_id,
                 )
             for name in ("validator", "address", "port", "price_per_gpu"):
                 if name in sent.model_fields_set:

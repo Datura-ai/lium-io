@@ -108,6 +108,8 @@ class SyncExecutorCentralMinerFailed(BaseMinerPortalRequest):
 class UpdateExecutorRequest(BaseMinerPortalRequest):
     message_type: RequestType = RequestType.UpdateExecutorRequest
     executor: SyncExecutorPayload
+    # the portal's id of the address edit this update carries, echoed on a refusal so it clears only that edit
+    edit_id: str | None = None
 
 
 class ExecutorUpdated(BaseMinerPortalRequest):
@@ -121,6 +123,7 @@ class ExecutorUpdateFailed(BaseMinerPortalRequest):
     error: str
     # this miner holds no node with that uuid, so the edit can never apply here
     not_on_miner: bool = False
+    edit_id: str | None = None
 
 
 class DeleteExecutorRequest(BaseMinerPortalRequest):
