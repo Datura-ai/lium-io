@@ -166,6 +166,9 @@ class VerifierParams:
 # only this failure by the probe's output (stderr and stdout): the other empty-uuid results (a sealed blob that failed
 # authentication, a stdout that could not be parsed) are not the probe's answer.
 UUID_MISMATCH_ERROR_PREFIX = "UUID mismatch"
+# CUDA's messages for a card that is there but held by another workload: its memory (cudaErrorMemoryAllocation) or,
+# in EXCLUSIVE_PROCESS compute mode, the whole card (cudaErrorDevicesUnavailable). Lowercase.
+GPU_HELD_BY_ANOTHER_WORKLOAD_MARKERS = ("out of memory", "busy or unavailable")
 ALL_CARDS_FAILED_ERROR_PREFIX = "All-cards GPU work-proof failed"
 
 # Whose clock `ValidationResult.elapsed_seconds` is: the validator's around the SSH run, or the
@@ -202,6 +205,9 @@ class ValidationResult:
     card_metrics: dict[int, dict] | None = None
     # The all-cards work-proof failed with no card answering at all (see AllCardsProbe.no_card_answered).
     all_cards_no_answer: bool = False
+    # The all-cards work-proof found a claimed card the node could not run it on (AllCardsProbe.card_refused),
+    # whether or not that run was enforced.
+    all_cards_card_refused: bool = False
     # The all-cards work-proof failed and at least one card gave a wrong answer (DAH-6332).
     all_cards_wrong_answer: bool = False
 
@@ -233,6 +239,21 @@ class AllCardsProbe:
         return bool(self.per_card) and all(
             not c.get("ok") and c.get("reason") != "wrong_answer" for c in self.per_card
         )
+
+    @property
+    def card_refused(self) -> bool:
+        """A claimed card the node itself could not run the challenge on (CUDA cannot select it, it gave no or a
+        wrong answer), as a card it lists but does not have does. Not a timeout (a slow model) or our side."""
+        return any(
+            not c.get("ok") and c.get("reason") not in _NOT_THE_NODES_REFUSAL
+            and not str(c.get("reason", "")).startswith("ssh_error")
+            for c in self.per_card
+        )
+
+
+# per-card outcomes that say nothing against the card being there: slowness, the transport, our own error, and a
+# card whose memory another workload holds (it ran far enough to allocate)
+_NOT_THE_NODES_REFUSAL = frozenset({"timeout", "timeout_after_retry", "validator_error", "vram_busy"})
 
 
 def _not_probed(reason: str) -> AllCardsProbe:
@@ -551,8 +572,12 @@ class ValidationService:
 
         exit_status = getattr(result, "exit_status", 0)
         stdout = getattr(result, "stdout", "") or ""
+        # the card is there and another workload holds it (the capability check reads it the same way,
+        # VERIFY_FAILED_VRAM_UNAVAILABLE); a card CUDA cannot see says "no CUDA-capable device" instead
+        output = f"{getattr(result, 'stderr', '') or ''}\n{stdout}".lower()
+        vram_busy = any(marker in output for marker in GPU_HELD_BY_ANOTHER_WORKLOAD_MARKERS)
         if exit_status != 0:
-            return {"card_index": index, "ok": False, "reason": f"exit_status={exit_status}"}
+            return {"card_index": index, "ok": False, "reason": "vram_busy" if vram_busy else f"exit_status={exit_status}"}
         if not stdout.strip():
             return {"card_index": index, "ok": False, "reason": "empty_output"}
         # The card passes only with the right answer to its own challenge (evaluate_matmul_output
@@ -572,7 +597,7 @@ class ValidationService:
             return {
                 "card_index": index,
                 "ok": False,
-                "reason": "no_answer" if no_answer else "wrong_answer",
+                "reason": ("vram_busy" if vram_busy else "no_answer") if no_answer else "wrong_answer",
                 "error": (judged.error_message or "")[:200],
                 "stderr_tail": (judged.stderr or "")[-200:],
             }
@@ -967,6 +992,7 @@ class ValidationService:
             judged.elapsed_seconds = run_seconds
             judged.elapsed_source = ELAPSED_SOURCE_VALIDATOR
             if all_cards is not None:
+                judged.all_cards_card_refused = all_cards.card_refused
                 judged.card_metrics = {
                     outcome["card_index"]: outcome["metrics"]
                     for outcome in all_cards.per_card

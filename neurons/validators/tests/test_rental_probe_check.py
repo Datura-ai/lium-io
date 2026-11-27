@@ -2023,6 +2023,38 @@ async def test_a_node_the_validator_cannot_probe_keeps_its_stored_listing():
 
 
 @pytest.mark.asyncio
+async def test_a_revoked_pass_hides_the_node_even_when_the_validator_cannot_probe():
+    """Review of lio#2515: the node's machine changed, so its last pass was revoked, and the validator has no
+    default renter image to probe the new machine. Unlike a node no probe ever passed on, this one was listed on
+    a pass that proves another machine: it is hidden until a probe of the machine it is now passes."""
+    redis = FakeRedis(last_ok=module._PASS_REVOKED_VALUE)
+    ctx, docker, _ = make_probe_context(redis=redis, images=())
+    with probe_settings():
+        result = await RentalProbeCheck().run(ctx)
+    assert result.passed is False and result.event.reason_code == Msg.NOT_YET_PROVEN.reason
+    assert result.updates == {"score": 0.0, "job_score": 0.0}
+    errors = run_availability_errors(False, [*result.extra_events, result.event])
+    assert [e["reason_code"] for e in errors] == ["VERIFICATION_FAILED"]
+    assert redis.standing_failure() is None and docker.create_calls == []
+
+
+@pytest.mark.asyncio
+async def test_a_revoked_pass_with_no_image_listed_for_the_gpu_does_not_hide_the_node_for_good():
+    """Review of lio#2515: the backend answers that it lists no default renter image for this GPU and driver, so
+    no probe can ever run to end the revocation. Holding the node would hide it for good, with nothing the
+    provider can do: the probe check does not hold it, and the revocation stays for when an image is listed."""
+    redis = FakeRedis(last_ok=module._PASS_REVOKED_VALUE)
+    ctx, docker, _ = make_probe_context(redis=redis)
+    ctx.services.backend.get_default_docker_image.return_value = []
+    with probe_settings():
+        result = await RentalProbeCheck().run(ctx)
+    assert result.passed and result.event.reason_code == Msg.SKIPPED.reason
+    assert result.event.what_we_saw["reason"] == "no default renter image for this GPU and driver"
+    assert result.extra_events == [] and docker.create_calls == []
+    assert redis.store[f"{module._REDIS_LAST_OK_PREFIX}:{ctx.executor.uuid}"] == module._PASS_REVOKED_VALUE
+
+
+@pytest.mark.asyncio
 async def test_a_node_with_a_pass_on_record_keeps_a_cycle_without_a_verdict_unpenalised():
     ctx, _, _ = make_probe_context(redis=FakeRedis(last_ok=time.time() - 7 * 3600), images=())
     with probe_settings():

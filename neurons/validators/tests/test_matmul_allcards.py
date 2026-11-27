@@ -225,6 +225,39 @@ async def test_a_claimed_card_cuda_cannot_see_fails_even_though_its_run_exits_ze
     assert result.all_cards_wrong_answer is False  # DAH-6332: no card answered wrong
 
 
+@pytest.mark.parametrize(
+    "answer",
+    [
+        SimpleNamespace(exit_status=0, stdout="UUID:  None", stderr="CUDA error: out of memory"),
+        SimpleNamespace(exit_status=1, stdout="", stderr="cudaMalloc failed: out of memory"),
+        # EXCLUSIVE_PROCESS compute mode with another process on the card (second review on lium-io#2515)
+        SimpleNamespace(
+            exit_status=1, stdout="", stderr="CUDA error: CUDA-capable device(s) is/are busy or unavailable"
+        ),
+        SimpleNamespace(
+            exit_status=0, stdout="UUID:  None", stderr="CUDA-capable device(s) is/are busy or unavailable"
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_card_another_workload_holds_is_busy_not_refused(svc, monkeypatch, answer):
+    # review on lium-io#2515: a background job took card 3's memory after the workload snapshot
+    _flags(monkeypatch, enforce=False)
+
+    async def run(cmd, *args, **kwargs):
+        if _card_index(cmd) == 3:
+            return answer
+        return SimpleNamespace(exit_status=0, stdout=ANSWER, stderr="")
+
+    probe = await svc.probe_all_claimed_cards(SimpleNamespace(run=run), _executor(), {}, _spec(8))
+
+    assert probe.per_card[3]["reason"] == "vram_busy"
+    assert probe.card_refused is False
+    # a card CUDA cannot see is still a refusal
+    blind = await svc.probe_all_claimed_cards(_ssh_cuda_blind(real_cards=1), _executor(), {}, _spec(8))
+    assert blind.card_refused is True
+
+
 @pytest.mark.asyncio
 async def test_a_wrong_answer_on_one_card_is_never_a_no_answer(svc, monkeypatch):
     _flags(monkeypatch, enforce=True)

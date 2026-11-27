@@ -270,6 +270,8 @@ _REDIS_FAILED_PREFIX = RENTAL_PROBE_FAILED_PREFIX
 # the OK stamp expires: a deregistered executor's stamp ages out, and an expired stamp only makes the
 # probe run again on the next idle cycle
 _REDIS_STAMP_TTL_SECONDS = 30 * 24 * 3600
+# when a claimed card the all-cards work-proof refused last dropped the pass; lives one probe interval
+_REDIS_CARD_REFUSAL_REVOKED_PREFIX = "rental_probe_card_refusal_revoked"
 # A node whose probe has not passed for this many probe intervals and is skipped for a state of its own
 # Docker is logged as RENTAL_PROBE_LONG_UNPROBED.
 _LONG_UNPROBED_INTERVALS = 4
@@ -517,8 +519,14 @@ class RentalProbeCheck:
                 ctx, f"validator has no {missing} for this executor", steps=[], standing=standing, validator_side=True
             )
 
-        image_ref = await _default_renter_image(ctx)
+        image_ref, none_listed = await _default_renter_image(ctx)
         if image_ref is None:
+            if standing is _PASS_REVOKED and none_listed:
+                # no probe exists for this GPU and driver, so none can ever re-prove a revoked pass: holding the node
+                # would hide it for good with nothing the provider can do (review of lio#2515). It is judged on the
+                # rest of the cycle as before the revocation; the revocation stands, so the probe runs once an image
+                # is listed for it. A lookup that failed or had no GPU or driver to ask with still holds it.
+                return self._skipped(ctx, "no default renter image for this GPU and driver")
             return self._inconclusive(
                 ctx, "no default renter image for this GPU and driver", steps=[], standing=standing, validator_side=True
             )
@@ -651,20 +659,21 @@ class RentalProbeCheck:
                 what={"executor_uuid": ctx.executor.uuid, "no_verdict_this_cycle": no_verdict},
             )
             return CheckResult(passed=False, event=event, updates={"score": 0.0, "job_score": 0.0})
-        if standing is _NEVER_PASSED or standing is _PROOF_UNREADABLE:
+        unproven = standing is _NEVER_PASSED or standing is _PASS_REVOKED
+        if unproven or standing is _PROOF_UNREADABLE:
             # nothing failed, so nothing is recorded or cleared. Never passed: the reason hides the node
             # (REASONS_THAT_HIDE_AT_ONCE) until its first pass. Unreadable: no score, and the backend keeps
             # the node's stored listing state (REASONS_THAT_KEEP_STORED), so an unproven node is not listed
             # by it and a proven one is not hidden by a Redis read failure.
             event = render_message(
-                Msg.NOT_YET_PROVEN if standing is _NEVER_PASSED else Msg.PROOF_UNREADABLE,
+                Msg.NOT_YET_PROVEN if unproven else Msg.PROOF_UNREADABLE,
                 ctx=ctx,
                 check_id=self.check_id,
                 what={"executor_uuid": ctx.executor.uuid, "no_verdict_this_cycle": no_verdict},
             )
             # the hold travels with this result, not with where the run happens to end: an unproven node stays
             # hidden whatever the run reports after it (network figures included)
-            hold = failed_check_event(False, [event]) if standing is _NEVER_PASSED else None
+            hold = failed_check_event(False, [event]) if unproven else None
             return CheckResult(
                 passed=False,
                 event=event,
@@ -831,19 +840,23 @@ def _expected_gpu_count(ctx: Context) -> int:
     return ctx.state.gpu_count or len(_gpu_uuids(ctx))
 
 
-async def _default_renter_image(ctx: Context) -> str | None:
+async def _default_renter_image(ctx: Context) -> tuple[str | None, bool]:
+    """The default renter image for the node's GPU and driver, and whether the backend answered that it lists none
+    (False when there was nothing to ask with or the lookup failed)."""
     gpu_model = ctx.state.gpu_model
     driver_version = str((ctx.state.specs or {}).get("gpu", {}).get("driver") or "")
     if not gpu_model or not driver_version:
-        return None
+        return None, False
     try:
         images = await ctx.services.backend.get_default_docker_image(gpu_model, driver_version)
     except Exception:
         _read_failed(ctx, "the default renter image from the backend")
-        return None
+        return None, False
+    if images is None:
+        return None, False  # the client answers None on any error or non-200: not an answer of none
     if not images:
-        return None
-    return images[0].image_ref
+        return None, True
+    return images[0].image_ref, False
 
 
 async def _image_present_on_host(ctx: Context, image_ref: str) -> bool | None:
@@ -945,15 +958,27 @@ class _Failure:
 _NEVER_PASSED = _Failure("never_passed")
 # The stamp could not be read: whether a pass is on record is unknown, so the node is not scored on it.
 _PROOF_UNREADABLE = _Failure("proof_unreadable")
+# The last pass proves another machine (require_probe_pass): written over the stamp, so it reads as no pass for
+# the interval, and unlike _NEVER_PASSED it hides the node even when the validator cannot start a probe (review of
+# lio#2515). The next passed probe's stamp ends it.
+_PASS_REVOKED_VALUE = "revoked"
+_PASS_REVOKED = _Failure("pass_revoked")
 
 
 async def _never_passed(ctx: Context) -> _Failure | None:
     try:
-        last_ok = await _last_ok_at(ctx)
+        raw = await ctx.services.redis.get(f"{_REDIS_LAST_OK_PREFIX}:{ctx.executor.uuid}")
     except Exception:
         _read_failed(ctx, "its interval stamp in Redis")
         return _PROOF_UNREADABLE
-    return _NEVER_PASSED if last_ok is None else None
+    text = raw.decode() if isinstance(raw, bytes) else raw
+    if text == _PASS_REVOKED_VALUE:
+        return _PASS_REVOKED
+    try:
+        float(text)
+    except (TypeError, ValueError):
+        return _NEVER_PASSED
+    return None
 
 
 async def _standing_failure(ctx: Context) -> _Failure | None:
@@ -984,6 +1009,61 @@ async def has_standing_failure(ctx: Context) -> bool:
     if rented and rented.pods:
         return False
     return await _standing_failure(ctx) is not None
+
+
+async def require_probe_pass(ctx: Context, why: str) -> bool:
+    """The machine may no longer be the one the last probe proved: revoke that pass.
+
+    The node then stands as revoked (`_PASS_REVOKED`): it scores nothing and is hidden until a probe passes on the
+    machine it is now, which confirms every listed card as a CUDA device of its model, even on a cycle the
+    validator cannot start the probe on. The probe runs on the next idle cycle, this one too when the probe check
+    is still ahead. A rented node is left alone as before. True when the pass was dropped.
+    """
+    # A dry run shares Redis with the live validator, so it leaves the live pass alone.
+    if settings.DRY_RUN:
+        return False
+    try:
+        await ctx.services.redis.set(
+            f"{_REDIS_LAST_OK_PREFIX}:{ctx.executor.uuid}", _PASS_REVOKED_VALUE, ex=_REDIS_STAMP_TTL_SECONDS
+        )
+    except Exception:
+        logger.warning(
+            _m(f"Rental probe pass could not be dropped ({why}); the node keeps its last pass",
+               extra=get_extra_info(ctx.default_extra)),
+            exc_info=True,
+        )
+        return False
+    logger.info(_m(f"Rental probe pass dropped: {why}", extra=get_extra_info(ctx.default_extra)))
+    return True
+
+
+async def require_probe_pass_for_card_refusal(ctx: Context, why: str) -> None:
+    """A claimed card the all-cards work-proof could not run on revokes the pass at most once per probe interval.
+
+    The same machine refuses the same card every cycle (unenforced, the run does not fail the node), and the probe
+    that answers the first refusal proves every listed card in a renter's container. Revoking again on each repeat
+    would start a probe every cycle instead of every RENTAL_PROBE_INTERVAL_HOURS (review of lio#2515), so a refusal
+    within the interval of the last revocation leaves the pass alone; the interval itself then probes again.
+    """
+    if settings.DRY_RUN:
+        return
+    key = f"{_REDIS_CARD_REFUSAL_REVOKED_PREFIX}:{ctx.executor.uuid}"
+    try:
+        if await ctx.services.redis.get(key) is not None:
+            return
+    except Exception:
+        _read_failed(ctx, "when its pass was last dropped for a refused card")
+        return
+    if not await require_probe_pass(ctx, why):
+        return
+    try:
+        await ctx.services.redis.set(key, str(time.time()), ex=settings.RENTAL_PROBE_INTERVAL_HOURS * 3600)
+    except Exception:
+        logger.warning(
+            _m("Rental probe could not record when its pass was dropped for a refused card",
+               extra=get_extra_info(ctx.default_extra)),
+            exc_info=True,
+        )
 
 
 async def _stamp_failure(ctx: Context, failure: _Failure) -> None:
