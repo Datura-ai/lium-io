@@ -229,6 +229,13 @@ async def test_a_claimed_card_cuda_cannot_see_fails_even_though_its_run_exits_ze
     [
         SimpleNamespace(exit_status=0, stdout="UUID:  None", stderr="CUDA error: out of memory"),
         SimpleNamespace(exit_status=1, stdout="", stderr="cudaMalloc failed: out of memory"),
+        # EXCLUSIVE_PROCESS compute mode with another process on the card (second review on lium-io#2515)
+        SimpleNamespace(
+            exit_status=1, stdout="", stderr="CUDA error: CUDA-capable device(s) is/are busy or unavailable"
+        ),
+        SimpleNamespace(
+            exit_status=0, stdout="UUID:  None", stderr="CUDA-capable device(s) is/are busy or unavailable"
+        ),
     ],
 )
 @pytest.mark.asyncio

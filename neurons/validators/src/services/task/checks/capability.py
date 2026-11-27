@@ -12,7 +12,7 @@ from core.config import settings
 from core.utils import _m, get_extra_info
 from services.const import DEFAULT_JOB_OWNER_LIUM, SECONDS_PER_BLOCK
 from services.gpu_spec_table import normalize_gpu_model
-from services.matrix_validation_service import UUID_MISMATCH_ERROR_PREFIX
+from services.matrix_validation_service import GPU_HELD_BY_ANOTHER_WORKLOAD_MARKERS, UUID_MISMATCH_ERROR_PREFIX
 
 from ..availability import ReachSource, ReachTarget
 from ..messages import CapabilityMessages as Msg, MessageTemplate, render_message
@@ -334,9 +334,9 @@ _CONTAINER_GPU_ACCESS_MARKERS = (
     "no CUDA-capable device",
     "CUDA driver version is insufficient for CUDA runtime version",
 )
-# cudaMalloc failing for memory (DAH-3264: 49 such verdicts on 31 executors in 26 h); the message
-# form only — cudaGetErrorString(cudaErrorMemoryAllocation) is "out of memory".
-_VRAM_UNAVAILABLE_MARKERS = ("out of memory",)
+# a card another workload holds (DAH-3264: 49 out-of-memory verdicts on 31 executors in 26 h): the same markers the
+# all-cards matmul reads as vram_busy, so the two checks agree on a busy card
+_VRAM_UNAVAILABLE_MARKERS = GPU_HELD_BY_ANOTHER_WORKLOAD_MARKERS
 
 
 def _tail(text: str | None, limit: int = STDERR_TAIL_CHARS) -> str:
@@ -349,7 +349,7 @@ def _failure_template(result: ValidationResult | None) -> MessageTemplate:
 
     A timeout keeps its own reason. An answer with no uuid is classified by what stderr/stdout
     says: CUDA not ready (fabric) → `VERIFY_FAILED_CUDA_NOT_READY`, no CUDA device →
-    `VERIFY_FAILED_NO_CUDA_DEVICE`, out of memory → `VERIFY_FAILED_VRAM_UNAVAILABLE`.
+    `VERIFY_FAILED_NO_CUDA_DEVICE`, a card another workload holds → `VERIFY_FAILED_VRAM_UNAVAILABLE`.
     Each is its own reason code, as `GPU_VERIFY_TIMEOUT` is. A returned uuid that does not match
     — the anti-spoof case; the expected uuid is a per-call nonce, so a genuine executor never
     answers a wrong one — stays the generic `VERIFY_FAILED`, whatever stderr says. So does any

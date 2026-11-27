@@ -166,6 +166,9 @@ class VerifierParams:
 # only this failure by the probe's output (stderr and stdout): the other empty-uuid results (a sealed blob that failed
 # authentication, a stdout that could not be parsed) are not the probe's answer.
 UUID_MISMATCH_ERROR_PREFIX = "UUID mismatch"
+# CUDA's messages for a card that is there but held by another workload: its memory (cudaErrorMemoryAllocation) or,
+# in EXCLUSIVE_PROCESS compute mode, the whole card (cudaErrorDevicesUnavailable). Lowercase.
+GPU_HELD_BY_ANOTHER_WORKLOAD_MARKERS = ("out of memory", "busy or unavailable")
 
 # Whose clock `ValidationResult.elapsed_seconds` is: the validator's around the SSH run, or the
 # executor's own word for the step when the answer came through the local transport.
@@ -566,9 +569,10 @@ class ValidationService:
 
         exit_status = getattr(result, "exit_status", 0)
         stdout = getattr(result, "stdout", "") or ""
-        # out of memory: the card is there and another workload holds its memory (the capability check reads it the
-        # same way, VERIFY_FAILED_VRAM_UNAVAILABLE); a card CUDA cannot see says "no CUDA-capable device" instead
-        vram_busy = "out of memory" in f"{getattr(result, 'stderr', '') or ''}\n{stdout}".lower()
+        # the card is there and another workload holds it (the capability check reads it the same way,
+        # VERIFY_FAILED_VRAM_UNAVAILABLE); a card CUDA cannot see says "no CUDA-capable device" instead
+        output = f"{getattr(result, 'stderr', '') or ''}\n{stdout}".lower()
+        vram_busy = any(marker in output for marker in GPU_HELD_BY_ANOTHER_WORKLOAD_MARKERS)
         if exit_status != 0:
             return {"card_index": index, "ok": False, "reason": "vram_busy" if vram_busy else f"exit_status={exit_status}"}
         if not stdout.strip():
