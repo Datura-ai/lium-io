@@ -846,6 +846,14 @@ def _current_loopback_plugin_state_command() -> str:
     return _loopback_plugin_state_command(current_loopback_plugin_alias())
 
 
+# the failure_step of a restart whose kept workspace volume Docker no longer has: retrying cannot bring it back
+WORKSPACE_VOLUME_MISSING_STEP = "workspace_volume_missing"
+
+
+class WorkspaceVolumeMissingError(RuntimeError):
+    """Docker answered that the pod's kept workspace volume does not exist on the host."""
+
+
 class NoUsableLoopbackPluginError(Exception):
     """The current plugin cannot be used and no fallback plugin can be: the validator never installs
     or enables the legacy plugin, so the rent fails naming the fallbacks' states."""
@@ -5070,12 +5078,13 @@ class DockerService:
                 )
             )
 
-    async def _vloopback_driver_of_volume(
+    async def _driver_of_reused_volume(
         self,
         ssh_client: asyncssh.SSHClientConnection,
         local_volume: str,
-        log_extra: dict,
     ) -> str | None:
+        """The driver of a workspace volume a restart or edit reuses; refuses one Docker no longer has or cannot read,
+        since `docker run` would bind its name to a new empty local volume."""
         if not _is_safe_docker_volume_name(local_volume):
             return None
         volume = shlex.quote(local_volume)
@@ -5084,20 +5093,15 @@ class DockerService:
             timeout=_VLOOPBACK_REPAIR_COMMAND_TIMEOUT_SEC,
         )
         if getattr(result, "exit_status", 0) != 0:
-            # the recorded workspace is gone: Docker would recreate it as an uncapped local volume
+            # Docker's own answer for a volume it does not have; a plugin or SSH fault reads differently
+            if "no such volume" in f"{result.stderr or ''}{result.stdout or ''}".lower():
+                raise WorkspaceVolumeMissingError(
+                    f"workspace volume {local_volume} is no longer on the host; the pod's kept disk is gone"
+                )
             raise RuntimeError(
-                f"workspace volume {local_volume} could not be inspected; refusing an uncapped recreate"
+                f"workspace volume {local_volume} could not be inspected; refusing an empty recreate"
             )
-        driver = (result.stdout or "").strip()
-        if _is_vloopback_driver(driver):
-            return driver
-        logger.warning(
-            _m(
-                "Reused volume is not on a loopback plugin; sysbox /var/lib/docker stays uncapped",
-                extra=get_extra_info({**log_extra, "local_volume": local_volume, "driver": driver}),
-            )
-        )
-        return None
+        return (result.stdout or "").strip()
 
     async def repair_stale_vloopback_mountpoint(
         self,
@@ -12012,13 +12016,27 @@ class DockerService:
                                 extra=get_extra_info(default_extra),
                             )
                         )
-                if payload.is_sysbox and effective_storage_limit_gb and not created_local_volume:
-                    # restart/edit reuses the workspace volume: inner Docker goes on the same
-                    # loopback plugin, read from the volume itself
+                if local_volume and not created_local_volume:
+                    # restart/edit reuses the workspace volume: checked for every pod before the run spec binds its name
                     current_step = "docker_data_volume_driver"
-                    local_volume_driver = await self._vloopback_driver_of_volume(
-                        ssh_client, local_volume, default_extra
-                    )
+                    try:
+                        reused_driver = await self._driver_of_reused_volume(ssh_client, local_volume)
+                    except WorkspaceVolumeMissingError:
+                        current_step = WORKSPACE_VOLUME_MISSING_STEP
+                        raise
+                    if payload.is_sysbox and effective_storage_limit_gb:
+                        # inner Docker goes on the same loopback plugin, read from the volume itself
+                        if reused_driver and _is_vloopback_driver(reused_driver):
+                            local_volume_driver = reused_driver
+                        else:
+                            logger.warning(
+                                _m(
+                                    "Reused volume is not on a loopback plugin; sysbox /var/lib/docker stays uncapped",
+                                    extra=get_extra_info(
+                                        {**default_extra, "local_volume": local_volume, "driver": reused_driver}
+                                    ),
+                                )
+                            )
                 # host_pid_max was read and validated fail-closed before any host side-effect above
                 # (review finding on PR #1531); here it only sizes the container's pids.max.
                 run_spec = self._build_rental_container_run_spec(

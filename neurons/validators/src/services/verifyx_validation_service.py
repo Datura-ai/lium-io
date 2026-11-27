@@ -318,8 +318,8 @@ class VerifyXValidationService:
             "storage_min_available_gb": settings.verifyx.STORAGE_MIN_AVAILABLE_GB,
             "storage_throughput_test_gb": settings.verifyx.STORAGE_THROUGHPUT_TEST_GB,
             "network_timeout_seconds": settings.verifyx.NETWORK_TIMEOUT_SECONDS,
-            # every run, not only the first pass: without the floor each network step waits the whole timeout
-            # (package try + retry, speed test) and one slow leg stretches the test far past it
+            # every run, not only the first pass: without the floor each speed-test direction waits the whole
+            # timeout and one slow leg stretches the test far past it (package tries keep the full timeout)
             "network_floor_mbps": min(
                 settings.verifyx.NETWORK_MIN_DOWNLOAD_SPEED_MBPS, settings.verifyx.NETWORK_MIN_PACKAGE_DOWNLOAD_SPEED_MBPS
             ),

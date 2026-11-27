@@ -208,6 +208,15 @@ class ContextState:
     # the same read's per-card facts for the scrape's gpu_identity block; None = unreadable/not read
     kernel_gpu_minors: dict[str, int] | None = None
     kernel_gpu_pcis: dict[str, str] | None = None
+    # which view the list above came from: "host_pid1_root" or "container" (DAH-7076)
+    kernel_gpu_view_source: str = "container"
+    # with the host's list: the container view's own list and foreign mounts (a stale bind after a reset);
+    # the mounts are evidence only, a short container list still fails a short host list
+    container_kernel_gpu_uuids: list[str] | None = None
+    container_kernel_gpu_foreign_mounts: list[str] = field(default_factory=list)
+    # with the host's list: the same read's list of every card on the host (a shared host has other executors' cards);
+    # the subset-container check (DAH-6273) and the identity evidence use it, never the bans or specs
+    host_all_kernel_gpu_uuids: list[str] | None = None
     # the machine scrape's gpu_identity block (liumd), kept for HardwareIdentityCheck; None when
     # the scrape had none (Python fallback or an older liumd)
     gpu_identity: dict | None = None
@@ -399,6 +408,8 @@ class Context(BaseModel):
     # False once GpuKernelCountCheck finds a kernel list shorter than the reported count; the
     # check is non-fatal on a live rental, so the score gate lives in calculate_scores.
     gpu_kernel_count_passed: bool = True
+    # set with it when the finding is a reported card the create step cannot attach (every card listed)
+    gpu_kernel_unattachable: bool = False
     # False once a card is below its reported GPU model (DAH-6241); non-fatal on a live rental, so the score
     # gate lives in calculate_scores.
     gpu_model_passed: bool = True

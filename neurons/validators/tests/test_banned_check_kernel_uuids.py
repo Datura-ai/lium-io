@@ -130,3 +130,166 @@ async def test_overlaid_kernel_view_on_a_live_rental_is_not_fatal(context_factor
     assert result.event.reason_code == BannedProviderMessages.KERNEL_GPU_VIEW_OVERLAID.reason
     assert result.fatal is False
     assert result.updates["kernel_gpu_view_passed"] is False  # zeroes the score instead
+
+
+def _view_stdout(lines, mounts, info_file, *, host_all=None, container_mounts=(), container_files=()):
+    """A view's output; `host_all` makes it the host view's: `lines` are this executor's cards, then the whole list,
+    then the container's own mounts and file rows for its gpus path."""
+    rows = len(host_all) if host_all is not None else len(lines)
+    return "\n".join(
+        [
+            *mounts,
+            nvidia_devices.KERNEL_GPU_FS_SEPARATOR,
+            *(f"{info_file} proc" for _ in range(rows)),
+            *(f"{info_file}|regular empty file" for _ in range(rows)),
+            nvidia_devices.KERNEL_GPU_VIEW_SEPARATOR,
+            *lines,
+            *(
+                [
+                    nvidia_devices.HOST_ALL_CARDS_SEPARATOR,
+                    *host_all,
+                    nvidia_devices.HOST_CONTAINER_MOUNTS_SEPARATOR,
+                    *container_mounts,
+                    nvidia_devices.HOST_CONTAINER_FILES_SEPARATOR,
+                    *container_files,
+                ]
+                if host_all is not None
+                else []
+            ),
+        ]
+    )
+
+
+# DAH-7076, node fc1b5612: after a renter reset the container's bind of the card points at the deleted entry
+STALE_BIND = (
+    "1619 1575 0:23 /driver/nvidia/gpus/0001:00:00.0//deleted /proc/driver/nvidia/gpus/0001:00:00.0 "
+    "ro,nosuid,nodev,noexec,relatime master:5 - proc proc rw"
+)
+
+
+def _ssh_host_and_container(host_stdout: str, container_stdout: str) -> AsyncMock:
+    async def run(command, *args, **kwargs):
+        stdout = host_stdout if command == nvidia_devices.HOST_KERNEL_GPU_VIEW_CMD else container_stdout
+        return MagicMock(exit_status=0, stdout=stdout, stderr="")
+
+    ssh = AsyncMock()
+    ssh.run = AsyncMock(side_effect=run)
+    return ssh
+
+
+@pytest.mark.asyncio
+async def test_a_stale_bind_after_a_gpu_reset_is_read_through_the_host_and_passes(context_factory):
+    host = _view_stdout(
+        [f"{REAL}, 0"],
+        [],
+        nvidia_devices.HOST_PID1_ROOT + INFO_FILE,
+        host_all=[f"{REAL}, 0"],
+        container_mounts=[CONTAINER_MOUNTS[0], STALE_BIND],
+        container_files=[INFO_FILE],
+    )
+    container = _view_stdout([f"{REAL}, 0"], [CONTAINER_MOUNTS[0], STALE_BIND], INFO_FILE)
+    ctx = context_factory(
+        state=build_state(gpu_uuids=REAL, rented_data=RentedExecutorsResponse(executors={})),
+        ssh=_ssh_host_and_container(host, container),
+    )
+
+    result = await BannedProviderCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.what_we_saw["kernel_view_source"] == "host_pid1_root"
+    assert result.updates["state"].kernel_gpu_uuids == [REAL]
+    assert result.updates["state"].kernel_gpu_view_source == "host_pid1_root"
+    # the stale bind is still reported, as evidence only
+    [stale] = result.event.what_we_saw["container_kernel_gpu_foreign_mounts"]
+    assert stale.endswith("proc:/driver/nvidia/gpus/0001:00:00.0//deleted")
+    assert result.event.what_we_saw["kernel_gpu_foreign_mounts"] == []
+    # a list read through the stale bind is withheld, never a short container list
+    assert result.updates["state"].container_kernel_gpu_uuids is None
+
+
+@pytest.mark.asyncio
+async def test_an_unusable_host_view_falls_back_to_the_container_and_an_overlay_still_fails(context_factory):
+    # PID 1 is the container's own init: its table has the runtime's mounts, so the host rules refuse it
+    overlaid = _view_stdout([f"{REAL}, 0"], [*CONTAINER_MOUNTS, OVERLAY_MOUNT], INFO_FILE)
+    ctx = context_factory(
+        state=build_state(gpu_uuids=REAL, rented_data=RentedExecutorsResponse(executors={})),
+        ssh=_ssh_host_and_container(overlaid, overlaid),
+    )
+
+    result = await BannedProviderCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.reason_code == BannedProviderMessages.KERNEL_GPU_VIEW_OVERLAID.reason
+    assert result.event.what_we_saw["kernel_view_source"] == "container"
+    assert result.event.what_we_saw["container_kernel_gpu_foreign_mounts"] == []
+    assert result.updates["kernel_gpu_view_passed"] is False
+
+
+NEIGHBOUR = "GPU-0c3d9a51-77e2-4b10-9f6e-2d8a1b4c6e01"  # the other executor's card on the same host
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("own", "banned"), [(REAL, True), (NEIGHBOUR, False)])
+async def test_two_executors_on_one_host_each_take_only_their_own_card_from_the_host_list(
+    context_factory, own, banned
+):
+    # review 6053925574: the host's list has both executors' cards; the ban on one card fails only its executor
+    whole_host = [f"{REAL}, 0", f"{NEIGHBOUR}, 1"]
+    host = _view_stdout(
+        [f"{own}, {0 if own == REAL else 1}"],
+        [],
+        nvidia_devices.HOST_PID1_ROOT + INFO_FILE,
+        host_all=whole_host,
+    )
+    container = _view_stdout([f"{own}, 0"], [CONTAINER_MOUNTS[0]], INFO_FILE)
+    rented = RentedExecutorsResponse(executors={}, banned_provider_guids=[REAL])
+    ctx = context_factory(
+        state=build_state(gpu_uuids=own, rented_data=rented),
+        ssh=_ssh_host_and_container(host, container),
+    )
+
+    result = await BannedProviderCheck().run(ctx)
+
+    assert result.passed is not banned
+    assert result.event.what_we_saw["kernel_view_source"] == "host_pid1_root"
+    if not banned:
+        assert result.updates["state"].kernel_gpu_uuids == [NEIGHBOUR]
+        assert result.updates["state"].host_all_kernel_gpu_uuids == [REAL, NEIGHBOUR]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("container_mounts", "container_files"),
+    [
+        # r510: a tmpfs over the container's gpus path naming only the unbanned card
+        ([CONTAINER_MOUNTS[0], OVERLAY_MOUNT], [INFO_FILE]),
+        # a name under the container's gpus path that is not a PCI bus id
+        ([CONTAINER_MOUNTS[0]], [INFO_FILE, "/proc/driver/nvidia/gpus/not-a-bus-id/information"]),
+        # a proc bind of another path than its own
+        ([CONTAINER_MOUNTS[0], CONTAINER_MOUNTS[1].replace("gpus/0001", "gpus/0002", 1)], []),
+    ],
+)
+async def test_an_overlay_on_the_containers_own_gpus_path_fails_when_the_host_list_decides(
+    context_factory, container_mounts, container_files
+):
+    # host cards: REAL (banned) and NEIGHBOUR; the container's names pick only NEIGHBOUR, so they must be the kernel's
+    host = _view_stdout(
+        [f"{NEIGHBOUR}, 1"],
+        [],
+        nvidia_devices.HOST_PID1_ROOT + INFO_FILE,
+        host_all=[f"{REAL}, 0", f"{NEIGHBOUR}, 1"],
+        container_mounts=container_mounts,
+        container_files=container_files,
+    )
+    container = _view_stdout([f"{NEIGHBOUR}, 0"], container_mounts, INFO_FILE)
+    rented = RentedExecutorsResponse(executors={}, banned_provider_guids=[REAL])
+    ctx = context_factory(
+        state=build_state(gpu_uuids=NEIGHBOUR, rented_data=rented),
+        ssh=_ssh_host_and_container(host, container),
+    )
+
+    result = await BannedProviderCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.reason_code == BannedProviderMessages.KERNEL_GPU_VIEW_OVERLAID.reason
+    assert result.event.what_we_saw["kernel_view_source"] == "container"

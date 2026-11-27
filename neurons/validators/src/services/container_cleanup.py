@@ -6,6 +6,7 @@ import re
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 import shlex
+import time
 from types import SimpleNamespace
 from typing import Awaitable, Callable, Optional
 
@@ -22,6 +23,7 @@ from services.const import (
     FILLER_CACHE_VOLUME_PREFIXES,
     FILLER_CONTAINER_GRACE_MINUTES,
     FILLER_CONTAINER_PREFIX,
+    FILLER_LIST_READ_MARGIN_MINUTES,
     LEGACY_LIUM_CONTAINER_NAME,
     LIUM_HEALTH_CHECK_CONTAINER_NAME,
     LIUM_POD_ID_LABEL,
@@ -484,10 +486,17 @@ class ContainerCleanup:
                 if not pod_id and not legacy and not health_check:
                     continue
 
-                if age_minutes and age_minutes > self.stale_threshold_minutes:
-                    if legacy and not await self._legacy_ended(lium_workload_ended, stripped_name):
+                removal_age = self._removal_age_minutes_for_unlisted_container(stripped_name, rented_data)
+                if age_minutes and age_minutes > removal_age:
+                    if legacy and not await self._backend_confirms_workload_ended(lium_workload_ended, stripped_name):
                         continue
-                    if (
+                    if not legacy and age_minutes <= self.stale_threshold_minutes:
+                        # a filler younger than the fixed grace may be a run whose create callback comes late:
+                        # only the backend's record that it ended lets it go, and that one lookup also confirms
+                        # the removal, so it reserves no second one; past the grace the fixed rule applies
+                        if not await self._backend_confirms_workload_ended(lium_workload_ended, stripped_name):
+                            continue
+                    elif (
                         not legacy
                         and reserve_removal is not None
                         and stripped_name.startswith((POD_CONTAINER_PREFIX, FILLER_CONTAINER_PREFIX))
@@ -554,6 +563,19 @@ class ContainerCleanup:
         await self.remove_never_started_check_containers(ssh_client, executor_uuid)
 
         return len(removed_names), removed_names, unremovable_names
+
+    def _removal_age_minutes_for_unlisted_container(self, name: str, rented_data: RentedExecutorsResponse | None) -> float:
+        """Minutes old an unlisted container must be before it is removed.
+
+        DAH-7071: a filler_ container older than the rented list it is missing from is no live run, so
+        it goes once its age (host clock) passes the validator's time since the list was read, plus a
+        margin. pod_ and health_check_ containers, and a list with no read time, keep the fixed grace.
+        """
+        read_at = rented_data.read_at if rented_data is not None else None
+        if not name.startswith(FILLER_CONTAINER_PREFIX) or read_at is None:
+            return self.stale_threshold_minutes
+        # an old list read never waits longer than the fixed grace
+        return min(self.stale_threshold_minutes, (time.time() - read_at) / 60 + FILLER_LIST_READ_MARGIN_MINUTES)
 
     async def remove_never_started_check_containers(self, ssh_client, executor_uuid: str) -> int:
         # best-effort like the volume prune above: never raises
@@ -990,10 +1012,10 @@ class ContainerCleanup:
             return 0
 
     @staticmethod
-    async def _legacy_ended(
+    async def _backend_confirms_workload_ended(
         lium_workload_ended: Callable[[str], Awaitable[bool]] | None, container_name: str
     ) -> bool:
-        """A pre-label pod_/filler_<uuid> goes only when the backend's record says it ended."""
+        """True only when the backend's record says the pod_/filler_<uuid> workload ended (no callback: never)."""
         if lium_workload_ended is None:
             return False
         try:

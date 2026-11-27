@@ -6,7 +6,7 @@ set -eu
 # which pull by tag (DAH-3419); the runner is the one container every updater recreates. Only an updater
 # container of the runner's own compose project is replaced, never created: a stack without one (the dstack
 # TEE) is left alone. If the new updater cannot start, the old one is put back.
-UPDATER_IMAGE="daturaai/lium-watchtower:1.2.4"
+UPDATER_IMAGE="daturaai/lium-watchtower:1.2.5"
 ensure_updater() {
     # The runner's own container, by the ID in its mount paths (/var/lib/docker/containers/<id>/hostname), not
     # $HOSTNAME (an updater that recreates the runner copies the old hostname) and not a label lookup (that can
@@ -64,6 +64,18 @@ ensure_updater() {
     done <<LABELS
 $labels
 LABELS
+    # The provider's runtime settings (watchtower/README.md) go to the new container too: dropping them would turn
+    # a disabled updater back on, or reset a longer WATCHTOWER_INTERVAL to the default. The updater reads its
+    # settings' names in any case, so they are matched in any case here and passed on exactly as written.
+    env=$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$updater" 2>/dev/null) || return 0
+    while IFS= read -r setting; do
+        case "$(printf '%s' "${setting%%=*}" | tr '[:lower:]' '[:upper:]')" in
+            WATCHTOWER_ENABLED | WATCHTOWER_IMAGE | WATCHTOWER_INTERVAL | WATCHTOWER_ENV_FILE_PATH)
+                case "$setting" in *=*) set -- "$@" --env "$setting" ;; esac ;;
+        esac
+    done <<SETTINGS
+$env
+SETTINGS
     if ! docker pull --quiet "$want" >/dev/null 2>&1; then
         echo "Updater kept: $want cannot be pulled; retrying at the next runner start."
         return 0

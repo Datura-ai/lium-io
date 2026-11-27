@@ -47,6 +47,7 @@ def test_reason_enum_pins_the_stable_code_contract():
         "validation_failed",
         "rented_sysbox_not_confirmed",
         "disk_limited_remainder",
+        "port_check_deferred_remainder",
         "insufficient_ram_for_vram",
     }
 
@@ -190,6 +191,18 @@ def _job(**overrides) -> JobResult:
             "port_limited_remainder",
             "fewer than its minimum rental",
         ),
+        (
+            # DAH-5851: a deferred cycle's filler ports are not the node's free ports; the pay after it is not promised,
+            # it follows the next completed check's ports (review 6011537848)
+            lambda job: MinerLogLine.no_payout_because_port_limited_remainder(
+                job, PortLimitedRemainder(
+                    available_port_count=2, required_port_count=3, free_split_count=3, paid_split_count=0,
+                    unpaid_gpu_count=3, port_check_deferred=True,
+                )
+            ),
+            "port_check_deferred_remainder",
+            "depends on the free ports the next completed port check measures",
+        ),
     ],
 )
 def test_zero_reason_constructor_code_and_message(build, expected_code, message_fragment):
@@ -277,6 +290,7 @@ def test_insufficient_disk_reason_keeps_the_two_numbers_apart():
 
     assert line.fields["total_vram_gb"] == 1128.0
     assert line.fields["total_disk_gb"] == 500.0
+    assert line.fields["disk_unknown"] is False  # measured short: consumers may say "add disk"
     assert "500.0 GB of total disk but 1128.0 GB of GPU VRAM" in line.message
     assert "at least 1692.0 GB" in line.message
 

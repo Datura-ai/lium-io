@@ -70,8 +70,9 @@ DISABLE_TRIES = 3
 # sooner; it also covers the 1 s timeout floors
 START_SECONDS = 5
 # the probe ends this long before the validator's deadline, however long the lock, install and enable
-# took: the removals before and after it, every disable try with its pause, and START_SECONDS
-PROBE_RESERVE_SECONDS = 4 * CLEANUP_SECONDS + DISABLE_TRIES * (DISABLE_TRY_SECONDS + 1) + START_SECONDS
+# took: the removals before and after it, the volume listing before a disable, every disable try with
+# its pause, and START_SECONDS
+PROBE_RESERVE_SECONDS = 5 * CLEANUP_SECONDS + DISABLE_TRIES * (DISABLE_TRY_SECONDS + 1) + START_SECONDS
 TOO_LITTLE_TIME_TO_PROBE = "too little of the validator's deadline left to probe"
 # the validator's state check prints the same: the ID changes with every install, DATA_DIR with `plugin set`
 INSTALLATION_FORMAT = "{{.Id}} {{json .Settings.Env}}"
@@ -152,21 +153,32 @@ def remove_probe_marker():
 probe_volume = "lium-loopback-probe-" + generation
 probe_container = probe_volume
 
+# what the last cleanup could not remove: the plugin keeps the probe's mount lease until Docker's unmount
+# reaches it, and a plugin turned off before that keeps the lease for good, so no later probe can remove
+# its volume (DAH-7237)
+probe_left = []
+# set only once a cleanup in this run removed the probe: until then its disk file may hold the lease
+probe_removed = []
+
 def remove_probe_leftovers():
     # the container first: a `docker run` cut off by its timeout leaves it running with the volume
     # attached. Returns what stayed behind
+    probe_left[:] = ["the probe cleanup"]  # stays if a call below is cut off
+    probe_removed[:] = []
     leftovers = []
     removed = run_docker("rm", "-f", probe_container, timeout=CLEANUP_SECONDS)
     if removed.returncode and "no such container" not in removed.stderr.lower():
         leftovers.append("container " + probe_container)
     if run_docker("volume", "rm", "-f", probe_volume, timeout=CLEANUP_SECONDS).returncode:
         leftovers.append("volume " + probe_volume)
+    probe_left[:] = leftovers
+    probe_removed[:] = [] if leftovers else [True]
     return leftovers
 
 def mount_probe_volume():
     # install and enable mount nothing, and a host may refuse what the plugin asks of its loop
     # device (direct I/O, 4096-byte sectors): one probe volume is mounted before the plugin is
-    # handed out, else it stays installed but disabled and the older plugin keeps renting.
+    # handed out, else the older plugin keeps renting (the plugin is disabled only if it owns no volume).
     # 1g: the plugin's mkfs.xfs refuses anything under 300 MB; sparse, so a host with little
     # free disk is not refused by the reservation instead of by its loop device
     deadline = min(time.monotonic() + PROBE_SECONDS, validator_deadline - PROBE_RESERVE_SECONDS)
@@ -211,6 +223,52 @@ def disable_plugin(plugin_id):
             pass
     raise RuntimeError("the plugin could not be disabled")
 
+def volumes_on_plugin(plugin):
+    # Docker hides the volumes of a disabled plugin and does not restore a plugin's refcounts after a
+    # daemon restart, so its own refusal to disable a plugin in use cannot be relied on. Every regular
+    # file in the plugin's own DATA_DIR is a volume (the plugin's List reads that folder), whether the plugin
+    # is enabled or not; an earlier build may keep them under an earlier Docker data root. The daemon's
+    # listing names the plugin by alias or ID
+    global step
+    step = "the listing of the plugin's data directory"
+    plugin_id = plugin["Id"]
+    data_dirs = [entry[len("DATA_DIR="):] for entry in plugin.get("Settings", {}).get("Env", [])
+                 if entry.startswith("DATA_DIR=")]
+    if len(data_dirs) != 1 or not data_dirs[0].startswith("/srv/") or ".." in data_dirs[0].split("/"):
+        raise RuntimeError("cannot tell where the plugin keeps its volumes")
+    try:
+        names = {entry.name for entry in os.scandir(host_root + data_dirs[0][len("/srv"):])
+                 if entry.is_file(follow_symlinks=False)}
+    except FileNotFoundError:
+        names = set()
+    except OSError:
+        raise RuntimeError("cannot list the plugin's data directory") from None
+    # the probe's disk file is setup's own only once a cleanup in this run removed the probe; before that
+    # (a run out of time before its cleanup) it may hold the plugin's lease, whatever Docker lists
+    if probe_removed:
+        names.discard(probe_volume)
+    listed = run_docker("volume", "ls", "--format", "{{.Name}} {{.Driver}}", timeout=CLEANUP_SECONDS)
+    if listed.returncode:
+        raise RuntimeError("cannot list the volumes" + stderr_of(listed))
+    for line in listed.stdout.splitlines():
+        fields = line.split()
+        if len(fields) == 2 and fields[1] in (alias, plugin_id, plugin_id[:12]):
+            names.add(fields[0])
+    return names
+
+def disable_unless_it_owns_volumes(plugin):
+    # a disabled plugin hides its volumes, so a rental on it loses its disk at the next restart or create:
+    # one that holds any stays enabled and is only not handed out (no marker) for new volumes
+    try:
+        owned = volumes_on_plugin(plugin)
+    except RuntimeError as error:
+        raise RuntimeError("kept enabled, " + str(error)) from None
+    if owned:
+        raise RuntimeError("kept enabled: the plugin owns " + str(len(owned)) + " volume(s)")
+    if probe_left:
+        raise RuntimeError("kept enabled: the probe left " + ", ".join(probe_left))
+    disable_plugin(plugin["Id"])
+
 def read_saved_config(plugin_id):
     global step
     if len(plugin_id) != 64 or any(c not in "0123456789abcdef" for c in plugin_id):
@@ -220,16 +278,13 @@ def read_saved_config(plugin_id):
         return json.load(source)
 
 def remove_plugin_of_another_build(plugin):
-    # Docker refuses to disable or remove a plugin its volumes still use; the listing only makes
-    # that refusal readable. A probe a killed setup left on that build is reclaimed first: its
-    # cleanup otherwise runs only after this replacement, and the host would never move on
+    # Docker does not reliably refuse to disable or remove a plugin its volumes use (volumes_on_plugin).
+    # A probe a killed setup left on that build is reclaimed first: its cleanup otherwise runs only
+    # after this replacement, and the host would never move on
     leftovers = remove_probe_leftovers()
     if leftovers:
         raise RuntimeError("an earlier probe left " + ", ".join(leftovers))
-    listed = run_docker("volume", "ls", "--format", "{{.Driver}}")
-    if listed.returncode:
-        raise RuntimeError("cannot list the volumes of an earlier build")
-    if alias in listed.stdout.split():
+    if volumes_on_plugin(plugin):
         raise RuntimeError("an earlier build of the plugin still owns volumes")
     if plugin["Enabled"]:
         disable_plugin(plugin["Id"])
@@ -311,7 +366,7 @@ try:
             except BaseException as error:
                 reason = str(error) if isinstance(error, RuntimeError) else "probe volume failed: " + type(error).__name__
                 try:
-                    disable_plugin(plugin_id)
+                    disable_unless_it_owns_volumes(plugin)
                 except RuntimeError as disable_error:
                     reason += "; " + str(disable_error)
                 raise RuntimeError(reason) from None

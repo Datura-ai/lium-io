@@ -11,7 +11,12 @@ from services.nvidia_devices import read_kernel_gpu_view
 
 from ..messages import HardwareIdentityMessages as Msg, render_message
 from ..pipeline import CheckResult, Context
-from .banned_provider import has_live_rental, kernel_gpu_view, reported_gpu_uuids
+from .banned_provider import (
+    KERNEL_VIEW_SOURCE_HOST,
+    has_live_rental,
+    kernel_gpu_view_with_source,
+    reported_gpu_uuids,
+)
 from .gpu_identity import CARDS_MAX, dev_node_missing
 
 logger = logging.getLogger(__name__)
@@ -243,7 +248,7 @@ class HardwareIdentityCheck:
             card for card in (raw_cards[:CARDS_MAX] if isinstance(raw_cards, list) else [])
             if isinstance(card, dict)
         ]
-        view = await kernel_gpu_view(ctx)
+        view, source, _container, host_all = await kernel_gpu_view_with_source(ctx)
         kernel_uuids = view.uuids
         kernel = sorted(set(kernel_uuids)) if kernel_uuids is not None else None
         gpus = kernel or reported
@@ -278,7 +283,10 @@ class HardwareIdentityCheck:
             logger.warning("hardware identity record unavailable", exc_info=True, extra=ctx.default_extra)
 
         host_kernel = None
-        if gpu_sources_disagree(reported, kernel) and ctx.ssh is not None:
+        if gpu_sources_disagree(reported, kernel) and source == KERNEL_VIEW_SOURCE_HOST:
+            # one host inventory per cycle, never re-read: its whole list came with this executor's cards
+            host_kernel = sorted(set(host_all)) if host_all else None
+        elif gpu_sources_disagree(reported, kernel) and ctx.ssh is not None:
             # a container handed some of the host's cards lists only those; the host's own list is the full one
             host_view = await read_kernel_gpu_view(ctx.ssh, host_view=True)
             host_uuids = host_view.uuids
@@ -311,6 +319,7 @@ class HardwareIdentityCheck:
             if previous and previous.get("dmi")
             else None,
             "kernel_gpu_uuids": kernel,
+            "kernel_view_source": source,
             "host_kernel_gpu_uuids": host_kernel,
             "reported_gpu_uuids": reported,
             "dmi_overlays": overlays,

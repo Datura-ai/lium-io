@@ -6,7 +6,7 @@ import asyncssh
 import pytest
 from datura.requests.miner_requests import ExecutorSSHInfo
 from payload_models.payloads import MinerJobRequestPayload
-from services.attestation_service import HostPolicyResult
+from services.attestation_service import AttestationService, HostPolicyResult
 from services.task.models import JobResult, build_msg
 from services.task.service import TaskService
 
@@ -14,10 +14,13 @@ HOST_KEY = asyncssh.generate_private_key("ssh-ed25519").export_public_key().deco
 
 
 class _Shell:
+    opened: list["_Shell"] = []
+
     def __init__(self, **kwargs: object) -> None:
         self.known_hosts = kwargs.get("known_hosts")
 
     async def __aenter__(self) -> "_Shell":
+        _Shell.opened.append(self)
         return self
 
     async def __aexit__(self, *_: object) -> bool:
@@ -44,11 +47,13 @@ def _service(known_hosts: asyncssh.SSHKnownHosts | None) -> TaskService:
     return service
 
 
-async def _run(known_hosts: asyncssh.SSHKnownHosts | None, service: TaskService | None = None) -> JobResult:
+async def _run(
+    known_hosts: asyncssh.SSHKnownHosts | None, service: TaskService | None = None, ssh_host_key: str = HOST_KEY
+) -> JobResult:
     executor = ExecutorSSHInfo(
         uuid="node-9", address="10.0.0.5", port=8080, ssh_username="root", ssh_port=2200,
-        python_path="/usr/bin/python3", root_dir="/root/app", ssh_host_key=HOST_KEY,
-    )
+        python_path="/usr/bin/python3", root_dir="/root/app",
+    ).model_copy(update={"ssh_host_key": ssh_host_key})  # past the format rule, as the refusal test needs
     miner = MinerJobRequestPayload(
         job_batch_id="batch-1", miner_hotkey="5Miner", miner_coldkey="5Cold",
         miner_address="10.0.0.5", miner_port=8080, executors=[],
@@ -95,3 +100,16 @@ async def test_the_cycle_leaves_a_hostnames_registered_key_to_node_account_check
     await _run(None, service)
 
     assert service.attestation_service.prepare_host_policy.await_args.kwargs["check_registered_key"] is False
+
+
+@pytest.mark.asyncio
+async def test_a_cycle_whose_reported_host_key_builds_no_policy_opens_no_shell(monkeypatch) -> None:
+    monkeypatch.setattr("services.attestation_service.settings.TDX_VERIFIER_URL", None)
+    service = _service(None)
+    service.attestation_service = AttestationService()
+    _Shell.opened.clear()
+
+    result = await _run(None, service, ssh_host_key=f"{HOST_KEY}\nx")
+
+    assert _Shell.opened == []
+    assert result.ssh_host_key_verified is False

@@ -13,7 +13,7 @@ from typing import Any, Literal
 from services import executor_payload
 from services.file_encrypt_service import ORIGINAL_KEYS
 from services.gpu_spec_table import classify_gpu_model, list_sxm_on_pcie_adapter_as_pcie
-from services.nvidia_devices import KernelGpuView, read_kernel_gpu_view
+from services.nvidia_devices import read_kernel_gpu_view
 
 from core.config import settings
 from core.utils import _m, get_extra_info
@@ -25,7 +25,7 @@ from ..pipeline import CheckResult, Context
 from ..runner import SSHCommandResult
 from .container_download_speed import SPECS_KEY as IN_POD_DOWNLOAD_KEY
 from .container_download_speed import SPECS_MEASURED_AT_KEY as IN_POD_DOWNLOAD_AT_KEY
-from .banned_provider import kernel_gpu_view
+from .banned_provider import KernelGpuViews, kernel_gpu_view_with_source
 from .gpu_loss_hold import GpuLossHoldCheck
 from .gpu_identity import enforced, evaluate_gpu_identity, event_fields, log_gpu_identity
 from .rented_gpu_drop import RentedGpuDropCheck, missing_gpus_under_reset
@@ -127,12 +127,12 @@ def _identity_cards(block: Any) -> list[dict[str, Any]]:
 
 async def _identity_kernel_uuids(
     ctx: Context, cards: list[dict[str, Any]]
-) -> tuple[list[str] | None, KernelGpuView | None]:
-    """The container's kernel card list from the cycle cache, else the host's in enforce.
+) -> tuple[list[str] | None, KernelGpuViews | None]:
+    """The cycle's kernel card list, else the host's whole list in enforce.
 
-    Shadow must stay outcome-neutral in task time: it uses the cached container read and does not
-    add the host read. Enforce may add that one read when the container's list does not name every
-    card the block does.
+    Shadow must stay outcome-neutral in task time: it uses the cycle's own list and does not add
+    the host read. Enforce may use the read's host list, or take that one read, when the list does
+    not name every card the block does.
     """
     if ctx.ssh is None:
         return None, None
@@ -141,21 +141,23 @@ async def _identity_kernel_uuids(
         for card in cards
         if isinstance(card, dict) and card.get("uuid")
     }
-    view = await kernel_gpu_view(ctx)
-    container = [uuid for uuid in view.uuids or [] if str(uuid).strip()]
-    covered = not wanted or bool(container) and wanted <= {
-        str(uuid).strip().lower() for uuid in container
-    }
+    views = await kernel_gpu_view_with_source(ctx)
+    own = [uuid for uuid in views.view.uuids or [] if str(uuid).strip()]
+    covered = not wanted or bool(own) and wanted <= {str(uuid).strip().lower() for uuid in own}
     if covered or settings.VALIDATOR_LIUMD_EVIDENCE_MODE != "enforce":
-        return container or None, view
+        return own or None, views
+    host = [uuid for uuid in views.host_all_uuids or [] if str(uuid).strip()]
+    if host and wanted <= {str(uuid).strip().lower() for uuid in host}:
+        return host, views
     try:
         host_view = await read_kernel_gpu_view(ctx.ssh, host_view=True)
     except Exception:
-        return container or None, view
+        return own or None, views
     host = [uuid for uuid in host_view.uuids or [] if str(uuid).strip()]
     if host and (not wanted or wanted <= {str(uuid).strip().lower() for uuid in host}):
-        return host, view
-    return container or None, view
+        return host, views
+    return own or None, views
+
 
 def _decrypt_payload(ctx: Context, stdout: str) -> str:
     # decrypt the scrape's Fernet token out of whatever else the executor printed
@@ -565,10 +567,10 @@ class MachineSpecScrapeCheck:
             len(raw_gpu_details),
             claimed_model=raw_gpu_details[0].get("name"),
         )
-        kernel_view = None
+        kernel_views = None
         if _KERNEL_VIEW_REASONS & set(identity["reasons"]):
             block = specs.get("gpu_identity")
-            kernel_uuids, kernel_view = await _identity_kernel_uuids(ctx, _identity_cards(block))
+            kernel_uuids, kernel_views = await _identity_kernel_uuids(ctx, _identity_cards(block))
             if kernel_uuids:
                 identity = evaluate_gpu_identity(
                     block,
@@ -581,7 +583,7 @@ class MachineSpecScrapeCheck:
         if enforced(mode, identity):
             return self._fail_gpu_identity(ctx, identity, answer), None
         return self._result_from_specs(
-            ctx, specs, delivery="liumd", task=task, snapshot=False, kernel_view=kernel_view
+            ctx, specs, delivery="liumd", task=task, snapshot=False, kernel_views=kernel_views
         ), None
 
     @staticmethod
@@ -641,7 +643,7 @@ class MachineSpecScrapeCheck:
         task: Any = None,
         what: dict[str, Any] | None = None,
         snapshot: bool = True,
-        kernel_view: KernelGpuView | None = None,
+        kernel_views: KernelGpuViews | None = None,
     ) -> CheckResult:
         specs.pop("port_verify_first_miss", None)
         specs.pop("split_disk", None)
@@ -706,14 +708,19 @@ class MachineSpecScrapeCheck:
             liumd_shadow_facts_task=task,
             liumd_shadow_facts_attempted=True,
         )
-        if kernel_view is not None:
+        if kernel_views is not None:
             # the scrape's own read is the cycle's kernel view; BannedProviderCheck reuses it
+            view = kernel_views.view
             state_updates.update(
-                kernel_gpu_uuids=kernel_view.uuids,
+                kernel_gpu_uuids=view.uuids,
                 kernel_gpu_uuids_read_attempted=True,
-                kernel_gpu_foreign_mounts=kernel_view.foreign_mounts,
-                kernel_gpu_minors=kernel_view.minors,
-                kernel_gpu_pcis=kernel_view.pcis,
+                kernel_gpu_foreign_mounts=view.foreign_mounts,
+                kernel_gpu_minors=view.minors,
+                kernel_gpu_pcis=view.pcis,
+                kernel_gpu_view_source=kernel_views.source,
+                container_kernel_gpu_uuids=kernel_views.container.uuids,
+                container_kernel_gpu_foreign_mounts=kernel_views.container.foreign_mounts,
+                host_all_kernel_gpu_uuids=kernel_views.host_all_uuids,
             )
         updated_state = replace(ctx.state, **state_updates)
         return CheckResult(

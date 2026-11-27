@@ -39,6 +39,7 @@ HIDES_AT_ONCE = [
     ("gpu.validate.model", "GPU_DETAILS_MISMATCH"),
     ("gpu.validate.fingerprint", "GPU_UUID_CHANGED"),
     ("gpu.validate.nvlink_fault", "NVLINK_FAULT"),
+    ("executor.validate.rental_probe", "RENTAL_PROBE_NOT_YET_PROVEN"),
     ("executor.validate.login_user", "LOGIN_USER_NOT_ROOT"),
 ]
 

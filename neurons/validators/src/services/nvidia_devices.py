@@ -157,11 +157,20 @@ def _emit_kernel_xml_disagreement(
 KERNEL_GPU_UUID_READ_TIMEOUT_SECONDS = 15
 
 
-def _proc_gpu_info_cmd(root: str = "", *, with_pci: bool = False) -> str:
+def _proc_gpu_info_cmd(
+    root: str = "", *, own_cards: bool = False, with_pci: bool = False
+) -> str:
+    # own_cards (DAH-7076): read `root`'s entry for each card under the container's own
+    # /proc/driver/nvidia/gpus (its runtime binds, by PCI bus id), so a host shared by several
+    # executors lists only this executor's cards. The bind's name stays when its target is stale.
+    loop = (
+        f'for d in /proc/driver/nvidia/gpus/*; do f="{root}$d/information"; '
+        if own_cards
+        else f"for f in {root}/proc/driver/nvidia/gpus/*/information; do "
+    )
     fmt, args = ("%s, %s, %s\\n", "uuid, minor, pci") if with_pci else ("%s, %s\\n", "uuid, minor")
     return (
-        f"for f in {root}/proc/driver/nvidia/gpus/*/information; do "
-        '[ -r "$f" ] || continue; '
+        loop + '[ -r "$f" ] || continue; '
         "awk -F: -v info=\"$f\" '"
         'BEGIN { n = split(info, parts, "/"); pci = parts[n-1] } '
         '$1 == "GPU UUID" { uuid = $2 } '
@@ -314,7 +323,7 @@ async def _query_gpu_nodes_for_uuids(
     except RuntimeError as exc:
         errors.append(str(exc))
         uuid_to_minor = {}
-    # An empty map is the real signal, not the exception: PROC_GPU_INFO_CMD swallows an
+    # An empty map is the real signal, not the exception: HOST_PROC_GPU_INFO_CMD swallows an
     # unreadable procfs (unexpanded glob, `|| continue`, stderr discarded) and exits 0, so an
     # honest host with no readable procfs would otherwise log identically to a spoof.
     proc_unreadable = not uuid_to_minor
@@ -399,6 +408,19 @@ KERNEL_GPU_VIEW_SEPARATOR = "--kernel-gpu-uuids--"
 # container's own root or is not readable.
 HOST_PID1_ROOT = "/proc/1/root"
 HOST_PID1_MOUNTINFO = "/proc/1/mountinfo"
+# DAH-7076: the UUID-to-minor lookup the create step attaches by. The executor's own binds under
+# /proc/driver/nvidia/gpus are made when it starts; a GPU reset re-creates the card's host entry and
+# the bind keeps pointing at the deleted one until the executor restarts. Through PID 1's root a
+# pid:host executor reads the host's entries; where the PID namespace is not shared the same path is
+# the container's own view, as before. The container path runs only when that path lists nothing.
+HOST_PROC_GPU_INFO_CMD = (
+    f"{{ {_proc_gpu_info_cmd(HOST_PID1_ROOT, own_cards=True)}; }} | grep . || {{ {PROC_GPU_INFO_CMD}; }}"
+)
+# the host's whole list follows this executor's own cards in the host view's output
+HOST_ALL_CARDS_SEPARATOR = "--host-all-gpu-uuids--"
+# then the container's own evidence for its gpus path, whose names pick this executor's cards (r510)
+HOST_CONTAINER_MOUNTS_SEPARATOR = "--container-gpu-mounts--"
+HOST_CONTAINER_FILES_SEPARATOR = "--container-gpu-files--"
 
 
 def kernel_gpu_view_cmd(*, host_view: bool = False) -> str:
@@ -409,7 +431,17 @@ def kernel_gpu_view_cmd(*, host_view: bool = False) -> str:
         f"grep -F ' /proc/driver/nvidia' {mountinfo} 2>/dev/null; "
         f"echo {KERNEL_GPU_FS_SEPARATOR}; stat -f -c '%n %T' {glob} 2>/dev/null; "
         f"stat -c '%n|%F' {glob} 2>/dev/null; "
-        f"echo {KERNEL_GPU_VIEW_SEPARATOR}; {_proc_gpu_info_cmd(root, with_pci=True)}"
+        f"echo {KERNEL_GPU_VIEW_SEPARATOR}; "
+        + (
+            f"{_proc_gpu_info_cmd(root, own_cards=True, with_pci=True)}; echo {HOST_ALL_CARDS_SEPARATOR}; "
+            f"{_proc_gpu_info_cmd(root, with_pci=True)}; "
+            f"echo {HOST_CONTAINER_MOUNTS_SEPARATOR}; grep -F ' /proc/driver/nvidia' /proc/self/mountinfo 2>/dev/null; "
+            f"echo {HOST_CONTAINER_FILES_SEPARATOR}; stat -f -c '%n %T' {PROC_GPU_INFO_GLOB} 2>/dev/null; "
+            f"stat -c '%n|%F' {PROC_GPU_INFO_GLOB} 2>/dev/null; "
+            f'for d in {PROC_NVIDIA_GPUS_PATH}/*; do [ -e "$d" ] && echo "$d/information"; done'
+            if host_view
+            else _proc_gpu_info_cmd(root, with_pci=True)
+        )
     )
 
 
@@ -435,7 +467,7 @@ class KernelGpuView(NamedTuple):
 
 
 def foreign_mounts_over_proc_nvidia_gpus(
-    mountinfo: str, file_fs: str = "", *, host_view: bool = False
+    mountinfo: str, file_fs: str = "", *, host_view: bool = False, allow_reset_binds: bool = False
 ) -> list[str]:
     """Mounts or files at or under /proc/driver/nvidia/gpus whose filesystem is not procfs.
 
@@ -454,6 +486,9 @@ def foreign_mounts_over_proc_nvidia_gpus(
     `host_view` judges the host's own mount table (PID 1's mountinfo). A host has no reason to
     mount anything at or under /proc/driver/nvidia, so there every such mount is foreign, the
     runtime's tmpfs and proc binds included: with them the table is a container's, not a host's.
+
+    `allow_reset_binds` (DAH-7076, only for the container's evidence when the host list decides) passes one more
+    shape: a proc bind of its own path whose root carries the kernel's `//deleted` marker, which a GPU reset leaves.
     """
     found: list[str] = []
     for line in mountinfo.splitlines():
@@ -471,7 +506,9 @@ def foreign_mounts_over_proc_nvidia_gpus(
             found.append(f"{mount_point} {fstype}")
         elif on_gpus and fstype != "proc":
             found.append(f"{mount_point} {fstype}")
-        elif on_gpus and root != mount_point[len("/proc") :]:
+        elif on_gpus and root != mount_point[len("/proc") :] and not (
+            allow_reset_binds and root == mount_point[len("/proc") :] + "//deleted"
+        ):
             found.append(f"{mount_point} proc:{root}")
     for line in file_fs.splitlines():
         if not line.strip():
@@ -493,6 +530,27 @@ def foreign_mounts_over_proc_nvidia_gpus(
 async def read_kernel_gpu_view(
     ssh: asyncssh.SSHClientConnection, *, host_view: bool = False
 ) -> KernelGpuView:
+    """The container's list, or with `host_view` the host's whole list (see _read_kernel_gpu_views)."""
+    return (await _read_kernel_gpu_views(ssh, host_view=host_view))[1]
+
+
+async def read_host_kernel_gpu_views(
+    ssh: asyncssh.SSHClientConnection,
+) -> tuple[KernelGpuView, KernelGpuView]:
+    """One host read (DAH-7076): this executor's own cards as the host lists them, and the host's whole list.
+
+    The own view's foreign mounts are the container's own gpus path's (r510), never the host table's.
+
+    A host shared by several executors lists every executor's cards; only the cards under the container's own
+    /proc/driver/nvidia/gpus are this executor's, so the first view is the one its bans and specs use. The
+    second is the same read's whole list, the full inventory a container handed a subset is checked against.
+    """
+    return await _read_kernel_gpu_views(ssh, host_view=True)
+
+
+async def _read_kernel_gpu_views(
+    ssh: asyncssh.SSHClientConnection, *, host_view: bool = False
+) -> tuple[KernelGpuView, KernelGpuView]:
     """GPU UUIDs as the kernel driver reports them in /proc/driver/nvidia/gpus/*/information.
 
     DAH-2662: the ban list is matched against the UUIDs the host *reports* (NVML, which an
@@ -527,15 +585,19 @@ async def read_kernel_gpu_view(
             )
         mountinfo, _, rest = (res.stdout or "").partition(KERNEL_GPU_FS_SEPARATOR)
         file_fs, _, uuid_lines = rest.partition(KERNEL_GPU_VIEW_SEPARATOR)
+        container_evidence = ""
         if host_view:
             # judged as the paths the host itself has; a row without the prefix stays as it is
             file_fs = "\n".join(line.removeprefix(HOST_PID1_ROOT) for line in file_fs.splitlines())
+            uuid_lines, found, container_evidence = uuid_lines.partition(HOST_CONTAINER_MOUNTS_SEPARATOR)
+            if not found:
+                raise RuntimeError("host GPU view printed no container evidence")
     except Exception as exc:
         if host_view:
             logger.info(
                 _m("%s failed: %s", {"executor_peer": _ssh_peer(ssh)}), what, repr(exc)[:500]
             )
-            return KernelGpuView(uuids=None, foreign_mounts=[])
+            return _both(KernelGpuView(uuids=None, foreign_mounts=[]))
         # fail-open by design; the line is what tells ops the kernel view was missing on this host
         logger.warning(
             _m(
@@ -544,7 +606,7 @@ async def read_kernel_gpu_view(
             ),
             repr(exc)[:500],
         )
-        return KernelGpuView(uuids=None, foreign_mounts=[])
+        return _both(KernelGpuView(uuids=None, foreign_mounts=[]))
     foreign_mounts = foreign_mounts_over_proc_nvidia_gpus(mountinfo, file_fs, host_view=host_view)
     if foreign_mounts and host_view:
         # the usual case: PID 1 is the container's own init, so this is its mount table again
@@ -554,31 +616,52 @@ async def read_kernel_gpu_view(
             PROC_NVIDIA_PATH,
             foreign_mounts,
         )
-        return KernelGpuView(uuids=None, foreign_mounts=foreign_mounts)
+        # the own view carries no mounts: an unusable host table is no finding on this executor
+        return KernelGpuView(uuids=None, foreign_mounts=[]), KernelGpuView(uuids=None, foreign_mounts=foreign_mounts)
+    if host_view:
+        # r510: the container's own gpus names pick this executor's cards, so an overlay there is this executor's
+        # foreign mount, as on main; only the reset's stale bind passes, and every name must be a bus id (checked as
+        # an information path)
+        container_mounts, _, container_files = container_evidence.partition(HOST_CONTAINER_FILES_SEPARATOR)
+        foreign_mounts = foreign_mounts_over_proc_nvidia_gpus(
+            container_mounts, container_files, allow_reset_binds=True
+        )
     if foreign_mounts:
         logger.warning(
             _m("foreign mount over %s: %s", {"executor_peer": _ssh_peer(ssh)}),
             PROC_NVIDIA_GPUS_PATH,
             foreign_mounts,
         )
-        return KernelGpuView(uuids=None, foreign_mounts=foreign_mounts)
-    minors, pcis = _parse_uuid_minor_pci_csv(uuid_lines)
-    uuids = list(minors)
+        return _both(KernelGpuView(uuids=None, foreign_mounts=foreign_mounts))
+    own_lines, _, all_lines = (
+        uuid_lines.partition(HOST_ALL_CARDS_SEPARATOR) if host_view else (uuid_lines, "", uuid_lines)
+    )
     # positive evidence: every UUID row must come from a file stat placed on procfs; a host whose
     # stat printed nothing is unreadable (None), not a finding
     procfs_rows = [line for line in file_fs.splitlines() if line.strip().endswith(" proc")]
-    if len(procfs_rows) < len(uuids):
-        logger.warning(
-            _m("%s had no procfs evidence for every card; withheld", {"executor_peer": _ssh_peer(ssh)}),
-            what,
+    views = []
+    for lines in (own_lines, all_lines):
+        minors, pcis = _parse_uuid_minor_pci_csv(lines)
+        uuids = list(minors)
+        if len(procfs_rows) < len(uuids):
+            logger.warning(
+                _m("%s had no procfs evidence for every card; withheld", {"executor_peer": _ssh_peer(ssh)}),
+                what,
+            )
+            return _both(KernelGpuView(uuids=None, foreign_mounts=[]))
+        views.append(
+            KernelGpuView(
+                uuids=uuids or None,
+                foreign_mounts=[],
+                minors=minors or None,
+                pcis=pcis or None,
+            )
         )
-        return KernelGpuView(uuids=None, foreign_mounts=[])
-    return KernelGpuView(
-        uuids=uuids or None,
-        foreign_mounts=[],
-        minors=minors or None,
-        pcis=pcis or None,
-    )
+    return views[0], views[1]
+
+
+def _both(view: KernelGpuView) -> tuple[KernelGpuView, KernelGpuView]:
+    return view, view
 
 
 async def query_gpu_minor_map_from_proc(
@@ -588,7 +671,7 @@ async def query_gpu_minor_map_from_proc(
 ) -> dict[str, int]:
     if host_probe is not None and host_probe.gpu_minor_map_stdout is not None:
         return _parse_uuid_minor_csv(host_probe.gpu_minor_map_stdout)
-    res = await ssh.run(PROC_GPU_INFO_CMD)
+    res = await ssh.run(HOST_PROC_GPU_INFO_CMD)
     if res.exit_status != 0:
         raise RuntimeError(
             "NVIDIA /proc GPU minor query failed on executor: "

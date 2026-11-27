@@ -580,14 +580,20 @@ async def test_a_non_text_gpu_name_does_not_abort_a_shadow_run(monkeypatch):
 @pytest.mark.asyncio
 async def test_identity_kernel_reads_the_host_only_in_enforce(monkeypatch):
     calls = []
+    empty = KernelGpuView(uuids=None, foreign_mounts=[])
 
-    async def container(ctx):
-        calls.append("container")
-        return KernelGpuView(
-            uuids=["GPU-a"],
-            foreign_mounts=[],
-            minors={"GPU-a": 0},
-            pcis={"GPU-a": "0000:31:00.0"},
+    async def views(ctx):
+        calls.append("cycle")
+        return machine_spec_scrape.KernelGpuViews(
+            KernelGpuView(
+                uuids=["GPU-a"],
+                foreign_mounts=[],
+                minors={"GPU-a": 0},
+                pcis={"GPU-a": "0000:31:00.0"},
+            ),
+            "container",
+            empty,
+            None,
         )
 
     async def host(ssh, *, host_view=False):
@@ -599,18 +605,18 @@ async def test_identity_kernel_reads_the_host_only_in_enforce(monkeypatch):
             pcis={"GPU-a": "0000:31:00.0", "GPU-b": "0000:32:00.0"},
         )
 
-    monkeypatch.setattr(machine_spec_scrape, "kernel_gpu_view", container)
+    monkeypatch.setattr(machine_spec_scrape, "kernel_gpu_view_with_source", views)
     monkeypatch.setattr(machine_spec_scrape, "read_kernel_gpu_view", host)
     ctx = SimpleNamespace(ssh=object())
     cards = [{"uuid": "GPU-a"}, {"uuid": "GPU-b"}]
 
     monkeypatch.setattr(machine_spec_scrape.settings, "VALIDATOR_LIUMD_EVIDENCE_MODE", "shadow")
     uuids, _ = await machine_spec_scrape._identity_kernel_uuids(ctx, cards)
-    assert calls == ["container"]
+    assert calls == ["cycle"]
     assert uuids == ["GPU-a"]
 
     calls.clear()
     monkeypatch.setattr(machine_spec_scrape.settings, "VALIDATOR_LIUMD_EVIDENCE_MODE", "enforce")
     uuids, _ = await machine_spec_scrape._identity_kernel_uuids(ctx, cards)
-    assert calls == ["container", "host"]
+    assert calls == ["cycle", "host"]
     assert uuids == ["GPU-a", "GPU-b"]
