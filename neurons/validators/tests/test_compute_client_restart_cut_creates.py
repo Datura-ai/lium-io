@@ -703,7 +703,8 @@ async def test_a_node_left_delete_keeps_the_source_creates_record_for_a_restart(
 @pytest.mark.parametrize("deleted", [True, False])
 @pytest.mark.parametrize("node_left", [True, False])
 async def test_only_a_node_left_deletes_answer_echoes_its_command_id(deleted: bool, node_left: bool) -> None:
-    """DAH-6531: the backend waits on one node-left delete; an answer to any other delete for the pod must not match."""
+    """DAH-6531: any answer to a node-left delete carries its command_id. A plain delete echoes its own only on a
+    failure (DAH-7216), so its answer can never match the node-left delete the backend waits on."""
     client = _client(_redis_service())
     client.lock = asyncio.Lock()
     client.get_miner_axon_info = AsyncMock(return_value=MagicMock(ip="1.2.3.4", port=8000))
@@ -720,7 +721,7 @@ async def test_only_a_node_left_deletes_answer_echoes_its_command_id(deleted: bo
 
     await client._drive_miner_job(request)
 
-    assert [m.command_id for m in client.message_queue] == ["cmd-1" if node_left else ""]
+    assert [m.command_id for m in client.message_queue] == ["cmd-1" if node_left or not deleted else ""]
 
 
 @pytest.mark.asyncio
