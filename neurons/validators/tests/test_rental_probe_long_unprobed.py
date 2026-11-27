@@ -27,6 +27,7 @@ async def _count_unprobed_logs_and_reason(caplog, ctx, docker) -> tuple[int, str
 
 
 @pytest.mark.asyncio
+@pytest.mark.real_rental_probe_proof
 async def test_a_never_probed_node_without_the_image_is_not_listed(caplog):
     # unlisted until its first pass, which says more than the long-unprobed log line
     redis = FakeRedis(last_ok=None)
@@ -52,13 +53,15 @@ async def test_a_node_probed_within_four_intervals_is_not_logged(caplog):
 
 
 @pytest.mark.asyncio
-async def test_an_unreadable_image_list_on_a_never_probed_node_is_not_listed(caplog):
+@pytest.mark.real_rental_probe_proof
+async def test_an_unreadable_image_list_on_a_never_probed_node_keeps_its_listing(caplog):
+    # an image list the validator could not read is the validator's side, so the stored listing stands
     ctx, docker, _ = make_probe_context(redis=FakeRedis(last_ok=None))
     ctx.ssh.run.side_effect = asyncssh.ConnectionLost("lost")
 
     result = await _count_unprobed_logs_and_reason(caplog, ctx, docker)
 
-    assert result == (0, Msg.NOT_YET_PROVEN.reason)
+    assert result == (0, Msg.NOT_RUN_ON_VALIDATOR.reason)
 
 
 @pytest.mark.asyncio

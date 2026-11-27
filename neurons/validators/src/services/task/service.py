@@ -26,6 +26,7 @@ from services.ssh_service import SSHService
 
 from .checks.port_connectivity import PortConnectivityCheck
 from .checks.post_rental_gpu_recheck import PostRentalGpuRecheckCheck
+from .checks.rental_probe import with_the_unproven_hold
 from .availability import (
     MAX_PEER_TEXT_LENGTH,
     ReachSource,
@@ -331,6 +332,11 @@ class TaskService:
                             error.model_dump(mode="json") for error in availability_errors([waiting])
                         ]
                     result.availability_errors = result.availability_errors or None
+                # DAH-7229: a run that ended before the rental probe still holds a node no probe has passed on. After
+                # DAH-5718, so a lost session's None (keep what is stored) stays None
+                result.availability_errors = await with_the_unproven_hold(
+                    last_context, checks, events, result.availability_errors
+                )
                 # DAH-3405: the last event is the one that ended the run — the failed fatal check,
                 # the finalize event of a run that completed without a score, or the rented halt
                 # (success=True, score 0 when the image is OUTDATED).

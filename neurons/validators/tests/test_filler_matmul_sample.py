@@ -376,6 +376,7 @@ class _AllCardsService(SamplingValidationService):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(("standing", "enforced"), [(True, True), (False, True), (True, False)])
+@pytest.mark.real_rental_probe_proof
 async def test_a_standing_rental_probe_failure_defers_the_all_cards_run_and_marks_the_cycle(
     context_factory, monkeypatch, standing, enforced
 ):
@@ -389,6 +390,8 @@ async def test_a_standing_rental_probe_failure_defers_the_all_cards_run_and_mark
     redis = FakeRedis()
     if standing:
         await redis.set("rental_probe_failed:executor-123", "gpu_count")
+    else:
+        await redis.set("rental_probe_proven:executor-123", "1")  # a pass on record, no failure standing
     service = _AllCardsService()
     ctx = context_factory(
         services=build_services(validation=service, redis=redis), state=build_state(specs=_cards(8))
@@ -400,3 +403,22 @@ async def test_a_standing_rental_probe_failure_defers_the_all_cards_run_and_mark
     assert result.passed is True
     assert service.probe_all_cards == [not standing]
     assert result.updates.get("state", ctx.state).allcards_skipped_for_standing_probe_failure is (standing and enforced)
+
+
+@pytest.mark.asyncio
+@pytest.mark.real_rental_probe_proof
+async def test_a_node_no_probe_has_passed_on_defers_the_all_cards_run(context_factory, monkeypatch):
+    """Follow-up of lio#2442: a node no probe has passed on had no time reserved for its first probe, so a slow
+    all-cards run could keep it hidden for good. It defers like a standing failure; the cycle still does not relist."""
+    monkeypatch.setattr(capability.settings, "MATMUL_ALLCARDS_CHECK_ENABLED", True)
+    monkeypatch.setattr(capability.settings, "MATMUL_ALLCARDS_ENFORCEMENT_ENABLED", True)
+    monkeypatch.setattr(capability, "unmeasured_cards", lambda *_a, **_kw: set())
+    service = _AllCardsService()
+    ctx = context_factory(
+        services=build_services(validation=service, redis=FakeRedis()), state=build_state(specs=_cards(8))
+    )
+
+    result = await CapabilityCheck().run(ctx)
+
+    assert service.probe_all_cards == [False]
+    assert result.updates["state"].allcards_skipped_for_standing_probe_failure is True
