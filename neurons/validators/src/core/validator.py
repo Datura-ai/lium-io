@@ -49,6 +49,7 @@ from services.executor_connectivity_service import ExecutorConnectivityService
 from services.file_encrypt_service import FileEncryptService
 from services.matrix_validation_service import ValidationService
 from services.miner_service import MinerService
+from services.storage_operations import start_a_new_wave
 from services.redis_service import (
     GPU_ESTIMATES_CHANNEL,
     PENDING_PODS_PREFIX,
@@ -508,6 +509,7 @@ class Validator:
                 )
 
                 self.last_job_run_blocks = current_block
+                start_a_new_wave()
                 if cycle_asked_for_now:
                     # Cleared here and not at the read: every return above this line means no
                     # cycle started, and the operator's request must survive to the next tick.

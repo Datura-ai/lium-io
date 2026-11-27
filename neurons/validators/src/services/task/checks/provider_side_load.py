@@ -20,6 +20,7 @@ from services.storage_operations import (
 from .cpu_truth import advertised_cpu_count
 from .custom_build_orphan_sweep import BUILD_DIND_PREFIX
 from .rental_owner import rental_of_this_node
+from .provider_maintenance import JOB_BATCH_ID_FORMAT
 from .gpu_usage import (
     carries_a_rental_prefix,
     lium_workload_containers,
@@ -275,7 +276,7 @@ async def lium_containers(ctx: Context) -> set[str] | None:
         containers.update(f"{BUILD_DIND_PREFIX}{pod.pod_id}" for pod in rented_executor.pods)
     specs = ctx.state.specs or {}
     containers.update(await late_started_containers_the_backend_owns(ctx, containers))
-    containers.update(await excused_storage_helper_keys(ctx))
+    containers.update(await excused_storage_helper_keys(ctx, fresh=False))
     stack_ids: set[str] = executor_stack_container_ids(specs)
     if settings.PROVIDER_SIDE_LOAD_STACK_EXCUSE_CAP_ENABLED and stack_excuse_is_over_its_cap(specs):
         # like the name tier: over the cap the whole tier excuses nothing
@@ -286,9 +287,23 @@ async def lium_containers(ctx: Context) -> set[str] | None:
     return containers
 
 
-async def excused_storage_helper_keys(ctx: Context) -> set[str]:
+def cycle_wave_id(job_batch_id: str | None) -> str | None:
+    """The wave to share a records read with: the cycle's own id, or None when the id names no
+    single cycle ("Unknown" when the block time could not be read, "pod-watch"), so runs that
+    repeat that label never reuse an earlier run's records."""
+    try:
+        datetime.strptime(job_batch_id or "", JOB_BATCH_ID_FORMAT)
+    except ValueError:
+        return None
+    return job_batch_id
+
+
+async def excused_storage_helper_keys(ctx: Context, fresh: bool = True) -> set[str]:
     return await settle_excused_storage_helper_keys(
-        ctx.services.redis, ctx.executor.uuid, lambda op: storage_operation_open(ctx, op)
+        ctx.services.redis,
+        ctx.executor.uuid,
+        lambda op: storage_operation_open(ctx, op),
+        wave_id=None if fresh else cycle_wave_id(ctx.config.job_batch_id),
     )
 
 

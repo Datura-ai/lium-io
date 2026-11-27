@@ -961,6 +961,15 @@ class RedisService:
     async def smembers(self, key: str):
         return await self.redis.smembers(key)
 
+    async def smembers_many(self, keys: list[str]) -> list:
+        """Several SMEMBERS in one round trip, in the order of `keys`."""
+        if not keys:
+            return []
+        async with self.redis.pipeline(transaction=False) as pipe:
+            for key in keys:
+                pipe.smembers(key)
+            return await pipe.execute()
+
     async def lpush(self, key: str, element: bytes):
         """Add an element to a list in Redis."""
         await self.redis.lpush(key, element)

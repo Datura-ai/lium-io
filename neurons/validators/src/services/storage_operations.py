@@ -44,7 +44,12 @@ STORAGE_HELPER_KEY_MARK = "helper:"
 # the backend fails a backup still open after 4 h (BACKUP_AUTH_TOKEN_EXPIRY_HOURS): no helper
 # legitimately outlives that, so no record does either
 STARTED_STORAGE_HELPERS_TTL_SECONDS = 4 * 3600
+# DAH-6394: the executors that have records, so a check wave reads every record in one round trip
+STARTED_STORAGE_HELPER_EXECUTORS_KEY = "started_storage_helper_executors"
 _STARTED_STORAGE_HELPERS_REDIS_TIMEOUT_SEC = 2
+# a read waits its turn on the bounded pool (REDIS_POOL_WAIT_TIMEOUT_SECONDS 60 s + socket 10 s); it is
+# one read per wave, or one fresh read per node over the CPU limit, never one per node per wave
+_STARTED_STORAGE_HELPERS_READ_TIMEOUT_SEC = 70
 
 
 def storage_helper_name(operation_id: UUID | str) -> str:
@@ -78,20 +83,70 @@ def _key(executor_id: str) -> str:
     return f"{STARTED_STORAGE_HELPERS_PREFIX}{executor_id}"
 
 
-async def _redis_call(what: str, call: Callable[[], Awaitable[None]]) -> bool:
+async def _redis_call(
+    what: str, call: Callable[[], Awaitable[None]], timeout: float | None = None
+) -> bool:
     """Best effort: Redis down or slow leaves the records as they are (an unrecorded helper's
     cores stay on the provider, as before DAH-6148)."""
     try:
-        await asyncio.wait_for(call(), timeout=_STARTED_STORAGE_HELPERS_REDIS_TIMEOUT_SEC)
+        await asyncio.wait_for(call(), timeout=timeout or _STARTED_STORAGE_HELPERS_REDIS_TIMEOUT_SEC)
         return True
     except Exception as exc:  # noqa: BLE001
-        logger.warning("Storage helper records: %s failed: %s", what, exc)
+        logger.warning("Storage helper records: %s failed: %r", what, exc)
         return False
 
 
-async def _raw_records(redis: RedisService, executor_id: str) -> list[str]:
-    members = await redis.smembers(_key(executor_id))
+def _texts(members) -> list[str]:
     return [m.decode() if isinstance(m, bytes) else str(m) for m in members or ()]
+
+
+async def _raw_records(redis: RedisService, executor_id: str) -> list[str]:
+    return _texts(await redis.smembers(_key(executor_id)))
+
+
+async def _all_raw_records(redis: RedisService) -> dict[str, list[str]]:
+    executor_ids = _texts(await redis.smembers(STARTED_STORAGE_HELPER_EXECUTORS_KEY))
+    sets = await redis.smembers_many([_key(executor_id) for executor_id in executor_ids])
+    records = {executor_id: _texts(members) for executor_id, members in zip(executor_ids, sets)}
+    expired = [e for e, raw in records.items() if not raw]
+    try:
+        for executor_id in expired:
+            await redis.srem(STARTED_STORAGE_HELPER_EXECUTORS_KEY, executor_id)
+    except Exception as exc:  # noqa: BLE001 - a failed cleanup must not lose the records already read
+        logger.warning("Storage helper records: dropping expired executors failed: %r", exc)
+    return records
+
+
+@dataclass(frozen=True)
+class WaveRead:
+    """The wave's one read of every executor's records: the wave's checks share it."""
+
+    wave_id: str
+    records: asyncio.Future
+
+
+_wave_read: WaveRead | None = None
+
+
+def start_a_new_wave() -> None:
+    """A cycle run starts: its checks read the records again even when its id repeats the
+    previous run's (an operator-forced cycle in the same BLOCKS_FOR_JOB window)."""
+    global _wave_read
+    _wave_read = None
+
+
+def _wave_raw_records(redis: RedisService, wave_id: str) -> Awaitable[dict[str, list[str]]]:
+    global _wave_read
+    failed = (
+        _wave_read is not None
+        and _wave_read.records.done()
+        and (_wave_read.records.cancelled() or _wave_read.records.exception() is not None)
+    )
+    # a failed read is not the wave's records: the next check reads again
+    if _wave_read is None or _wave_read.wave_id != wave_id or failed:
+        _wave_read = WaveRead(wave_id, asyncio.ensure_future(_all_raw_records(redis)))
+    # one check timing out must not cancel the read the rest of the wave awaits
+    return asyncio.shield(_wave_read.records)
 
 
 def _reporter_key(operation_id: UUID | str) -> str:
@@ -111,6 +166,8 @@ async def note_started_storage_helper(
         record = StorageHelperRecord(str(UUID(str(operation_id))), int(time.time()))
         await redis.sadd(_key(executor_id), record.format())
         await redis.expire(_key(executor_id), STARTED_STORAGE_HELPERS_TTL_SECONDS)
+        await redis.sadd(STARTED_STORAGE_HELPER_EXECUTORS_KEY, executor_id)
+        await redis.expire(STARTED_STORAGE_HELPER_EXECUTORS_KEY, STARTED_STORAGE_HELPERS_TTL_SECONDS)
         if spec and isinstance(spec.get("reporter"), Mapping):
             await redis.set(
                 _reporter_key(operation_id),
@@ -141,6 +198,7 @@ async def settle_excused_storage_helper_keys(
     redis: RedisService,
     executor_id: str,
     is_open: Callable[[str], Awaitable[bool | None]],
+    wave_id: str | None = None,
 ) -> set[str]:
     """Drops the records whose operation ended and returns the helper keys to excuse.
 
@@ -150,13 +208,22 @@ async def settle_excused_storage_helper_keys(
     helper is excused by its exact name; an ended one, or one past the TTL, loses its record. An
     operation the backend did not answer for keeps its record and excuses nothing this cycle, and
     so does Redis not answering.
+
+    With `wave_id` the records come from the wave's one shared read (DAH-6394); without it, from a
+    fresh read of this executor's records.
     """
     raw_records: list[str] = []
 
     async def read_raw_records() -> None:
-        raw_records.extend(await _raw_records(redis, executor_id))
+        if wave_id:
+            raw_records.extend((await _wave_raw_records(redis, wave_id)).get(executor_id, ()))
+        else:
+            raw_records.extend(await _raw_records(redis, executor_id))
 
-    if not await _redis_call(f"read helpers of {executor_id}", read_raw_records):
+    records_were_read = await _redis_call(
+        f"read helpers of {executor_id}", read_raw_records, _STARTED_STORAGE_HELPERS_READ_TIMEOUT_SEC
+    )
+    if not records_were_read:
         return set()
     now = int(time.time())
     records = {raw: StorageHelperRecord.parse(raw) for raw in raw_records}

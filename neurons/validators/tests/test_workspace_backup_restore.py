@@ -477,7 +477,7 @@ async def _run_encrypted_restic_backup(monkeypatch, mountinfo: str):
     miner.redis_service = AsyncMock()  # DAH-6148: records the helper it starts
     await miner.handle_backup_container_req(_executor_info(), payload, Mock(), docker_service)
     start.assert_awaited_once()
-    key, record = miner.redis_service.sadd.await_args.args
+    key, record = miner.redis_service.sadd.await_args_list[0].args
     assert key == "started_storage_helpers:" + _executor_info().uuid
     assert record.startswith("11111111-1111-4111-8111-111111111111|")
     return docker_service.setup_encrypted_local_volume

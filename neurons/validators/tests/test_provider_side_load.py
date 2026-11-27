@@ -4,7 +4,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from contextlib import contextmanager
 from unittest.mock import AsyncMock, MagicMock, patch
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 
@@ -35,7 +35,7 @@ from neurons.validators.src.services.storage_operations import (
     storage_helper_key,
     storage_helper_name,
 )
-from tests.helpers import build_state
+from tests.helpers import build_context_config, build_state
 
 GB_KB = 1024 * 1024
 
@@ -872,6 +872,16 @@ def _backend_says(ctx, answer, report_age: int | None = 30):
     return ctx
 
 
+@pytest.fixture(autouse=True)
+def _no_wave_read_from_another_test(monkeypatch):
+    # the module is imported under two names; each keeps its own wave read
+    import sys
+
+    for name in ("services.storage_operations", "neurons.validators.src.services.storage_operations"):
+        if name in sys.modules:
+            monkeypatch.setattr(sys.modules[name], "_wave_read", None)
+
+
 def _with_recorded_helpers(
     ctx,
     *operations: UUID,
@@ -886,7 +896,14 @@ def _with_recorded_helpers(
     store = records if records is not None else set()
     store.update(f"{op}|{int(time.time()) - age}" for op in operations)
     redis = ctx.services.redis
-    redis.smembers = AsyncMock(side_effect=lambda key: {record.encode() for record in store})
+
+    def members(key):
+        if key == storage_operations.STARTED_STORAGE_HELPER_EXECUTORS_KEY:
+            return {ctx.executor.uuid.encode()}
+        return {record.encode() for record in store}
+
+    redis.smembers = AsyncMock(side_effect=members)
+    redis.smembers_many = AsyncMock(side_effect=lambda keys: [members(key) for key in keys])
     redis.srem = AsyncMock(side_effect=lambda key, record: store.discard(record))
     redis.sadd = AsyncMock(side_effect=lambda key, record: store.add(record))
     return _backend_says(ctx, backend, report_age)
@@ -1002,20 +1019,23 @@ async def test_an_open_operation_whose_runner_went_quiet_excuses_nothing(
 @pytest.mark.asyncio
 async def test_a_backup_that_starts_before_the_second_look_is_lium_load(context_factory):
     # the records are read again just before the second look, so a helper recorded after the
-    # first read is excused in the same cycle
+    # wave's read is excused in the same cycle
     store: set[str] = set()
     ctx = _with_recorded_helpers(
-        context_factory(state=_rented_state(SN13_SPECS), runner=_helper_runner(BACKUP_HELPER)),
+        context_factory(
+            state=_rented_state(SN13_SPECS),
+            runner=_helper_runner(BACKUP_HELPER),
+            # a real cycle id: the cycle's checks share one records read
+            config=build_context_config(job_batch_id="2026-11-20 20:00:00"),
+        ),
         records=store,
     )
-    first_read = ctx.services.redis.smembers.side_effect
 
-    def started_after_the_first_read(key):
+    def started_after_the_waves_read(keys):
         store.add(f"{OPERATION}|{int(time.time())}")
-        ctx.services.redis.smembers.side_effect = first_read
-        return set()
+        return [set() for _ in keys]
 
-    ctx.services.redis.smembers.side_effect = started_after_the_first_read
+    ctx.services.redis.smembers_many.side_effect = started_after_the_waves_read
 
     assert await _provider_cores(ctx) == 1.9
 
@@ -1115,8 +1135,7 @@ def _set_redis(store: set[str]) -> MagicMock:
 
 @pytest.mark.asyncio
 async def test_a_started_operation_records_its_helper_until_it_is_forgotten():
-    store: set[str] = set()
-    redis = _set_redis(store)
+    redis = _sets_redis({})
 
     async def running(op):
         return True
@@ -1126,7 +1145,9 @@ async def test_a_started_operation_records_its_helper_until_it_is_forgotten():
     assert await settle_excused_storage_helper_keys(redis, "executor-1", running) == {
         storage_helper_key(OPERATION)
     }
-    redis.expire.assert_awaited_once()
+    redis.expire.assert_any_await(
+        "started_storage_helpers:executor-1", storage_operations.STARTED_STORAGE_HELPERS_TTL_SECONDS
+    )
     await forget_storage_helper(redis, "executor-1", OPERATION)
     assert await settle_excused_storage_helper_keys(redis, "executor-1", running) == set()
 
@@ -1144,6 +1165,191 @@ async def test_a_backend_answer_slower_than_the_redis_timeout_still_excuses(monk
     keys = await settle_excused_storage_helper_keys(_set_redis(store), "executor-1", slow_running)
 
     assert keys == {storage_helper_key(OPERATION)}
+
+
+def test_a_helper_record_read_outlasts_its_wait_on_the_redis_pool():
+    from neurons.validators.src.services.redis_service import (
+        REDIS_POOL_WAIT_TIMEOUT_SECONDS,
+        REDIS_SOCKET_TIMEOUT_SECONDS,
+    )
+
+    timeout = storage_operations._STARTED_STORAGE_HELPERS_READ_TIMEOUT_SEC
+    assert timeout >= REDIS_POOL_WAIT_TIMEOUT_SECONDS + REDIS_SOCKET_TIMEOUT_SECONDS
+
+
+def _sets_redis(sets: dict[str, set[str]]) -> MagicMock:
+    def sadd(key, member):
+        sets.setdefault(key, set()).add(member)
+
+    return MagicMock(
+        sadd=AsyncMock(side_effect=sadd),
+        srem=AsyncMock(side_effect=lambda key, member: sets.get(key, set()).discard(member)),
+        expire=AsyncMock(),
+        smembers=AsyncMock(side_effect=lambda key: set(sets.get(key, ()))),
+        smembers_many=AsyncMock(side_effect=lambda keys: [set(sets.get(k, ())) for k in keys]),
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_wave_reads_every_executors_helper_records_once():
+    sets: dict[str, set[str]] = {}
+    redis = _sets_redis(sets)
+    other = uuid4()
+    await note_started_storage_helper(redis, "executor-1", OPERATION)
+    await note_started_storage_helper(redis, "executor-2", other)
+
+    async def running(op):
+        return True
+
+    keys = await asyncio.gather(
+        *(
+            settle_excused_storage_helper_keys(redis, e, running, wave_id="wave-1")
+            for e in ("executor-1", "executor-2", "executor-3")
+        )
+    )
+
+    assert keys == [{storage_helper_key(OPERATION)}, {storage_helper_key(other)}, set()]
+    redis.smembers_many.assert_awaited_once()
+    redis.smembers.assert_awaited_once()  # the executor list only, not one read per executor
+
+
+@pytest.mark.asyncio
+async def test_a_failed_cleanup_of_expired_executors_keeps_the_waves_records():
+    sets: dict[str, set[str]] = {}
+    redis = _sets_redis(sets)
+    await note_started_storage_helper(redis, "executor-1", OPERATION)
+    sets["started_storage_helper_executors"].add("executor-gone")  # its records expired: cleanup runs
+    redis.srem.side_effect = ConnectionError("redis down")
+
+    async def running(op):
+        return True
+
+    assert await settle_excused_storage_helper_keys(redis, "executor-1", running, wave_id="wave-1") == {
+        storage_helper_key(OPERATION)
+    }
+
+
+@pytest.mark.asyncio
+async def test_a_failed_wave_read_is_read_again_by_the_next_check():
+    sets: dict[str, set[str]] = {}
+    redis = _sets_redis(sets)
+    await note_started_storage_helper(redis, "executor-1", OPERATION)
+    calls = {"n": 0}
+
+    def smembers_many(keys):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise ConnectionError("redis down")
+        return [set(sets.get(k, ())) for k in keys]
+
+    redis.smembers_many.side_effect = smembers_many
+
+    async def running(op):
+        return True
+
+    assert (
+        await settle_excused_storage_helper_keys(redis, "executor-1", running, wave_id="wave-f")
+        == set()
+    )
+    assert await settle_excused_storage_helper_keys(
+        redis, "executor-1", running, wave_id="wave-f"
+    ) == {storage_helper_key(OPERATION)}
+
+
+@pytest.mark.asyncio
+async def test_a_fresh_read_sees_a_helper_started_after_the_waves_read():
+    sets: dict[str, set[str]] = {}
+    redis = _sets_redis(sets)
+
+    async def running(op):
+        return True
+
+    assert (
+        await settle_excused_storage_helper_keys(redis, "executor-1", running, wave_id="wave-1")
+        == set()
+    )
+    await note_started_storage_helper(redis, "executor-1", OPERATION)
+
+    assert (
+        await settle_excused_storage_helper_keys(redis, "executor-1", running, wave_id="wave-1")
+        == set()
+    )
+    assert await settle_excused_storage_helper_keys(redis, "executor-1", running) == {
+        storage_helper_key(OPERATION)
+    }
+    assert await settle_excused_storage_helper_keys(
+        redis, "executor-1", running, wave_id="wave-2"
+    ) == {storage_helper_key(OPERATION)}
+
+
+@pytest.mark.asyncio
+async def test_a_cycle_run_that_repeats_the_previous_id_reads_the_records_again():
+    # an operator-forced cycle in the same BLOCKS_FOR_JOB window gets the previous cycle's id
+    sets: dict[str, set[str]] = {}
+    redis = _sets_redis(sets)
+
+    async def running(op):
+        return True
+
+    assert await settle_excused_storage_helper_keys(redis, "executor-1", running, wave_id="wave-1") == set()
+    await note_started_storage_helper(redis, "executor-1", OPERATION)
+    storage_operations.start_a_new_wave()
+
+    assert await settle_excused_storage_helper_keys(redis, "executor-1", running, wave_id="wave-1") == {
+        storage_helper_key(OPERATION)
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("label", ["Unknown", "pod-watch", None])
+async def test_cycles_under_a_label_that_names_no_cycle_never_share_records(label):
+    # a cycle whose block time could not be read is labelled "Unknown" like the one before it:
+    # the second must read the records again, not reuse the first cycle's
+    from neurons.validators.src.services.task.checks import provider_side_load as psl
+
+    sets: dict[str, set[str]] = {}
+    ctx = MagicMock()
+    ctx.services.redis = _sets_redis(sets)
+    ctx.executor.uuid = "executor-1"
+    ctx.config.job_batch_id = label
+
+    with patch.object(psl, "storage_operation_open", AsyncMock(return_value=True)):
+        assert await psl.excused_storage_helper_keys(ctx, fresh=False) == set()
+        await note_started_storage_helper(ctx.services.redis, "executor-1", OPERATION)
+        assert await psl.excused_storage_helper_keys(ctx, fresh=False) == {
+            storage_helper_key(OPERATION)
+        }
+
+
+@pytest.mark.asyncio
+async def test_checks_of_one_cycle_share_its_records_read():
+    from neurons.validators.src.services.task.checks import provider_side_load as psl
+
+    sets: dict[str, set[str]] = {}
+    ctx = MagicMock()
+    ctx.services.redis = _sets_redis(sets)
+    ctx.executor.uuid = "executor-1"
+    ctx.config.job_batch_id = "2026-11-20 20:00:00"
+
+    with patch.object(psl, "storage_operation_open", AsyncMock(return_value=True)):
+        await psl.excused_storage_helper_keys(ctx, fresh=False)
+        await psl.excused_storage_helper_keys(ctx, fresh=False)
+
+    assert ctx.services.redis.smembers_many.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_an_executor_whose_records_expired_leaves_the_executor_list():
+    sets = {storage_operations.STARTED_STORAGE_HELPER_EXECUTORS_KEY: {"executor-1"}}
+
+    async def running(op):
+        return True
+
+    await settle_excused_storage_helper_keys(
+        _sets_redis(sets), "executor-1", running, wave_id="wave-1"
+    )
+
+    assert sets[storage_operations.STARTED_STORAGE_HELPER_EXECUTORS_KEY] == set()
 
 
 def test_a_helper_record_round_trips():
