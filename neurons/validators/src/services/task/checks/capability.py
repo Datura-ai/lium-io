@@ -52,8 +52,6 @@ GPU_MODEL_VERDICT_KEY = "gpu_model_verdict:{miner_hotkey}:{executor_uuid}"
 GPU_MODEL_VERDICT_TTL_SECONDS = 7 * 24 * 60 * 60
 GPU_MODEL_NO_VERDICT_TTL_SECONDS = 24 * 60 * 60
 GPU_MODEL_FULL_CHECK_DUE_KEY = "gpu_model_full_check_due:{miner_hotkey}:{executor_uuid}"
-# set at each filler stop for a day: a stored full-check failure stops the filler again only after it expires
-GPU_MODEL_FULL_CHECK_WAIT_KEY = "gpu_model_full_check_wait:{miner_hotkey}:{executor_uuid}"
 
 
 class CapabilityCheck:
@@ -80,18 +78,10 @@ class CapabilityCheck:
         filler_container = get_filler_only_container(ctx)
         stopped_filler: list[str] = []
         due_card: int | None = None
-        full_check_failures: list[GpuModelMismatch] = []
         if filler_container:
             seen, mismatches = await stored_gpu_model_verdict(ctx)
-            full_check_failures = [m for m in mismatches if m.kind == FULL_CHECK_FAILED]
-            stopped_filler, due_card = await _stop_filler_when_full_check_due(ctx, seen, bool(full_check_failures))
-            if full_check_failures and not stopped_filler:
-                # a proven wrong answer stands until a full check passes; the filler runs on until the daily retry
-                return gpu_model_mismatch_result(
-                    ctx,
-                    self.check_id,
-                    {**full_check_failures[0].as_dict(), "filler_container": filler_container, "transport": "filler"},
-                )
+            if not seen:
+                stopped_filler, due_card = await _stop_filler_when_full_check_due(ctx)
         if filler_container and not stopped_filler:
             what_filler: dict = {"filler_container": filler_container}
             cycle = _filler_cycle_index(ctx)
@@ -254,17 +244,15 @@ class CapabilityCheck:
         if stopped_filler:
             failure_details["stopped_fillers_for_full_check"] = stopped_filler
             if _probe_gave_wrong_answer(result):
-                # stored, so the node fails every cycle until a full check passes, not this cycle only
-                await judge_gpu_model(ctx, [full_check_failed(specs, 0)], {0})
-            elif full_check_failures:
-                # no answer clears nothing: the stored wrong answer stands
+                # stored like any mismatch: until a full check passes, the node fails and Lium's filler is removed
+                failed = full_check_failed(specs, 0)
+                await judge_gpu_model(ctx, [failed], {0})
                 return gpu_model_mismatch_result(
-                    ctx, self.check_id, {**full_check_failures[0].as_dict(), "transport": transport, **failure_details}
+                    ctx, self.check_id, {**failed.as_dict(), "transport": transport, **failure_details}
                 )
-            else:
-                # DAH-6332: only a wrong answer proves a mismatch; the day entry stored at the stop retries the node
-                event = render_message(Msg.FULL_CHECK_INCONCLUSIVE, ctx=ctx, check_id=self.check_id, what=failure_details)
-                return CheckResult(passed=True, event=event)
+            # DAH-6332: only a wrong answer proves a mismatch; the day entry stored at the stop retries the node
+            event = render_message(Msg.FULL_CHECK_INCONCLUSIVE, ctx=ctx, check_id=self.check_id, what=failure_details)
+            return CheckResult(passed=True, event=event)
 
         if _probe_gave_no_answer(result):
             lium_workload = await lium_workload_live_now(ctx)
@@ -597,18 +585,6 @@ def _full_check_due_key(ctx: Context) -> str:
     return GPU_MODEL_FULL_CHECK_DUE_KEY.format(miner_hotkey=ctx.miner_hotkey, executor_uuid=ctx.executor.uuid)
 
 
-def _full_check_wait_key(ctx: Context) -> str:
-    return GPU_MODEL_FULL_CHECK_WAIT_KEY.format(miner_hotkey=ctx.miner_hotkey, executor_uuid=ctx.executor.uuid)
-
-
-async def _full_check_waits(ctx: Context) -> bool:
-    """True for a day after a filler stop. A Redis error also waits: the filler is never stopped for it."""
-    try:
-        return await ctx.services.redis.get(_full_check_wait_key(ctx)) is not None
-    except Exception:
-        return True
-
-
 async def _mark_full_check_due(ctx: Context, card_index: int) -> None:
     if settings.DRY_RUN:
         return
@@ -653,45 +629,24 @@ def _lium_filler(ctx: Context) -> bool:
     return rented_data is not None and rented_data.get_default_job_owner(ctx.executor.uuid) == DEFAULT_JOB_OWNER_LIUM
 
 
-async def _stop_filler_when_full_check_due(
-    ctx: Context, seen: bool, failure_stands: bool
-) -> tuple[list[str], int | None]:
-    """(the fillers stopped for the full check, the card whose sample failed); ([], None) when no check is due.
-    A stored full-check failure makes the check due once a day; its card is carried by the stored mismatch."""
-    if failure_stands:
-        if await _full_check_waits(ctx):
-            return [], None
-        return await _stop_filler_for_full_check(ctx, keep_verdict=True), None
-    if seen:
-        return [], None
-    due_card = await _full_check_due_card(ctx)
-    if due_card is None:
-        return [], None
-    return await _stop_filler_for_full_check(ctx, keep_verdict=False), due_card
-
-
-async def _stop_filler_for_full_check(ctx: Context, *, keep_verdict: bool) -> list[str]:
+async def _stop_filler_when_full_check_due(ctx: Context) -> tuple[list[str], int | None]:
     """DAH-6332: the cycle after a filler sample with no verdict, stop Lium's filler on the node once so
     the full GPU check runs on idle cards; the default job places a filler again afterwards. The node
     then keeps the once-a-day pace unless the full check stores a real verdict, so a node is never
     stopped every cycle. Another owner's filler is not ours to stop: its node keeps being sampled.
-    Called only while the mark is set or a stored full-check failure is due its daily retry (`keep_verdict`).
-    Returns the stopped filler names, or [] when the filler path runs as before."""
+    Returns (the stopped filler names, the card whose sample failed), or ([], None) when the filler path
+    runs as before."""
+    due_card = await _full_check_due_card(ctx)
+    if due_card is None or settings.DRY_RUN or not _lium_filler(ctx):
+        return [], None
     rented_data = ctx.state.rented_data
-    if settings.DRY_RUN or rented_data.get_default_job_owner(ctx.executor.uuid) != DEFAULT_JOB_OWNER_LIUM:
-        return []
     removed = await remove_lium_fillers(ctx, rented_data.get_filler_containers(ctx.executor.uuid))
     if not removed:
-        return []  # the filler still holds the cards: the mark stays and the next cycle tries again
+        return [], None  # the filler still holds the cards: the mark stays and the next cycle tries again
     with contextlib.suppress(Exception):
         await ctx.services.redis.delete(_full_check_due_key(ctx))
-    with contextlib.suppress(Exception):
-        await ctx.services.redis.set(_full_check_wait_key(ctx), "1", ex=GPU_MODEL_NO_VERDICT_TTL_SECONDS)
-    if keep_verdict:
-        await refresh_gpu_model_verdict(ctx)  # the failure ends with a pass, not the TTL
-    else:
-        await _store_gpu_model_verdict(ctx, [], GPU_MODEL_NO_VERDICT_TTL_SECONDS)
-    return removed
+    await _store_gpu_model_verdict(ctx, [], GPU_MODEL_NO_VERDICT_TTL_SECONDS)
+    return removed, due_card
 
 
 async def _read_gpu_model_verdict(ctx: Context) -> tuple[bool, list[GpuModelMismatch], set[int], bool]:

@@ -912,11 +912,11 @@ RIGHT_ANSWER = ValidationResult(success=True, metrics=REAL_H100[1])
 @pytest.mark.asyncio
 @pytest.mark.parametrize("all_cards", [False, True], ids=["all_cards_off", "all_cards_on"])
 @pytest.mark.parametrize("card", [0, 1], ids=["card_0", "due_card"])
-@pytest.mark.parametrize("retry", [RIGHT_ANSWER, NO_ROOM, WRONG_UUID], ids=["passes", "no_answer", "wrong_uuid"])
-async def test_a_wrong_uuid_after_the_stop_fails_the_node_every_cycle_until_a_daily_full_check_passes(
+@pytest.mark.parametrize("retry", [NO_ROOM, WRONG_UUID], ids=["no_answer", "wrong_uuid"])
+async def test_a_wrong_uuid_after_the_stop_fails_the_node_and_removes_the_filler_until_a_full_check_passes(
     context_factory, sample_never_due, monkeypatch, all_cards, card, retry
 ):
-    # review: the empty day entry stored at the stop passed the node, filler and all, for a day
+    # review: a proven wrong answer is stored like any mismatch, under all-cards on and off
     monkeypatch.setattr(capability.settings, "MATMUL_ALLCARDS_CHECK_ENABLED", all_cards)
     monkeypatch.setattr(capability.settings, "MATMUL_ALLCARDS_ENFORCEMENT_ENABLED", all_cards)
     redis = FakeRedis()
@@ -924,38 +924,32 @@ async def test_a_wrong_uuid_after_the_stop_fails_the_node_every_cycle_until_a_da
     def service_answering(answer: ValidationResult):
         return _DueCardService(answer) if card else SamplingValidationService(result=answer)
 
+    def without_filler(service):
+        return context_factory(services=build_services(validation=service, redis=redis), state=build_state(specs=TWO_H100))
+
     ctx = _two_card_filler_ctx(context_factory, redis, service_answering(WRONG_UUID))
     await redis.set(capability._full_check_due_key(ctx), str(card))
     result = await CapabilityCheck().run(ctx)
     assert result.passed is False
+    assert result.event.reason_code == Msg.GPU_WORK_PROOF_FAILED.reason
     assert result.event.what_we_saw["stopped_fillers_for_full_check"] == ["filler_active"]
     assert _stored_kinds(redis) == [(card, "full_check_failed")]
 
-    for _ in range(3):  # the filler is back: the node fails, and the filler is neither stopped nor sampled
-        service = service_answering(RIGHT_ANSWER)
-        ctx = _two_card_filler_ctx(context_factory, redis, service)
-        result = await CapabilityCheck().run(ctx)
-        assert result.passed is False
-        assert result.event.reason_code == Msg.GPU_WORK_PROOF_FAILED.reason
-        assert service.budgets == []
-        ctx.ssh.run.assert_not_awaited()
+    # the default job placed a filler again: the node fails and the filler is removed, as on any stored mismatch
+    service = service_answering(RIGHT_ANSWER)
+    result = await CapabilityCheck().run(_two_card_filler_ctx(context_factory, redis, service))
+    assert result.passed is False
+    assert result.event.reason_code == Msg.GPU_WORK_PROOF_FAILED.reason
+    assert result.event.what_we_saw["removed_fillers"] == ["filler_active"]
+    assert service.budgets == []
 
-    del redis.store[capability._full_check_wait_key(ctx)]  # a day later: the full check runs again, once
-    ctx = _two_card_filler_ctx(context_factory, redis, service_answering(retry))
-    result = await CapabilityCheck().run(ctx)
-    assert result.event.what_we_saw["stopped_fillers_for_full_check"] == ["filler_active"]
-    assert result.passed is retry.success
-    assert redis.ttl[_verdict_key()] == capability.GPU_MODEL_VERDICT_TTL_SECONDS
-    assert redis.ttl[capability._full_check_wait_key(ctx)] == capability.GPU_MODEL_NO_VERDICT_TTL_SECONDS
+    # no filler: the normal full check runs; a retry with no answer or a wrong answer clears nothing
+    assert (await CapabilityCheck().run(without_filler(service_answering(retry)))).passed is False
+    assert _stored_kinds(redis) == [(card, "full_check_failed")]
 
     # only a full check that passes clears it
-    service = service_answering(RIGHT_ANSWER)
-    ctx = _two_card_filler_ctx(context_factory, redis, service)
-    result = await CapabilityCheck().run(ctx)
-    assert result.passed is retry.success
-    assert service.budgets == []
-    ctx.ssh.run.assert_not_awaited()
-    assert bool(_stored_kinds(redis)) is not retry.success
+    assert (await CapabilityCheck().run(without_filler(service_answering(RIGHT_ANSWER)))).passed is True
+    assert _stored_kinds(redis) == []
 
 
 @pytest.mark.asyncio
