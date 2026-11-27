@@ -3520,7 +3520,8 @@
         "OperationInProgress",
         "ExecutorUnreachable",
         "ClockLockNotSupported",
-        "GpusLostOnHost"
+        "GpusLostOnHost",
+        "ResetUnconfirmed"
       ],
       "title": "GpuResetErrorCode",
       "type": "string"

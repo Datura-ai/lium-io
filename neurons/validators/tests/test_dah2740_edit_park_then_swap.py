@@ -95,6 +95,8 @@ def _ssh_recording(*, container_present: bool = True, stop_exit: int = 0, rename
             return _ssh_result(stdout="drop\n")
         if "/proc/$p/mountinfo" in cmd:  # the park's mount read: the plaintext path is not mounted
             return _ssh_result(stdout="unmounted\n")
+        if " -rgc " in cmd:  # DAH-4663: the clock reset answers for the pod's GPU
+            return _ssh_result(stdout="GPU-test 0\nGPU-test -rac 0\nGPU-test -rmc 0\n")
         if cmd == HUNG_GPU_QUERY_COMMAND:  # DAH-5301: the pod's GPU is healthy
             return _ssh_result(stdout="GPU-test, 0, 0\n--compute-apps--\n")
         if "docker stop" in cmd:
@@ -176,6 +178,7 @@ async def test_a_successful_edit_runs_the_same_host_commands(svc, monkeypatch):
     # the real clock-lock safety net (conftest stubs it): its -rgc is one of the host commands
     monkeypatch.setattr("services.docker_service.reset_leftover_clock_locks", gpu_clocks.reset_leftover_clock_locks)
     monkeypatch.setattr(svc.redis_service, "get", AsyncMock(return_value=None), raising=False)  # no lock records
+    monkeypatch.setattr(gpu_clocks.secrets, "token_hex", lambda _n: "t")  # the reset's results file name
 
     name, parked = _pod_name(payload), _kept(payload)
 
@@ -223,10 +226,14 @@ async def test_a_successful_edit_runs_the_same_host_commands(svc, monkeypatch):
         # the kept workspace is read before the run spec binds its name (a missing one would be created empty)
         f"/usr/bin/docker volume inspect {payload.local_volume} --format '{{{{.Driver}}}}'",
         # DAH-4663: the clock-lock safety net resets the pod's GPUs, inside the failed-create cleanup, before docker run
-        # then, in the same call, each reset under its own SIGKILL timeout: application and memory clocks back to default
-        "nvidia-smi -i GPU-test -rgc >/dev/null 2>&1; echo GPU-test $?; sh -c "
-        "'( timeout -s KILL 15 nvidia-smi -i GPU-test -rac >/dev/null 2>&1; echo GPU-test -rac $?; "
-        "timeout -s KILL 15 nvidia-smi -i GPU-test -rmc >/dev/null 2>&1; echo GPU-test -rmc $? ) & wait'",
+        # with application and memory clocks, every GPU in parallel, each reset under its own SIGKILL timeout
+        "sh -c '( timeout -s KILL 15 nvidia-smi -i GPU-test -rgc >/dev/null 2>&1; "
+        "echo GPU-test $? | tee -a /tmp/lium-gpu-clock-reset-t 2>/dev/null; "
+        "timeout -s KILL 15 nvidia-smi -i GPU-test -rac >/dev/null 2>&1; "
+        "echo GPU-test -rac $? | tee -a /tmp/lium-gpu-clock-reset-t 2>/dev/null; "
+        "timeout -s KILL 15 nvidia-smi -i GPU-test -rmc >/dev/null 2>&1; "
+        "echo GPU-test -rmc $? | tee -a /tmp/lium-gpu-clock-reset-t 2>/dev/null ) & "
+        "wait; rm -f /tmp/lium-gpu-clock-reset-t'",
         host_key,
         # the validator's own collector starter (services.executor_payload), not the executor's reported paths
         DockerService._build_inspector_collector_command(_executor_info(payload), "start"),

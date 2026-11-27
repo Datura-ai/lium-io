@@ -17,7 +17,7 @@ from unittest.mock import AsyncMock
 import pytest
 from payload_models.payloads import GpuResetErrorCode
 from services.gpu_clocks import (
-    APP_MEM_CLOCK_RESET_TIMEOUT_SECONDS,
+    PER_RESET_TIMEOUT_SECONDS,
     build_clock_command,
     clamp_range,
     clock_locked_gpu_uuids,
@@ -40,8 +40,10 @@ class FakeHost:
     """Answers the commands by what they start with; records every command."""
 
     def __init__(self, *, device_ids=(U[0], U[1]), count=None, mig=(), runtime="runc", inspect_exit=0,
-                 lgc_exit=0, rgc_exit=0, supported=SUPPORTED, app_mem_exit=0):
+                 lgc_exit=0, rgc_exit=0, supported=SUPPORTED, app_mem_exit=0, answered=()):
         self.commands: list[str] = []
+        self.answered = answered  # rgc_exit None: the GPUs whose lines reached the host's results file before the overrun
+        self.files: dict[str, str] = {}
         self.timeouts: list[int] = []
         self.app_mem_exit = app_mem_exit  # None: the host's timeout kills the -rac/-rmc batch (no line of theirs)
         request = {"Count": count or 0, "DeviceIDs": list(device_ids) or None, "Capabilities": [["gpu"]]}
@@ -64,8 +66,12 @@ class FakeHost:
             return make_command_result(self.lgc_exit == 0, "not supported", exit_code=self.lgc_exit)
         if "--query-gpu=clocks.gr" in cmd:
             return make_command_result(True, "1410")
+        if cmd.startswith("cat /tmp/lium-gpu-clock-reset-"):  # the read-back after a lost answer
+            return make_command_result(True, self.files.pop(cmd.split()[1], ""))
         if " -rgc " in cmd:  # the batched resets: "<uuid> <exit>" per GPU, then "<uuid> <flag> <exit>" per -rac/-rmc
             if self.rgc_exit is None:  # the whole call times out: the runner answers -1, no output
+                path = re.search(r"tee -a (\S+) ", cmd).group(1)
+                self.files[path] = "".join(f"{u} 0\n{u} -rac 0\n{u} -rmc 0\n" for u in self.answered)
                 return make_command_result(False, "", exit_code=-1)
             lines = [f"{u} {self.rgc_exit}" for u in _reset_uuids(cmd)]
             if self.app_mem_exit is not None:
@@ -85,7 +91,7 @@ def _assert_invariants(host: FakeHost, allowed) -> None:
 
 
 def _reset_uuids(cmd: str) -> list[str]:
-    return [part.split()[2] for part in cmd.split("; ") if part.startswith("nvidia-smi -i ") and " -rgc " in part]
+    return re.findall(r"nvidia-smi -i (\S+) -rgc ", cmd)
 
 
 async def _lock(host, redis=None, *, backend=(U[0], U[1]), indices=None, lo=1200, hi=1500, reset=False, **kw):
@@ -273,45 +279,70 @@ async def test_reset_runs_rgc_per_gpu_and_clears_the_records():
 
 
 @pytest.mark.asyncio
-async def test_a_create_resets_application_and_memory_clocks_after_the_graphics_reset_of_every_gpu():
-    """A host's -ac/-lmc (or a pod's -ac once the host ran -acp UNRESTRICTED) never reaches the next renter: after
-    the -rgc batch, in the same SSH call (one round trip on the create's path), each under its own host-side timeout,
-    -rac/-rmc reset them on every GPU in parallel and echo each exit."""
+async def test_a_create_resets_graphics_application_and_memory_clocks_of_every_gpu_in_one_call():
+    """A host's -ac/-lmc (or a pod's -ac once the host ran -acp UNRESTRICTED) never reaches the next renter: in one SSH
+    call, every GPU in parallel runs -rgc, -rac, -rmc, each under its own host-side SIGKILL timeout, and echoes each
+    exit."""
     host, redis = FakeHost(), FakeRedis()
     assert await reset_leftover_clock_locks(host, redis, [U[0], U[1]]) == []
     _assert_invariants(host, [U[0], U[1]])
     (cmd,) = host.commands
-    rgc, _, app_mem = cmd.partition("; sh -c ")
-    assert _reset_uuids(rgc) == [U[0], U[1]] and " -rac" not in rgc
-    resets = " ".join(
-        "( " + "; ".join(f"timeout -s KILL {APP_MEM_CLOCK_RESET_TIMEOUT_SECONDS / 2:g} nvidia-smi -i {u} {flag} "
-                         f">/dev/null 2>&1; echo {u} {flag} $?" for flag in ("-rac", "-rmc"))
+    t = f"timeout -s KILL {PER_RESET_TIMEOUT_SECONDS:g}"
+    f = re.search(r"tee -a (/tmp/lium-gpu-clock-reset-[0-9a-f]{16}) ", cmd).group(1)
+    jobs = " ".join(
+        f"( {t} nvidia-smi -i {u} -rgc >/dev/null 2>&1; echo {u} $? | tee -a {f} 2>/dev/null; "
+        + "; ".join(
+            f"{t} nvidia-smi -i {u} {flag} >/dev/null 2>&1; echo {u} {flag} $? | tee -a {f} 2>/dev/null"
+            for flag in ("-rac", "-rmc")
+        )
         + " ) &"
         for u in (U[0], U[1])
-    ) + " wait"
-    assert app_mem == f"'{resets}'"
-    # the runner waits past both budgets, so a stalled -rac/-rmc is killed on the host before the call is given up
-    assert host.timeouts[0] > 30 + APP_MEM_CLOCK_RESET_TIMEOUT_SECONDS
+    )
+    # each line goes to stdout and the host file as its reset ends; the file goes once every reset is done
+    assert cmd == f"sh -c '{jobs} wait; rm -f {f}'"
+    # the runner waits past one GPU's three resets, so a stalled one is killed on the host before the call is given up
+    assert host.timeouts[0] > 3 * PER_RESET_TIMEOUT_SECONDS
+
+
+def _fake_nvidia_smi(tmp_path, body: str) -> dict:
+    fake = tmp_path / "nvidia-smi"
+    fake.write_text(f"#!/bin/sh\n{body}")
+    fake.chmod(0o755)
+    return {**os.environ, "PATH": f"{tmp_path}:{os.environ['PATH']}"}
 
 
 @pytest.mark.asyncio
-async def test_application_and_memory_clock_resets_of_an_8_gpu_node_run_in_parallel_inside_the_budget(tmp_path):
-    """Prod 18-19 Nov: on 8-GPU H200/B300 nodes the 16 nvidia-smi runs one after another outlasted the 30 s budget,
-    so no GPU's clocks were reset. Run for real with a 1 s nvidia-smi: 8 GPUs answer in about one call's time."""
-    fake = tmp_path / "nvidia-smi"
-    fake.write_text("#!/bin/sh\nsleep 1\n")
-    fake.chmod(0o755)
+async def test_the_resets_of_an_8_gpu_node_run_in_parallel_and_answer_whatever_the_gpu_count(tmp_path):
+    """Prod 25 Nov (8x H200): the -rgc runs went one GPU after another with no bound of their own, so with the
+    -rac/-rmc batch the call outlasted the runner's budget and gave no answer at all. Run for real with a 1 s
+    nvidia-smi: 8 GPUs answer all 24 resets in about three runs' time (one after another: 8 s of -rgc alone)."""
+    env = _fake_nvidia_smi(tmp_path, "sleep 1\n")
     uuids = [f"GPU-{i:08d}-0000-0000-0000-000000000000" for i in range(8)]
-    cmd = gpu_clocks._reset_app_and_memory_clocks(uuids)
     t0 = time.monotonic()
     proc = await asyncio.create_subprocess_shell(
-        cmd, stdout=asyncio.subprocess.PIPE, env={**os.environ, "PATH": f"{tmp_path}:{os.environ['PATH']}"}
+        gpu_clocks._reset_command(uuids, None, str(tmp_path / "results")), stdout=asyncio.subprocess.PIPE, env=env
     )
     out, _ = await proc.communicate()
     elapsed = time.monotonic() - t0
     lines = sorted(out.decode().split("\n")[:-1])
-    assert lines == sorted(f"{u} {flag} 0" for u in uuids for flag in ("-rac", "-rmc"))
-    assert elapsed < 6, f"{elapsed:.1f} s: the resets ran one after another (16 s)"
+    assert lines == sorted([f"{u} 0" for u in uuids] + [f"{u} {flag} 0" for u in uuids for flag in ("-rac", "-rmc")])
+    assert elapsed < 6, f"{elapsed:.1f} s: the resets ran one after another"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("results", ["results", "missing-dir/results"])
+async def test_every_line_reaches_stdout_whether_or_not_the_host_file_can_be_written(tmp_path, results):
+    """Review (lio#2499): a host whose /tmp cannot be written still answers every reset; no file is left either way."""
+    env = _fake_nvidia_smi(tmp_path, "exit 0\n")
+    path = tmp_path / results
+    proc = await asyncio.create_subprocess_shell(
+        gpu_clocks._reset_command([U[0], U[1]], None, str(path)), stdout=asyncio.subprocess.PIPE, env=env
+    )
+    out, _ = await proc.communicate()
+    expected = [f"{u} 0" for u in (U[0], U[1])] + [f"{u} {flag} 0" for u in (U[0], U[1]) for flag in ("-rac", "-rmc")]
+    assert sorted(out.decode().split("\n")[:-1]) == sorted(expected)
+    assert proc.returncode == 0
+    assert not path.exists()
 
 
 def _alive(pid: int) -> bool:
@@ -334,64 +365,140 @@ wait "$c"
 @pytest.mark.asyncio
 @pytest.mark.parametrize("child_only_timeout", [False, True])
 @pytest.mark.parametrize("ignores_term", [False, True])
-async def test_a_stalled_application_or_memory_reset_is_killed_on_the_host_and_the_rgc_lines_still_come_back(
-    tmp_path, monkeypatch, ignores_term, child_only_timeout
+@pytest.mark.parametrize("stalls", ["-rgc", "-rac"])
+async def test_a_stalled_reset_is_killed_on_the_host_and_every_other_line_still_comes_back(
+    tmp_path, monkeypatch, ignores_term, child_only_timeout, stalls
 ):
-    """Review (lio#2309): in one SSH call a hung -rac/-rmc must not hold the -rgc results. Run for real: an
-    nvidia-smi that never returns is killed by the batch's host-side timeout, the -rgc lines already printed come
-    back, and the call ends near that timeout. Review (lio#2362): one that ignores TERM is killed too, so it never
-    changes clocks after the handoff (it would touch the marker 3 s in). Review (lio#2362, 24 Nov): none is still
-    alive when the call returns, so the create never starts beside a running reset."""
-    marker = tmp_path / "still-running"
-    pids = tmp_path / "pids"
-    fake = tmp_path / "nvidia-smi"
+    """Review (lio#2309): a hung reset must not hold the other results. Run for real: an nvidia-smi that never
+    returns is killed by its own host-side timeout (137), every other line comes back, and the call ends near that
+    timeout. Review (lio#2362): one that ignores TERM is killed too, so it never changes clocks after the handoff (it
+    would touch the marker 3 s in), and none is alive when the call returns. Prod 25 Nov: a hung -rgc is bounded too."""
+    marker, pids = tmp_path / "still-running", tmp_path / "pids"
     trap = 'trap "" TERM\n' if ignores_term else ""
-    fake.write_text(f"#!/bin/sh\necho $$ >> {pids}\n{trap}sleep 3\ntouch {marker}\n")
-    fake.chmod(0o755)
+    env = _fake_nvidia_smi(tmp_path, f'[ "$3" = {stalls} ] || exit 0\necho $$ >> {pids}\n{trap}sleep 3\ntouch {marker}\n')
     if child_only_timeout:
         (tmp_path / "timeout").write_text(_CHILD_ONLY_TIMEOUT)
         (tmp_path / "timeout").chmod(0o755)
-    monkeypatch.setattr(gpu_clocks, "APP_MEM_CLOCK_RESET_TIMEOUT_SECONDS", 1)
-    cmd = f"echo {U[0]} 0; echo {U[1]} 0; {gpu_clocks._reset_app_and_memory_clocks([U[0], U[1]])}"
+    monkeypatch.setattr(gpu_clocks, "PER_RESET_TIMEOUT_SECONDS", 1)
     t0 = time.monotonic()
     proc = await asyncio.create_subprocess_shell(
-        cmd, stdout=asyncio.subprocess.PIPE, env={**os.environ, "PATH": f"{tmp_path}:{os.environ['PATH']}"}
+        gpu_clocks._reset_command([U[0], U[1]], None, str(tmp_path / "results")), stdout=asyncio.subprocess.PIPE, env=env
     )
     out, _ = await asyncio.wait_for(proc.communicate(), timeout=20)
     elapsed = time.monotonic() - t0
-    assert out.decode().split("\n")[:2] == [f"{U[0]} 0", f"{U[1]} 0"]
+    expected = {f"{u} {'137' if stalls == '-rgc' else '0'}" for u in (U[0], U[1])} | {
+        f"{u} {flag} {'137' if flag == stalls else '0'}" for u in (U[0], U[1]) for flag in ("-rac", "-rmc")
+    }
+    assert set(out.decode().split("\n")[:-1]) == expected
     assert elapsed < 2.5, f"{elapsed:.1f} s: the stalled reset was not killed on the host"
     started = [int(pid) for pid in pids.read_text().split()]
-    assert len(started) == 4  # -rac then -rmc on both GPUs
-    assert [pid for pid in started if _alive(pid)] == [], (
-        "an nvidia-smi was still running when the call returned"
-    )
+    assert len(started) == 2  # the stalled reset on both GPUs
+    assert [pid for pid in started if _alive(pid)] == [], "an nvidia-smi was still running when the call returned"
     await asyncio.sleep(4 - elapsed)
     assert not marker.exists(), "an nvidia-smi outlived the call"
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("app_mem_exit", [None, 1])
-async def test_a_stalled_or_failed_application_or_memory_reset_keeps_the_rgc_results_and_the_create(
+@pytest.mark.parametrize("app_mem_exit", [1, 6])
+async def test_an_answered_failed_or_not_found_application_or_memory_reset_keeps_the_rgc_results_and_the_create(
     app_mem_exit, caplog
 ):
-    """Review: a -rac/-rmc that times out (killed on the host) or fails never erases the -rgc results: the GPUs' lock
-    records from a previous rental go, the create is not refused, and each failure is logged; exit 3 (not supported)
-    is not."""
+    """Review: a -rac/-rmc that answered a failure, or 6 "not found" beside an answered -rgc, never erases the -rgc
+    results: the GPUs' lock records from a previous rental go and the create is not refused; a failure is logged, and
+    exit 3 (not supported) is not."""
     host, redis = FakeHost(app_mem_exit=app_mem_exit), FakeRedis()
     for u in (U[0], U[1]):
         redis.store[f"gpu_clock_lock:{u}"] = json.dumps({"pod_id": "old"})
     with caplog.at_level("WARNING", logger="services.gpu_clocks"):
         assert await reset_leftover_clock_locks(host, redis, [U[0], U[1]]) == []
     assert not any(k.startswith("gpu_clock_lock:") for k in redis.store)
-    expected = "unknown" if app_mem_exit is None else "1"
-    assert caplog.text.count("gpu_clock_action=rac_rmc_failed") == 4 and f"exit={expected}" in caplog.text
+    assert caplog.text.count("gpu_clock_action=rac_rmc_failed") == (4 if app_mem_exit == 1 else 0)
 
     caplog.clear()
     host.app_mem_exit = 3
     with caplog.at_level("WARNING", logger="services.gpu_clocks"):
         assert await reset_leftover_clock_locks(host, redis, [U[0]]) == []
     assert "rac_rmc_failed" not in caplog.text
+
+
+@pytest.mark.asyncio
+# review (lio#2499): uutils timeout (Ubuntu 26.04) exits 124 where GNU `timeout -s KILL` exits 137
+@pytest.mark.parametrize("app_mem_exit", [None, 137, 124], ids=["no-line", "killed-gnu", "killed-uutils"])
+@pytest.mark.parametrize("rgc_exit", [0, 3, 4])
+@pytest.mark.parametrize("recorded", [False, True])
+async def test_an_application_or_memory_reset_that_gave_no_answer_refuses_the_create_only_on_a_recorded_gpu(
+    app_mem_exit, rgc_exit, recorded, caplog
+):
+    """Any clock reset that gave no answer (graphics, application or memory) leaves the GPU's clocks unknown: a GPU with
+    a lock record refuses the create and keeps its record; one without is logged per GPU and the create goes on (review
+    6076421144, staged until a week of 8-GPU creates is read)."""
+    host, redis = FakeHost(rgc_exit=rgc_exit, app_mem_exit=app_mem_exit), FakeRedis()
+    if recorded:
+        redis.store[f"gpu_clock_lock:{U[0]}"] = json.dumps({"pod_id": "old"})
+    with caplog.at_level("WARNING", logger="services.gpu_clocks"):
+        refused = await reset_leftover_clock_locks(
+            host, redis, [U[0], U[1]], keep_pod_id="pod9", purpose="create", node_id="node7"
+        )
+    assert refused == ([U[0]] if recorded else [])
+    assert (f"gpu_clock_lock:{U[0]}" in redis.store) == recorded
+    logged = [r.getMessage() for r in caplog.records if "reset_no_answer_unrecorded" in r.getMessage()]
+    assert len(logged) == (1 if recorded else 2)
+    assert logged[-1].startswith(f"gpu_clock_action=reset_no_answer_unrecorded purpose=create node=node7 pod=pod9 gpu={U[1]} ")
+    assert f"gpu_clock_action=rgc_failed node=node7 pod=pod9 gpu={U[1]} recorded=false" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_a_lost_answers_read_back_is_bounded_to_10_seconds():
+    """Review: the read-back after a lost answer keeps the create's wait under its old budget."""
+    host = FakeHost(rgc_exit=None, answered=[U[0]])
+    await reset_leftover_clock_locks(host, FakeRedis(), [U[0], U[1]])
+    assert host.commands[-1].startswith("cat /tmp/lium-gpu-clock-reset-") and host.timeouts[-1] == 10
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("rgc_exit", "app_mem_exit", "counts", "warned"),
+    [
+        (0, 0, "rgc_ok=2 rgc_failed=0 rgc_no_answer=0 app_mem_ok=4 app_mem_unsupported=0 app_mem_not_found=0", 0),
+        # prod 26 Nov (8x RTX 4090 48GB): -rac/-rmc answer 6 "not found" on a GPU whose -rgc answered: no such control
+        (0, 6, "rgc_ok=2 rgc_failed=0 rgc_no_answer=0 app_mem_ok=0 app_mem_unsupported=0 app_mem_not_found=4", 0),
+        # a completed -rgc refusal (3 not supported, 4 no permission) still found the GPU: its 6s are not found too
+        (3, 6, "rgc_ok=0 rgc_failed=2 rgc_no_answer=0 app_mem_ok=0 app_mem_unsupported=0 app_mem_not_found=4", 0),
+        (4, 6, "rgc_ok=0 rgc_failed=2 rgc_no_answer=0 app_mem_ok=0 app_mem_unsupported=0 app_mem_not_found=4", 0),
+        # review (lio#2499): -rgc 15 (GPU fell off the bus) leaves the GPU in doubt: its -rac/-rmc 6s are failed resets,
+        # one warning each
+        (15, 6, "rgc_ok=0 rgc_failed=2 rgc_no_answer=0 app_mem_ok=0 app_mem_unsupported=0 app_mem_not_found=0 "
+                "app_mem_failed=4", 4),
+        # a 6 beside an -rgc that also answered 6 may be the GPU itself not found: a failure
+        (6, 6, "rgc_ok=0 rgc_failed=2 rgc_no_answer=0 app_mem_ok=0 app_mem_unsupported=0 app_mem_not_found=0", 4),
+        # killed by the host's timeout: no verdict
+        (137, 137, "rgc_ok=0 rgc_failed=0 rgc_no_answer=2 app_mem_ok=0 app_mem_unsupported=0 app_mem_not_found=0", 4),
+        # the same kill under uutils timeout (review lio#2499)
+        (124, 124, "rgc_ok=0 rgc_failed=0 rgc_no_answer=2 app_mem_ok=0 app_mem_unsupported=0 app_mem_not_found=0", 4),
+        # prod 25 Nov (8x H200): the whole call gave no answer
+        (None, None, "rgc_ok=0 rgc_failed=0 rgc_no_answer=2 app_mem_ok=0 app_mem_unsupported=0 app_mem_not_found=0", 4),
+    ],
+)
+async def test_every_create_reset_logs_one_outcome_line(rgc_exit, app_mem_exit, counts, warned, caplog):
+    """A successful reset logs a line too, so the resets of creates can be counted, not only their failures."""
+    host, redis = FakeHost(rgc_exit=rgc_exit, app_mem_exit=app_mem_exit), FakeRedis()
+    with caplog.at_level("INFO", logger="services.gpu_clocks"):
+        await reset_leftover_clock_locks(host, redis, [U[0], U[1]], keep_pod_id="pod9", purpose="create")
+    (line,) = [r.getMessage() for r in caplog.records if "reset_outcome" in r.getMessage()]
+    assert line.startswith(f"gpu_clock_action=reset_outcome purpose=create pod=pod9 gpus=2 {counts} ")
+    assert caplog.text.count("gpu_clock_action=rac_rmc_failed") == warned
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("killed_exit", [137, 124], ids=["gnu", "uutils"])
+async def test_a_gpu_whose_rgc_was_killed_has_no_verdict_and_refuses_the_create_only_with_a_record(killed_exit):
+    """A -rgc killed on the host gave no verdict: a recorded GPU may still hold our lowered clocks, so it refuses the
+    create and keeps its record; an unrecorded one is logged only (review 6076421144). GNU and uutils timeout alike."""
+    host, redis = FakeHost(rgc_exit=killed_exit), FakeRedis()
+    assert await reset_leftover_clock_locks(host, redis, [U[0], U[1]]) == []
+    redis.store[f"gpu_clock_lock:{U[0]}"] = json.dumps({"pod_id": "old"})
+    assert await reset_leftover_clock_locks(host, redis, [U[0], U[1]]) == [U[0]]
+    assert f"gpu_clock_lock:{U[0]}" in redis.store
 
 
 @pytest.mark.asyncio
@@ -625,7 +732,7 @@ async def test_a_create_reset_answers_every_gpu_it_could_not_reset_unless_it_has
     with caplog.at_level(logging.WARNING):
         assert await reset_leftover_clock_locks(host, redis, [U[0], U[1]]) == expected
     assert f"gpu_clock_lock:{U[0]}" in redis.store, "kept for the next try"
-    assert f"gpu_clock_action=rgc_failed gpu={U[1]} recorded=false" in caplog.text, "every unrecorded failure is logged"
+    assert f"gpu_clock_action=rgc_failed node=- pod=- gpu={U[1]} recorded=false" in caplog.text, "every unrecorded failure is logged"
 
 
 @pytest.mark.asyncio
@@ -645,28 +752,69 @@ async def test_the_pods_own_edit_or_reboot_keeps_its_lock_and_another_pods_creat
 
 
 @pytest.mark.asyncio
-async def test_a_create_reset_whose_ssh_call_fails_answers_every_recorded_gpu():
+@pytest.mark.parametrize("recorded", [[], [U[1]]], ids=["no-records", "one-record"])
+async def test_a_create_reset_whose_ssh_call_fails_refuses_on_every_recorded_gpu(recorded):
     host, redis = FakeHost(), FakeRedis()
-    redis.store[f"gpu_clock_lock:{U[1]}"] = json.dumps({"pod_id": "old"})
+    for uuid in recorded:
+        redis.store[f"gpu_clock_lock:{uuid}"] = json.dumps({"pod_id": "old"})
     host.run = AsyncMock(side_effect=OSError("connection lost"))
 
-    assert await reset_leftover_clock_locks(host, redis, [U[0], U[1]]) == [U[1]]
+    assert await reset_leftover_clock_locks(host, redis, [U[0], U[1]]) == recorded
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("recorded", "expected"), [([], []), ([U[1]], [U[1]])], ids=["no-records", "one-record"])
-async def test_a_create_reset_batch_that_times_out_answers_only_the_recorded_gpus(recorded, expected):
-    host, redis = FakeHost(rgc_exit=None), FakeRedis()
+@pytest.mark.parametrize("recorded", [[], [U[0], U[1]]], ids=["no-records", "both-recorded"])
+async def test_a_create_reset_that_overruns_keeps_the_answered_gpus_and_refuses_on_the_unanswered(recorded):
+    """The call's answer is lost past the runner's budget: the GPU that answered is read back from the host's results
+    file (its record goes), and only the unanswered one refuses the create, when it has a lock record."""
+    host, redis = FakeHost(rgc_exit=None, answered=[U[0]]), FakeRedis()
     for uuid in recorded:
         redis.store[f"gpu_clock_lock:{uuid}"] = json.dumps({"pod_id": "old"})
 
-    # no "<uuid> <exit>" line at all is no verdict on any GPU: with no records the create goes on to Docker
-    assert await reset_leftover_clock_locks(host, redis, [U[0], U[1]]) == expected
+    assert await reset_leftover_clock_locks(host, redis, [U[0], U[1]]) == ([U[1]] if recorded else [])
+    assert host.commands[-1].startswith("cat /tmp/lium-gpu-clock-reset-") and host.files == {}, "read back, removed"
+    assert f"gpu_clock_lock:{U[0]}" not in redis.store
+    assert (f"gpu_clock_lock:{U[1]}" in redis.store) == bool(recorded)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("call_exit", [0, 1])
+async def test_a_partial_answer_counts_its_lines_whatever_the_calls_exit_code(call_exit):
+    """Review (lio#2499): GPU A answered all three resets, GPU B none for -rmc, and no results file is left. The lines
+    that came back count with exit 1 as with exit 0: only B refuses the create, and A's lock record goes."""
+    host, redis = FakeHost(), FakeRedis()
+    for uuid in (U[0], U[1]):
+        redis.store[f"gpu_clock_lock:{uuid}"] = json.dumps({"pod_id": "old"})
+    stdout = f"{U[0]} 0\n{U[0]} -rac 0\n{U[0]} -rmc 0\n{U[1]} 0\n{U[1]} -rac 0"
+    fake_run = host.run
+
+    async def run(cmd, **kw):
+        if " -rgc " in cmd and not cmd.startswith("cat "):
+            host.commands.append(cmd)
+            return make_command_result(call_exit == 0, stdout, exit_code=call_exit)
+        return await fake_run(cmd, **kw)
+
+    host.run = run
+    assert await reset_leftover_clock_locks(host, redis, [U[0], U[1]]) == [U[1]]
+    assert f"gpu_clock_lock:{U[0]}" not in redis.store
+    assert f"gpu_clock_lock:{U[1]}" in redis.store
+
+
+@pytest.mark.asyncio
+async def test_a_create_reset_that_overruns_with_no_line_goes_on_for_gpus_without_a_lock_record():
+    host, redis = FakeHost(rgc_exit=None), FakeRedis()
+    assert await reset_leftover_clock_locks(host, redis, [U[0], U[1]]) == []
+
+
+@pytest.mark.asyncio
+async def test_an_unrecorded_gpus_answered_failed_reset_still_refuses_the_create():
+    """Log-only covers no answer only: an answered failure (not 3/4) refuses, record or not."""
+    assert await reset_leftover_clock_locks(FakeHost(rgc_exit=6), FakeRedis(), [U[0]]) == [U[0]]
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(("still_locked", "refused"), [([], False), ([U[0]], True)])
-async def test_a_create_is_refused_only_when_a_recorded_lock_could_not_be_reset(monkeypatch, still_locked, refused):
+async def test_a_create_is_refused_when_a_gpu_could_not_be_confirmed_reset(monkeypatch, still_locked, refused):
     import services.docker_service as ds
 
     service, _gates, _started = _service_with_gated_steps([])

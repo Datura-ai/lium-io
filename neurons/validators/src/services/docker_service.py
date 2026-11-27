@@ -15296,7 +15296,7 @@ class DockerService:
                 # the pod's own lock survives its edit or reboot (review)
                 still_locked = await reset_leftover_clock_locks(
                     SSHCommandRunner(ssh_client, max_retries=0), self.redis_service, payload.gpu_uuids,
-                    keep_pod_id=payload.pod_id,
+                    keep_pod_id=payload.pod_id, purpose="create", node_id=payload.executor_id,
                 )
             except Exception as exc:
                 logger.warning(
@@ -15305,7 +15305,10 @@ class DockerService:
                 return
         if still_locked:
             # never hand a renter locked clocks, whoever locked them
-            raise RuntimeError(f"GPU clocks could not be reset to default: {', '.join(still_locked)}")
+            raise RuntimeError(
+                f"GPU clocks could not be confirmed reset to default (the reset failed or gave no answer): "
+                f"{', '.join(still_locked)}"
+            )
 
     async def delete_container(
         self,
