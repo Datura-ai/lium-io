@@ -1,6 +1,7 @@
 import asyncio
 import threading
 
+import aiohttp
 import pytest
 from aiohttp import web
 
@@ -42,6 +43,24 @@ async def test_probes_run_on_their_own_loop_and_never_on_the_callers():
     finally:
         await runner.cleanup()
     assert threads == {"port-probes"}
+
+
+@pytest.mark.asyncio
+async def test_the_probe_session_keeps_no_cookie_a_node_sends():
+    async def answer(_request):
+        response = web.Response(text=f"{TOKEN}:1")
+        response.set_cookie("grow", "x" * 100)
+        return response
+
+    runner, port = await _serve(answer)
+    try:
+        tester = PortTester()
+        assert await tester.test_one("127.0.0.1", PortPair(1, port), TOKEN)
+        # a default jar drops cookies from IP hosts only; a hostname node's cookies would be kept
+        assert isinstance(tester._session.cookie_jar, aiohttp.DummyCookieJar)
+        assert len(tester._session.cookie_jar) == 0
+    finally:
+        await runner.cleanup()
 
 
 @pytest.mark.asyncio
