@@ -122,12 +122,14 @@ def evaluate_gpu_identity(
         return bool(kernel) and uuid is not None and uuid.lower() in kernel
 
     claimed_model = _as_text(claimed_model)
+    nvml_error = _as_text(block.get("nvml_error"))
     judged: dict[str, Any] = {
         "present": isinstance(cards_value, list),
         "claimed_count": claimed,
         "evidence_count": 0,
         "nvidia_module_present": block.get("nvidia_module_present") is True,
         "proc_driver_present": block.get("proc_driver_present") is True,
+        "nvml_error": nvml_error,
         "reasons": [],
         "details": [],
         "would_fail": False,
@@ -161,6 +163,8 @@ def evaluate_gpu_identity(
         add("nvidia_module_missing", "nvidia kernel module is not present")
     if not judged["proc_driver_present"] and not kernel_names_all:
         add("proc_driver_missing", "/proc/driver/nvidia/gpus is not readable")
+    if nvml_error:
+        add("nvml_error", f"nvidia-smi: {nvml_error}")
     if claimed is not None and len(cards) < claimed:
         add("missing_card", f"claimed {claimed} cards, evidence has {len(cards)}")
     nvml_cards = sum(1 for card in cards if _as_dict(_as_dict(card.get("sources")).get("nvml")))
@@ -184,7 +188,7 @@ def evaluate_gpu_identity(
             add("nvml_source_missing", f"{label}: nvml source missing")
         if not proc and not kernel_names(card):
             add("proc_source_missing", f"{label}: proc source missing")
-        if not sysfs:
+        if not sysfs and not kernel_names(card):
             add("sysfs_source_missing", f"{label}: sysfs source missing")
         for name, fields in SOURCE_FIELDS.items():
             source = _as_dict(sources.get(name))
@@ -205,7 +209,12 @@ def evaluate_gpu_identity(
         if minor is not None:
             add("dev_node_missing", f"{label}: /dev/nvidia{minor} missing")
         model = _as_text(card.get("model"))
-        if claimed_model and model and model.lower() != claimed_model.lower():
+        if (
+            claimed_model
+            and model
+            and not kernel_names(card)
+            and model.lower() != claimed_model.lower()
+        ):
             add("claimed_model_mismatch", f"{label}: model {model!r}, claimed {claimed_model!r}")
 
     judged["reasons"] = reasons
@@ -229,6 +238,7 @@ def log_gpu_identity(ctx: Context, judged: dict[str, Any], mode: str) -> None:
         "evidence_count": judged["evidence_count"],
         "nvidia_module_present": judged["nvidia_module_present"],
         "proc_driver_present": judged["proc_driver_present"],
+        "nvml_error": judged.get("nvml_error"),
         "reasons": judged["reasons"],
         "details": judged.get("details", []),
         "would_fail": judged["would_fail"],
@@ -251,5 +261,6 @@ def event_fields(judged: dict[str, Any]) -> dict[str, Any]:
         "evidence_count": judged["evidence_count"],
         "nvidia_module_present": judged["nvidia_module_present"],
         "proc_driver_present": judged["proc_driver_present"],
+        "nvml_error": judged.get("nvml_error"),
         "reasons": judged["reasons"],
     }

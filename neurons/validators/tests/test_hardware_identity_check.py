@@ -497,3 +497,20 @@ async def test_identity_uuid_not_in_the_container_kernel_follows_the_mode(contex
     enforced = await _run(_ctx(context_factory, **kwargs))
     assert enforced.passed is False
     assert "identity_uuid_not_in_container_kernel" in enforced.event.what_we_saw["findings"]
+
+
+@pytest.mark.asyncio
+async def test_an_unknown_block_minor_is_not_a_mismatch(context_factory, monkeypatch):
+    monkeypatch.setattr(hardware_identity.settings, "VALIDATOR_LIUMD_EVIDENCE_MODE", "enforce")
+    ctx = _ctx(
+        context_factory,
+        stdout=_stdout(),
+        gpu_identity=_identity(_identity_card(minor=None)),
+        kernel_minors={"GPU-a": 0},
+        kernel_pcis={"GPU-a": "0000:00:1b.0"},
+    )
+
+    result = await _run(ctx)
+
+    assert result.passed is True
+    assert result.event.what_we_saw["identity_findings"] == []

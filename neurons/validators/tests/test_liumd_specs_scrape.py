@@ -6,6 +6,7 @@ import asyncio
 import copy
 import json
 import logging
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -574,3 +575,42 @@ async def test_a_non_text_gpu_name_does_not_abort_a_shadow_run(monkeypatch):
     result = await MachineSpecScrapeCheck().run(_ctx(runner))
 
     assert result.passed is True
+
+
+@pytest.mark.asyncio
+async def test_identity_kernel_reads_the_host_only_in_enforce(monkeypatch):
+    calls = []
+
+    async def container(ctx):
+        calls.append("container")
+        return KernelGpuView(
+            uuids=["GPU-a"],
+            foreign_mounts=[],
+            minors={"GPU-a": 0},
+            pcis={"GPU-a": "0000:31:00.0"},
+        )
+
+    async def host(ssh, *, host_view=False):
+        calls.append("host")
+        return KernelGpuView(
+            uuids=["GPU-a", "GPU-b"],
+            foreign_mounts=[],
+            minors={"GPU-a": 0, "GPU-b": 1},
+            pcis={"GPU-a": "0000:31:00.0", "GPU-b": "0000:32:00.0"},
+        )
+
+    monkeypatch.setattr(machine_spec_scrape, "kernel_gpu_view", container)
+    monkeypatch.setattr(machine_spec_scrape, "read_kernel_gpu_view", host)
+    ctx = SimpleNamespace(ssh=object())
+    cards = [{"uuid": "GPU-a"}, {"uuid": "GPU-b"}]
+
+    monkeypatch.setattr(machine_spec_scrape.settings, "VALIDATOR_LIUMD_EVIDENCE_MODE", "shadow")
+    uuids, _ = await machine_spec_scrape._identity_kernel_uuids(ctx, cards)
+    assert calls == ["container"]
+    assert uuids == ["GPU-a"]
+
+    calls.clear()
+    monkeypatch.setattr(machine_spec_scrape.settings, "VALIDATOR_LIUMD_EVIDENCE_MODE", "enforce")
+    uuids, _ = await machine_spec_scrape._identity_kernel_uuids(ctx, cards)
+    assert calls == ["container", "host"]
+    assert uuids == ["GPU-a", "GPU-b"]

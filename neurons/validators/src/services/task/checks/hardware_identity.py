@@ -132,13 +132,19 @@ def gpu_identity_kernel_findings(
             )
             continue
         kernel_minor = minors.get(uuid) if minors is not None else None
-        if minors is not None and kernel_minor != card.get("minor"):
+        card_minor = card.get("minor")
+        if kernel_minor is not None and card_minor is not None and kernel_minor != card_minor:
             add(
                 "identity_minor_mismatch",
-                f"{label}: block minor {card.get('minor')}, kernel minor {kernel_minor}",
+                f"{label}: block minor {card_minor}, kernel minor {kernel_minor}",
             )
         kernel_pci = pcis.get(uuid) if pcis is not None else None
-        if pcis is not None and isinstance(pci, str) and pci and kernel_pci != pci.lower():
+        if (
+            kernel_pci
+            and isinstance(pci, str)
+            and pci
+            and kernel_pci != pci.lower()
+        ):
             add(
                 "identity_pci_mismatch",
                 f"{label}: block pci {pci}, kernel pci {kernel_pci}",

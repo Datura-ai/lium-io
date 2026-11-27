@@ -246,3 +246,20 @@ def test_details_name_the_card_and_the_two_values():
 
 def test_clean_details_are_empty():
     assert evaluate_gpu_identity(_report(_card()), 1)["details"] == []
+
+
+def test_an_nvml_read_error_is_a_reason_even_when_the_cards_parse():
+    report = _report(_card())
+    report["nvml_error"] = "nvidia-smi exit Some(15)"
+    judged = evaluate_gpu_identity(report, 1)
+    assert "nvml_error" in judged["reasons"]
+    assert any("nvidia-smi exit" in detail for detail in judged["details"])
+
+
+def test_kernel_named_cards_do_not_judge_model_or_sysfs():
+    card = _card(uuid="GPU-a", sysfs=False, model="NVIDIA L4")
+    judged = evaluate_gpu_identity(
+        _report(card), 1, claimed_model="NVIDIA H100", kernel_uuids=["GPU-a"]
+    )
+    assert "sysfs_source_missing" not in judged["reasons"]
+    assert "claimed_model_mismatch" not in judged["reasons"]
