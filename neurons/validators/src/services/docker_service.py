@@ -14955,7 +14955,7 @@ class DockerService:
         payload: ContainerDeleteRequest,
         log: _BoundLog,
         stage: str,
-    ) -> None:
+    ) -> bool:
         # DAH-5101: a pod whose volume holds gigabytes of unwritten data stalls its delete for as
         # long as a slow disk needs to absorb them: dockerd unmounts the volume when the container
         # stops and the unmount flushes it. The rental is over and the volume is removed below, so
@@ -14977,7 +14977,7 @@ class DockerService:
                 error=f"{type(exc).__name__}: {exc}",
                 **fields,
             )
-            return
+            return False
         fields["duration_ms"] = int((time.monotonic() - started) * 1000)
         fields["result"] = (result.stdout or "").strip()
         if getattr(result, "exit_status", 0) != 0:
@@ -14987,8 +14987,9 @@ class DockerService:
                 stderr=(result.stderr or "").strip(),
                 **fields,
             )
-        else:
-            log.info("Wiped the volume's files", **fields)
+            return False
+        log.info("Wiped the volume's files", **fields)
+        return True
 
     async def _terminate_and_wait(
         self,
@@ -15418,8 +15419,11 @@ class DockerService:
                 with _best_effort_delete_step(log, "read_pod_image_id"):
                     image_id = await docker_client.container_image_id(container=payload.container_name)
 
-                if self._wipes_volume_before_stop(payload):
-                    await self._wipe_volume(connect_ssh, payload, log, stage="before the stop")
+                # a failed first wipe keeps the SDK stop: its fresh SSH dial may fail while the open
+                # Docker connection is healthy, and the own-connection wait would then skip the grace
+                if self._wipes_volume_before_stop(payload) and await self._wipe_volume(
+                    connect_ssh, payload, log, stage="before the stop"
+                ):
                     stopped = not await self._terminate_and_wait(connect_ssh, payload, log)
                     if not stopped:
                         await self._wipe_volume(connect_ssh, payload, log, stage="before the kill")

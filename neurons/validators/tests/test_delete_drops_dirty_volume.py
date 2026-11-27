@@ -410,9 +410,12 @@ async def test_delete_proceeds_as_before_when_the_wipe_fails(
     result = await asyncio.wait_for(_delete(docker_service, payload), timeout=5)
 
     assert isinstance(result, ContainerDeleted)
-    assert order[0] == ("ssh", _bounded(WIPE_CMD, 0.05))
-    # at most a wipe, the wait and the second wipe stand before the removal
-    assert ("remove", payload.container_name) in order[:4]
+    # a failed first wipe falls back to the SDK stop with its grace, not the own-connection wait
+    assert order[:3] == [
+        ("ssh", _bounded(WIPE_CMD, 0.05)),
+        ("stop", payload.container_name),
+        ("remove", payload.container_name),
+    ]
 
 
 @pytest.mark.asyncio
