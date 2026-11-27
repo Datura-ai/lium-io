@@ -287,7 +287,7 @@ async def test_a_stalled_inspect_is_cut_off_before_the_deadline_and_the_run_is_k
     ctx = context_factory(ssh=SimpleNamespace(run=stalled))
     sink = AsyncMock()
     started = asyncio.get_running_loop().time()
-    ok, events, _ = await asyncio.wait_for(Pipeline([guard, _Finalize()], sink).run(ctx), timeout=5)
+    ok, events, _ = await asyncio.wait_for(Pipeline([_RootLogin(), guard, _Finalize()], sink).run(ctx), timeout=5)
 
     assert asyncio.get_running_loop().time() - started < 2
     assert ok is True and finalized == [True]
@@ -335,15 +335,32 @@ async def test_the_guard_runs_once_per_cycle_however_the_pipeline_ends(context_f
 
     sink = AsyncMock()
     completion = RentalEgressGuardCheck(last_run=last_run)
-    ok, events, _ = await Pipeline([_Step(), completion, _Scored()], sink).run(context_factory(ssh=ssh))
+    pipeline = Pipeline([_RootLogin(), _Step(), completion, _Scored()], sink)
+    ok, events, _ = await pipeline.run(context_factory(ssh=ssh))
 
     assert ok is (exit_ != "fatal")
     assert ran == (["step", "scored"] if exit_ == "passed" else ["step"])
-    assert [event.check_id for event in events] == ran
+    assert [event.check_id for event in events] == ["login", *ran]
     assert sink.emit.await_args_list[-1].args[0].check_id == RentalEgressGuardCheck.check_id
     [helper] = _helper_calls(ssh)
     assert helper.endswith(helper_command(link_local_drop_script("br-0123456789ab", [])))
     assert len(last_run) == 1
+
+
+class _RootLogin:
+    """The run's login check, confirming root: completion steps run only after one."""
+
+    check_id = "login"
+    fatal = True
+
+    async def run(self, ctx):
+        from services.task.messages import LoginUserMessages
+        from services.task.pipeline import CheckResult
+
+        return CheckResult(
+            passed=True,
+            event=rental_egress_guard.render_message(LoginUserMessages.ROOT, ctx=ctx, check_id=self.check_id, what={}),
+        )
 
 
 @pytest.mark.parametrize("template", ["MISMATCH", "BINDING_UNVERIFIED"])
@@ -539,7 +556,7 @@ esac
 rc=$?
 if [ -n "${mutating:-}" ] && [ -n "${DIE_AFTER:-}" ]; then
   n=$(( $(cat "$STATE/count" 2>/dev/null || echo 0) + 1 )); echo $n > "$STATE/count"
-  [ "$n" -eq "$DIE_AFTER" ] && kill -9 $PPID
+  [ "$n" -eq "$DIE_AFTER" ] && kill -9 "$(cat "$STATE/run_pid")"
 fi
 exit $rc
 """
@@ -667,7 +684,10 @@ def test_a_swap_killed_after_any_mutation_is_recovered_without_flushing_the_prot
     env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}", "STATE": str(state)}
     script = link_local_drop_script("br-bbbbbbbbbbbb", [])
 
-    first = subprocess.run(["sh", "-c", script], env={**env, "DIE_AFTER": str(die_after)}, capture_output=True)
+    # the stub kills the pid the run started as, never its own $PPID: a shell that execs its last command (bash -c) makes
+    # that command's parent the test runner itself
+    killable = f'echo $$ > "$STATE/run_pid"; {script}'
+    first = subprocess.run(["sh", "-c", killable], env={**env, "DIE_AFTER": str(die_after)}, capture_output=True)
     in_force = _jumps_and_rules(state)
     assert in_force and in_force[0][1] in (old_rules, new_rules)  # something still protects after the kill
     second = subprocess.run(["sh", "-c", script], env=env, capture_output=True, text=True)

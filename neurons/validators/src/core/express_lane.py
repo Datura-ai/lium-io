@@ -24,18 +24,20 @@ import logging
 import os
 import time
 from collections import Counter
-from collections.abc import Callable, Iterator
+from collections.abc import Awaitable, Callable, Iterator
 from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
 import bittensor
-from clients.validator_portal_api import PortalExecutor, ValidatorPortalAPI
+from clients.validator_portal_api import PortalExecutor, ValidatorPortalAPI, start_owner_hotkeys_read
 from payload_models.payloads import MinerJobEnryptedFiles, MinerJobRequestPayload
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
-from services.executor_image_policy import ExpectedImageSnapshot
+from services.executor_image_policy import ExpectedImageSnapshot, normalize_sha256_digest
+from services.executor_rollout import RolloutWindow, rollout_grace_reason
 from services.miner_service import EXPRESS_LANE, MinerService
 from services.redis_service import EXPRESS_REDIS_SLOT
+from services.task.messages import CYCLE_END_READ_REASONS, RENTED_AFTER_START_REASONS, ExecutorImageMessages
 from services.task_service import JobResult
 
 from core.config import settings
@@ -71,6 +73,8 @@ SESSION_LOST_IN_PORT_CHECK = "the validator's SSH session closed during the port
 # miner's snapshot misses may already have used). Its own bound keeps a node whose session always
 # drops from staying queued, and hidden from the wave, for good: ~20 min at RETRY_SECONDS.
 SESSION_LOST_MAX_RUNS = 10
+NO_TASK_TIME_FOR_THE_RENTAL_PROBE = "the task had no time left for the rental probe or VerifyX"
+RENTED_DURING_THE_CHECK = "the backend found the node rented during the check"
 # Self-hosted miners' executor lists: how often, how many miners at once, and the longest a miner
 # that keeps not answering is skipped (one miss skips one interval, doubling per further miss).
 # Each ask is bounded by REST_EXECUTOR_LIST_TIMEOUT (miner_service).
@@ -124,6 +128,10 @@ class CycleInputs:
     # DAH-6013: executor id -> end (UTC) of the provider maintenance window the backend still holds it for. The
     # lane rechecks each node once its window has ended instead of leaving it to the next cycle.
     maintenance_ends: dict[str, datetime] = field(default_factory=dict)
+    # The cycle's job block and the rollout window the cycle read for it (lio#2389 review): the lane reads this
+    # window, never the registry, so an express result neither counts a cycle again nor waits on Docker Hub
+    job_block: int | None = None
+    rollout_window: RolloutWindow | None = None
 
 
 @dataclass
@@ -182,6 +190,7 @@ class ExpressLane:
         subtensor_client,
         cycle_inputs: Callable[[], CycleInputs | None],
         portal_api=ValidatorPortalAPI,
+        registry_digest: Callable[[], Awaitable[str | None]] | None = None,
     ):
         self.miner_service = miner_service
         self.redis_service = redis_service
@@ -192,6 +201,8 @@ class ExpressLane:
         # before it.
         self.cycle_inputs = cycle_inputs
         self.portal_api = portal_api
+        # The validator's read-only registry digest fetch (no rollout state is touched by it)
+        self.registry_digest = registry_digest
         self._pending: dict[str, _Pending] = {}
         # The wave leaves what this lane has queued to it (MinerService._claim_for_cycle), through
         # a view of this dict, never rebound, so the wave always reads the current queue.
@@ -211,6 +222,7 @@ class ExpressLane:
         self._self_hosted_misses: Counter[str] = Counter()  # miner hotkey -> misses in a row
         self._next_self_hosted_listing = 0.0  # monotonic
         self._listing: asyncio.Task | None = None
+        self._owner_refresh: asyncio.Future | None = None  # DAH-6740
         # DAH-5716: runs started per queued recheck request.
         # shortcut: in memory, so a restart restarts the budget; the request's TTL still bounds it.
         self._recheck_runs: Counter[str] = Counter()
@@ -255,6 +267,10 @@ class ExpressLane:
 
     async def tick(self) -> int:
         """One pass: discover, select under the caps, launch. Returns how many were launched."""
+        # DAH-6740: every upload this validator signs reads the owner map, so it refreshes even when no wave runs; in the
+        # background, so a slow portal never holds discovery
+        if self._owner_refresh is None or self._owner_refresh.done():
+            self._owner_refresh = start_owner_hotkeys_read()  # the same read the upload gate waits on
         inputs = self.cycle_inputs()
         if inputs is None:
             return 0
@@ -288,6 +304,7 @@ class ExpressLane:
             )
         if not chosen:
             return 0
+        # after a restart each run's upload waits for the first owner read (first_owner_hotkeys_read), in every lane
         return await self._launch(chosen)
 
     async def _restore_first_seen(self) -> None:
@@ -682,7 +699,28 @@ class ExpressLane:
                         await self._end_recheck(pending)
             self._defer(pending, SESSION_LOST_IN_PORT_CHECK)
             return
+        if result.failure_reason_code in CYCLE_END_READ_REASONS:
+            # DAH-5933: a result the scored cycle holds for its cycle-end rented read (a budget stop, a rental the
+            # backend found during the check, a renter's create since cycle start) has no verdict: no failed first
+            # pass goes out; asked again within MAX_ATTEMPTS, then the cycle carries or withholds it
+            rented = result.failure_reason_code in RENTED_AFTER_START_REASONS
+            self._defer(pending, RENTED_DURING_THE_CHECK if rented else NO_TASK_TIME_FOR_THE_RENTAL_PROBE)
+            return
         passed = result.score > 0 or result.job_score > 0
+        if not passed and await self._rollout_explains(result):
+            # lio#2389 review: a failure the executor-image rollout explains gets no verdict in the cycle; published
+            # here it would be a zero that takes a node updating right after the push off the rent list
+            self._left_to_cycle.add(executor_id)
+            self._pending.pop(executor_id, None)
+            logger.info(
+                _m(
+                    "[express] Executor left to the normal cycle: the rollout explains its failure",
+                    extra=get_extra_info(
+                        {"executor_uuid": executor_id, "reason_code": result.failure_reason_code, "attempt": pending.attempts}
+                    ),
+                )
+            )
+            return
         should_run_first_pass_again = (
             not passed
             and settings.EXPRESS_LANE_FAILED_FIRST_PASS_RETRY_ENABLED
@@ -792,6 +830,26 @@ class ExpressLane:
                 ),
             )
         )
+
+    async def _rollout_explains(self, result: JobResult) -> bool:
+        """Whether the rollout grace withholds this failure, as `withhold_rollout_verdicts` does at the cycle end.
+
+        The window the cycle holds decides first. An OUTDATED failure it does not cover asks the registry once (a
+        read, never `observe`, so no cycle is counted): a digest other than the window's is a push since the cycle
+        started, and the cycle end's own read opens a window on this cycle that withholds it (lio#2389 review)."""
+        inputs = self.cycle_inputs()
+        if inputs is None or inputs.rollout_window is None or inputs.job_block is None:
+            return False
+        window = inputs.rollout_window
+        if rollout_grace_reason(result, window, inputs.job_block) is not None:
+            return True
+        if result.failure_reason_code != ExecutorImageMessages.OUTDATED.reason or self.registry_digest is None:
+            return False
+        held = normalize_sha256_digest(window.digest)
+        if held is None:  # the first digest ever seen opens no window at the cycle end either
+            return False
+        now = normalize_sha256_digest(await self.registry_digest())
+        return now is not None and now != held
 
     def _defer(self, pending: _Pending, reason: str) -> None:
         """Try again after retry_seconds_for(reason), or after max_attempts_for(reason) asks leave

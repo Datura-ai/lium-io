@@ -285,6 +285,24 @@ def _accepted_miner_hotkeys() -> set[str]:
     )
 
 
+def _owner_set_signed(payload: UploadSShKeyPayload, own_hotkey: str) -> bool:
+    """DAH-6740: the validator also signed this key for this node's own hotkey as one of the listing owner's.
+
+    Only the own hotkey counts here: the pool hotkey is accepted by every pool node, so signing it for an own-key
+    listing would bind the key to nothing. The validator (and the backend's health check, on the validator's word) signs
+    only the hotkeys the portal itself names for the listing's owner, never what a miner reports, and an upload needs
+    this node's own or the central miner's auth (MinerMiddleware).
+    """
+    signature = (payload.owner_hotkey_signatures or {}).get(own_hotkey)
+    if not own_hotkey or not signature:
+        return False
+    try:
+        blob = ssh_pubkey_signing_blob(payload.public_key, payload.nonce, own_hotkey)
+        return match_validator_hotkey(blob, signature) is not None
+    except Exception:
+        return False
+
+
 def _check_miner_binding(payload: UploadSShKeyPayload) -> None:
     """Check the validator issued this key for this executor's own miner hotkey or the pool's.
 
@@ -306,6 +324,8 @@ def _check_miner_binding(payload: UploadSShKeyPayload) -> None:
             miner_binding = "mismatch"
         else:
             return
+    if _owner_set_signed(payload, own_hotkey):
+        return
     enforced = settings.REQUIRE_MINER_BOUND_SSH_KEY
     logger.warning(
         _m(
@@ -462,6 +482,8 @@ MINER_IDENTITY_NONCE_PATTERN = r"^[0-9a-fA-F]{32,128}$"
 @apis_router.get("/miner-identity", response_model_exclude_none=True)
 async def get_miner_identity(
     nonce: Annotated[str, Query(pattern=MINER_IDENTITY_NONCE_PATTERN)],
+    # only on request: a long mapping list would overrun the answer size a caller that does not read it allows
+    declared_ports: Annotated[bool, Query()] = False,
 ) -> MinerIdentityResponse:
     """
     The miner hotkey this executor is configured for (`MINER_HOTKEY_SS58_ADDRESS`), with the
@@ -480,6 +502,18 @@ async def get_miner_identity(
         nonce=nonce,
         account_claim=claim,
         ssh_host_key_port=port,
+        declared_ports=(
+            {
+                "port_range": settings.RENTING_PORT_RANGE,
+                "port_mappings": settings.RENTING_PORT_MAPPINGS,
+                # the SSH port this executor reports to validators (miner_service), which they exclude from rental ports
+                "ssh_port": settings.SSH_PUBLIC_PORT or settings.SSH_PORT,
+                # the port sshd listens on here; a mapping from it forwards to sshd, so no pod can be reached on it
+                "ssh_internal_port": settings.SSH_PORT,
+            }
+            if declared_ports
+            else None
+        ),
         # off the event loop: an RSA signature still costs ~ms, and this endpoint is public
         host_key_proofs=(
             await asyncio.to_thread(_host_key_proofs, nonce, settings.MINER_HOTKEY_SS58_ADDRESS, claim) if port else None

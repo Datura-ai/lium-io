@@ -1,6 +1,6 @@
 [project]
 name = "watchtower"
-version = "1.2.3"
+version = "1.2.5"
 description = "Automated Docker image update service with cryptographic verification"
 authors = [
     {name = "Lium Team"},
@@ -8,11 +8,13 @@ authors = [
 dependencies = [
     "docker>=7.1.0",
     "requests>=2.32.0",
+    "aiohttp>=3.13.3",
     "bittensor==9.10.1",
     "pydantic>=2.10.0",
     "pydantic-settings>=2.7.0",
     "python-dotenv>=1.0.0",
     "pytest>=8.3.0",
+    "datura @ file:///${PROJECT_ROOT}/../datura",
 ]
 requires-python = "<3.13,>=3.11"
 license = {text = "MIT"}

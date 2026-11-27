@@ -60,6 +60,11 @@ _package_fallback_probes: dict[tuple[str, str], int] = {}
 # margin for scoring, publishing and cleanup; with less than MIN_COLD_RETRY_SECONDS of that it is skipped.
 MIN_COLD_RETRY_SECONDS = 240
 COLD_RETRY_MARGIN_SECONDS = 60
+# DAH-5933: the first sample gets the task's time less COLD_RETRY_MARGIN_SECONDS for scoring, publishing and cleanup,
+# so a slow VerifyX (up to its 600 s cap) cannot run past the task. With less than MIN_COLD_RETRY_SECONDS for VerifyX
+# itself the cycle reports VERIFYX_NO_TASK_TIME, which carries like RENTAL_CHECK_NO_TASK_TIME: the validator's budget,
+# not the node, decided it. No extra reserve for the rental probe: it needs 360 s after the GPU checks, so a smaller
+# reserve never lets it run and only cuts VerifyX runs that would pass (review at 1749a1d).
 # cap on the rental-state re-read before the retry; a slower answer counts as unknown (busy)
 RENTAL_STATE_TIMEOUT_SECONDS = 30
 # during the retry only the per-executor pending-pod marker is re-read, every interval; the backend's
@@ -130,6 +135,81 @@ async def _filler_reuse_is_due(ctx: Context, stored: tuple) -> bool:
     return due
 
 
+# The EMA starts as the first sample alone (compute_ema), and the wire carries no sample count: a node whose first
+# sample is stored while a filler runs must not reuse that one cold sample for a day. Each direction is seeded on its
+# own (a failed upload keeps the download, an unmeasured upload stays unseeded), so each is tracked on its own: the
+# validator marks a direction it sees unseeded, then the first reading stored for it; that direction settles once the
+# backend stores a different one. Reuse waits until no direction holds its first sample alone.
+_FIRST_SAMPLE_PREFIX = "verifyx:first_sample_ema"
+_DIRECTIONS = ("download", "upload")
+_SETTLED = "settled"
+
+
+def _first_sample_key(ctx: Context) -> str:
+    return f"{_FIRST_SAMPLE_PREFIX}:{ctx.miner_hotkey}:{ctx.executor.uuid}"
+
+
+async def _read_first_sample_mark(ctx: Context) -> dict | None:
+    raw = await ctx.services.redis.get(_first_sample_key(ctx))
+    if raw is None:
+        return None
+    mark = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+    return mark if isinstance(mark, dict) else None
+
+
+async def _mark_unseeded(ctx: Context, stored: tuple) -> None:
+    """Marks each direction the stored EMA does not hold as unseeded, whatever its tracked state: an EMA the backend
+    no longer sends (a node that went inactive) starts again from its next sample alone, so that sample is a first
+    sample too. Runs on every check, and every check renews an existing mark's expiry: a node checked every cycle
+    never loses its mark while the stored EMA stays its first sample, whether or not the EMA is reusable this cycle."""
+    unseeded = [direction for direction, value in zip(_DIRECTIONS, stored) if value is None]
+    try:
+        mark = await _read_first_sample_mark(ctx)
+        if mark is None and not unseeded:
+            return
+        mark = mark or {}
+        for direction in unseeded:
+            mark[direction] = None
+        await ctx.services.redis.set(_first_sample_key(ctx), json.dumps(mark), ex=_FILLER_REUSE_TTL_SECONDS)
+    except Exception:
+        logger.warning(_m("VerifyX unseeded mark not written to Redis", extra=get_extra_info(ctx.default_extra)))
+
+
+def _advance_first_sample_mark(mark: dict, stored: tuple) -> tuple[dict, bool]:
+    """The mark after this stored EMA, and whether some direction still holds only its first sample. A direction
+    missing from the mark was seeded before it was seen unseeded: settled, as before."""
+    first = False
+    advanced = {}
+    for direction, value in zip(_DIRECTIONS, stored):
+        state = mark.get(direction, _SETTLED)
+        if state is None and value is not None:
+            state = value  # the direction's first stored reading
+        elif state not in (None, _SETTLED) and value != state:
+            state = _SETTLED
+        first = first or state not in (None, _SETTLED)
+        advanced[direction] = state
+    return advanced, first
+
+
+async def _is_first_sample(ctx: Context, stored: tuple) -> bool:
+    """True while a direction of the stored EMA is still the first reading stored for it after the validator saw it
+    unseeded. No mark (a node seeded before this validator saw it unseeded, or Redis down) reads as settled."""
+    redis = ctx.services.redis
+    try:
+        mark = await _read_first_sample_mark(ctx)
+        if mark is None:
+            return False
+        advanced, first = _advance_first_sample_mark(mark, stored)
+        if all(state == _SETTLED for state in advanced.values()):
+            await redis.delete(_first_sample_key(ctx))
+        elif advanced != mark:
+            await redis.set(_first_sample_key(ctx), json.dumps(advanced), ex=_FILLER_REUSE_TTL_SECONDS)
+        return first
+    except Exception:
+        logger.warning(_m("VerifyX first-sample mark unreadable in Redis", extra=get_extra_info(ctx.default_extra)))
+    return False
+
+
 @dataclass(frozen=True)
 class ColdSampleRetry:
     """DAH-2959: a never-measured node's two download samples and the one the check kept.
@@ -171,6 +251,17 @@ class VerifyXCheck:
     replays_after_session_drop = False
     fatal = True
 
+    def _no_task_time(self, ctx: Context, what: dict) -> CheckResult:
+        return CheckResult(
+            passed=False,
+            event=render_message(
+                Msg.NO_TASK_TIME,
+                ctx=ctx,
+                check_id=self.check_id,
+                what={**what, "seconds_needed": MIN_COLD_RETRY_SECONDS},
+            ),
+        )
+
     def _extract_errors(self, result) -> str | list | None:
         """Extract errors from result with clear priority: data.errors > result.error."""
         if result.data and result.data.get("errors"):
@@ -178,7 +269,6 @@ class VerifyXCheck:
         return result.error
 
     async def run(self, ctx: Context) -> CheckResult:
-        verifyx_service = ctx.services.verifyx
         specs = ctx.state.specs
         if not specs:
             event = render_message(
@@ -192,6 +282,8 @@ class VerifyXCheck:
         filler_container = _get_filler_only_container(ctx)
         stored_ema = _stored_network_ema(ctx)
         await _keep_ema_copy(ctx, stored_ema)
+        seen = (stored_ema.ema_verifyx_download_speed, stored_ema.ema_verifyx_upload_speed) if stored_ema else ()
+        await _mark_unseeded(ctx, seen or (None, None))
         # A never-measured node is probed even under a filler: with no EMA to reuse it would
         # score 0 every cycle and stay hidden for as long as the filler runs.
         # A stored upload EMA below the floor is probed too: skipping would pass it while the
@@ -205,9 +297,11 @@ class VerifyXCheck:
                 or stored_ema.ema_verifyx_upload_speed >= MIN_VERIFYX_EMA_UPLOAD_SPEED_MBPS
             )
         )
-        # a day of reuse is up: this probe refreshes the network reading only (r4472607210)
-        filler_refresh = bool(reusable) and await _filler_reuse_is_due(
-            ctx, (stored_ema.ema_verifyx_download_speed, stored_ema.ema_verifyx_upload_speed)
+        # a day of reuse is up, or the stored EMA is still the first sample alone: this probe refreshes the network
+        # reading only (r4472607210)
+        stored = (stored_ema.ema_verifyx_download_speed, stored_ema.ema_verifyx_upload_speed) if reusable else ()
+        filler_refresh = bool(reusable) and (
+            await _is_first_sample(ctx, stored) or await _filler_reuse_is_due(ctx, stored)
         )
         if reusable and not filler_refresh:
             updated_specs = specs_with_last_known_verifyx_ema(ctx)
@@ -284,13 +378,14 @@ class VerifyXCheck:
             result = local.verifyx
             transport = "local_verify"
         else:
-            result = await verifyx_service.validate_verifyx_and_process_job(
-                shell=ctx.services.shell,
-                executor_info=ctx.executor,
-                default_extra=ctx.default_extra,
-                machine_spec=specs,
-                **sizing,
-            )
+            budget = task_seconds_left(ctx) - COLD_RETRY_MARGIN_SECONDS
+            if budget < MIN_COLD_RETRY_SECONDS:
+                return self._no_task_time(ctx, {"seconds_left": max(0, int(budget))})
+            # the preflight shares this budget, so even a full one bounds the whole call; the service still caps
+            # the remote run at VERIFYX_COMMAND_TIMEOUT_SECONDS after the preflight
+            result = await _verifyx_within(ctx, specs, sizing, budget)
+            if result is None:
+                return self._no_task_time(ctx, {"cut_off_after_seconds": int(budget)})
 
         prev_ema = (
             ctx.state.rented_data.network_ema.get(ctx.executor.uuid)
@@ -591,11 +686,6 @@ def _first_pass_challenge_config() -> dict[str, float]:
     return {
         "memory_max_test_gb": settings.FIRST_PASS_VERIFYX_MEMORY_MAX_TEST_GB,
         "storage_throughput_test_gb": settings.FIRST_PASS_VERIFYX_STORAGE_TEST_GB,
-        # the waits are sized in libverifyx.so, which knows the package and speed-test sizes
-        "network_floor_mbps": min(
-            settings.verifyx.NETWORK_MIN_DOWNLOAD_SPEED_MBPS, settings.verifyx.NETWORK_MIN_PACKAGE_DOWNLOAD_SPEED_MBPS
-        ),
-        "network_min_timeout_seconds": settings.FIRST_PASS_VERIFYX_NETWORK_TIMEOUT_SECONDS,
     }
 
 
@@ -949,6 +1039,36 @@ def hold_verifyx_ema(ctx: Context, specs: dict[str, Any]) -> dict[str, Any]:
     return {**specs, "network": held}
 
 
+async def _verifyx_within(ctx: Context, specs: dict, sizing: dict, budget: float):
+    """DAH-5933: the first sample cut at `budget`; None when the cut came first. A cut-off run, or one whose SSH
+    call failed, is killed on the host as the cold retry's is, or kept for the next run to reap."""
+    verifyx_service = ctx.services.verifyx
+    run_dir = f".verifyx-{secrets.token_hex(8)}"
+    result = None
+    try:
+        result = await asyncio.wait_for(
+            verifyx_service.validate_verifyx_and_process_job(
+                shell=ctx.services.shell,
+                executor_info=ctx.executor,
+                default_extra=ctx.default_extra,
+                machine_spec=specs,
+                run_dir=run_dir,
+                # the remote deadline is this one, so a run whose cleanup cannot connect stops with it (review F-24)
+                deadline_monotonic=time.monotonic() + budget,
+                **sizing,
+            ),
+            timeout=budget,
+        )
+    except TimeoutError:
+        pass
+    finally:
+        if (result is None or (result.diagnostics or {}).get("transport_error") is not None) and not (
+            await verifyx_service.kill_remote_verifyx(ctx.services.shell, run_dir, ctx.default_extra)
+        ):
+            await _remember_stale_run(ctx, run_dir)
+    return result
+
+
 async def _remember_stale_run(ctx: Context, run_dir: str) -> None:
     """Keep a cut-off run whose cleanup failed, so the next VerifyX run on the node reaps it."""
     key = verifyx_stale_runs_key(ctx.miner_hotkey, ctx.executor.uuid)
@@ -1096,7 +1216,7 @@ class VerifyXColdRetryCheck:
             )
 
         # Cut at the deadline less the margin (never past its own SSH timeout) and judge on the
-        # first sample. Raced against a rental-state watcher: a create (customer or filler) started
+        # first sample. Raced against a rental-state watcher: a renter's create started
         # after the rental data the pre-retry lookup used was read cuts it off at the next poll, within RENTAL_WATCH_INTERVAL_SECONDS
         # plus one Redis read, even if its pending-pod marker is already gone. A pod can share the node
         # for that long at most. An outer cancel still propagates.

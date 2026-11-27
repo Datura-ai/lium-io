@@ -160,7 +160,7 @@ def test_fetch_verified_digest_returns_digest_on_success(mock_get, mock_verify):
     # Assert — verified digest is returned and the correct URL was used
     assert digest == "sha256:newdigest"
     mock_get.assert_called_once_with(
-        "http://test-endpoint.com/digest", headers={"User-Agent": "lium-watchtower/1.2.3"}, timeout=30
+        "http://test-endpoint.com/digest", headers={"User-Agent": "lium-watchtower/1.2.5"}, timeout=30
     )
     mock_verify.assert_called_once()
 
@@ -1376,7 +1376,20 @@ def test_check_and_update_skips_the_probe_for_a_runner_that_was_only_created(
     mock_pull.assert_called_once_with(client, IMAGE, NEW_DIGEST)
 
 
-# ── the validator hotkey rotation: two trusted signers, real signatures ───────────────────────
+# ── the trusted validator: named by a message the subnet owner signed, real signatures ───────────────────────
+
+
+import json
+
+import validator_trust_service as trust_service
+from bittensor_wallet import Keypair
+from datura.validator_trust import SignedTrustMessage, trust_line
+from validator_trust_service import ValidatorTrust
+
+OWNER = Keypair.create_from_uri("//WatchtowerTrustOwner")
+NEW_OWNER = Keypair.create_from_uri("//WatchtowerTrustNewOwner")
+OLD_VALIDATOR = Keypair.create_from_uri("//WatchtowerTrustOldValidator")
+NEW_VALIDATOR = Keypair.create_from_uri("//WatchtowerTrustNewValidator")
 
 
 def _signed_digest(keypair, digest="sha256:rotation", ts=None):
@@ -1386,82 +1399,279 @@ def _signed_digest(keypair, digest="sha256:rotation", ts=None):
     )
 
 
-def test_trusted_validator_hotkeys_lists_the_active_hotkey_first_then_next():
-    # regression: the pair is emitted next-first (the log names the wrong key as active), or the
-    # next slot is dropped (every executor refuses the digest the moment the platform's wallet swaps)
-    import bittensor
+def _message(owner: Keypair, validator: Keypair, revision: int) -> SignedTrustMessage:
+    line = trust_line(validator.ss58_address, revision)
+    return SignedTrustMessage(message=line, signature="0x" + owner.sign(line).hex())
+
+
+def _image(tmp_path, signed: SignedTrustMessage):
+    image = tmp_path / f"image-{signed.message.rsplit(':', 1)[1]}.json"
+    image.write_text(json.dumps(signed._asdict()))
+    return image
+
+
+def _start(tmp_path, image=None) -> ValidatorTrust:
+    """A watchtower process starting from the image copy `image` (none when absent)."""
+    trust = ValidatorTrust(image_message=image or tmp_path / "absent.json")
+    trust.load()
+    return trust
+
+
+def _down(*args, **kwargs):
+    raise requests.ConnectionError("down")
+
+
+def _backend(monkeypatch, answer) -> None:
+    """The message route answers `answer(url)` (a dict, None for a 404, or it raises); chain reads go to `_chain`."""
+    monkeypatch.setattr(trust_service, "fetch_json", lambda url, body=None: answer(url))
+
+
+def _chain(monkeypatch, read) -> None:
+    monkeypatch.setattr(trust_service, "read_subnet_owner_coldkey", read)
+
+
+def _accepts(monkeypatch, trust: ValidatorTrust, keypair: Keypair) -> bool:
+    """Whether a digest signed by `keypair` passes the watchtower's check while it holds `trust`."""
     import watchtower
 
-    current = bittensor.Keypair.create_from_uri("//WatchtowerRotationOrderCurrent")
-    nxt = bittensor.Keypair.create_from_uri("//WatchtowerRotationOrderNext")
-    with patch("watchtower.WATCHTOWER_VALIDATOR_HOTKEY", current.ss58_address), patch(
-        "watchtower.WATCHTOWER_VALIDATOR_NEXT_HOTKEY", nxt.ss58_address
-    ):
-        assert watchtower.trusted_validator_hotkeys() == (current.ss58_address, nxt.ss58_address)
+    monkeypatch.setattr(watchtower, "validator_trust", trust)
+    try:
+        verify_watchtower_signature(_signed_digest(keypair))
+        return True
+    except Exception as e:
+        assert "Invalid signature" in str(e)
+        return False
 
 
-def test_built_in_validator_hotkeys_are_two_distinct_decodable_addresses():
-    # regression: a typo in either built-in constant (the digest check raises on decode instead of
-    # refusing), or the same address in both slots (the rotation trusts one signer while claiming two)
-    import bittensor
+@pytest.fixture(autouse=True)
+def _release_owner(monkeypatch):
+    monkeypatch.setattr(trust_service, "RELEASE_SUBNET_OWNER_COLDKEY", OWNER.ss58_address)
+    monkeypatch.setattr("watchtower.WATCHTOWER_VALIDATOR_HOTKEY", OLD_VALIDATOR.ss58_address)
+
+
+def test_acceptance_validator_change_holds_with_backend_and_chain_down(tmp_path, monkeypatch):
+    running = _start(tmp_path, _image(tmp_path, _message(OWNER, OLD_VALIDATOR, 1)))
+    assert _accepts(monkeypatch, running, OLD_VALIDATOR)
+
+    # the backend serves the owner's message naming the new validator
+    _chain(monkeypatch, lambda url: OWNER.ss58_address)
+    _backend(monkeypatch, lambda url: _message(OWNER, NEW_VALIDATOR, 2)._asdict())
+    running.refresh()
+    assert _accepts(monkeypatch, running, NEW_VALIDATOR)
+    assert not _accepts(monkeypatch, running, OLD_VALIDATOR)
+
+    # backend and chain both go down: the new validator stays
+    _backend(monkeypatch, _down)
+    _chain(monkeypatch, _down)
+    running.refresh()
+    assert running.report() == {
+        "validator": NEW_VALIDATOR.ss58_address, "revision": 2, "subnet_owner": OWNER.ss58_address
+    }
+    assert _accepts(monkeypatch, running, NEW_VALIDATOR)
+    assert not _accepts(monkeypatch, running, OLD_VALIDATOR)
+
+    # restarted on a release that carries the new message, backend and chain still down
+    restarted = _start(tmp_path, _image(tmp_path, _message(OWNER, NEW_VALIDATOR, 2)))
+    restarted.refresh()
+    assert _accepts(monkeypatch, restarted, NEW_VALIDATOR)
+    assert not _accepts(monkeypatch, restarted, OLD_VALIDATOR)
+
+
+def test_a_restart_on_an_older_image_takes_the_new_validator_back_at_the_first_message_read(tmp_path, monkeypatch):
+    # no volume: the taken message lives in memory, so a restart starts from the image copy again
+    restarted = _start(tmp_path, _image(tmp_path, _message(OWNER, OLD_VALIDATOR, 1)))
+    assert _accepts(monkeypatch, restarted, OLD_VALIDATOR)
+    _chain(monkeypatch, _down)
+    _backend(monkeypatch, lambda url: _message(OWNER, NEW_VALIDATOR, 2)._asdict())
+    restarted.refresh()
+    assert _accepts(monkeypatch, restarted, NEW_VALIDATOR)
+    assert not _accepts(monkeypatch, restarted, OLD_VALIDATOR)
+
+
+def test_higher_revision_wins_and_a_lower_or_equal_one_is_refused(tmp_path):
+    trust = _start(tmp_path, _image(tmp_path, _message(OWNER, OLD_VALIDATOR, 5)))
+    assert not trust.offer(_message(OWNER, NEW_VALIDATOR, 4))
+    assert not trust.offer(_message(OWNER, NEW_VALIDATOR, 5))
+    assert trust.report()["validator"] == OLD_VALIDATOR.ss58_address
+    assert trust.offer(_message(OWNER, NEW_VALIDATOR, 6))
+    assert trust.report()["validator"] == NEW_VALIDATOR.ss58_address
+    # a rollback needs a higher revision too
+    assert not trust.offer(_message(OWNER, OLD_VALIDATOR, 5))
+    assert trust.offer(_message(OWNER, OLD_VALIDATOR, 7))
+    assert trust.report() == {
+        "validator": OLD_VALIDATOR.ss58_address, "revision": 7, "subnet_owner": OWNER.ss58_address
+    }
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        _down,
+        lambda url: None,  # 404
+        lambda url: {"message": "garbage"},
+        lambda url: {"message": trust_line(NEW_VALIDATOR.ss58_address, 9), "signature": "0x" + "00" * 64},
+        lambda url: _message(NEW_VALIDATOR, NEW_VALIDATOR, 9)._asdict(),  # not the owner's signature
+    ],
+)
+def test_the_last_good_message_is_kept_on_any_error(tmp_path, monkeypatch, answer):
+    trust = _start(tmp_path, _image(tmp_path, _message(OWNER, OLD_VALIDATOR, 1)))
+    _backend(monkeypatch, answer)
+    trust.refresh_message()
+    assert trust.report()["validator"] == OLD_VALIDATOR.ss58_address
+    assert _accepts(monkeypatch, trust, OLD_VALIDATOR)
+    assert not _accepts(monkeypatch, trust, NEW_VALIDATOR)
+
+
+def test_the_baked_hotkey_is_trusted_only_while_no_message_is_held(tmp_path, monkeypatch):
     import watchtower
 
-    built_in = watchtower.trusted_validator_hotkeys()
-
-    assert len(built_in) == 2
-    assert len(set(built_in)) == 2
-    for hotkey in built_in:
-        assert bittensor.Keypair(ss58_address=hotkey).ss58_address == hotkey
-
-
-def test_digest_signed_by_the_current_hotkey_is_accepted_with_next_configured():
-    import bittensor
-
-    current = bittensor.Keypair.create_from_uri("//WatchtowerRotationCurrent")
-    nxt = bittensor.Keypair.create_from_uri("//WatchtowerRotationNext")
-    with patch("watchtower.WATCHTOWER_VALIDATOR_HOTKEY", current.ss58_address), patch(
-        "watchtower.WATCHTOWER_VALIDATOR_NEXT_HOTKEY", nxt.ss58_address
-    ):
-        verify_watchtower_signature(_signed_digest(current))
+    trust = _start(tmp_path)  # no image copy
+    monkeypatch.setattr(watchtower, "validator_trust", trust)
+    assert watchtower.trusted_validator_hotkeys() == (OLD_VALIDATOR.ss58_address,)
+    assert trust.offer(_message(OWNER, NEW_VALIDATOR, 1))
+    assert watchtower.trusted_validator_hotkeys() == (NEW_VALIDATOR.ss58_address,)
+    assert not _accepts(monkeypatch, trust, OLD_VALIDATOR)
 
 
-def test_digest_signed_by_the_next_hotkey_is_accepted_before_the_swap():
-    # regression: only the first hotkey is checked, so the digest goes unverifiable the moment the
-    # platform's wallet swaps and no executor updates again
-    import bittensor
-
-    current = bittensor.Keypair.create_from_uri("//WatchtowerRotationCurrent")
-    nxt = bittensor.Keypair.create_from_uri("//WatchtowerRotationNext")
-    with patch("watchtower.WATCHTOWER_VALIDATOR_HOTKEY", current.ss58_address), patch(
-        "watchtower.WATCHTOWER_VALIDATOR_NEXT_HOTKEY", nxt.ss58_address
-    ):
-        verify_watchtower_signature(_signed_digest(nxt))
+def test_an_image_copy_not_signed_by_the_release_owner_is_ignored(tmp_path, monkeypatch):
+    trust = _start(tmp_path, _image(tmp_path, _message(NEW_OWNER, NEW_VALIDATOR, 1)))
+    assert trust.report()["validator"] is None
+    assert _accepts(monkeypatch, trust, OLD_VALIDATOR)
+    assert not _accepts(monkeypatch, trust, NEW_VALIDATOR)
 
 
-def test_digest_signed_by_a_third_hotkey_is_refused_with_two_trusted():
-    # regression: a loop that keeps the last comparison, or treats "no key raised" as verified
-    import bittensor
+def test_an_owner_change_needs_every_chain_node_and_then_verifies_new_messages(tmp_path, monkeypatch):
+    trust = _start(tmp_path, _image(tmp_path, _message(OWNER, OLD_VALIDATOR, 1)))
+    first_node = trust_service.PUBLIC_CHAIN_NODES[0]
+    _chain(monkeypatch, lambda url: NEW_OWNER.ss58_address if url == first_node else OWNER.ss58_address)
+    assert not trust.refresh_owner()
+    assert trust.owner == OWNER.ss58_address
+    _chain(monkeypatch, lambda url: NEW_OWNER.ss58_address)
+    assert trust.refresh_owner()
+    # the held validator stays until the new owner signs a higher revision; the old owner is no longer heard
+    assert trust.report()["validator"] == OLD_VALIDATOR.ss58_address
+    assert not trust.offer(_message(OWNER, NEW_VALIDATOR, 2))
+    assert trust.offer(_message(NEW_OWNER, NEW_VALIDATOR, 2))
 
-    current = bittensor.Keypair.create_from_uri("//WatchtowerRotationCurrent")
-    nxt = bittensor.Keypair.create_from_uri("//WatchtowerRotationNext")
-    stranger = bittensor.Keypair.create_from_uri("//WatchtowerRotationStranger")
-    with patch("watchtower.WATCHTOWER_VALIDATOR_HOTKEY", current.ss58_address), patch(
-        "watchtower.WATCHTOWER_VALIDATOR_NEXT_HOTKEY", nxt.ss58_address
-    ):
-        with pytest.raises(Exception, match="Invalid signature"):
-            verify_watchtower_signature(_signed_digest(stranger))
 
-
-def test_a_blank_next_hotkey_trusts_one_signer():
-    # a staging config_override that names only WATCHTOWER_VALIDATOR_HOTKEY behaves as before this release
-    import bittensor
+def test_a_non_prod_build_trusts_its_own_hotkey_and_reads_no_message(tmp_path, monkeypatch):
     import watchtower
 
-    current = bittensor.Keypair.create_from_uri("//WatchtowerRotationCurrent")
-    nxt = bittensor.Keypair.create_from_uri("//WatchtowerRotationNext")
-    with patch("watchtower.WATCHTOWER_VALIDATOR_HOTKEY", current.ss58_address), patch(
-        "watchtower.WATCHTOWER_VALIDATOR_NEXT_HOTKEY", ""
-    ):
-        assert watchtower.trusted_validator_hotkeys() == (current.ss58_address,)
-        with pytest.raises(Exception, match="Invalid signature"):
-            verify_watchtower_signature(_signed_digest(nxt))
+    trust = ValidatorTrust(image_message=_image(tmp_path, _message(OWNER, NEW_VALIDATOR, 1)), enabled=False)
+    trust.load()
+    _backend(monkeypatch, lambda url: pytest.fail("a non-prod build read the message"))
+    trust.refresh()
+    assert not trust.offer(_message(OWNER, NEW_VALIDATOR, 2))
+    monkeypatch.setattr(watchtower, "validator_trust", trust)
+    assert watchtower.trusted_validator_hotkeys() == (OLD_VALIDATOR.ss58_address,)
+
+
+def test_the_shipped_message_is_signed_by_the_release_owner_and_names_the_baked_hotkey():
+    from datura.validator_trust import RELEASE_SUBNET_OWNER_COLDKEY, verify_trust_message
+
+    import config
+
+    data = json.loads(trust_service.IMAGE_MESSAGE_PATH.read_text())
+    trusted = verify_trust_message(SignedTrustMessage(data["message"], data["signature"]), RELEASE_SUBNET_OWNER_COLDKEY)
+    assert trusted.validator == config.WATCHTOWER_VALIDATOR_HOTKEY
+
+
+def test_the_message_route_sits_next_to_the_digest_endpoint():
+    assert trust_service.VALIDATOR_MESSAGE_URL == "https://lium.io/api/watchtower/validator-message"
+
+
+def _serve(handler_body):
+    """A real HTTP server on localhost whose GET runs `handler_body(handler)`; returns (url, stop)."""
+    import http.server
+    import threading
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            handler_body(self)
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server.daemon_threads = True
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return f"http://127.0.0.1:{server.server_port}/watchtower/validator-message", server.shutdown
+
+
+def test_fetch_json_gives_up_on_a_reply_that_arrives_in_short_reads_within_the_total_bound(monkeypatch):
+    """review lium-io#2384: a server sending a byte every 0.3 s never trips a socket read timeout; the whole request
+    is bounded instead (aiohttp total timeout), so a slow chain node cannot hold the digest check"""
+    import time as _time
+
+    def drip(handler):
+        handler.send_response(200)
+        handler.send_header("Content-Length", "256")
+        handler.end_headers()
+        for _ in range(256):
+            try:
+                handler.wfile.write(b" ")
+                handler.wfile.flush()
+            except OSError:
+                return
+            _time.sleep(0.3)
+
+    url, stop = _serve(drip)
+    monkeypatch.setattr(trust_service, "FETCH_TIMEOUT_SECONDS", 1.0)
+    try:
+        started = _time.monotonic()
+        with pytest.raises(TimeoutError):
+            trust_service.fetch_json(url)
+        assert _time.monotonic() - started < 3
+    finally:
+        stop()
+
+
+def test_fetch_json_reads_a_reply_and_refuses_one_over_the_cap():
+    def reply(body):
+        def handle(handler):
+            handler.send_response(200)
+            handler.send_header("Content-Length", str(len(body)))
+            handler.end_headers()
+            handler.wfile.write(body)
+        return handle
+
+    url, stop = _serve(reply(b'{"message": "m", "signature": "s"}'))
+    try:
+        assert trust_service.fetch_json(url) == {"message": "m", "signature": "s"}
+    finally:
+        stop()
+    url, stop = _serve(reply(b" " * (trust_service.FETCH_LIMIT_BYTES + 8192)))
+    try:
+        with pytest.raises(ValueError, match="over"):
+            trust_service.fetch_json(url)
+    finally:
+        stop()
+
+def test_trust_a_staging_build_follows_only_its_own_owner_key_and_never_reads_the_chain(tmp_path, monkeypatch):
+    staging = Keypair.create_from_uri("//WatchtowerTrustStagingOwner")
+    _chain(monkeypatch, Mock(side_effect=AssertionError("chain read")))
+    trust = ValidatorTrust(image_message=_image(tmp_path, _message(OWNER, NEW_VALIDATOR, 8)),
+                           owner=staging.ss58_address, read_chain=False, message=_message(staging, OLD_VALIDATOR, 1))
+    trust.load()
+    assert trust.report()["validator"] == OLD_VALIDATOR.ss58_address
+    assert trust.offer(_message(OWNER, NEW_VALIDATOR, 2)) is False
+    assert trust.refresh_owner() is False and trust.owner == staging.ss58_address
+    assert trust.offer(_message(staging, NEW_VALIDATOR, 2)) is True
+
+
+def test_a_disabled_watchtower_stays_up_idle_and_never_checks():
+    """WATCHTOWER_ENABLED=false: main() must not return (under unless-stopped an exit is restarted every second)."""
+    import watchtower as wt
+
+    class Stop(Exception):
+        pass
+
+    with patch.object(wt.settings, "WATCHTOWER_ENABLED", False), \
+            patch.object(wt.time, "sleep", side_effect=[None, Stop()]) as sleep, \
+            patch.object(wt, "check_and_update") as check, patch.object(wt.validator_trust, "load") as load:
+        with pytest.raises(Stop):
+            wt.main()
+    assert sleep.call_count == 2
+    check.assert_not_called()
+    load.assert_not_called()
+

@@ -7,7 +7,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import aiohttp
 import bittensor
 import pytest
-from neurons.validators.src.clients.backend_client import BackendClient
+from neurons.validators.src.clients import backend_client as backend_client_module
+from neurons.validators.src.clients.backend_client import BackendClient, HealthCheckTimedOut
 from pydantic import BaseModel
 from tenacity import wait_none
 
@@ -213,6 +214,22 @@ async def test_check_executor_health_sends_the_host_port_only_when_given(client)
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("nonce", [None, "4c545331" + "00" * 28])
+async def test_check_executor_health_sends_owner_hotkeys_with_the_dated_nonce_it_was_given(client, nonce):
+    """The backend signs owner hotkeys only with a dated nonce, so the health check sends the owner hotkeys next to the
+    nonce the caller passes (upload_nonce_for_miner: none for a miner not proven to relay it)."""
+    with (
+        patch.object(backend_client_module, "portal_owner_hotkeys", return_value={"5OtherAccount"}),
+        patch.object(client, "_signed_request", AsyncMock(return_value=None)) as post,
+    ):
+        await client.check_executor_health("1.2.3.4", 8001, "hotkey", 9001, upload_nonce=nonce)
+
+    sent = post.await_args.kwargs["json_data"]
+    assert sent["owner_hotkeys"] == ["5OtherAccount"]
+    assert sent.get("upload_nonce") == nonce
+
+
+@pytest.mark.asyncio
 async def test_check_executor_health_sends_the_upload_nonce_only_when_given(client):
     with patch.object(client, "_signed_request", AsyncMock(return_value=None)) as post:
         await client.check_executor_health("1.2.3.4", 8001, "hotkey", 9001)
@@ -245,10 +262,31 @@ async def test_check_executor_health_bounds_the_whole_call_including_retries(res
 
     with patch.object(BackendClient, "get_session", return_value=mock_session):
         started = asyncio.get_running_loop().time()
-        result = await client.check_executor_health("1.2.3.4", 8001, "hotkey", 9001, timeout=0.2)
+        with pytest.raises(HealthCheckTimedOut):
+            await client.check_executor_health("1.2.3.4", 8001, "hotkey", 9001, timeout=0.2)
 
-    assert result is None
     assert asyncio.get_running_loop().time() - started < 0.35
+
+
+@pytest.mark.asyncio
+async def test_a_health_check_that_runs_out_its_wait_is_a_timeout_not_a_failed_request(reset_session, client):
+    # the request's own timeout lies past the wait, so running out of time never reads as an API error (None)
+    async def hang():
+        await asyncio.sleep(10)
+
+    async_cm = AsyncMock()
+    async_cm.__aenter__ = AsyncMock(side_effect=hang)
+    async_cm.__aexit__ = AsyncMock(return_value=None)
+    mock_session = AsyncMock()
+    mock_session.closed = False
+    mock_session.request = MagicMock(return_value=async_cm)
+
+    with patch.object(BackendClient, "get_session", return_value=mock_session):
+        with pytest.raises(HealthCheckTimedOut) as raised:
+            await client.check_executor_health("1.2.3.4", 8001, "hotkey", 9001, timeout=0.2)
+
+    assert raised.value.timeout == 0.2
+    assert mock_session.request.call_args.kwargs["timeout"].total > 0.2
 
 
 @pytest.mark.asyncio
@@ -657,3 +695,20 @@ async def test_backend_calls_sign_the_whole_request(reset_session, method, path,
     message = BackendClient.signed_request_message(method, path, body, headers["timestamp"])
     assert headers["hotkey"] == keypair.ss58_address
     assert keypair.verify(message, bytes.fromhex(headers["signature"].removeprefix("0x")))
+
+
+@pytest.mark.asyncio
+async def test_check_executor_health_sends_the_portals_owner_hotkeys_for_the_listing(client, monkeypatch):
+    # DAH-6740: the backend signs its health-check key for these, as the validator's own uploads do
+    from clients import validator_portal_api
+
+    monkeypatch.setattr(validator_portal_api, "_owner_hotkeys", {})
+    monkeypatch.setattr(validator_portal_api, "_owner_hotkeys_read_at", None)
+    validator_portal_api.remember_owner_hotkeys({"hotkey": ["5OwnerB", "5OwnerA"]})
+    with patch.object(client, "_signed_request", new=AsyncMock(return_value=None)) as signed:
+        await client.check_executor_health("1.2.3.4", 8001, "hotkey", 9001)
+        await client.check_executor_health("1.2.3.4", 8001, "another", 9001)
+
+    owned, other = (call.kwargs["json_data"] for call in signed.await_args_list)
+    assert owned["owner_hotkeys"] == ["5OwnerA", "5OwnerB"]
+    assert "owner_hotkeys" not in other

@@ -11,6 +11,7 @@ HOW A NODE PICKS A POOL:
                                                           mining score is zeroed, e.g. Sysbox
                                                           not confirmed; reason below)
   idle AND model in program AND price ok AND disk >= 1.5x VRAM
+       AND RAM >= half of VRAM (when that gate is enforced)
        AND (not full-8x OR NCU/split/attested-CVM offered) AND power cap appliable
                                AND capacity?            -> unrented pool (earns)
   otherwise                                            -> 0 incentive (reason below)
@@ -28,6 +29,7 @@ WHAT THIS CATALOG HOLDS — every `MinerLogLine` the miner-facing log block
      GPU model not in the unrented program (earns only when rented),
      price above the market soft limit (lower the price to earn),
      total disk below 1.5x total GPU VRAM (add disk to earn),
+     system RAM below half of total GPU VRAM, when enforced (add RAM to earn),
      8x H200/B200/B300 with no NCU profiling, GPU splitting or passed TDX
        attestation (offer any of the three to earn),
      container that cannot apply a GPU power cap (give it CAP_SYS_ADMIN to earn),
@@ -83,6 +85,7 @@ if TYPE_CHECKING:
     from incentive.rental_price import (
         DiskLimitedRemainder,
         InsufficientDisk,
+        InsufficientRam,
         MissingFull8xCapability,
         PortLimitedRemainder,
         PowerCapIncapable,
@@ -111,6 +114,7 @@ class ZeroIncentiveReason(StrEnum):
     NO_UNRENTED_CAPACITY_FOR_GPU_COUNT = "no_unrented_capacity_for_gpu_count"
     NVIDIA_DRIVER_BELOW_MINIMUM = "nvidia_driver_below_minimum"
     INSUFFICIENT_DISK_FOR_VRAM = "insufficient_disk_for_vram"
+    INSUFFICIENT_RAM_FOR_VRAM = "insufficient_ram_for_vram"
     SYSBOX_NOT_ENABLED = "sysbox_not_enabled"
     FULL_8X_WITHOUT_NCU_OR_SPLIT = "flagship_without_ncu_or_split"  # wire code, append-only: consumers key on it (DAH-5197 keeps the value)
     CANNOT_APPLY_GPU_POWER_CAP = "cannot_apply_gpu_power_cap"
@@ -128,6 +132,9 @@ class ZeroIncentiveReason(StrEnum):
     RENTED_SYSBOX_NOT_CONFIRMED = "rented_sysbox_not_confirmed"
     # Group B (appended): free splits of a partly rented split node without disk room for their share (DAH-4961)
     DISK_LIMITED_REMAINDER = "disk_limited_remainder"
+    # Group B (appended): the free splits' pay was capped by a port check deferred for disk pressure (DAH-5851), not
+    # by the node's ports; not a listing gate, the free GPUs stay listed on the last completed check's ports
+    PORT_CHECK_DEFERRED_REMAINDER = "port_check_deferred_remainder"
 
 
 # The reason code a failed run carries when no check produced one (an exception in the pipeline).
@@ -321,7 +328,7 @@ class MinerLogLine(BaseModel):
         return MinerLogLine._no_payout(
             result,
             reason=ZeroIncentiveReason.OUTDATED_EXECUTOR_IMAGE,
-            message=outdated_image_remediation(str(expected_ref), enforced=True),
+            message=outdated_image_remediation(str(expected_ref), report.get("status")),
             extra_fields={
                 "executor_image_status": report.get("status"),
                 "observed_digest": report.get("observed_digest"),
@@ -387,20 +394,59 @@ class MinerLogLine(BaseModel):
         # takes the measurement whole: the two totals are interchangeable floats, and swapping
         # them would quietly tell the miner to add disk he already has
         required_disk_gb: float = round(measured.vram_gb * measured.rate, 1)
-        return MinerLogLine._no_payout(
-            result,
-            reason=ZeroIncentiveReason.INSUFFICIENT_DISK_FOR_VRAM,
-            message=(
+        if measured.disk_unknown:
+            # no reading: "0 GB of total disk" would be false
+            fix = (
+                "Install containerd's ctr CLI on the host (the containerd package ships it)"
+                if measured.needs_ctr
+                else "Fix the cause above so Docker's containerd answers with a root on the host"
+            )
+            message = (
+                f"No unrented incentive: this executor's disk could not be measured, because the validator could not "
+                f"find where Docker's containerd image store keeps containers ({measured.unknown_cause}). An idle "
+                f"executor must have at least {measured.rate}x its {measured.vram_gb} GB of GPU VRAM "
+                f"({required_disk_gb} GB) in total disk. {fix}, or rent it out to earn."
+            )
+        else:
+            message = (
                 f"No unrented incentive: this executor has {measured.disk_gb} GB of total disk but "
                 f"{measured.vram_gb} GB of GPU VRAM. An idle executor must have at least "
                 f"{measured.rate}x its GPU VRAM in disk to earn the unrented incentive. Give it at "
                 f"least {required_disk_gb} GB of total disk, or rent it out to earn."
+            )
+        return MinerLogLine._no_payout(
+            result,
+            reason=ZeroIncentiveReason.INSUFFICIENT_DISK_FOR_VRAM,
+            message=message,
+            extra_fields={
+                "total_vram_gb": measured.vram_gb,
+                "total_disk_gb": None if measured.disk_unknown else measured.disk_gb,
+                # unknown is not measured-short: consumers must not tell this provider to add disk
+                "disk_unknown": measured.disk_unknown,
+                "min_disk_to_vram_rate": measured.rate,
+                "required_disk_gb": required_disk_gb,
+            },
+        )
+
+    @staticmethod
+    def no_payout_because_insufficient_ram_for_vram(
+        result: JobResult, measured: InsufficientRam
+    ) -> MinerLogLine:
+        required_ram_gb: float = measured.required_ram_gb
+        return MinerLogLine._no_payout(
+            result,
+            reason=ZeroIncentiveReason.INSUFFICIENT_RAM_FOR_VRAM,
+            message=(
+                f"No unrented incentive: this executor has {measured.ram_gb} GB of RAM but "
+                f"{measured.vram_gb} GB of GPU VRAM. An idle executor needs system RAM of at least "
+                f"{measured.rate}x its GPU VRAM to earn the unrented incentive. Give it at least "
+                f"{required_ram_gb} GB of RAM, or rent it out to earn."
             ),
             extra_fields={
                 "total_vram_gb": measured.vram_gb,
-                "total_disk_gb": measured.disk_gb,
-                "min_disk_to_vram_rate": measured.rate,
-                "required_disk_gb": required_disk_gb,
+                "total_ram_gb": measured.ram_gb,
+                "min_ram_to_vram_rate": measured.rate,
+                "required_ram_gb": required_ram_gb,
             },
         )
 
@@ -522,6 +568,28 @@ class MinerLogLine(BaseModel):
                     "required_port_count": port_limited.required_port_count,
                     "free_split_count": 0,
                     "paid_split_count": 0,
+                },
+            )
+        if port_limited.port_check_deferred:
+            # DAH-5851: the count is this deferred cycle's filler ports; the node's own free ports were not measured,
+            # so naming it as the node's free ports (or asking for more ports) would misstate the node
+            return MinerLogLine._no_payout(
+                result,
+                reason=ZeroIncentiveReason.PORT_CHECK_DEFERRED_REMAINDER,
+                message=(
+                    f"No unrented incentive this cycle for {unpaid} of the free GPUs on this partially rented "
+                    "node: its port check was deferred because writes were still being flushed to the Docker "
+                    "filesystem, and idle pay counts only ports measured in the same cycle "
+                    f"({port_limited.available_port_count} this time). The free GPUs stay listed on the ports "
+                    "from the last completed check and the rented GPUs keep earning. How many of the free GPUs "
+                    "earn after this depends on the free ports the next completed port check measures."
+                ),
+                extra_fields={
+                    "gpu_count": unpaid,
+                    "available_port_count": port_limited.available_port_count,
+                    "required_port_count": port_limited.required_port_count,
+                    "free_split_count": port_limited.free_split_count,
+                    "paid_split_count": port_limited.paid_split_count,
                 },
             )
         if port_limited.paid_split_count:

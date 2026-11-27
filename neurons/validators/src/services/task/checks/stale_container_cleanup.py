@@ -9,15 +9,14 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
-from core.config import settings
 from core.utils import _m
 from protocol.vc_protocol.compute_requests import (
     LIVE_FILLER_RUN_STATUSES,
     FillerRunActiveResponse,
     PodRentalActiveResponse,
 )
-from protocol.vc_protocol.validator_requests import POD_STATES_MAX_ITEMS, ContainerState, PodContainerState
-from services.container_cleanup import rented_list_unknown_reason
+from protocol.vc_protocol.validator_requests import ContainerState, PodContainerState
+from services.container_cleanup import SnapshotSSH, rented_list_unknown_reason
 from services.redis_service import CLEANUP_SEEN_EXECUTORS_SET
 
 from ...const import (
@@ -47,18 +46,13 @@ DOWNLOAD_TEMPORARY_SWEEP_INTERVAL_SECONDS = 60 * 60
 # container is gone (the next cycle finds nothing to reap). So every reaped pod id is queued in
 # redis BEFORE its container is removed and re-sent with every cycle's pod_states until it is this
 # old; the backend's write is idempotent (a repeat changes nothing), so a re-send costs nothing.
-# With settings.POD_STATES_REPORT_ENABLED the cycle's states go out in PodStatesReport chunks, so
-# every queued id is sent every cycle. Without it the spec is the only carrier and holds at most
-# POD_STATES_MAX_ITEMS states (the backend's bound): the rented pods' observed states have first
-# claim on those slots, the queued ids take turns for the rest (least recently sent first) and never
-# fewer than REAPED_POD_STATES_FLOOR of them, so a node with 256 rented pods still moves its queue.
+# The cycle's states go out in PodStatesReport chunks, so every queued id is sent every cycle.
 REAPED_POD_STATE_RETENTION_SECONDS = 24 * 60 * 60
 # How long after its rental closed a volume is still the delete's to remove, not the low-disk sweep's.
 ENDED_RENTAL_VOLUME_GRACE = timedelta(hours=1)
 # A volume_<uuid> neither a pod nor a filler run is known by is removed only after this long.
 UNKNOWN_VOLUME_MIN_AGE = timedelta(days=7)
 REAPED_POD_STATES_KEY_PREFIX = "reaped_pod_states:"
-REAPED_POD_STATES_FLOOR = 32
 # DAH-5117 review 4373847343: a removed container's GPU processes are dropped once per name. An ended
 # record stays ended, so a provider recreating pod_<old id> each cycle would otherwise be exempt forever.
 # Never expired: see _ReapedPodStateQueue.claim_gpu_exemptions.
@@ -187,6 +181,8 @@ class StaleContainerCleanupCheck:
             reserved.add(name)
             return True
 
+        # DAH-7109: the always-run reads below are answered from this one SSH call until a command changes the host
+        ssh_client = await SnapshotSSH.take(ctx.ssh)
         if first_sight:
             removed_count, removed_names, unremovable_names = 0, [], []
         else:
@@ -195,7 +191,7 @@ class StaleContainerCleanupCheck:
                 removed_names,
                 unremovable_names,
             ) = await ctx.services.container_cleanup.cleanup(
-                ssh_client=ctx.ssh,
+                ssh_client=ssh_client,
                 rented_data=ctx.state.rented_data,
                 executor_uuid=ctx.executor.uuid,
                 on_before_remove=queue.add,
@@ -219,14 +215,14 @@ class StaleContainerCleanupCheck:
             # stamped first: a sweep cut by the step's budget must not run again next cycle ahead of the reclaim
             self._last_sweep_at[ctx.executor.uuid] = now
             swept_download_temporaries = await ctx.services.container_cleanup.sweep_abandoned_download_temporaries(
-                ssh_client=ctx.ssh,
+                ssh_client=ssh_client,
                 executor_uuid=ctx.executor.uuid,
             )
             # A volume_<uuid> whose container is gone and whose pod or filler run is over is never read
             # again; same hourly throttle, since each candidate costs backend lookups. Before the
             # reclaim below, which measures free disk itself: the renter's leftovers go first.
             removed_orphan_volumes = await ctx.services.container_cleanup.remove_orphan_rental_volumes(
-                ssh_client=ctx.ssh,
+                ssh_client=ssh_client,
                 rented_data=ctx.state.rented_data,
                 executor_uuid=ctx.executor.uuid,
                 is_orphan=lambda volume_id, age: _is_orphan_volume(ctx, volume_id, age),
@@ -238,7 +234,7 @@ class StaleContainerCleanupCheck:
         # ~37 GB forever), so a node that has fallen under the rental listing floor is rescued from
         # here, where the decision is made on real free space and outside any launch.
         reclaimed_cache_volumes = await ctx.services.container_cleanup.reclaim_dphn_cache_when_disk_is_tight(
-            ssh_client=ctx.ssh,
+            ssh_client=ssh_client,
             executor_uuid=ctx.executor.uuid,
         )
 
@@ -282,7 +278,7 @@ class StaleContainerCleanupCheck:
         for name in unremovable_names:
             # queued before the attempt (the hook runs first), still on the host: not reaped
             await queue.drop(name)
-        reaped = await queue.states(limit=self._reaped_slots_in_spec(ctx))
+        reaped = await queue.states()
         if not unremovable_names and not reaped and not removed_names:
             return CheckResult(passed=True, event=event)
         # the GPU exemption for confirmed AND gone removals is claimed in run(), outside the budget
@@ -292,31 +288,6 @@ class StaleContainerCleanupCheck:
             pod_states=[*ctx.state.pod_states, *reaped],
         )
         return CheckResult(passed=True, event=event, updates={"state": state})
-
-    @staticmethod
-    def _reaped_slots_in_spec(ctx: Context) -> int | None:
-        """How many queued reaped ids go into this cycle's message; None for all of them.
-
-        With POD_STATES_REPORT_ENABLED the states travel as PodStatesReport chunks after the spec
-        (256 per chunk, as many chunks as it takes), so there is no share to divide. Without it the
-        spec is the only carrier and holds at most POD_STATES_MAX_ITEMS (the backend drops a longer
-        spec whole, node listing included, and a second spec per cycle would write a second cycle
-        row and validation report). TenantEnforcementCheck adds one observed state per rented pod
-        later in the cycle; those slots are reserved here and the reaped ids share what is left,
-        but never fewer than REAPED_POD_STATES_FLOOR: the reaped ids sit first in the list, so the
-        wire's cut takes observed states instead, and a reaped id that misses its 24 h window is
-        lost for good. The cost falls on a node with more than 256 - REAPED_POD_STATES_FLOOR rented
-        pods: the last rented pods in the backend's list have their states cut every cycle until the
-        queue drains (at most its 24 h retention). The backend writes only the states it receives
-        and never reads a pod missing from a list as absent, so those rows keep their last state.
-        The flag is the fix; this floor only stops the queue from expiring unsent.
-        """
-        if settings.POD_STATES_REPORT_ENABLED:
-            return None
-        rented_data = ctx.state.rented_data
-        rented = rented_data.executors.get(ctx.executor.uuid) if rented_data else None
-        rented_pod_count = len(rented.pods) if rented else 0
-        return max(REAPED_POD_STATES_FLOOR, POD_STATES_MAX_ITEMS - rented_pod_count)
 
     async def _first_sight(self, ctx: Context) -> bool:
         """Record the executor UUID; True the first time this validator meets it.
@@ -459,10 +430,6 @@ class _QueuedReap:
             datetime.fromisoformat(str(sent_at)) if sent_at else None,
         )
 
-    def send_order(self) -> tuple[int, datetime]:
-        # never sent first, then the one whose last report is oldest
-        return (0, self.observed_at) if self.sent_at is None else (1, self.sent_at)
-
 
 class _ReapedPodStateQueue:
     """Per-executor redis hash ``pod_id -> {observed_at, sent_at}`` of reaped rental containers
@@ -535,14 +502,8 @@ class _ReapedPodStateQueue:
         except Exception as e:
             logger.warning(_m("reaped pod state not dropped", extra={**self._extra, "pod_id": pod_id, "error": str(e)}))
 
-    async def states(self, limit: int | None) -> list[PodContainerState]:
-        """Up to ``limit`` queued reaps for this cycle's message (all of them for None), and record
-        that they went out.
-
-        Never-sent ids first, then the ones whose last report is oldest; what does not fit keeps
-        its place and goes next cycle, so a queue longer than the message's share is sent whole
-        over ceil(queue / share) cycles instead of the same head every time.
-        """
+    async def states(self) -> list[PodContainerState]:
+        """Every queued reap for this cycle's message, and record that they went out."""
         queued: dict[str, _QueuedReap] = dict(self._this_cycle)
         if self._redis is not None:
             try:
@@ -570,15 +531,7 @@ class _ReapedPodStateQueue:
                 except Exception as e:
                     logger.warning(_m("expired reaped pod states not dropped", extra={**self._extra, "error": str(e)}))
 
-        in_send_order = sorted(queued.items(), key=lambda item: item[1].send_order())
-        sending = in_send_order if limit is None else in_send_order[: max(0, limit)]
-        if len(sending) < len(in_send_order):
-            logger.info(
-                _m(
-                    "reaped pod states over this cycle's share of the message; the rest go next cycle",
-                    extra={**self._extra, "queued": len(in_send_order), "sent": len(sending), "share": limit},
-                )
-            )
+        sending = list(queued.items())
         sent_at = datetime.now(UTC)
         for pod_id, entry in sending:
             entry.sent_at = sent_at

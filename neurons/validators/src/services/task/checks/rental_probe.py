@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import shlex
 import time
 import uuid
@@ -24,6 +25,7 @@ from payload_models.payloads import (
 from core.config import settings
 from core.utils import _m, get_extra_info
 from services.container_cleanup import retained_volume_pod_ids
+from services.nvidia_devices import PROC_GPU_INFO_CMD, _parse_uuid_minor_csv
 from services.redis_service import (
     RENTAL_PROBE_FAILED_PREFIX,
     RENTAL_PROBE_OK_PREFIX,
@@ -31,6 +33,7 @@ from services.redis_service import (
 
 from ...const import MIN_POD_PORT_COUNT, POD_CONTAINER_PREFIX
 from ...node_host import open_public_connection, public_host_sock
+from ..availability import failed_check_event
 from ..messages import NO_OUTBOUND_INTERNET_REMEDIATION, OutboundInternetMessages
 from ..messages import RentalProbeMessages as Msg
 from ..messages import render_message
@@ -94,9 +97,11 @@ _REMEDIATION_BY_STEP: dict[str, str] = {
         "login as root."
     ),
     STEP_GPU_COUNT: (
-        "The renter container started and SSH worked, but `nvidia-smi -L` inside it did not list "
-        "the {expected} GPU(s) this node advertises. Check the NVIDIA container runtime and "
-        "`docker run --gpus all nvidia-smi -L` by hand."
+        "The renter container started and SSH worked, but it could not use the {expected} GPU(s) this "
+        "node advertises: `nvidia-smi -L` inside it must list them all, each one's /dev/nvidiaN device "
+        "node must be present and each must work under CUDA as the listed model (its UUID, name and memory, "
+        "a write and a kernel on it). Check the NVIDIA container runtime and "
+        "`docker run --gpus all <image> sh -c 'nvidia-smi -L; ls /dev/nvidia*'` by hand."
     ),
     STEP_EGRESS: NO_OUTBOUND_INTERNET_REMEDIATION,
 }
@@ -107,7 +112,119 @@ _SSHD_BANNER_TIMEOUT_SECONDS = 5
 _SSH_LOGIN_TIMEOUT_SECONDS = 30
 # waits between login attempts; the last value repeats until the deadline
 _SSH_LOGIN_BACKOFF_SECONDS = (1.0, 2.0, 4.0, 8.0)
-_NVIDIA_SMI_TIMEOUT_SECONDS = 30
+# the whole GPU check in the container (two nvidia-smi calls, the device nodes, a context and a write on
+# every CUDA device, then PyTorch's import and a kernel on every device), not one call
+_GPU_CHECK_TIMEOUT_SECONDS = 120
+# NVML lists every card the driver knows, so `nvidia-smi -L` can name a card whose /dev/nvidiaN was never
+# handed to the container; the renter gets only the cards it can open. The same session also prints the
+# container's GPU device nodes, the kernel minors of its listed cards and what CUDA can do on each device.
+_DEVICE_NODES_MARK = "--gpu-device-nodes--"
+_GPU_MINORS_MARK = "--gpu-minors--"
+_MIG_MODE_MARK = "--gpu-mig-mode--"
+_CUDA_DEVICES_MARK = "--cuda-devices--"
+# each GPU device node with its device number (hex major:minor): a card is counted by the number it opens,
+# not by the node's name
+_DEVICE_NODES_CMD = 'for f in /dev/nvidia[0-9]*; do [ -c "$f" ] && stat -Lc "%n %t:%T" "$f"; done 2>/dev/null; true'
+_NVIDIA_MAJOR = 195
+_NO_LIBCUDA = "libcuda.so.1 not found"
+# A device count proves nothing about the devices: every CUDA device must report its UUID, name and memory,
+# take a context and a 64 MiB write that reads back, and, where the image has PyTorch (what renters run),
+# run a kernel there too. Prints `error <why>` when libcuda.so.1 cannot be loaded or the driver refuses,
+# else `<source>\tcount\t<n>` and one `<source>\t<i>\tok\t<uuid>\t<MiB>\t<name>`,
+# `<source>\t<i>\tbusy\t<uuid>\t<MiB>\t<name>` (identity read, but no memory free for the work) or
+# `<source>\t<i>\terror\t<what>` line per device, source `cuda` (driver API) or `torch`.
+_CUDA_DEVICES_PY = (
+    "import ctypes\n"
+    "try:\n"
+    "    cuda = ctypes.CDLL('libcuda.so.1')\n"
+    "except OSError:\n"
+    f"    print('error {_NO_LIBCUDA}')\n"
+    "    raise SystemExit(0)\n"
+    "n = ctypes.c_int(0)\n"
+    "rc = cuda.cuInit(0) or cuda.cuDeviceGetCount(ctypes.byref(n))\n"
+    "if rc:\n"
+    "    print(f'error {rc}')\n"
+    "    raise SystemExit(0)\n"
+    "print(f'cuda\\tcount\\t{n.value}', flush=True)\n"
+    "class Fail(Exception):\n"
+    "    rc = 0\n"
+    "def call(fn, *args):\n"
+    "    rc = getattr(cuda, fn)(*args)\n"
+    "    if rc:\n"
+    "        exc = Fail(f'{fn} {rc}')\n"
+    "        exc.rc = rc\n"
+    "        raise exc\n"
+    "def uuid_text(raw):\n"
+    "    h = bytes(raw).hex()\n"
+    "    return f'GPU-{h[:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:32]}'\n"
+    "SIZE = 1 << 26\n"
+    "for i in range(n.value):\n"
+    "    ctx = ctypes.c_void_p(0)\n"
+    "    ident = None\n"
+    "    try:\n"
+    "        dev = ctypes.c_int(0)\n"
+    "        call('cuDeviceGet', ctypes.byref(dev), i)\n"
+    "        name = ctypes.create_string_buffer(256)\n"
+    "        call('cuDeviceGetName', name, 256, dev)\n"
+    "        mem = ctypes.c_size_t(0)\n"
+    "        call('cuDeviceTotalMem_v2', ctypes.byref(mem), dev)\n"
+    "        uid = (ctypes.c_ubyte * 16)()\n"
+    "        call('cuDeviceGetUuid', uid, dev)\n"
+    "        ident = (uuid_text(uid), str(mem.value >> 20), name.value.decode(errors='replace').strip())\n"
+    "        call('cuCtxCreate_v2', ctypes.byref(ctx), 0, dev)\n"
+    "        ptr = ctypes.c_uint64(0)\n"
+    "        call('cuMemAlloc_v2', ctypes.byref(ptr), ctypes.c_size_t(SIZE))\n"
+    "        pattern = 0x5A5A5A00 + i\n"
+    "        call('cuMemsetD32_v2', ptr, ctypes.c_uint(pattern), ctypes.c_size_t(SIZE // 4))\n"
+    "        back = (ctypes.c_uint32 * 1024)()\n"
+    "        call('cuMemcpyDtoH_v2', back, ctypes.c_uint64(ptr.value + SIZE - 4096), ctypes.c_size_t(4096))\n"
+    "        call('cuCtxSynchronize')\n"
+    "        if any(v != pattern for v in back):\n"
+    "            raise Fail('device memory did not read back what was written')\n"
+    "        print('\\t'.join(('cuda', str(i), 'ok') + ident), flush=True)\n"
+    "    except Fail as exc:\n"
+    # CUDA_ERROR_OUT_OF_MEMORY on the context or the write: the device is who it says, its memory is taken
+    "        if exc.rc == 2 and ident:\n"
+    "            print('\\t'.join(('cuda', str(i), 'busy') + ident), flush=True)\n"
+    "        else:\n"
+    "            print(f'cuda\\t{i}\\terror\\t{exc}', flush=True)\n"
+    "    finally:\n"
+    "        if ctx.value:\n"
+    "            cuda.cuCtxDestroy_v2(ctx)\n"
+    "try:\n"
+    "    import torch\n"
+    "except Exception:\n"
+    "    raise SystemExit(0)\n"
+    # a CPU build, or one too old to report a device's UUID, is no reading
+    "if not getattr(torch.version, 'cuda', None) or not hasattr(torch._C._CudaDeviceProperties, 'uuid'):\n"
+    "    raise SystemExit(0)\n"
+    "k = torch.cuda.device_count()\n"
+    "print(f'torch\\tcount\\t{k}', flush=True)\n"
+    "for i in range(k):\n"
+    "    ident = None\n"
+    "    try:\n"
+    "        p = torch.cuda.get_device_properties(i)\n"
+    "        raw = getattr(p.uuid, 'bytes', None)\n"
+    "        u = uuid_text(raw) if raw else str(p.uuid)\n"
+    "        u = u if u.startswith('GPU-') else f'GPU-{u}'\n"
+    "        ident = (u, str(p.total_memory >> 20), p.name.strip())\n"
+    "        x = torch.arange(1 << 20, device=f'cuda:{i}', dtype=torch.int64)\n"
+    "        if int((x * 2).sum().item()) != (1 << 20) * ((1 << 20) - 1):\n"
+    "            raise RuntimeError('a kernel returned a wrong result')\n"
+    "        print('\\t'.join(('torch', str(i), 'ok') + ident), flush=True)\n"
+    "    except Exception as exc:\n"
+    "        if ident and 'out of memory' in str(exc).lower():\n"
+    "            print('\\t'.join(('torch', str(i), 'busy') + ident), flush=True)\n"
+    "            continue\n"
+    "        print(f'torch\\t{i}\\terror\\t{type(exc).__name__}: {str(exc)[:60]}'.replace('\\n', ' '), flush=True)\n"
+)
+GPU_LIST_COMMAND = (
+    f"nvidia-smi -L; rc=$?; echo {_DEVICE_NODES_MARK}; {_DEVICE_NODES_CMD}; "
+    f"echo {_GPU_MINORS_MARK}; {PROC_GPU_INFO_CMD}; "
+    f"echo {_MIG_MODE_MARK}; nvidia-smi --query-gpu=mig.mode.current --format=csv,noheader 2>/dev/null; "
+    # run with the image's CUDA_VISIBLE_DEVICES unset: an image default narrows nothing a renter can't undo
+    f"echo {_CUDA_DEVICES_MARK}; env -u CUDA_VISIBLE_DEVICES python3 -c {shlex.quote(_CUDA_DEVICES_PY)} 2>/dev/null; exit $rc"
+)
 # getent's resolver timeouts plus the script's 10 s fetch
 _EGRESS_TIMEOUT_SECONDS = 45
 # create_container has its own bounded retries (a 90 s port-retry budget, SSH timeouts) but no overall
@@ -144,6 +261,7 @@ _WIPE_TEARDOWN_EXTRA_SECONDS = 120
 _SHELL_COMMAND_TIMEOUT_SECONDS = 60
 # every string copied out of the host into the event is bounded (PR_PROCESS §5)
 _TAIL_CHARS = 600
+_OUTPUT_SEP = " | output: "
 _REDIS_LAST_OK_PREFIX = RENTAL_PROBE_OK_PREFIX
 # the failed step of the last probe, standing until a probe passes (review: a skipped or inconclusive
 # next cycle must not relist the node without a clean probe). It has no lifetime: a broken node relisted
@@ -211,7 +329,8 @@ class RentalProbeCheck:
     default renter image through `DockerService.create_container`, the path a renter's pod takes,
     with a probe-owned SSH key and the ports PortConnectivityCheck verified; waits for sshd's banner
     on the mapped port; logs in, retrying until the same RENTAL_PROBE_SSH_DEADLINE_SECONDS deadline;
-    runs `nvidia-smi -L`; and tears the container down through `delete_container`. Each step is
+    runs `nvidia-smi -L` and confirms the container can open every listed GPU (its device node, the CUDA
+    device count); and tears the container down through `delete_container`. Each step is
     timed and lands in `what_we_saw["probe_steps"]`.
 
     A failed step zeroes the score and clears the verified job with reason code RENTAL_PROBE_FAILED
@@ -234,7 +353,12 @@ class RentalProbeCheck:
     renter holds it, and re-reads the node's idleness from the backend and this validator's pending-pod
     marks under the lock, not from the cycle-start snapshot; the lock is released as soon as the
     create returns. Anything the probe cannot read (backend, Redis) makes it skip or reach no verdict;
-    it never penalises on missing data alone.
+    it never penalises on missing data alone. A node with no passed probe on record is the exception:
+    a cycle without a verdict hides it (RENTAL_PROBE_NOT_YET_PROVEN, score 0, nothing cleared), so a node
+    is first listed by a probe that passed, never by a skip. A record that cannot be read scores nothing
+    and leaves the listing as stored (RENTAL_PROBE_PROOF_UNREADABLE), as does a probe the validator cannot
+    run for a reason on its own side (RENTAL_PROBE_NOT_RUN_ON_VALIDATOR: no default renter image for the
+    GPU and driver, no input, no create lock).
 
     An idle node running a Lium filler is probed too, beside the filler rather than in its place:
     create_container is told `beside_fillers`, so it
@@ -320,13 +444,18 @@ class RentalProbeCheck:
 
         if outcome.failed_step is None:
             try:
-                await _stamp_last_ok(ctx)
+                # run() drops this pass when VerifyX or the all-cards proof skipped the cycle; a stamp then would hold
+                # the next full probe back a whole interval, so only a pass the cycle keeps is stamped
+                if not _cycle_skipped_a_work_proof(ctx):
+                    await _stamp_last_ok(ctx)
                 await _clear_failure(ctx)
             finally:
                 _teardown_after_verdict(ctx, outcome)
             return CheckResult(
                 passed=True,
                 event=render_message(Msg.PROBE_OK, ctx=ctx, check_id=self.check_id, what=what),
+                # DAH-6784: the probe ran this cycle and its rental succeeded: the full check
+                updates={"idle_check_passed": True},
             )
 
         # A renter may have taken the node while the probe ran: their create sweeps our container
@@ -371,8 +500,10 @@ class RentalProbeCheck:
         with the lock held; every refusal after the lock was taken releases it first.
         """
         # the last probe's failed step, standing until a probe passes; None when there is none or
-        # Redis could not be read (then this cycle behaves as if there were none, and logs why)
-        standing = await _standing_failure(ctx)
+        # Redis could not be read (then this cycle behaves as if there were none, and logs why). A node
+        # no probe has passed on yet stands the same way: it is first listed by a pass, not by a skip;
+        # so does one whose pass record cannot be read (an unknown record is not a pass).
+        standing = await _standing_failure(ctx) or await _never_passed(ctx)
 
         skip_reason, skip_what = await _skip_reason(ctx, standing)
         if skip_reason == "rented":
@@ -383,13 +514,13 @@ class RentalProbeCheck:
         missing = _missing_inputs(ctx)
         if missing:
             return self._inconclusive(
-                ctx, f"validator has no {missing} for this executor", steps=[], standing=standing
+                ctx, f"validator has no {missing} for this executor", steps=[], standing=standing, validator_side=True
             )
 
         image_ref = await _default_renter_image(ctx)
         if image_ref is None:
             return self._inconclusive(
-                ctx, "no default renter image for this GPU and driver", steps=[], standing=standing
+                ctx, "no default renter image for this GPU and driver", steps=[], standing=standing, validator_side=True
             )
         image_present = await _image_present_on_host(ctx, image_ref)
         if image_present is None:
@@ -420,7 +551,7 @@ class RentalProbeCheck:
         create_lock = await _take_create_lock(ctx)
         if create_lock is None:
             return self._inconclusive(
-                ctx, "could not take the node's create lock", steps=[], standing=standing
+                ctx, "could not take the node's create lock", steps=[], standing=standing, validator_side=True
             )
         if not create_lock.held:
             # a renter's create: rented, as far as the standing failure is concerned
@@ -498,12 +629,48 @@ class RentalProbeCheck:
                     "create_step": failure.create_step,
                     "ssh_port": ssh_port,
                 },
+                # a rented node is left alone (class docstring): a rental placed after the reads above keeps
+                # its node, the backend applies this reset only while no customer pod runs there
+                "clear_verified_job_unrented_only": True,
             },
         )
 
-    def _carried(self, ctx: Context, standing: _Failure, *, no_verdict: str) -> CheckResult:
+    def _carried(
+        self, ctx: Context, standing: _Failure, *, no_verdict: str, validator_side: bool = False
+    ) -> CheckResult:
         """This cycle reached no verdict of its own and the last probe failed: fail the node again with
         that step (review). `no_verdict` is what this cycle would otherwise have reported."""
+        if standing is _NEVER_PASSED and validator_side:
+            # the probe could not start for a reason on the validator's side (no default renter image for the
+            # GPU and driver, no input, no create lock): that says nothing about the node, so it is not hidden as
+            # unproven; like an unreadable record, no score and the stored listing stays (review of lio#2442)
+            event = render_message(
+                Msg.NOT_RUN_ON_VALIDATOR,
+                ctx=ctx,
+                check_id=self.check_id,
+                what={"executor_uuid": ctx.executor.uuid, "no_verdict_this_cycle": no_verdict},
+            )
+            return CheckResult(passed=False, event=event, updates={"score": 0.0, "job_score": 0.0})
+        if standing is _NEVER_PASSED or standing is _PROOF_UNREADABLE:
+            # nothing failed, so nothing is recorded or cleared. Never passed: the reason hides the node
+            # (REASONS_THAT_HIDE_AT_ONCE) until its first pass. Unreadable: no score, and the backend keeps
+            # the node's stored listing state (REASONS_THAT_KEEP_STORED), so an unproven node is not listed
+            # by it and a proven one is not hidden by a Redis read failure.
+            event = render_message(
+                Msg.NOT_YET_PROVEN if standing is _NEVER_PASSED else Msg.PROOF_UNREADABLE,
+                ctx=ctx,
+                check_id=self.check_id,
+                what={"executor_uuid": ctx.executor.uuid, "no_verdict_this_cycle": no_verdict},
+            )
+            # the hold travels with this result, not with where the run happens to end: an unproven node stays
+            # hidden whatever the run reports after it (network figures included)
+            hold = failed_check_event(False, [event]) if standing is _NEVER_PASSED else None
+            return CheckResult(
+                passed=False,
+                event=event,
+                updates={"score": 0.0, "job_score": 0.0},
+                extra_events=[hold] if hold else [],
+            )
         what: dict[str, Any] = {
             "executor_uuid": ctx.executor.uuid,
             "failed_step": standing.step,
@@ -540,9 +707,12 @@ class RentalProbeCheck:
         steps: list[_Step],
         what: dict[str, Any] | None = None,
         standing: _Failure | None = None,
+        validator_side: bool = False,
     ) -> CheckResult:
         if standing is not None:
-            return self._carried(ctx, standing, no_verdict=f"inconclusive: {reason}")
+            return self._carried(
+                ctx, standing, no_verdict=f"inconclusive: {reason}", validator_side=validator_side
+            )
         event = render_message(
             Msg.INCONCLUSIVE,
             ctx=ctx,
@@ -649,9 +819,12 @@ def _missing_inputs(ctx: Context) -> str | None:
     return None
 
 
+def _gpu_details(ctx: Context) -> list:
+    return ctx.state.gpu_details or (ctx.state.specs or {}).get("gpu", {}).get("details", [])
+
+
 def _gpu_uuids(ctx: Context) -> list[str]:
-    details = ctx.state.gpu_details or (ctx.state.specs or {}).get("gpu", {}).get("details", [])
-    return [d["uuid"] for d in details if isinstance(d, dict) and d.get("uuid")]
+    return [d["uuid"] for d in _gpu_details(ctx) if isinstance(d, dict) and d.get("uuid")]
 
 
 def _expected_gpu_count(ctx: Context) -> int:
@@ -712,6 +885,13 @@ async def _log_if_long_unprobed(ctx: Context, reason: str) -> None:
     )
 
 
+def _cycle_skipped_a_work_proof(ctx: Context) -> bool:
+    """VerifyX or the all-cards proof skipped this cycle for a standing probe failure: run() never passes it"""
+    return bool(
+        ctx.state.verifyx_skipped_for_standing_probe_failure or ctx.state.allcards_skipped_for_standing_probe_failure
+    )
+
+
 async def _last_ok_at(ctx: Context) -> float | None:
     """Epoch of the last passed probe, None when there is none; raises when Redis cannot be read."""
     raw = await ctx.services.redis.get(f"{_REDIS_LAST_OK_PREFIX}:{ctx.executor.uuid}")
@@ -759,6 +939,23 @@ class _Failure:
     create_step: str | None = None
 
 
+# The standing state of a node with no passed probe on record (DAH-7044): a node is first listed by a
+# probe that passed, not by cycles that reached no verdict. Never written to Redis; the first pass's
+# stamp ends it.
+_NEVER_PASSED = _Failure("never_passed")
+# The stamp could not be read: whether a pass is on record is unknown, so the node is not scored on it.
+_PROOF_UNREADABLE = _Failure("proof_unreadable")
+
+
+async def _never_passed(ctx: Context) -> _Failure | None:
+    try:
+        last_ok = await _last_ok_at(ctx)
+    except Exception:
+        _read_failed(ctx, "its interval stamp in Redis")
+        return _PROOF_UNREADABLE
+    return _NEVER_PASSED if last_ok is None else None
+
+
 async def _standing_failure(ctx: Context) -> _Failure | None:
     """The last probe's failed step, kept until a probe passes.
 
@@ -778,9 +975,6 @@ async def _standing_failure(ctx: Context) -> _Failure | None:
         _read_failed(ctx, "the lifetime of its standing failure in Redis")
     text = raw.decode() if isinstance(raw, bytes) else str(raw)
     step, _, create_step = text.partition(":")
-    if step == STEP_EGRESS and not settings.NO_OUTBOUND_INTERNET_ENFORCEMENT_ENABLED:
-        # enforcement switched off after the failure was stamped: the egress step fails nothing any more
-        return None
     return _Failure(step, create_step or None) if step else None
 
 
@@ -945,9 +1139,9 @@ async def _probe(
     2. `_step_sshd_listen`: wait for sshd's banner on the mapped port.
     3. `_step_ssh_login`: log in with the probe's key, retrying until the deadline, and run `nvidia-smi -L`
        (and EGRESS_PROBE_SCRIPT, under NO_OUTBOUND_INTERNET_CHECK_ENABLED).
-    4. `_step_gpu_count`: compare the listed GPUs with what the node advertises.
-    5. `_step_egress`: the container resolved and fetched pypi.org; fails the probe only under
-       NO_OUTBOUND_INTERNET_ENFORCEMENT_ENABLED.
+    4. `_step_gpu_count`: compare the listed GPUs, and those the container can open, with what the node
+       advertises.
+    5. `_step_egress`: the container resolved and fetched pypi.org, or the probe fails.
     6. `_step_teardown`: remove the container and the pending-pod mark, whichever step ended the probe.
 
     A step that ends the probe returns None and says why in `outcome` (a failed step, or an inconclusive
@@ -982,7 +1176,7 @@ async def _probe(
         login = await _step_ssh_login(ctx, outcome, private_key, ssh_port, deadline_at=deadline_at)
         if login is None:
             return outcome
-        _step_gpu_count(ctx, outcome, login)
+        _step_gpu_count(ctx, outcome, login, beside_fillers)
         if outcome.failed_step is None:
             _step_egress(ctx, outcome, login)
         if outcome.failed_step is None and outcome.inconclusive_reason is None:
@@ -1137,22 +1331,32 @@ async def _step_ssh_login(
     return login
 
 
-def _step_gpu_count(ctx: Context, outcome: _ProbeOutcome, login: _Login) -> None:
-    """Step 4: `nvidia-smi -L` inside the container must list the GPUs this node advertises."""
+def _step_gpu_count(ctx: Context, outcome: _ProbeOutcome, login: _Login, beside_fillers: bool = False) -> None:
+    """Step 4: `nvidia-smi -L` inside the container must list the GPUs this node advertises, and the
+    container must be able to open each of them (_usable_gpus)."""
     expected = _expected_gpu_count(ctx)
     if login.command_error is not None:
         gpu_ok = False
-        detail = f"nvidia-smi -L did not run over the SSH session: {login.command_error}"
+        detail = f"the GPU check in the container {login.command_error}"
     else:
         smi = login.result
-        seen = _count_gpus(smi.stdout or "")
-        gpu_ok = smi.exit_status == 0 and seen == expected
-        detail = (
-            None
-            if gpu_ok
-            else f"expected {expected} GPU(s), nvidia-smi -L listed {seen} (exit {smi.exit_status}): "
-            f"{(smi.stderr or smi.stdout or '')[-_TAIL_CHARS:]}"
-        )
+        smi_out = (smi.stdout or "").partition(_DEVICE_NODES_MARK)[0]
+        seen = _count_gpus(smi_out)
+        short = _usable_gpus(smi.stdout or "", _gpu_details(ctx), beside_fillers).short_of(expected)
+        gpu_ok = smi.exit_status == 0 and seen == expected and short is None
+        if gpu_ok:
+            detail = None
+        elif smi.exit_status != 0 or seen != expected:
+            summary = (
+                f"expected {expected} GPU(s), nvidia-smi -L listed {seen} (exit {smi.exit_status})"
+                + (f", {short}" if short else "")
+            )[: _TAIL_CHARS - len(_OUTPUT_SEP)] + _OUTPUT_SEP
+            # the record keeps the last _TAIL_CHARS of a detail: the summary is cut at its end and the output
+            # gets only the room it leaves, so the usable count at its start is never cut off
+            room = _TAIL_CHARS - len(summary)
+            detail = summary + ((smi.stderr or smi_out or "")[-room:] if room else "")
+        else:
+            detail = f"expected {expected} GPU(s), nvidia-smi -L listed {seen} but {short}"[:_TAIL_CHARS]
     outcome.steps.append(_Step(STEP_GPU_COUNT, login.command_seconds, gpu_ok, detail))
     if not gpu_ok:
         outcome.failed_step = STEP_GPU_COUNT
@@ -1185,17 +1389,8 @@ def _step_egress(ctx: Context, outcome: _ProbeOutcome, login: _Login) -> None:
         return
     ok = probe.verdict == "ok"
     outcome.steps.append(_Step(STEP_EGRESS, login.egress_seconds, ok, None if ok else reason))
-    if ok:
-        return
-    if settings.NO_OUTBOUND_INTERNET_ENFORCEMENT_ENABLED:
+    if not ok:
         outcome.failed_step = STEP_EGRESS
-        return
-    logger.warning(
-        _m(
-            "Rental probe container cannot reach the internet (NO_OUTBOUND_INTERNET_ENFORCEMENT_ENABLED is off)",
-            extra=get_extra_info({**ctx.default_extra, **probe.as_record()}),
-        )
-    )
 
 
 def _teardown_deadline_seconds() -> int:
@@ -1532,14 +1727,18 @@ async def _login_and_list_gpus(
     try:
         async with conn:
             login.result = await conn.run(
-                "nvidia-smi -L", check=False, timeout=_NVIDIA_SMI_TIMEOUT_SECONDS
+                GPU_LIST_COMMAND, check=False, timeout=_GPU_CHECK_TIMEOUT_SECONDS
             )
             login.command_seconds = time.perf_counter() - command_started
             if egress:
                 await _run_egress_script_rerun_once_on_no_egress(conn, login)
     except (TimeoutError, asyncssh.Error, OSError) as exc:
         if not login.egress_attempted:
-            login.command_error = repr(exc)
+            login.command_error = (
+                f"did not finish within {_GPU_CHECK_TIMEOUT_SECONDS} s"
+                if isinstance(exc, TimeoutError)
+                else f"did not run over the SSH session: {exc!r}"
+            )
         elif login.egress_result is None and login.egress_error is None:
             login.egress_error = repr(exc)
     if not login.command_seconds:
@@ -1574,6 +1773,171 @@ async def _run_egress_script(conn: asyncssh.SSHClientConnection) -> asyncssh.SSH
 
 def _count_gpus(nvidia_smi_output: str) -> int:
     return sum(1 for line in nvidia_smi_output.splitlines() if line.startswith("GPU "))
+
+
+@dataclass(frozen=True)
+class _UsableGpus:
+    """What a process in the renter container can open: the GPU device nodes it was given (only those of
+    its listed cards when the kernel's minors are readable) and how many listed GPUs CUDA confirmed as
+    working devices of the listed model (None: no reading), with why the others were not."""
+
+    device_nodes: int
+    cuda_confirmed: int | None
+    cuda_error: str | None
+    unknown_uuids: int = 0
+    cut_short: bool = False
+    cuda_problems: tuple[str, ...] = ()
+
+    def short_of(self, expected: int) -> str | None:
+        """Every shortfall found, after the count of listed GPUs the container can use."""
+        reasons = []
+        if self.cut_short:
+            # no CUDA result was read, so this is no CUDA failure
+            reasons.append("the probe output ended before the CUDA section")
+        if self.unknown_uuids:
+            reasons.append(
+                f"the container has {self.unknown_uuids} nvidia-smi GPU UUID(s) the kernel driver "
+                "does not know"
+            )
+        if self.device_nodes < expected:
+            reasons.append(
+                f"the container has {self.device_nodes} usable GPU device node(s) (/dev/nvidiaN)"
+            )
+        if self.cuda_error is not None:
+            reasons.append(f"CUDA failed to start ({self.cuda_error})")
+        elif self.cuda_confirmed is not None and self.cuda_confirmed < expected:
+            shown = self.cuda_problems[:_SHOWN_CUDA_PROBLEMS]
+            more = len(self.cuda_problems) - len(shown)
+            reasons.append(
+                f"CUDA confirmed {self.cuda_confirmed} as working devices of the listed model ("
+                + "; ".join(shown)
+                + (f"; {more} more" if more > 0 else "")
+                + ")"
+            )
+        if not reasons:
+            return None
+        # cut short: the device node and CUDA readings are incomplete, so no card is confirmed
+        cuda = expected if self.cuda_confirmed is None else self.cuda_confirmed
+        unread = self.cut_short or self.cuda_error is not None
+        usable = 0 if unread else min(self.device_nodes, cuda, expected)
+        return f"{usable} of {expected} GPU(s) confirmed usable: {'; '.join(reasons)}"
+
+
+# the record keeps _TAIL_CHARS of a detail: a few problems name the failure, the rest are counted
+_SHOWN_CUDA_PROBLEMS = 3
+# CUDA reports a little less memory than NVML (the driver's reserve); another model is far off
+_MEMORY_TOLERANCE = 0.1
+_CUDA_SOURCES = {"cuda": "CUDA", "torch": "PyTorch"}
+
+
+def _listed_gpus(smi_text: str, details: list[dict] | None) -> dict[str, tuple[str | None, float | None]]:
+    """Each listed GPU's UUID with the name and memory (MiB) a CUDA device of it must report. The name is
+    NVML's in the container (the same driver's spelling), else the listing's."""
+    smi_names = dict(
+        (uuid, name.strip())
+        for name, uuid in re.findall(r"^GPU \d+: (.+?) \(UUID: (GPU-[0-9a-fA-F-]+)\)", smi_text, re.MULTILINE)
+    )
+    if not details:
+        return {uuid: (name, None) for uuid, name in smi_names.items()}
+    listed = {}
+    for d in details:
+        if not isinstance(d, dict) or not d.get("uuid"):
+            continue
+        try:
+            memory = float(d.get("capacity")) or None
+        except (TypeError, ValueError):
+            memory = None
+        listed[d["uuid"]] = (smi_names.get(d["uuid"]) or d.get("name"), memory)
+    return listed
+
+
+def _confirm_cuda_devices(
+    lines: list[str], listed: dict[str, tuple[str | None, float | None]], beside_fillers: bool = False
+) -> tuple[int, tuple[str, ...]]:
+    """How many listed GPUs every CUDA source (the driver API, and PyTorch when the image has it) confirmed
+    as a distinct working device of the listed model, and why the others were not."""
+    confirmed = set(listed)
+    problems: list[str] = []
+    for source, label in _CUDA_SOURCES.items():
+        rows = [line.split("\t") for line in lines if line.startswith(f"{source}\t")]
+        if not rows:
+            continue
+        seen: dict[str, int] = {}
+        matched = set()
+        for row in rows:
+            if len(row) >= 4 and row[2] == "error":
+                problems.append(f"{label} device {row[1]} failed: {row[3][:80]}")
+            elif len(row) >= 6 and row[2] in ("ok", "busy"):
+                uuid, memory, name = row[3], row[4], row[5]
+                seen[uuid] = seen.get(uuid, 0) + 1
+                if uuid not in listed:
+                    problems.append(f"{label} device {row[1]} is {uuid}, no listed GPU")
+                    continue
+                want_name, want_memory = listed[uuid]
+                if not memory.isdigit():
+                    problems.append(f"{label} device {row[1]} ({uuid}) reported no readable memory size")
+                elif want_name and name != want_name:
+                    problems.append(f"{label} device {row[1]} ({uuid}) is a {name!r}, listed as {want_name!r}")
+                elif want_memory and abs(int(memory) - want_memory) > want_memory * _MEMORY_TOLERANCE:
+                    problems.append(
+                        f"{label} device {row[1]} ({uuid}) has {memory} MiB, listed with {want_memory:.0f} MiB"
+                    )
+                elif row[2] == "busy" and not beside_fillers:
+                    problems.append(f"{label} device {row[1]} ({uuid}) has no free memory and no filler runs beside")
+                else:
+                    # busy beside a filler: the filler holds that memory; the device's identity still had to match
+                    matched.add(uuid)
+        twice = {uuid for uuid, n in seen.items() if n > 1}
+        if twice:
+            # two devices behind one UUID are one card: it counts once, the listed cards it hides are missing
+            problems.append(f"{label} reports {len(twice)} GPU UUID(s) on more than one device")
+        missing = len(set(listed) - set(seen))
+        if missing:
+            problems.append(f"{missing} listed GPU(s) are no {label} device")
+        confirmed &= matched
+    return len(confirmed), tuple(problems)
+
+
+def _usable_gpus(output: str, details: list[dict] | None = None, beside_fillers: bool = False) -> _UsableGpus:
+    """Parse GPU_LIST_COMMAND's sections against the listed GPUs (`details`; none: the container's
+    nvidia-smi listing). A missing section reads as nothing usable: the command always prints its marks,
+    so output without them did not come from it."""
+    smi_text, _, rest = output.partition(_DEVICE_NODES_MARK)
+    nodes_text, _, rest = rest.partition(_GPU_MINORS_MARK)
+    minors_text, _, rest = rest.partition(_MIG_MODE_MARK)
+    mig_text, cuda_mark, cuda_text = rest.partition(_CUDA_DEVICES_MARK)
+    node_minors = {
+        int(minor, 16)
+        for major, minor in re.findall(r"^/dev/nvidia\d+ ([0-9a-f]+):([0-9a-f]+)$", nodes_text, re.MULTILINE)
+        if int(major, 16) == _NVIDIA_MAJOR
+    }
+    kernel_minors = _parse_uuid_minor_csv(minors_text)
+    smi_uuids = re.findall(r"\(UUID: (GPU-[0-9a-fA-F-]+)\)", smi_text)
+    unknown = 0
+    if kernel_minors:
+        # linked by UUID -> kernel minor -> /dev/nvidiaN: the nvidia-smi index is not the minor on every host,
+        # and a UUID the kernel does not list is no card the driver gave this container
+        unknown = sum(1 for uuid in smi_uuids if uuid not in kernel_minors)
+        usable = len({kernel_minors[uuid] for uuid in smi_uuids if uuid in kernel_minors} & node_minors)
+    else:
+        usable = len(node_minors)
+    if not cuda_mark:
+        # the command prints every mark, the CUDA one last: without it the output was cut short
+        return _UsableGpus(usable, None, None, unknown, cut_short=True)
+    lines = [line.strip("\r") for line in cuda_text.strip().splitlines() if line.strip()]
+    if not lines:
+        # an image without python3: no reading; the device nodes decide
+        return _UsableGpus(usable, None, None, unknown)
+    if lines[0] == f"error {_NO_LIBCUDA}":
+        # no renter process can use a GPU without the driver library, whatever the device nodes say
+        return _UsableGpus(usable, None, _NO_LIBCUDA, unknown)
+    if re.search(r"^\s*Enabled\s*$", mig_text, re.MULTILINE):
+        # CUDA enumerates MIG instances, not cards
+        return _UsableGpus(usable, None, None, unknown)
+    if not lines[0].startswith("cuda\tcount\t"):
+        return _UsableGpus(usable, None, lines[0][:80], unknown)
+    confirmed, problems = _confirm_cuda_devices(lines, _listed_gpus(smi_text, details), beside_fillers)
+    return _UsableGpus(usable, confirmed, None, unknown, cuda_problems=problems)
 
 
 async def _teardown(ctx: Context, created: ContainerCreated, pod_id: str) -> str | None:

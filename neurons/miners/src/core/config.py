@@ -1,4 +1,5 @@
 from typing import TYPE_CHECKING
+import importlib.util
 import pathlib
 
 import bittensor
@@ -10,17 +11,32 @@ from datura.chain import (
 )
 from core.collateral import DEFAULT_MAX_GAS_PRICE_GWEI, DEFAULT_SENT_RECORD
 from lium_core.shared_config import SharedConfigClient
-from pydantic import Field, model_validator
+from bittensor_wallet import Keypair
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 if TYPE_CHECKING:
     from bittensor import Wallet
 
-# The Lium validator's hotkeys (public ss58 addresses). CURRENT is the one on chain today; NEXT is
-# the one the owner swaps to. Same pair as the executor's core/config.py and the platform's
-# ACCEPTED_VALIDATOR_HOTKEYS — the swap is a config flip in each, not a code change.
+# The Lium validator's hotkeys (public ss58 addresses), trusted only while no message signed by the subnet owner
+# has been taken (services/validator_trust_service.py). Deliberately not settings: a local .env must not repoint
+# the miner at another validator. A non-prod image names its own validator in core/config_override.py
+# (`_VALIDATOR_HOTKEY_SS58`, written at build time) and never reads a message.
 LIUM_VALIDATOR_HOTKEY_CURRENT = "5F7X5UpKSr26KU3jKfpLmT8kuKtBNyHhEnfS8xtxPCqCb13p"
 LIUM_VALIDATOR_HOTKEY_NEXT = "5F1aH9124FPvDNMWKgPCCJ8WeBBV3B3vpijDCyxZVyZgrEV9"
+
+
+def _baked_validator_hotkeys() -> tuple[str, ...]:
+    if importlib.util.find_spec("core.config_override") is None:
+        return LIUM_VALIDATOR_HOTKEY_CURRENT, LIUM_VALIDATOR_HOTKEY_NEXT
+    # an override module makes this a non-prod build: anything wrong with it is a broken build, not a fallback
+    from core.config_override import _VALIDATOR_HOTKEY_SS58 as override
+
+    Keypair(ss58_address=override)  # raises ValueError on a mistyped address
+    return (override,)
+
+
+BAKED_VALIDATOR_HOTKEYS = _baked_validator_hotkeys()
 
 
 class DebugSettings(BaseSettings):
@@ -92,25 +108,11 @@ class Settings(BaseSettings):
 
     MINER_PORTAL_URI: str = Field(env="MINER_PORTAL_URI", default="wss://provider-api.lium.io")
     MINER_PORTAL_API_URL: str | None = Field(env="MINER_PORTAL_API_URL", default="https://provider-api.lium.io/api")
-    # Swap both at once (DEFAULT=<new>, NEXT=<old>): changing DEFAULT alone drops the old hotkey
-    # immediately. NEXT="" drops it later.
-    DEFAULT_VALIDATOR_HOTKEY: str = Field(env="DEFAULT_VALIDATOR_HOTKEY", default=LIUM_VALIDATOR_HOTKEY_CURRENT)
-    VALIDATOR_NEXT_HOTKEY: str = Field(env="VALIDATOR_NEXT_HOTKEY", default=LIUM_VALIDATOR_HOTKEY_NEXT)
     CENTRAL_MODE: bool = Field(env="CENTRAL_MODE", default=False)
+    # Comma-separated CIDRs: a /temp-dev copy names its VPC, where its nodes have only a private address. Unset in
+    # production, where a node address must be public (services/node_address.py).
+    NODE_ADDRESS_ALLOWED_NETWORKS: str = Field(env="NODE_ADDRESS_ALLOWED_NETWORKS", default="")
 
-    @model_validator(mode="after")
-    def drop_the_lium_next_hotkey_for_another_validator(self) -> "Settings":
-        # a staging or e2e miner names its own validator and must not trust the prod one's new hotkey
-        is_next_hotkey_set = "VALIDATOR_NEXT_HOTKEY" in self.model_fields_set
-        if not is_next_hotkey_set and self.DEFAULT_VALIDATOR_HOTKEY != LIUM_VALIDATOR_HOTKEY_CURRENT:
-            self.VALIDATOR_NEXT_HOTKEY = ""
-        return self
-
-    @property
-    def accepted_validator_hotkeys(self) -> frozenset[str]:
-        """Every validator hotkey whose sign-in this miner accepts: the active one and the one it swaps to."""
-        return frozenset(h.strip() for h in (self.DEFAULT_VALIDATOR_HOTKEY, self.VALIDATOR_NEXT_HOTKEY) if h and h.strip())
-    
     # Debug settings - loaded from DEBUG_* environment variables
     debug: DebugSettings = Field(default_factory=DebugSettings)
 

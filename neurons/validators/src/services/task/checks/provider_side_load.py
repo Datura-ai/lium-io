@@ -13,6 +13,7 @@ from core.utils import _m, get_extra_info
 from services.const import LIUM_INFRA_CONTAINER_PREFIXES
 from services.storage_operations import (
     STORAGE_HELPER_KEY_MARK,
+    report_exited_detached_helper,
     settle_excused_storage_helper_keys,
 )
 
@@ -302,6 +303,11 @@ async def storage_operation_open(ctx: Context, operation_id: str) -> bool | None
         return None
     if answer is None or not answer.active:
         return None if answer is None else False
+    # a cancel the backend is running stops the helper itself and reports CANCELLED; a dead helper then is not lost
+    if answer.status != "CANCEL_REQUESTED" and ctx.runner is not None and await report_exited_detached_helper(
+        lambda command: _stdout(ctx, command), ctx.services.redis, operation_id
+    ):
+        return False
     # the progress token lives on the node, so open alone is not proof the helper still works
     # for Lium: an operation whose runner stopped reporting excuses nothing
     if answer.last_report_at is None:
@@ -313,6 +319,11 @@ async def storage_operation_open(ctx: Context, operation_id: str) -> bool | None
     # a report "from the future" would pass any age check: past a minute of clock skew, no answer
     fresh = -STORAGE_REPORT_MAX_FUTURE_SECONDS <= age <= STORAGE_REPORT_MAX_AGE_SECONDS
     return True if fresh else None
+
+
+async def _stdout(ctx: Context, command: str) -> str | None:
+    result = await ctx.runner.run(command, timeout=CPU_RESAMPLE_TIMEOUT_SECONDS, retryable=False)
+    return result.stdout if result.success else None
 
 
 def executor_stack_container_ids(specs: dict[str, Any]) -> set[str]:
@@ -370,7 +381,8 @@ def compute_provider_side_load(
     across all cores) minus the core-percents of LIUM's containers only, in cores. A container
     Lium did not put there is the provider's own workload and stays in the total - subtracting
     it would let the provider mine another subnet with `docker run` and read as idle. Disk:
-    hard_disk.used minus the docker breakdown (images+containers+volumes, DAH-2514), in kB —
+    hard_disk.data_root_used minus data_root_docker_used (the docker breakdown on data-root's filesystem;
+    older scrapes: used minus images+containers+volumes, DAH-2514), in kB —
     includes the OS baseline, so thresholds must leave room for it.
 
     Each part needs all its inputs present, numeric and well-shaped, else stays None — never
@@ -396,8 +408,13 @@ def compute_provider_side_load(
 
     try:
         hard_disk = specs.get("hard_disk") or {}
-        used_kb = int(hard_disk.get("used"))
-        docker_parts_kb = [int(hard_disk.get(key)) for key in ("images", "containers", "volumes")]
+        if "data_root_docker_used" in hard_disk:
+            # data-root's own used kB less only the docker bytes on that filesystem (a split store holds the rest)
+            used_kb = int(hard_disk.get("data_root_used"))
+            docker_parts_kb = [int(hard_disk.get("data_root_docker_used"))]
+        else:
+            used_kb = int(hard_disk.get("used"))
+            docker_parts_kb = [int(hard_disk.get(key)) for key in ("images", "containers", "volumes")]
         if used_kb >= 0 and all(part_kb >= 0 for part_kb in docker_parts_kb):
             disk_kb = max(0, used_kb - sum(docker_parts_kb))
     except (TypeError, ValueError, AttributeError, OverflowError):

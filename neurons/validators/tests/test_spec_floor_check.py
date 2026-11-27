@@ -8,7 +8,6 @@ bounded. Every healthy listed shape stays above these floors.
 from __future__ import annotations
 
 import pytest
-from neurons.validators.src.services.task.checks import spec_floor
 from neurons.validators.src.services.task.checks.spec_floor import SpecFloorCheck
 from neurons.validators.src.services.task.messages import SpecFloorMessages as Msg
 
@@ -16,11 +15,6 @@ from tests.helpers import build_state
 from tests.test_gpu_fingerprint_check import _live_rental
 
 KIB_PER_GB = 1024 * 1024
-
-
-@pytest.fixture(autouse=True)
-def enforced(monkeypatch):
-    monkeypatch.setattr(spec_floor.settings, "SPEC_FLOOR_ENFORCEMENT_ENABLED", True)
 
 
 def _uuid(i: int) -> str:
@@ -77,6 +71,46 @@ async def test_implausible_spec_fails_idle_node_fatally(kwargs, finding, context
     assert finding in result.event.what_we_saw["findings"]
 
 
+_REAL = "0" * 31 + "1:" + "a" * 64
+_EMPTY_MD5 = "d41d8cd98f00b204e9800998ecf8427e"
+_EMPTY_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
+
+def _checksums(**overrides):
+    return {"docker": _REAL, "nvidia_smi": _REAL, "libnvidia_ml": _REAL, **overrides}
+
+
+@pytest.mark.parametrize(
+    "checksums",
+    [
+        # md5 of zero bytes in both halves
+        _checksums(docker=f"{_EMPTY_MD5}:{_EMPTY_MD5}", nvidia_smi=f"{_EMPTY_MD5}:{_EMPTY_MD5}"),
+        _checksums(nvidia_smi=f"{_EMPTY_MD5}:{_EMPTY_SHA256}"),
+        _checksums(docker="0" * 31 + "1:" + _EMPTY_SHA256),
+        _checksums(docker=""),
+        {"libnvidia_ml": _REAL},
+        "not-a-dict",
+    ],
+)
+@pytest.mark.asyncio
+async def test_file_checksums_no_real_host_reports_fail_the_node(checksums, context_factory):
+    specs = {**_specs(), "md5_checksums": checksums}
+    ctx = context_factory(state=build_state(specs=specs))
+
+    result = await SpecFloorCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.what_we_saw["findings"] == ["file_checksums"]
+
+
+@pytest.mark.asyncio
+async def test_real_file_checksums_pass(context_factory):
+    specs = {**_specs(), "md5_checksums": _checksums()}
+    ctx = context_factory(state=build_state(specs=specs))
+
+    assert (await SpecFloorCheck().run(ctx)).passed is True
+
+
 @pytest.mark.asyncio
 async def test_one_card_read_twice_in_a_scrape_passes(context_factory):
     # A healthy node's scrape can list one card twice; the kernel-count check owns a short set.
@@ -91,15 +125,3 @@ async def test_a_live_rental_is_not_halted(context_factory):
 
     assert (result.passed, result.fatal) == (False, False)
     assert result.updates == {"spec_floor_passed": False}
-
-
-@pytest.mark.asyncio
-async def test_with_enforcement_off_a_node_below_the_floors_is_only_logged(context_factory, monkeypatch):
-    monkeypatch.setattr(spec_floor.settings, "SPEC_FLOOR_ENFORCEMENT_ENABLED", False)
-
-    _, result = await _run(context_factory, cpu=0, ram_gb=12)
-
-    assert (result.passed, result.updates) == (True, {})
-    assert result.event.reason_code == Msg.REJECTED.reason
-    assert result.event.severity == "warning"
-    assert result.event.what_we_saw["findings"] == ["cpu_count", "ram_per_gpu"]

@@ -1116,7 +1116,7 @@ async def test_a_replayed_memory_keeps_the_listing_but_never_pays_free_gpus_acro
 
     monkeypatch.setattr(settings, "DISK_PRESSURE_GATE_ENFORCEMENT_ENABLED", True)
     redis_service = DummyRedis()
-    unpaid, deferred, listed = [], [], []
+    unpaid, deferred, listed, flagged = [], [], [], []
     for _ in range(8):
         ctx, connectivity = _gate_ctx(context_factory, redis_service=redis_service, state=_rented_state(), reading=STALLED)
         if not redis_service.verified_ports:
@@ -1132,8 +1132,11 @@ async def test_a_replayed_memory_keeps_the_listing_but_never_pays_free_gpus_acro
         incentive._expand_partially_rented_split_results()
         limited = RentalPriceIncentive._port_limited_remainder(incentive.job_results[MINER_HOTKEY][1])
         unpaid.append(limited.unpaid_gpu_count if limited else 0)
+        flagged.append(limited.port_check_deferred if limited else None)
 
     assert deferred == [True, True, True, False] * 2
+    # the listed ports cover every free split: the deferral, not the node's ports, is what leaves them unpaid
+    assert flagged == [True, True, True, None] * 2
     assert unpaid == [7, 7, 7, 0] * 2  # 7 free one-GPU splits: paid only on the measured cycle
     # DAH-5851: the free GPUs stay listed on the last completed check's ports (24 remembered, then the forced 100)
     assert listed == [24, 24, 24, 100, 100, 100, 100, 100]

@@ -31,18 +31,11 @@ from services.docker_service import (
     inflight_creates,
 )
 from services.gpu_reset import RECENT_RENTER_GPU_RESET_SECONDS
+from services.host_memory_guard import host_memory_guard_script
 from services.hung_gpu_reset import HUNG_GPU_QUERY_COMMAND, HungGpuResult
 from services.redis_service import GPU_RESET_PENDING_KIND
 from services.prerun_host_probe import prerun_host_probe_command
 from helpers import no_host_start_lock, shared_pod_start_stop_lock
-
-
-@pytest.fixture(autouse=True)
-def _hung_gpu_reset_on(monkeypatch):
-    # DAH-5301: these cover the reset itself (the flag on); its shadow mode is in test_gpu_clocks/test_hung_gpu_reset
-    from core.config import settings
-
-    monkeypatch.setattr(settings, "HUNG_GPU_RESET_ON_REBOOT_ENABLED", True)
 
 
 @pytest.fixture
@@ -198,6 +191,8 @@ async def test_a_successful_edit_runs_the_same_host_commands(svc, monkeypatch):
     assert ssh.commands.index('/usr/bin/docker volume ls --format "{{.Name}}"') < hung_query
     assert hung_query < len(ssh.commands) - 1 - ssh.commands[::-1].index(_POWER_READ)  # before the last power read
     assert [cmd for cmd in ssh.commands if cmd != HUNG_GPU_QUERY_COMMAND] == [
+        # with the host reads, before anything else on the session and before any container starts
+        host_memory_guard_script(),
         # the pre-run host probe (DAH-3257); no image-label section, the volume is not encrypted; before the park, so
         # a probe that stops the create leaves the current container as it was
         prerun_host_probe_command(
@@ -226,12 +221,13 @@ async def test_a_successful_edit_runs_the_same_host_commands(svc, monkeypatch):
         "nvidia-smi --query-gpu=uuid,power.limit,power.default_limit,power.min_limit,power.max_limit"
         " --format=csv,noheader,nounits",
         # DAH-4663: the clock-lock safety net resets the pod's GPUs, inside the failed-create cleanup, before docker run
-        "nvidia-smi -i GPU-test -rgc >/dev/null 2>&1; echo GPU-test $?",
-        # then, in its own call: application and memory clocks back to default
-        "nvidia-smi -i GPU-test -rac >/dev/null 2>&1; echo GPU-test -rac $?; "
-        "nvidia-smi -i GPU-test -rmc >/dev/null 2>&1; echo GPU-test -rmc $?",
+        # then, in the same call, each reset under its own SIGKILL timeout: application and memory clocks back to default
+        "nvidia-smi -i GPU-test -rgc >/dev/null 2>&1; echo GPU-test $?; sh -c "
+        "'( timeout -s KILL 15 nvidia-smi -i GPU-test -rac >/dev/null 2>&1; echo GPU-test -rac $?; "
+        "timeout -s KILL 15 nvidia-smi -i GPU-test -rmc >/dev/null 2>&1; echo GPU-test -rmc $? ) & wait'",
         host_key,
-        "nohup /usr/bin/python /root/app/src/inspector_executor.py --start-collector >/dev/null 2>&1 &",
+        # the validator's own collector starter (services.executor_payload), not the executor's reported paths
+        DockerService._build_inspector_collector_command(_executor_info(payload), "start"),
         f"/usr/bin/docker rm -fv id-{name}",
     ]
 
@@ -481,6 +477,233 @@ async def test_a_kill_without_an_exit_event_falls_back_to_killing_the_processes(
         svc._run_rental_docker_create_with_port_retry.assert_not_awaited()
 
 
+@pytest.mark.parametrize(
+    ("init", "docker_catches_up_after", "step"),
+    [
+        ("gone", 3, None),  # a big sysbox pod's teardown: init is dead, dockerd reports the exit a few reads later
+        ("gone", None, "park_current_container"),  # init is dead but dockerd never catches up: not the host's fault
+        ("alive", 2, None),  # a pid-namespace init still reaping its children reads alive, then the container stops
+        ("alive", None, "container_cleanup"),  # init outlived SIGKILL (F-1633) and it never stops: the host's fault
+        ("unknown", None, "container_cleanup"),  # init unreadable and the container never stops
+    ],
+    ids=["slow_teardown_parks", "dockerd_lags", "reaping_init_parks", "init_survives", "unreadable_and_running"],
+)
+@pytest.mark.asyncio
+async def test_only_an_init_that_outlives_sigkill_is_unkillable(svc, monkeypatch, init, docker_catches_up_after, step):
+    # DAH-7025: one State.Running read 3 s after the direct kill called a slow DinD teardown "unkillable"
+    monkeypatch.setattr("services.docker_service._PARK_KILL_SETTLE_SECONDS", 0)
+    monkeypatch.setattr("services.docker_service._PARK_KILL_WAIT_SECONDS", 10)
+    payload = _edit_payload()
+    ssh = _ssh_recording(stop_exit=1)
+    inner = ssh.run
+    reads_after_direct_kill = []
+
+    async def slow(cmd, *args, **kwargs):
+        if cmd.startswith("/usr/bin/docker kill"):
+            ssh.commands.append(cmd)
+            return _ssh_result(exit_status=1, stderr="cannot kill container: tried to kill container, but did not receive an exit event")
+        if cmd == DockerCommand.kill_container_processes(_kept(payload)):
+            ssh.commands.append(cmd)
+            reads_after_direct_kill.append(0)
+            return _ssh_result(stdout=f"killed pid=4242 shim=4241 init={init}\n")
+        if "docker inspect -f '{{.State.Running}}'" in cmd and reads_after_direct_kill:
+            reads_after_direct_kill[0] += 1
+            caught_up = docker_catches_up_after is not None and reads_after_direct_kill[0] >= docker_catches_up_after
+            return _ssh_result(stdout="false\n" if caught_up else "true\n")
+        return await inner(cmd, *args, **kwargs)
+
+    ssh.run = slow
+    _patch_happy(svc, monkeypatch, ssh)
+
+    result = await _run(svc, payload)
+
+    if step is None:
+        assert isinstance(result, ContainerCreated)
+    else:
+        assert isinstance(result, FailedContainerRequest)
+        assert result.failure_step == step
+        svc._run_rental_docker_create_with_port_retry.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_slow_dockerd_keeps_the_park_within_one_wait(svc, monkeypatch):
+    # DAH-7025 review: each State.Running read answered 36 s late, so a delete waiting for the edit it cancelled gave up first
+    clock = [0.0]
+    monkeypatch.setattr("services.docker_service.time", SimpleNamespace(time=lambda: _PARKED_AT, monotonic=lambda: clock[0]))
+    monkeypatch.setattr("services.docker_service._PARK_KILL_SETTLE_SECONDS", 0)
+    payload = _edit_payload()
+    ssh = _ssh_recording(stop_exit=1)
+    inner_run, inner_open = ssh.run, ssh.create_process
+    direct_kill = DockerCommand.kill_container_processes(_kept(payload))
+    host_timeouts, rename_back_timeouts = [], []
+
+    async def no_exit_event(cmd, *args, **kwargs):
+        if cmd.startswith("/usr/bin/docker kill"):
+            ssh.commands.append(cmd)
+            return _ssh_result(exit_status=1, stderr="cannot kill container: tried to kill container, but did not receive an exit event")
+        if cmd == direct_kill:
+            ssh.commands.append(cmd)
+            return _ssh_result(stdout="killed pid=4242 shim=4241 init=gone\n")
+        return await inner_run(cmd, *args, **kwargs)
+
+    async def opened(command: str):
+        inner = shlex.split(command)[-1] if command.startswith("timeout ") else command
+        if inner == direct_kill or "{{.State.Running}}" in inner:
+            host_timeouts.append(int(shlex.split(command)[3]))
+        if "{{.State.Running}}" in inner:
+            clock[0] += 12  # dockerd answers each read late, still "running"
+        if inner.startswith("/usr/bin/docker rename kept_unmounted_"):
+            rename_back_timeouts.append(int(shlex.split(command)[3]))
+        return await inner_open(command)
+
+    ssh.run = no_exit_event
+    ssh.create_process = opened
+    _patch_happy(svc, monkeypatch, ssh)
+
+    result = await _run(svc, payload)
+
+    # the direct kill comes first, then reads that each end by the one 30 s budget; none starts past it, and the
+    # park makes no read of its own: the wait's last read ("running") decides the rename back
+    assert host_timeouts == [30, 30, 18, 6]
+    # the rename back is a write: cut short after dockerd applied it, the restore would remove the renter's pod
+    assert rename_back_timeouts == [60]
+    assert isinstance(result, FailedContainerRequest) and result.failure_step == "park_current_container"
+
+
+@pytest.mark.asyncio
+async def test_a_delete_during_the_wait_after_the_kill_ends_the_edit_inside_its_wait(svc, monkeypatch):
+    # DAH-7025 review: a delete arrived during the first post-kill read, which dockerd answered 36 s late; the delete
+    # gave up waiting and tore down while the edit still worked. The edit now gives way and leaves the parked
+    # container to the delete, which removes the pod's kept containers.
+    payload = _edit_payload()
+    ssh = _ssh_recording(stop_exit=1)
+    inner = ssh.run
+    first_read_started, never = asyncio.Event(), asyncio.Event()
+
+    async def dockerd_hangs_after_the_kill(cmd, *args, **kwargs):
+        if cmd.startswith("/usr/bin/docker kill"):
+            ssh.commands.append(cmd)
+            return _ssh_result(exit_status=1, stderr="cannot kill container: tried to kill container, but did not receive an exit event")
+        if cmd == DockerCommand.kill_container_processes(_kept(payload)):
+            ssh.commands.append(cmd)
+            return _ssh_result(stdout="killed pid=4242 shim=4241 init=gone\n")
+        if "docker inspect -f '{{.State.Running}}'" in cmd:
+            ssh.commands.append(cmd)
+            first_read_started.set()
+            await never.wait()
+        return await inner(cmd, *args, **kwargs)
+
+    ssh.run = dockerd_hangs_after_the_kill
+    _patch_happy(svc, monkeypatch, ssh)
+    monkeypatch.setattr(svc, "_bring_up_existing_container", AsyncMock())
+
+    async def tracked_edit():
+        with inflight_creates.track(payload.pod_id, executor_key(payload)):
+            return await _run(svc, payload)
+
+    edit = asyncio.create_task(tracked_edit())
+    await asyncio.wait_for(first_read_started.wait(), 10)
+    assert inflight_creates.cancel(payload.pod_id, executor_key(payload))
+
+    assert await inflight_creates.wait_until_done(payload.pod_id, 5, executor_key(payload))
+    result = await edit
+    assert isinstance(result, FailedContainerRequest) and result.failure_step == "cancelled_by_delete"
+    # nothing after the hung read: no rename back, no restore, no removal of the parked container
+    assert ssh.commands[-1].startswith("/usr/bin/docker inspect -f '{{.State.Running}}'")
+    svc._bring_up_existing_container.assert_not_awaited()
+
+
+@pytest.mark.parametrize(("init_exits_on_read", "step"), [(2, "park_current_container"), (None, "container_cleanup")],
+                         ids=["init_exits_before_the_deadline", "init_survives_to_the_deadline"])
+@pytest.mark.asyncio
+async def test_an_init_that_exits_after_the_first_reading_is_not_unkillable(svc, monkeypatch, init_exits_on_read, step):
+    # DAH-7025 review: init read alive once at 3 s, exited at 10 s, Docker said Running=true to the deadline
+    monkeypatch.setattr("services.docker_service._PARK_KILL_SETTLE_SECONDS", 0)
+    monkeypatch.setattr("services.docker_service._PARK_KILL_WAIT_SECONDS", 10)
+    payload = _edit_payload()
+    ssh = _ssh_recording(stop_exit=1)
+    inner = ssh.run
+    direct = "killed pid=4242 started=777 shim=4241 init=alive\n"
+    probe = DockerCommand.init_state(direct)
+    init_reads = []
+
+    async def slow(cmd, *args, **kwargs):
+        if cmd.startswith("/usr/bin/docker kill"):
+            ssh.commands.append(cmd)
+            return _ssh_result(exit_status=1, stderr="cannot kill container: tried to kill container, but did not receive an exit event")
+        if cmd == DockerCommand.kill_container_processes(_kept(payload)):
+            ssh.commands.append(cmd)
+            return _ssh_result(stdout=direct)
+        if cmd == probe:
+            init_reads.append(cmd)
+            gone = init_exits_on_read is not None and len(init_reads) >= init_exits_on_read
+            return _ssh_result(stdout="init=gone\n" if gone else "init=alive\n")
+        if "docker inspect -f '{{.State.Running}}'" in cmd:
+            return _ssh_result(stdout="true\n")
+        return await inner(cmd, *args, **kwargs)
+
+    ssh.run = slow
+    _patch_happy(svc, monkeypatch, ssh)
+
+    result = await _run(svc, payload)
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.failure_step == step
+    assert init_reads, "init was never re-read"
+    svc._run_rental_docker_create_with_port_retry.assert_not_awaited()
+
+
+def test_the_init_reread_tells_a_live_init_from_an_exited_one():
+    import subprocess
+
+    assert DockerCommand.init_state("killed pid=42 started=9 shim=none init=gone") is None
+    child = subprocess.Popen(["sleep", "60"])
+    try:
+        started = open(f"/proc/{child.pid}/stat").read().rsplit(") ", 1)[1].split()[19]
+        alive = DockerCommand.init_state(f"killed pid={child.pid} started={started} shim=none init=alive")
+        assert subprocess.run(["sh", "-c", alive], capture_output=True, text=True).stdout.strip() == "init=alive"
+    finally:
+        child.kill()
+    child.wait()
+    assert subprocess.run(["sh", "-c", alive], capture_output=True, text=True).stdout.strip() == "init=gone"
+
+
+def test_the_direct_kill_reads_a_killed_init_as_gone():
+    # the script's own /proc reading, on a real process: the pid lookup stands in for docker inspect
+    import subprocess
+
+    script = DockerCommand.kill_container_processes("pod_x")
+    lookup = "$(/usr/bin/docker inspect -f '{{.State.Pid}}' pod_x 2>/dev/null)"
+    assert lookup in script
+    # the killed child stays a zombie until wait(): the same pid and start time, state Z, so it reads as gone
+    child = subprocess.Popen(["sleep", "60"])
+    try:
+        ran = subprocess.run(
+            ["sh", "-c", script.replace(lookup, str(child.pid))],
+            capture_output=True, text=True, timeout=20,
+        )
+    finally:
+        child.kill()
+    child.wait()
+    assert ran.stdout.strip().endswith("init=gone"), ran.stdout
+    assert f"pid={child.pid}" in ran.stdout
+
+
+def test_the_direct_kill_reads_an_init_reaped_before_the_lookup_as_gone():
+    # Docker can still return the pid of an init that already exited and was reaped: no /proc entry is gone, not unknown
+    import subprocess
+
+    script = DockerCommand.kill_container_processes("pod_x")
+    lookup = "$(/usr/bin/docker inspect -f '{{.State.Pid}}' pod_x 2>/dev/null)"
+    child = subprocess.Popen(["true"])
+    child.wait()
+    ran = subprocess.run(
+        ["sh", "-c", script.replace(lookup, str(child.pid))],
+        capture_output=True, text=True, timeout=20,
+    )
+    assert ran.stdout.strip().endswith("init=gone"), ran.stdout
+
+
 @pytest.mark.asyncio
 async def test_an_edit_without_a_container_on_the_host_behaves_like_a_create(svc, monkeypatch):
     payload = _edit_payload()
@@ -511,8 +734,7 @@ def _hung_reset(outcome, calls: list | None = None):
     """Stands in for reset_hung_pod_gpus the way it uses `resetting`: a hung find holds the caller's mark
     and hands it the result before letting go; an exception escapes like an SSH error would."""
 
-    async def fake(runner, pod_gpu_uuids, *, resetting, shadow):
-        assert not shadow
+    async def fake(runner, pod_gpu_uuids, *, resetting):
         if calls is not None:
             calls.append(pod_gpu_uuids)
         if isinstance(outcome, Exception):
@@ -561,8 +783,7 @@ async def test_the_hung_gpu_reset_holds_the_gpu_reset_pending_mark(svc, monkeypa
     svc.redis_service.mark_gpu_reset_recent = AsyncMock()
     held = []
 
-    async def fake_reset(runner, pod_gpu_uuids, *, resetting, shadow):
-        assert not shadow
+    async def fake_reset(runner, pod_gpu_uuids, *, resetting):
         async with resetting():
             # the rented checks skip the node while the GPUs reset
             held.append(svc.redis_service.add_pending_pod.await_args)
@@ -846,15 +1067,16 @@ async def test_park_waits_for_a_killed_container_that_exits_late(svc, monkeypatc
 
 @pytest.mark.parametrize(
     ("last_read", "park_renames_back"),
-    [(_ssh_result(stdout="true\n"), True), (_ssh_result(stdout="false\n"), False), (_ssh_result(exit_status=1, stderr="timeout"), False)],
-    ids=["still_running", "exited_after_the_wait", "inconclusive"],
+    [(_ssh_result(stdout="true\n"), True), (_ssh_result(exit_status=1, stderr="timeout"), False)],
+    ids=["still_running", "inconclusive"],
 )
 @pytest.mark.asyncio
 async def test_park_renames_back_only_when_a_last_read_says_it_still_runs(svc, monkeypatch, last_read, park_renames_back):
     # a kill that lands after the wait must not leave the pod stopped under its own name with no
-    # replacement: only an explicit "true" renames back; otherwise it stays parked and the undo restores it
+    # replacement: only the wait's last read answering "true" renames back (no read of its own, DAH-7025 review);
+    # an earlier "true" does not count, so an unanswered last read keeps it parked and the undo restores it
     monkeypatch.setattr("services.docker_service._PARK_KILL_SETTLE_SECONDS", 0)
-    monkeypatch.setattr("services.docker_service._PARK_KILL_WAIT_SECONDS", 1)
+    monkeypatch.setattr("services.docker_service._PARK_KILL_WAIT_SECONDS", 2)
     payload = _edit_payload()
     ssh = _ssh_recording(stop_exit=1)
     reads, after_last_read_at = [], []
@@ -863,10 +1085,11 @@ async def test_park_renames_back_only_when_a_last_read_says_it_still_runs(svc, m
     async def running_until_the_last_read(cmd, *args, **kwargs):
         if "docker inspect -f '{{.State.Running}}'" in cmd:
             reads.append(cmd)
+            ssh.commands.append(cmd)
             if len(reads) == 2:
-                ssh.commands.append(cmd)
                 after_last_read_at.append(len(ssh.commands))
                 return last_read
+            return _ssh_result(stdout="true\n")
         return await inner(cmd, *args, **kwargs)
 
     ssh.run = running_until_the_last_read
@@ -1286,7 +1509,8 @@ async def test_a_failed_edit_brings_a_kept_container_back_unmounted(
     # not running (or not renamed): it is stopped under its kept name, and the next (successful) edit keeps it
     assert _docker(ssh.commands, "rename")[1:] == ([f"/usr/bin/docker rename {kept} {name}"] if status == "running" and not start_error else [])
     if stop_wedged:
-        assert killed_directly == [DockerCommand.kill_container_processes(kept)]
+        # the park's stop and this one: a lost exit event goes straight to the direct kill, each time
+        assert killed_directly == [DockerCommand.kill_container_processes(kept)] * 2
         assert ssh.commands[-1] == f"/usr/bin/docker inspect -f '{{{{.State.Running}}}}' {kept}"
     else:
         assert ssh.commands[-1] == f"/usr/bin/docker stop -t 10 {kept}"
@@ -1447,7 +1671,7 @@ async def test_the_kept_copy_takes_only_the_parked_layers_own_files_never_its_im
 
     [copy] = _docker(ssh.commands, "cp")
     assert f"{_kept(payload)}:" not in copy  # never `docker cp <parked>:<path>`, the merged rootfs
-    assert "GraphDriver.Data.UpperDir" in copy and "find . -mindepth 1" in copy and "$w -print0" in copy
+    assert ".Data.UpperDir" in copy and "find . -mindepth 1" in copy and "$w -print0" in copy
     assert "tar --null -T - -cf - | /usr/bin/docker cp - " in copy
 
 
@@ -1543,6 +1767,10 @@ def test_the_layer_read_runs_in_a_real_shell(tmp_path, mounts, diff, kept):
         ("containerd", True, None, None),
         # Docker restarted it inside the validator start's window: files since then are the renter's
         ("overlay2", True, ((120, -60),), 60),
+        # a sysbox (DinD) pod on the containerd store: its root is a bind mount, the host's mount table names the overlay
+        ("sysbox", False, ((0, -60),), 0),
+        # the same on Docker 29: its default API omits GraphDriver, so the template naming it exits 1
+        ("sysbox-docker29", False, ((0, -60),), 0),
         ("given", False, ((0, -60),), 0),  # stopped on the containerd store: the upper dir the running read used
         ("none", True, ((0, -60),), 0),  # no upper dir anywhere: docker diff decides, and lists the startup file
         ("kept", True, ((0, -60),), 0),  # a copy already kept: a window never releases it, only docker diff decides
@@ -1564,11 +1792,18 @@ def test_the_layer_read_skips_only_files_written_in_a_recorded_validator_start(
     (upper / "root" / ".jupyter").mkdir(parents=True)
     (upper / "root" / ".jupyter" / "lab.json").write_text("{}")
     (proc / "4242").mkdir()
+    overlay = f"overlay overlay rw,lowerdir=/l1:/l2,upperdir={host_upper},workdir=/w\n"
     (proc / "4242" / "mountinfo").write_text(
         "1 0 0:1 / /proc rw - proc proc rw\n"
-        f"2 0 0:2 / / rw,relatime - overlay overlay rw,lowerdir=/l1:/l2,upperdir={host_upper},workdir=/w\n"
+        + ("2 0 0:2 /rootfs / rw - ext4 /dev/root rw\n" if store.startswith("sysbox") else f"2 0 0:2 / / rw,relatime - {overlay}")
     )
-    inspect = {"overlay2": f"4242 {host_upper}", "containerd": "4242 <no value>"}.get(store, "0 <no value>")
+    # only a running container's rootfs is mounted on the host
+    (proc / "1" / "mountinfo").write_text(
+        f"3 1 0:3 / /var/lib/docker/rootfs/overlayfs/othercid rw - overlay overlay rw,upperdir=/other/diff\n"
+        + (f"4 1 0:4 / /var/lib/docker/rootfs/overlayfs/cid rw,relatime - {overlay}" if store.startswith("sysbox") else "")
+    )
+    pid = "4242" if store in ("overlay2", "containerd", "sysbox", "sysbox-docker29") else "0"
+    upper_dir_reply = {"overlay2": f"echo {host_upper}", "sysbox-docker29": "exit 1"}.get(store, "echo '<no value>'")
     docker_started = (
         "0001-01-01T00:00:00Z"
         if docker_started_ago is None
@@ -1579,7 +1814,8 @@ def test_the_layer_read_skips_only_files_written_in_a_recorded_validator_start(
     docker = tmp_path / "docker"
     docker.write_text(
         "#!/bin/sh\n"
-        f'case "$3" in *UpperDir*) echo "{inspect}"; exit;; *StartedAt*) echo "cid {docker_started}"; exit;; *.Id*) echo cid; exit;; esac\n'
+        f'case "$3" in *UpperDir*) {upper_dir_reply}; exit;; *State.Pid*) echo "{pid} cid"; exit;; '
+        f'*StartedAt*) echo "cid {docker_started}"; exit;; esac\n'
         '[ "$1" = inspect ] && { echo /lium-cipher; exit; }\n'
         # docker diff lists the same file: only the upper-dir read can tell it is startup noise
         f'[ "$1" = diff ] && {{ touch {tmp_path}/diffed; printf "C /root\\nA /root/.jupyter\\nA /root/.jupyter/lab.json\\n"; exit; }}\n'
@@ -1612,7 +1848,8 @@ def test_a_readable_upper_dir_without_the_volume_path_drops_without_docker_diff(
     docker = tmp_path / "docker"
     docker.write_text(
         "#!/bin/sh\n"
-        f'case "$3" in *UpperDir*) echo "4242 {host_upper}"; exit;; *StartedAt*) echo "cid 0001-01-01T00:00:00Z"; exit;; esac\n'
+        f'case "$3" in *UpperDir*) echo "{host_upper}"; exit;; *State.Pid*) echo "4242 cid"; exit;; '
+        '*StartedAt*) echo "cid 0001-01-01T00:00:00Z"; exit;; esac\n'
         '[ "$1" = inspect ] && { echo /lium-cipher; exit; }\n'
         f'[ "$1" = diff ] && {{ touch {tmp_path}/diffed; exit; }}\n'
         "exit 2\n"
@@ -1681,6 +1918,70 @@ async def test_a_remount_of_a_running_container_records_no_validator_start(svc):
 
     svc.setup_encrypted_local_volume.assert_awaited_once()
     assert [c for c in ssh.run.await_args_list if docker_service._VALIDATOR_STARTS_DIR in c.args[0]] == []
+
+
+@pytest.mark.asyncio
+async def test_a_killed_bootstrap_logs_why_the_container_died(svc, caplog):
+    # pod a5d55eaf (23 Nov): every remount's bootstrap exited 137 because the container kept restarting, and the
+    # warning said only "did not complete cleanly": its State and restart count are what prove the cause. The
+    # renter's workload is still running, so its output (which may carry its secrets) is never read into our log
+    import json
+    import logging
+
+    svc._encrypted_local_volume_name = AsyncMock(return_value="lium-cipher")
+    svc.setup_encrypted_local_volume = AsyncMock()
+    svc.install_open_ssh_server_and_start_ssh_service_with_rental_docker = AsyncMock(return_value=False)
+    state = {"Status": "running", "ExitCode": 1, "OOMKilled": False, "Error": "", "StartedAt": "s", "FinishedAt": "f"}
+
+    async def run(command, *args, **kwargs):
+        if "{{json .State}}" in command:
+            return _ssh_result(stdout=json.dumps(state) + "\n7 unless-stopped\n")
+        if "docker logs" in command:
+            return _ssh_result(stdout="RENTER_API_TOKEN=renter-secret\n")
+        return _ssh_result()
+
+    ssh = Mock(run=AsyncMock(side_effect=run))
+    with caplog.at_level(logging.WARNING, logger="services.docker_service"):
+        await svc._restore_mount_and_sshd_after_start(
+            docker_client=Mock(), ssh_client=ssh, container_name="pod_x", local_volume_path="/root",
+            pod_id="x", default_extra={},
+        )
+        await asyncio.gather(*docker_service._BOOTSTRAP_DIAGNOSTICS)
+
+    [record] = [r for r in caplog.records if "did not complete cleanly" in str(r.msg)]
+    extra = record.msg.extra
+    assert (extra["container_exit_code"], extra["container_restart_count"], extra["container_restart_policy"]) == (
+        1, 7, "unless-stopped"
+    )
+    assert extra["container_logs_tail"] is None
+    assert not [c for c in ssh.run.await_args_list if "docker logs" in c.args[0]]
+    assert "renter-secret" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_a_slow_bootstrap_diagnostic_read_does_not_hold_back_the_start(svc):
+    # the remount already took when the bootstrap failed: a hung diagnostic read must not run the caller into its
+    # deadline, which would treat the cut as a failed remount and stop the pod
+    svc._encrypted_local_volume_name = AsyncMock(return_value="lium-cipher")
+    svc.setup_encrypted_local_volume = AsyncMock()
+    svc.install_open_ssh_server_and_start_ssh_service_with_rental_docker = AsyncMock(return_value=False)
+    hung = asyncio.Event()
+
+    async def run(command, *args, **kwargs):
+        if "{{json .State}}" in command:
+            await hung.wait()
+        return _ssh_result()
+
+    ssh = Mock(run=AsyncMock(side_effect=run))
+    try:
+        async with asyncio.timeout(1):
+            await svc._restore_mount_and_sshd_after_start(
+                docker_client=Mock(), ssh_client=ssh, container_name="pod_x", local_volume_path="/root",
+                pod_id="x", default_extra={},
+            )
+    finally:
+        hung.set()
+        await asyncio.gather(*getattr(docker_service, "_BOOTSTRAP_DIAGNOSTICS", ()))
 
 
 @pytest.mark.asyncio
