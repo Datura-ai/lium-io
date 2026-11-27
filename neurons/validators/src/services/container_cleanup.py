@@ -6,12 +6,14 @@ import re
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 import shlex
+import time
+from types import SimpleNamespace
 from typing import Awaitable, Callable, Optional
 
 import asyncssh
 
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
-from core.docker_utils import ALPINE_HELPER_IMAGE, DockerCommand, df_available_bytes
+from core.docker_utils import ALPINE_HELPER_IMAGE, DockerCommand, df_command, parse_df_available_bytes
 from core.utils import _m
 from services.const import (
     DPHN_CACHE_LISTING_FLOOR_GB,
@@ -21,6 +23,7 @@ from services.const import (
     FILLER_CACHE_VOLUME_PREFIXES,
     FILLER_CONTAINER_GRACE_MINUTES,
     FILLER_CONTAINER_PREFIX,
+    FILLER_LIST_READ_MARGIN_MINUTES,
     LEGACY_LIUM_CONTAINER_NAME,
     LIUM_HEALTH_CHECK_CONTAINER_NAME,
     LIUM_POD_ID_LABEL,
@@ -273,6 +276,117 @@ def _bound_pod_id_label(container_name: str, label: str) -> str:
 CAPABILITY_CHECK_NAME = re.compile(r"^lium_capability_check_[0-9]+_[0-9a-f]{6}$")
 FULL_CONTAINER_ID = re.compile(r"[0-9a-f]{64}")
 LIST_CREATED_CONTAINERS = "/usr/bin/docker ps -a --no-trunc --filter status=created --format '{{.ID}} {{.Names}}'"
+LIST_VOLUME_NAMES = '/usr/bin/docker volume ls --format "{{.Name}}"'
+LIST_RUNNING_FILLERS = f'/usr/bin/docker ps --filter "name={FILLER_CONTAINER_PREFIX}" --format "{{{{.Names}}}}"'
+# one JSON array per container: a label with a newline cannot forge a second record
+RENTAL_LISTING_FORMAT = f'[{{{{json .Names}}}},{{{{json (.Label "{LIUM_POD_ID_LABEL}")}}}},{{{{json .CreatedAt}}}}]'
+RENTAL_LISTING = "date +%s && " + DockerCommand.ps_filter(
+    *(f"{prefix}*" for prefix in RENTAL_CONTAINER_PREFIXES), output_format=RENTAL_LISTING_FORMAT
+)
+FREE_DISK_UNDER_DOCKER_ROOT = (
+    "root=$(/usr/bin/docker info --format '{{.DockerRootDir}}') && "
+    '{ [ -n "$root" ] || root=/var/lib/docker; } && ' + df_command('"$root"')
+)
+
+# DAH-7109: the cleanup's always-run reads in one SSH call. Joined with `;` so a failing section hides no
+# other; each prints `<TAG>_RC\t<exit status>`. Tags come from docker's own --format (no pipe, which would
+# hide docker's exit status), POSIX sh only: the executor's shell may be dash.
+_SNAPSHOT_SECTIONS = {
+    # tag: (the command it answers, the same listing with each line tagged)
+    "RENTAL": (
+        RENTAL_LISTING,
+        DockerCommand.ps_filter(
+            *(f"{prefix}*" for prefix in RENTAL_CONTAINER_PREFIXES),
+            output_format="RENTAL\\t" + RENTAL_LISTING_FORMAT,
+        ),
+    ),
+    "DANGLING": (
+        DockerCommand.volume_ls_dangling(),
+        "/usr/bin/docker volume ls -f dangling=true --format 'DANGLING\\t{{.Name}}'",
+    ),
+    "CREATED": (
+        LIST_CREATED_CONTAINERS,
+        "/usr/bin/docker ps -a --no-trunc --filter status=created --format 'CREATED\\t{{.ID}} {{.Names}}'",
+    ),
+    "VOL": (LIST_VOLUME_NAMES, "/usr/bin/docker volume ls --format 'VOL\\t{{.Name}}'"),
+    "FILLER": (
+        LIST_RUNNING_FILLERS,
+        f"/usr/bin/docker ps --filter name={FILLER_CONTAINER_PREFIX} --format 'FILLER\\t{{{{.Names}}}}'",
+    ),
+}
+HOST_SNAPSHOT = "printf 'NOW\\t%s\\n' \"$(date +%s)\"; " + "; ".join(
+    f"{listing}; printf '{tag}_RC\\t%s\\n' \"$?\"" for tag, (_, listing) in _SNAPSHOT_SECTIONS.items()
+)
+
+
+def parse_host_snapshot(stdout: str) -> dict[str, SimpleNamespace]:
+    """Each complete section as the result its own command would give, keyed by that command.
+
+    A section without its exit-status line (output cut short) is left out, so that read goes to the host.
+    """
+    lines: dict[str, list[str]] = {tag: [] for tag in _SNAPSHOT_SECTIONS}
+    status: dict[str, int] = {}
+    now = ""
+    for line in stdout.splitlines():
+        tag, sep, value = line.partition("\t")
+        if not sep:
+            continue
+        if tag == "NOW":
+            now = value
+        elif tag in lines:
+            lines[tag].append(value)
+        elif tag.endswith("_RC") and tag[:-3] in lines and value.isdigit():
+            status[tag[:-3]] = int(value)
+    answers = {}
+    for tag, (command, _) in _SNAPSHOT_SECTIONS.items():
+        if tag not in status:
+            continue
+        body = lines[tag] if tag != "RENTAL" else [now, *lines[tag]]
+        answers[command] = SimpleNamespace(exit_status=status[tag], stdout="\n".join(body) + "\n", stderr="")
+    return answers
+
+
+class SnapshotSSH:
+    """The executor SSH connection, with the cleanup's always-run reads answered from one snapshot.
+
+    Any other command may change the host, so it drops the snapshot first: every later read goes to the
+    host, and a read never sees what the cycle's own removals freed as still taken.
+    """
+
+    def __init__(self, ssh_client, answers: dict[str, SimpleNamespace]):
+        self._ssh = ssh_client
+        self._answers = answers
+
+    @classmethod
+    async def take(cls, ssh_client) -> "SnapshotSSH":
+        try:
+            result = await ssh_client.run(HOST_SNAPSHOT)
+            answers = parse_host_snapshot(result.stdout or "")
+        except Exception as e:  # noqa: BLE001 - no snapshot: every read goes to the host as before
+            logger.warning(_m("Cleanup host snapshot failed", extra={"error": str(e)}))
+            answers = {}
+        return cls(ssh_client, answers)
+
+    def __getattr__(self, name):
+        return getattr(self._ssh, name)
+
+    async def run(self, command, *args, **kwargs):
+        answer = None if args or kwargs else self._answers.get(command)
+        if answer is not None:
+            return answer
+        self._answers = {}
+        return await self._ssh.run(command, *args, **kwargs)
+
+
+def _age_minutes(now: Optional[int], created_at) -> Optional[float]:
+    """Minutes since docker's CreatedAt ("2026-11-25 09:00:00 +0000 UTC") on the host clock `now`."""
+    if now is None or not isinstance(created_at, str):
+        return None
+    try:
+        created = datetime.strptime(created_at.rsplit(" ", 1)[0], "%Y-%m-%d %H:%M:%S %z")
+    except ValueError:
+        return None
+    return (now - created.timestamp()) / 60
 
 
 def never_started_check_containers(listing: str) -> list[str]:
@@ -363,7 +477,7 @@ class ContainerCleanup:
             extra["rented_container_count"] = len(rented_containers)
 
             # Check each container
-            for stripped_name, label in all_containers:
+            for stripped_name, label, age_minutes in all_containers:
                 pod_id = _bound_pod_id_label(stripped_name, label)
                 if stripped_name in rented_containers or (pod_id and pod_id in live_ids):
                     continue
@@ -372,11 +486,17 @@ class ContainerCleanup:
                 if not pod_id and not legacy and not health_check:
                     continue
 
-                age_minutes = await self._get_container_age_minutes(ssh_client, stripped_name)
-                if age_minutes and age_minutes > self.stale_threshold_minutes:
-                    if legacy and not await self._legacy_ended(lium_workload_ended, stripped_name):
+                removal_age = self._removal_age_minutes_for_unlisted_container(stripped_name, rented_data)
+                if age_minutes and age_minutes > removal_age:
+                    if legacy and not await self._backend_confirms_workload_ended(lium_workload_ended, stripped_name):
                         continue
-                    if (
+                    if not legacy and age_minutes <= self.stale_threshold_minutes:
+                        # a filler younger than the fixed grace may be a run whose create callback comes late:
+                        # only the backend's record that it ended lets it go, and that one lookup also confirms
+                        # the removal, so it reserves no second one; past the grace the fixed rule applies
+                        if not await self._backend_confirms_workload_ended(lium_workload_ended, stripped_name):
+                            continue
+                    elif (
                         not legacy
                         and reserve_removal is not None
                         and stripped_name.startswith((POD_CONTAINER_PREFIX, FILLER_CONTAINER_PREFIX))
@@ -443,6 +563,19 @@ class ContainerCleanup:
         await self.remove_never_started_check_containers(ssh_client, executor_uuid)
 
         return len(removed_names), removed_names, unremovable_names
+
+    def _removal_age_minutes_for_unlisted_container(self, name: str, rented_data: RentedExecutorsResponse | None) -> float:
+        """Minutes old an unlisted container must be before it is removed.
+
+        DAH-7071: a filler_ container older than the rented list it is missing from is no live run, so
+        it goes once its age (host clock) passes the validator's time since the list was read, plus a
+        margin. pod_ and health_check_ containers, and a list with no read time, keep the fixed grace.
+        """
+        read_at = rented_data.read_at if rented_data is not None else None
+        if not name.startswith(FILLER_CONTAINER_PREFIX) or read_at is None:
+            return self.stale_threshold_minutes
+        # an old list read never waits longer than the fixed grace
+        return min(self.stale_threshold_minutes, (time.time() - read_at) / 60 + FILLER_LIST_READ_MARGIN_MINUTES)
 
     async def remove_never_started_check_containers(self, ssh_client, executor_uuid: str) -> int:
         # best-effort like the volume prune above: never raises
@@ -701,10 +834,7 @@ class ContainerCleanup:
 
     async def _has_running_filler(self, ssh_client: asyncssh.SSHClientConnection) -> bool:
         # A cache a live filler still mounts is in use.
-        result = await ssh_client.run(
-            f'/usr/bin/docker ps --filter "name={FILLER_CONTAINER_PREFIX}" '
-            '--format "{{.Names}}"'
-        )
+        result = await ssh_client.run(LIST_RUNNING_FILLERS)
         if getattr(result, "exit_status", 0) != 0:
             return True  # cannot prove the node is idle -> do not reclaim
         return bool((result.stdout or "").strip())
@@ -713,12 +843,12 @@ class ContainerCleanup:
         # The root is DISCOVERED, not assumed: a node with docker moved to a dedicated disk would
         # otherwise be judged by its root filesystem, and the reclaim would either never fire while
         # docker's disk is full or fire and delete a healthy cache the node had room for.
-        info = await ssh_client.run("/usr/bin/docker info --format '{{.DockerRootDir}}'")
-        if getattr(info, "exit_status", 0) != 0:
+        # one call: a failed docker info or a failed df both exit non-zero
+        result = await ssh_client.run(FREE_DISK_UNDER_DOCKER_ROOT)
+        if getattr(result, "exit_status", 0) != 0:
             return None
-        docker_root: str = (info.stdout or "").strip() or "/var/lib/docker"
         try:
-            return await df_available_bytes(ssh_client, docker_root) / (1024**3)
+            return parse_df_available_bytes(result.stdout or "") / (1024**3)
         except Exception:
             # A backstop that cannot measure declines rather than guesses; the caller treats None as
             # "leave the cache alone".
@@ -727,7 +857,7 @@ class ContainerCleanup:
     async def _get_cache_volumes(
         self, ssh_client: asyncssh.SSHClientConnection, name_prefixes: tuple[str, ...]
     ) -> list[str]:
-        result = await ssh_client.run('/usr/bin/docker volume ls --format "{{.Name}}"')
+        result = await ssh_client.run(LIST_VOLUME_NAMES)
         if getattr(result, "exit_status", 0) != 0:
             return []
         return sorted(
@@ -882,10 +1012,10 @@ class ContainerCleanup:
             return 0
 
     @staticmethod
-    async def _legacy_ended(
+    async def _backend_confirms_workload_ended(
         lium_workload_ended: Callable[[str], Awaitable[bool]] | None, container_name: str
     ) -> bool:
-        """A pre-label pod_/filler_<uuid> goes only when the backend's record says it ended."""
+        """True only when the backend's record says the pod_/filler_<uuid> workload ended (no callback: never)."""
         if lium_workload_ended is None:
             return False
         try:
@@ -899,30 +1029,31 @@ class ContainerCleanup:
             )
             return False
 
-    async def _get_all_rental_containers(self, ssh_client) -> list[tuple[str, str]]:
-        """Get all containers with rental-related prefixes.
+    async def _get_all_rental_containers(self, ssh_client) -> list[tuple[str, str, Optional[float]]]:
+        """Get all containers with rental-related prefixes, with their age in minutes.
 
         Iterates RENTAL_CONTAINER_PREFIXES (services/const.py) so any short-lived
         container that competes for the rental port range is caught by cleanup.
         A stale running `health_check_*` from a crashed backend would otherwise
         hold ports 9100-9130 indefinitely.
+
+        DAH-7109: one SSH call. The host clock and each container's creation time come back with
+        the listing, instead of a `docker inspect` and a `date` call per candidate. The age is None
+        when either is unreadable, and such a container is never removed.
         """
         try:
-            patterns = [f"{prefix}*" for prefix in RENTAL_CONTAINER_PREFIXES]
-            # one JSON array per container: a label with a newline cannot forge a second record
-            output_format = f'[{{{{json .Names}}}},{{{{json (.Label "{LIUM_POD_ID_LABEL}")}}}}]'
-            result = await ssh_client.run(
-                DockerCommand.ps_filter(*patterns, output_format=output_format)
-            )
-            # (name, pod id label or ""); the name filter is a substring regex that lists "podman" too
+            result = await ssh_client.run(RENTAL_LISTING)
+            lines = (result.stdout or "").splitlines()
+            now = int(lines[0]) if lines and lines[0].strip().isdigit() else None
+            # (name, pod id label or "", age); the name filter is a substring regex that lists "podman" too
             containers = []
-            for line in (result.stdout or "").splitlines():
+            for line in lines[1:]:
                 try:
-                    name, pod_id = json.loads(line)
+                    name, pod_id, created_at = json.loads(line)
                 except (ValueError, TypeError):
                     continue
                 if isinstance(name, str) and isinstance(pod_id, str) and name:
-                    containers.append((name, pod_id.strip()))
+                    containers.append((name, pod_id.strip(), _age_minutes(now, created_at)))
             return containers
         except Exception as e:
             logger.warning(
@@ -935,36 +1066,6 @@ class ContainerCleanup:
             )
 
         return []
-
-    async def _get_container_age_minutes(self, ssh_client, container_name: str) -> Optional[float]:
-        """Get container age in minutes, returns None if unable to determine."""
-        try:
-            # Get container creation timestamp
-            created_result = await ssh_client.run(
-                DockerCommand.inspect_created_timestamp(container_name)
-            )
-            if created_result.exit_status != 0:
-                return None
-            created_timestamp = int(created_result.stdout.strip())
-
-            # Get current time on the machine
-            current_result = await ssh_client.run("date +%s")
-            if current_result.exit_status != 0:
-                return None
-            current_timestamp = int(current_result.stdout.strip())
-
-            # Calculate age
-            age_minutes = (current_timestamp - created_timestamp) / 60
-            return age_minutes
-
-        except Exception as e:
-            logger.warning(
-                _m(
-                    f"Error checking container age for {container_name}",
-                    extra={"container_name": container_name, "error": str(e)}
-                )
-            )
-            return None
 
     async def _remove_container(
         self,

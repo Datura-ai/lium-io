@@ -51,12 +51,13 @@ def calculate_scores(
     job_score = 1.0
     actual_score = 1.0
 
-    # Outdated executor image (DAH-2701). Enforcement is off by default until nodes
-    # auto-update again (DAH-3419); off, ExecutorImageCheck logs the verdict as a warning.
+    # Executor image (DAH-2701, DAH-6845): an unofficial build scores 0; an outdated one scores 0 only when the node was
+    # free when its image was read, so a rented node on an old image keeps its score and rental, a rental ending later
+    # in the cycle included, and leaves the rent list on the next cycle that reads it free
     image_report = getattr(ctx.state, "executor_image_report", None)
     if image_report and (
         image_report.status is ImageVerdict.UNOFFICIAL
-        or (settings.EXECUTOR_IMAGE_CHECK_ENFORCE and image_report.status is ImageVerdict.OUTDATED)
+        or (image_report.status is ImageVerdict.OUTDATED and not image_report.rented_when_read)
     ):
         actual_score = 0.0
         job_score = 0.0
@@ -156,7 +157,11 @@ def calculate_scores(
     if not ctx.gpu_kernel_count_passed:
         actual_score = 0.0
         job_score = 0.0
-        warning_messages.append("The kernel lists fewer GPUs than the node reports")
+        warning_messages.append(
+            "A reported GPU cannot be attached to a container"
+            if ctx.gpu_kernel_unattachable
+            else "The kernel lists fewer GPUs than the node reports"
+        )
 
     # GPU model gate (DAH-6241): same mechanics; the renter's pod keeps running, the provider is not paid.
     if not ctx.gpu_model_passed:

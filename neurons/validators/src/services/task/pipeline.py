@@ -28,7 +28,13 @@ from services.container_cleanup import ContainerCleanup
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from protocol.vc_protocol.validator_requests import PodContainerState
 from .availability import REASONS_THAT_HIDE_AT_ONCE, AvailabilityErrorCode
-from .messages import NodeAccountMessages, RentalVerificationMessages, TenantEnforcementMessages, render_message
+from .messages import (
+    LoginUserMessages,
+    NodeAccountMessages,
+    RentalVerificationMessages,
+    TenantEnforcementMessages,
+    render_message,
+)
 from .models import ValidationEvent
 from .runner import SSHCommandResult, SSHCommandRunner
 
@@ -199,6 +205,15 @@ class ContextState:
     # mounts that are not procfs at or under /proc/driver/nvidia/gpus ("<mount point> <fstype>");
     # non-empty = the kernel list above was withheld because it was read through them
     kernel_gpu_foreign_mounts: list[str] = field(default_factory=list)
+    # which view the list above came from: "host_pid1_root" or "container" (DAH-7076)
+    kernel_gpu_view_source: str = "container"
+    # with the host's list: the container view's own list and foreign mounts (a stale bind after a reset);
+    # the mounts are evidence only, a short container list still fails a short host list
+    container_kernel_gpu_uuids: list[str] | None = None
+    container_kernel_gpu_foreign_mounts: list[str] = field(default_factory=list)
+    # with the host's list: the same read's list of every card on the host (a shared host has other executors' cards);
+    # the subset-container check (DAH-6273) and the identity evidence use it, never the bans or specs
+    host_all_kernel_gpu_uuids: list[str] | None = None
     verified_port_count: int = 0
     # verified_port_count is out of the ports probed this cycle (at most BATCH_PORT_VERIFICATION_SIZE,
     # the lowest free ones), never the declared range: declared - probed were not probed at all,
@@ -387,6 +402,8 @@ class Context(BaseModel):
     # False once GpuKernelCountCheck finds a kernel list shorter than the reported count; the
     # check is non-fatal on a live rental, so the score gate lives in calculate_scores.
     gpu_kernel_count_passed: bool = True
+    # set with it when the finding is a reported card the create step cannot attach (every card listed)
+    gpu_kernel_unattachable: bool = False
     # False once a card is below its reported GPU model (DAH-6241); non-fatal on a live rental, so the score
     # gate lives in calculate_scores.
     gpu_model_passed: bool = True
@@ -877,7 +894,8 @@ class Pipeline:
         passed, events, end_ctx = await self._run_checks(ctx)
         # another account's machine answered, or the machine could not be confirmed as the account's (a read that
         # still failed after the reconnect, which a relay can cause): no completion step touches it (DAH-6539)
-        if any(event.reason_code in _NOT_THE_ACCOUNTS_MACHINE for event in events):
+        # a non-root login runs nothing on the host either: completion steps need the root login every script uses
+        if any(event.reason_code in _NOT_THE_ACCOUNTS_MACHINE or event.reason_code == LoginUserMessages.NOT_ROOT.reason for event in events):
             return passed, events, end_ctx
         for chk in self.on_completion:
             try:

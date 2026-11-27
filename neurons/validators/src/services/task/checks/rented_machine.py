@@ -345,13 +345,15 @@ class TenantEnforcementCheck:
         state_by_pod_id: dict[str, ContainerState] = {}
         # DAH-6141: pods whose rental the backend confirmed closed, skipped because a sibling is not closed
         closed_pod_ids: set[str] = set()
+        # pods whose container dockerd reported restarting this cycle
+        restarting_pod_ids: set[str] = set()
 
         def with_pod_states(result: CheckResult) -> CheckResult:
             if result.updates.get("rented") is not False:
                 # the run ends here as rented and never reaches the kernel-fault probe, so the no-verdicts before
                 # and after it are not in a row. A stale-pod run goes on as idle (rented=False) and is probed: no reset.
                 forget_unknown_streak(ctx)
-            return _with_pod_states(result, ctx, rented_pods, state_by_pod_id)
+            return _with_pod_states(result, ctx, rented_pods, state_by_pod_id, restarting_pod_ids)
 
         # DAH-4709: inside the window every pod's state is still read for the backend, but a pod that is down
         # is the provider's work, not POD_NOT_RUNNING, and is not recovered.
@@ -364,9 +366,12 @@ class TenantEnforcementCheck:
                 # bounded by the cycle time budget: a read hung on a dead shell ends as a TimeoutError (an OSError),
                 # so the cycle reports the node unreachable instead of being dropped without a result
                 async with asyncio.timeout(max(1.0, task_seconds_left(ctx) - POD_READ_RESERVE_SECONDS)):
-                    pod_running, ssh_pub_keys = await _check_pod_running_and_read_authorized_keys(
+                    pod_read = await _check_pod_running_and_read_authorized_keys(
                         ctx.ssh, pod_container_name, ctx.default_extra
                     )
+                pod_running, ssh_pub_keys = pod_read.running, pod_read.authorized_keys
+                if pod_read.restarting:
+                    restarting_pod_ids.add(pod_id)
             except (asyncssh.Error, OSError) as exc:
                 return with_pod_states(
                     _executor_transport_unreachable_result(
@@ -704,8 +709,8 @@ class TenantEnforcementCheck:
                 ):
                     # Re-read the pod, so the recovered container's own SSH keys are what gets
                     # reported and a start that did not stick still lands on POD_NOT_RUNNING.
-                    pod_running, read_keys = await _check_pod_running_and_read_authorized_keys(ctx.ssh, container_name, ctx.default_extra)
-                    ssh_pub_keys = read_keys or []
+                    pod_read = await _check_pod_running_and_read_authorized_keys(ctx.ssh, container_name, ctx.default_extra)
+                    pod_running, ssh_pub_keys = pod_read.running, pod_read.authorized_keys or []
                     container_finished_at = diagnostics.get("container_finished_at")
                     if pod_running and isinstance(container_finished_at, str):
                         await _report_host_reboot_recovery(ctx, pod_id, container_finished_at)
@@ -956,6 +961,7 @@ def _with_pod_states(
     ctx: Context,
     rented_pods: list[RentedPod],
     state_by_pod_id: dict[str, ContainerState],
+    restarting_pod_ids: set[str] = frozenset(),
 ) -> CheckResult:
     # DAH-3338: every verdict of the check carries one state per rented pod into ctx.state, on top
     # of what StaleContainerCleanupCheck reaped earlier in the cycle. A pod without an observation
@@ -974,6 +980,11 @@ def _with_pod_states(
     ]
     # a re-probe's state (DAH-3698) is carried, not the one the check started from
     state = replace(result.updates.get("state", ctx.state), pod_states=pod_states)
+    if restarting_pod_ids:
+        faults = dict(state.rented_pod_faults or {})
+        for pod_id in restarting_pod_ids:
+            faults[pod_id] = sorted({*faults.get(pod_id, []), RENTED_POD_RESTARTING})
+        state = replace(state, rented_pod_faults=faults)
     return result.model_copy(
         update={"updates": {**result.updates, "state": state}}
     )
@@ -1463,6 +1474,13 @@ class PodRunningAndAuthorizedKeys(NamedTuple):
     running: bool
     # None: dockerd refused the exec (a restarting or paused container), so the keys are unknown.
     authorized_keys: list[str] | None
+    # Docker's own state says restarting (dockerd refused the keys read): `docker ps` still lists it as running
+    restarting: bool = False
+
+
+# The per-pod verdict for a rented container caught in a restart loop. Reported only: the check's verdict on the
+# node, penalties, scoring and billing do not read it.
+RENTED_POD_RESTARTING = "RENTED_POD_RESTARTING"
 
 
 async def _check_pod_running_and_read_authorized_keys(
@@ -1479,6 +1497,7 @@ async def _check_pod_running_and_read_authorized_keys(
     except Exception:
         pod_running = False
 
+    restarting = False
     try:
         # Literal path, not ~: injection writes this exact file (DAH-2534).
         keys_result = await ssh_client.run(
@@ -1495,10 +1514,22 @@ async def _check_pod_running_and_read_authorized_keys(
     except Exception:
         ssh_keys = []
 
+    if pod_running and ssh_keys is None:
+        # Docker's own state, not the refusal text: a running container whose read failed is not restarting
+        try:
+            state = await ssh_client.run(
+                f"/usr/bin/docker inspect -f '{{{{.State.Restarting}}}}' {shlex.quote(container_name)}"
+            )
+            restarting = state.exit_status == 0 and state.stdout.strip() == "true"
+        except (asyncssh.Error, OSError):
+            raise
+        except Exception:
+            restarting = False
+
     if ssh_keys and any(body in line for line in ssh_keys for body in FOREIGN_POD_KEY_BODIES):
         ssh_keys = await _strip_foreign_pod_keys(ssh_client, container_name, ssh_keys, log_extra)
 
-    return PodRunningAndAuthorizedKeys(running=pod_running, authorized_keys=ssh_keys)
+    return PodRunningAndAuthorizedKeys(running=pod_running, authorized_keys=ssh_keys, restarting=restarting)
 
 
 # I-78: keys no renter, platform service or team member owns; removed from a rented pod on every read.

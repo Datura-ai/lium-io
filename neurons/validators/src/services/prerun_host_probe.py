@@ -27,7 +27,7 @@ from dataclasses import dataclass, field, replace
 from services.gpu_power_limit import POWER_STATE_CMD
 from services.nvidia_devices import (
     GPU_DEVICE_NODES_CMD,
-    PROC_GPU_INFO_CMD,
+    HOST_PROC_GPU_INFO_CMD,
     shared_device_nodes_command,
 )
 
@@ -204,7 +204,7 @@ def prerun_host_probe_command(
     """
     parts = [
         # awk, not sed: `\t` in a sed replacement is GNU-only; awk's "\t" is POSIX (and
-        # PROC_GPU_INFO_CMD already needs awk on the host).
+        # HOST_PROC_GPU_INFO_CMD already needs awk on the host).
         't() { tag=$1; shift; out="$(sh -c "$1" 2>/dev/null)"; rc=$?; '
         'if [ -n "$out" ]; then printf \'%s\\n\' "$out" | awk -v t="$tag" \'{ print t "\\t" $0 }\' '
         f"|| echo {PREFIX_FAILED_MARKER}; fi; "
@@ -212,7 +212,7 @@ def prerun_host_probe_command(
         _section(PS_TAG, DOCKER_PS_ALL_NAMES_IDS_CMD),
         _section(VOL_TAG, DOCKER_VOLUME_LS_NAME_DRIVER_CMD),
         _section(MNT_TAG, DOCKER_MOUNTED_VOLUME_NAMES_CMD),
-        _section(GPU_MINOR_MAP_TAG, PROC_GPU_INFO_CMD),
+        _section(GPU_MINOR_MAP_TAG, HOST_PROC_GPU_INFO_CMD),
         _section(GPUDEV_TAG, GPU_DEVICE_NODES_CMD),
         _section(SHARED_TAG, shared_device_nodes_command(is_whole_host_rental=False)),
         _section(

@@ -166,6 +166,7 @@ class VerifierParams:
 # only this failure by the probe's output (stderr and stdout): the other empty-uuid results (a sealed blob that failed
 # authentication, a stdout that could not be parsed) are not the probe's answer.
 UUID_MISMATCH_ERROR_PREFIX = "UUID mismatch"
+ALL_CARDS_FAILED_ERROR_PREFIX = "All-cards GPU work-proof failed"
 
 # Whose clock `ValidationResult.elapsed_seconds` is: the validator's around the SSH run, or the
 # executor's own word for the step when the answer came through the local transport.
@@ -200,7 +201,7 @@ class ValidationResult:
     # (None when the probe did not run); device 0's own are in `metrics`.
     card_metrics: dict[int, dict] | None = None
     # The all-cards work-proof this run made (None: one card, or not asked for); CapabilityCheck judges a failed one
-    # card by card (checks/capability.py `judge_all_cards`).
+    # card by card (checks/capability.py `judge_all_cards`), and DAH-6332 reads its `wrong_answer`.
     all_cards: "AllCardsProbe | None" = None
 
     def __bool__(self) -> bool:
@@ -887,7 +888,7 @@ class ValidationService:
             if settings.MATMUL_ALLCARDS_ENFORCEMENT_ENABLED and all_cards is not None and not all_cards.passed:
                 return ValidationResult(
                     success=False,
-                    error_message=f"All-cards GPU work-proof failed: {all_cards.failure_reason}",
+                    error_message=f"{ALL_CARDS_FAILED_ERROR_PREFIX}: {all_cards.failure_reason}",
                     all_cards=all_cards,
                 )
 

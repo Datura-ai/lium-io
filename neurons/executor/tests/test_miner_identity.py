@@ -59,12 +59,24 @@ def test_reports_the_declared_renting_ports(monkeypatch):
     monkeypatch.setattr(settings, "SSH_PORT", 2200)
     monkeypatch.setattr(settings, "SSH_PUBLIC_PORT", None)
     body = _client().get("/miner-identity", params={"nonce": NONCE, "declared_ports": 1}).json()
-    assert body["declared_ports"] == {"port_range": "20000-20009", "port_mappings": None, "ssh_port": 2200}
+    assert body["declared_ports"] == {
+        "port_range": "20000-20009",
+        "port_mappings": None,
+        "ssh_port": 2200,
+        "ssh_internal_port": 2200,
+    }
     # the SSH port validators dial is the public one when set; they never rent it out
     monkeypatch.setattr(settings, "RENTING_PORT_RANGE", None)
+    monkeypatch.setattr(settings, "SSH_PORT", 22)
     monkeypatch.setattr(settings, "SSH_PUBLIC_PORT", 20311)
     body = _client().get("/miner-identity", params={"nonce": NONCE, "declared_ports": 1}).json()
-    assert body["declared_ports"] == {"port_range": None, "port_mappings": None, "ssh_port": 20311}
+    # sshd's own port is reported too: a mapping from it reaches sshd, not a pod
+    assert body["declared_ports"] == {
+        "port_range": None,
+        "port_mappings": None,
+        "ssh_port": 20311,
+        "ssh_internal_port": 22,
+    }
 
 
 def test_a_caller_that_does_not_ask_gets_no_ports_however_many_are_mapped(monkeypatch):

@@ -22,6 +22,7 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 
+import asyncssh
 import pytest
 
 THIS_DIR = Path(__file__).resolve().parent
@@ -62,6 +63,9 @@ def _verifier_response() -> dict:
     return json.loads(VERIFIER_RESPONSE_PATH.read_text())
 
 
+HOST_KEY = asyncssh.generate_private_key("ssh-ed25519").export_public_key().decode().strip()
+
+
 def _make_executor(**overrides) -> ExecutorSSHInfo:
     defaults = dict(
         uuid="test-executor",
@@ -71,7 +75,8 @@ def _make_executor(**overrides) -> ExecutorSSHInfo:
         ssh_port=2222,
         python_path="/usr/bin/python",
         root_dir="/opt/executor",
-        ssh_host_key="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITestKey user@host",
+        # a parsable key: prepare_host_policy refuses one that builds no known_hosts policy
+        ssh_host_key=HOST_KEY,
         tdx_quote='{"quote": "00"}',
     )
     defaults.update(overrides)
@@ -530,7 +535,7 @@ async def test_g1_only_a_passed_verdict_bound_to_the_challenge_claims_gpu_cc(
 
     monkeypatch.setattr(service, "_verify_tdx", fake_tdx)
     monkeypatch.setattr(service, "_post_nras", fake_post)
-    monkeypatch.setattr(service, "_build_known_hosts", lambda executor_: None)
+    monkeypatch.setattr(service, "_build_known_hosts", lambda executor_: object())
 
     # Act
     result = await service.prepare_host_policy(executor, nonce=nonce)
@@ -546,7 +551,7 @@ async def test_g1_gpu_is_not_verified_without_a_tdx_digest(service, monkeypatch)
         return None, "dstack/tdx"
 
     monkeypatch.setattr(service, "_verify_tdx", fake_tdx)
-    monkeypatch.setattr(service, "_build_known_hosts", lambda executor_: None)
+    monkeypatch.setattr(service, "_build_known_hosts", lambda executor_: object())
 
     # Act
     result = await service.prepare_host_policy(_make_executor(nvidia_payload="x"), nonce=AttestationNonce.issue())

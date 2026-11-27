@@ -236,6 +236,10 @@ NORMALIZATION_MAP: dict[str, str] = {
 # card. V100S is another card ("Tesla V100S-PCIE-32GB") and does not match.
 V100_BOARD_NAME_RE = re.compile(r"Tesla V100-[A-Z0-9]+-(16|32)GB(-LS)?")
 V100 = "NVIDIA Tesla V100 Tensor Core GPU"
+# Every other Tesla the driver names without the "NVIDIA " prefix, bare or with its board and size ("Tesla P40",
+# "Tesla P100-PCIE-16GB", "Tesla M40 24GB"): its rate key is "NVIDIA Tesla <model>". A name whose key is not in
+# GPU_MODEL_RATES passes through; the VRAM range still judges the card (ticket-1398, P100 refused 25 Nov).
+TESLA_BOARD_NAME_RE = re.compile(r"Tesla ([A-Z]\d+)(?:-[A-Z0-9]+)?(?:[- ]\d+GB)?")
 
 
 def normalize_gpu_model(name: str | None) -> str:
@@ -243,7 +247,8 @@ def normalize_gpu_model(name: str | None) -> str:
 
     Returns:
         - "" if `name` is empty/None.
-        - The mapped canonical name if `name.strip()` is in NORMALIZATION_MAP or names a V100 board.
+        - The mapped canonical name if `name.strip()` is in NORMALIZATION_MAP, names a V100 board, or names
+          another Tesla whose "NVIDIA Tesla <model>" is a GPU_MODEL_RATES key.
         - Otherwise `name.strip()` unchanged (caller decides what to do).
     """
     if not name:
@@ -251,7 +256,12 @@ def normalize_gpu_model(name: str | None) -> str:
     stripped = name.strip()
     if V100_BOARD_NAME_RE.fullmatch(stripped):
         return V100
-    return NORMALIZATION_MAP.get(stripped, stripped)
+    if stripped in NORMALIZATION_MAP:
+        return NORMALIZATION_MAP[stripped]
+    tesla = TESLA_BOARD_NAME_RE.fullmatch(stripped)
+    if tesla and f"NVIDIA Tesla {tesla.group(1)}" in GPU_MODEL_RATES:
+        return f"NVIDIA Tesla {tesla.group(1)}"
+    return stripped
 
 
 RTX_4090 = "NVIDIA GeForce RTX 4090"

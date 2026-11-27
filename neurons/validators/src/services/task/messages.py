@@ -737,6 +737,17 @@ class NvmlDigestMessages:
         impact="Score set to 0; previous verification cleared",
         remediation="Reinstall the NVIDIA driver matching this version and ensure libnvidia-ml is not tampered.",
     )
+    DIGEST_UNREAD = MessageTemplate(
+        event="NVML library digest mismatch not confirmed",
+        reason="NVML_DIGEST_UNREAD",
+        severity="warning",
+        category="env",
+        impact="Score set to 0 for this cycle; verification kept",
+        remediation=(
+            "No action needed if the next check passes. "
+            "If it repeats, reinstall the NVIDIA driver matching this version."
+        ),
+    )
     DRIVER_UNKNOWN = MessageTemplate(
         event="Unknown NVIDIA driver version",
         reason="NVML_DRIVER_UNKNOWN",
@@ -919,7 +930,15 @@ class ExecutorImageMessages:
         reason="EXECUTOR_IMAGE_OUTDATED",
         severity="error",
         category="policy",
-        impact="Score set to 0 until the image is current",
+        impact="Free node: validation failed, off the rent list until the image is current",
+    )
+    # DAH-6845: a rented node on an OUTDATED image passes and keeps its incentive, so the event is a warning
+    RENTED_OUTDATED = MessageTemplate(
+        event="Executor image is outdated",
+        reason="EXECUTOR_IMAGE_OUTDATED",
+        severity="warning",
+        category="policy",
+        impact="Rental and incentive continue; update the image before the rental ends",
     )
     UNOFFICIAL = MessageTemplate(
         event="Executor is not an official build",
@@ -927,14 +946,6 @@ class ExecutorImageMessages:
         severity="error",
         category="policy",
         impact="Score set to 0 until the node runs the official executor image",
-    )
-    # Same reason code as OUTDATED so log queries keep matching; severity says it is not scored.
-    OUTDATED_WARNING = MessageTemplate(
-        event="Executor image is outdated",
-        reason="EXECUTOR_IMAGE_OUTDATED",
-        severity="warning",
-        category="policy",
-        impact="Warning only until EXECUTOR_IMAGE_CHECK_ENFORCE is on: score and incentive unchanged",
     )
 
 
@@ -1260,6 +1271,24 @@ class CollateralStatusMessages:
         severity="info",
         category="policy",
         impact="None; the last known collateral status is reported, or none deposited when there is none",
+    )
+
+
+class LoginUserMessages:
+    ROOT = MessageTemplate(
+        event="Validator logged in as root",
+        reason="LOGIN_USER_ROOT",
+        severity="info",
+        category="policy",
+        impact="Proceed",
+    )
+    NOT_ROOT = MessageTemplate(
+        event="Executor SSH user must be root",
+        reason="LOGIN_USER_NOT_ROOT",
+        severity="error",
+        category="policy",
+        impact="Verification failed; the node is not validated while its SSH login is not root",
+        remediation="Run the executor from the standard image, which logs the validator in as root.",
     )
 
 
@@ -2301,6 +2330,18 @@ class CapabilityMessages:
         "Score set to 0 this cycle: the node has no valid all-cards pass, so it is not offered until every card "
         "proves itself in the next idle cycle."
     )
+    # DAH-6332: the full check run with Lium's filler stopped gave no verdict
+    FULL_CHECK_INCONCLUSIVE = MessageTemplate(
+        event="GPU capability check after the filler stop gave no verdict",
+        reason="GPU_VERIFY_FULL_CHECK_INCONCLUSIVE",
+        severity="warning",
+        category="policy",
+        impact=(
+            "Score unchanged; no answer, a timeout or a validator-side error proves no GPU model mismatch. "
+            "The node is checked again in a day."
+        ),
+        remediation="No action needed.",
+    )
     VERIFY_FAILED = MessageTemplate(
         event="GPU capability verification failed",
         reason="GPU_VERIFY_FAILED",
@@ -2875,6 +2916,33 @@ class RentalProbeMessages:
         severity="error",
         category="runtime",
         impact="Score set to 0 and the verified job cleared until a probe passes; the node is probed again next cycle while it stays idle",
+    )
+    NOT_YET_PROVEN = MessageTemplate(
+        event="Not listed yet: no rental probe has passed on this node",
+        reason="RENTAL_PROBE_NOT_YET_PROVEN",
+        severity="warning",
+        category="runtime",
+        impact="Score set to 0 until a rental probe passes; the probe runs on the node while it is idle",
+        remediation=(
+            "Keep the node idle with the default renter image for its GPU and driver pulled; "
+            "it is listed after the first rental probe that passes."
+        ),
+    )
+    NOT_RUN_ON_VALIDATOR = MessageTemplate(
+        event="Rental probe could not run: the validator lacks what it needs for this node",
+        reason="RENTAL_PROBE_NOT_RUN_ON_VALIDATOR",
+        severity="warning",
+        category="runtime",
+        impact="No score this cycle; the listing stays as the last cycle left it",
+        remediation="Nothing to do on the node; the probe runs once the validator has what it needs.",
+    )
+    PROOF_UNREADABLE = MessageTemplate(
+        event="Rental probe record could not be read",
+        reason="RENTAL_PROBE_PROOF_UNREADABLE",
+        severity="warning",
+        category="runtime",
+        impact="No score this cycle; the listing stays as the last cycle that could read the record left it",
+        remediation="Nothing to do on the node; the record is read again next cycle.",
     )
     INCONCLUSIVE = MessageTemplate(
         event="Rental probe could not reach a verdict",

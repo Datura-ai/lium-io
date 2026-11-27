@@ -9,10 +9,12 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 from typing import TYPE_CHECKING
-from uuid import UUID, uuid4
+from uuid import UUID
 
 import aiohttp
 import asyncssh
+
+from services import executor_payload
 
 if TYPE_CHECKING:
     from services.redis_service import RedisService
@@ -20,12 +22,13 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 REMOTE_OPERATION_DIRECTORY = PurePosixPath("/root/app/storage-operations")
+# the executor image's own runner: its presence marks an image that supports storage operations. It is never run; the
+# validator runs its own copy (executor_payload.STORAGE)
 REMOTE_RUNNER_PATH = "/root/app/src/storage_runner.py"
 # Helpers with this label run storage_runner.py as their entrypoint: they run restic, retry and report by themselves
 # and outlive the executor container, so their docker state is the operation's state.
 WRAPPER_LABEL = "lium.storage-wrapper"
 KILLED_EXIT = 137
-REMOTE_SECRETS_DIRECTORY = PurePosixPath("/root/app/storage-secrets")
 
 # DAH-6148: an operation runs restic in a `lium-storage-<operation id[:12]>` helper container on
 # the node, and reruns it under the same name when it renews credentials or retries an upload.
@@ -220,31 +223,23 @@ async def supports_storage_operation(
     engine: object,
 ) -> bool:
     required_binary = "/usr/local/bin/restic" if engine == "restic" else "/usr/bin/aws"
+    # the interpreter the validator runs the operation with must start, or the run would end before it could report
     result = await ssh_client.run(
-        f"test -r {shlex.quote(REMOTE_RUNNER_PATH)} && test -x {shlex.quote(required_binary)}",
+        f"test -r {shlex.quote(REMOTE_RUNNER_PATH)} && test -x {shlex.quote(required_binary)} && "
+        f"{shlex.quote(executor_payload.EXECUTOR_PYTHON)} -I -c ''",
         check=False,
     )
     return result.exit_status == 0
 
 
-# Asks the executor's own storage models whether `workspace.bootstrap` exists (DAH-3274). An
-# executor image from before it drops the unknown key and refuses the non-empty target the
-# pod's entrypoint has already written to, so the create must stop before `docker run`.
-# Exit 0 = the field exists, exit 3 = the models import but have no such field (an old image);
-# any other status is the probe itself failing (no python at that path = 127, an import error =
-# 1, …) and is reported as such, not read as an old image (review, taiberium).
-# DAH-2002: the same probe for `workspace.exclude_patterns`; an old image would back up what the excludes skip.
-# An image with no `storage` package at all predates every field, so it is an old image too (exit 3);
-# any other import error re-raises, so its traceback reaches the probe's stderr.
+# Asks the storage models the operation will run with, the validator's copy staged on the executor and loaded by the
+# executor's interpreter, whether `workspace.bootstrap` exists (DAH-3274) or `workspace.exclude_patterns` (DAH-2002).
+# Exit 0 = the field exists, exit 3 = the models import but have no such field; any other status is the probe itself
+# failing (no python at that path = 127, an import error = 1, …) and is reported as such (review, taiberium).
 _WORKSPACE_FIELD_PROBE = (
     "import sys\n"
-    "sys.path.insert(0, '/root/app/src')\n"
-    "try:\n"
-    "    from storage.models import WorkspaceSpec\n"
-    "except ModuleNotFoundError as e:\n"
-    "    if e.name not in ('storage', 'storage.models'):\n"
-    "        raise\n"
-    "    sys.exit(3)\n"
+    "sys.path.insert(0, sys.argv[2])\n"
+    "from storage.models import WorkspaceSpec\n"
     "sys.exit(0 if sys.argv[1] in WorkspaceSpec.__dataclass_fields__ else 3)"
 )
 _BOOTSTRAP_PROBE_FIELD_MISSING = 3
@@ -262,13 +257,16 @@ async def supports_workspace_field(
     python_path: str,
     field: str,
 ) -> bool:
-    """True when the executor's models know `workspace.<field>`, False when they do not.
+    """True when the storage models the operation runs with know `workspace.<field>`, False when they do not.
 
     Raises RuntimeError, with the exit status and the tail of stderr, when the probe could not
-    answer — the caller must not take that for an old executor image.
+    answer — the caller must not take that for a missing field.
     """
     result = await ssh_client.run(
-        f"{shlex.quote(python_path)} -c {shlex.quote(_WORKSPACE_FIELD_PROBE)} {shlex.quote(field)}",
+        f"{executor_payload.unpack('storage', cleanup=True)}; "
+        # -I: only the standard library and the staged directory the probe adds are importable
+        f"{shlex.quote(python_path)} -I -c {shlex.quote(_WORKSPACE_FIELD_PROBE)} {shlex.quote(field)} \"$d\"",
+        input=executor_payload.archive(executor_payload.STORAGE).decode(),
         check=False,
     )
     if result.exit_status == 0:
@@ -292,6 +290,7 @@ async def start_storage_operation(
     retain_terminal_artifacts: bool,
 ) -> StorageOperationFiles:
     files = StorageOperationFiles.for_operation(operation_id)
+    stage_dir = None
     try:
         engine = spec.get("engine")
         if not await supports_storage_operation(ssh_client, engine):
@@ -332,6 +331,25 @@ async def start_storage_operation(
             await _remove_operation_artifacts(ssh_client, files)
         await _remove_stale_helper_container(ssh_client, operation_id)
 
+        # the validator's own runner, staged and checked before the spec (which carries the repository credentials) is
+        # written; its imports are tried with the launch's interpreter and flags, so a runner that cannot start fails
+        # this dispatch, which still reports, instead of ending before it reads its operation
+        staged = await ssh_client.run(
+            f"{executor_payload.unpack('storage')}; {executor_payload.verify(executor_payload.STORAGE)}; "
+            # -I: the check sees only the standard library and the staged directory it adds, never the working directory
+            f"{shlex.quote(python_path)} -I -c {shlex.quote(_RUNNER_IMPORT_PROBE)} \"$d\" || "
+            '{ rm -rf -- "$d"; exit 1; }; printf "%s" "$d"',
+            input=executor_payload.archive(executor_payload.STORAGE).decode(),
+            check=False,
+        )
+        if staged.exit_status != 0:
+            stderr = staged.stderr if isinstance(staged.stderr, str) else ""
+            tail = " ".join(stderr.strip().splitlines()[-2:])[-300:]
+            raise StorageOperationLaunchError(
+                f"storage runner cannot start on the executor (exit {staged.exit_status}{': ' + tail if tail else ''})"
+            )
+        stage_dir = _staged_directory(staged.stdout)
+
         async with ssh_client.start_sftp_client() as sftp:
             async with sftp.open(str(files.spec), "w") as remote_spec:
                 await remote_spec.write(
@@ -339,16 +357,10 @@ async def start_storage_operation(
                 )
             await sftp.chmod(str(files.spec), 0o600)
 
-        runner = " ".join(
-            shlex.quote(item)
-            for item in [
-                python_path,
-                REMOTE_RUNNER_PATH,
-                "--spec",
-                str(files.spec),
-                "--cancel-file",
-                str(files.cancel),
-            ]
+        # -E -s: the runner imports only the staged files and the standard library
+        runner = (
+            f'{shlex.quote(python_path)} -E -s "$D"/{executor_payload.STORAGE[0]} '
+            f"--spec {shlex.quote(str(files.spec))} --cancel-file {shlex.quote(str(files.cancel))}"
         )
         terminal_cleanup = (
             ""
@@ -367,17 +379,56 @@ async def start_storage_operation(
             "trap 'kill -TERM \"$child\" 2>/dev/null || true' TERM INT; "
             'wait "$child"; result=$?; '
             f"printf '%s\\n' \"$result\" > {shlex.quote(str(files.status))}; "
+            'rm -rf -- "$D"; '
             f"rm -f {shlex.quote(str(files.spec))} {shlex.quote(str(files.pid))} "
             f"{shlex.quote(str(files.cancel))}{terminal_cleanup}"
         )
         launch_command = (
-            f"nohup /bin/sh -c {shlex.quote(wrapper)} "
+            f"D={shlex.quote(stage_dir)} nohup /bin/sh -c {shlex.quote(wrapper)} "
             f"> {shlex.quote(str(files.log))} 2>&1 < /dev/null &"
         )
         await ssh_client.run(launch_command, check=True)
         return files
     except Exception as error:
+        if stage_dir is not None:
+            # the launch did not start the wrapper that removes it
+            await ssh_client.run(f"rm -rf -- {shlex.quote(stage_dir)}", check=False)
         await report_launch_failure(operation_id, spec, error)
+        raise
+
+
+_RUNNER_IMPORT_PROBE = "import sys\nsys.path.insert(0, sys.argv[1])\nimport storage_runner"
+
+
+def _staged_directory(stdout: object) -> str:
+    try:
+        return executor_payload.staged_directory("storage", stdout)
+    except ValueError as error:
+        raise StorageOperationLaunchError(str(error)) from None
+
+
+async def run_job_with_secrets(
+    ssh_client: asyncssh.SSHClientConnection,
+    purpose: str,
+    files: tuple[str, ...],
+    auth_token: str,
+    volume_info,
+    argv: Callable[[str], list[str]],
+    log: str | None = None,
+    **run_kwargs,
+) -> None:
+    """Stage a legacy tar job, then hand it its credentials file (upload_secrets_file) and start it: the credentials reach
+    the node only once the job that reads and deletes them is in place. A failed start removes both."""
+    staged = await ssh_client.run(executor_payload.stage_job(purpose, files), check=True)
+    stage_dir = executor_payload.staged_directory(purpose, staged.stdout)
+    try:
+        # inside the job's own private directory: whatever fails (the upload's close, the start, the job), removing that
+        # directory removes the credentials, and the job's shell removes it when it ends
+        secrets_file = await upload_secrets_file(ssh_client, auth_token, volume_info, stage_dir)
+        await ssh_client.run(executor_payload.run_job(stage_dir, files, argv(secrets_file), log=log), check=True, **run_kwargs)
+    except BaseException:
+        # a cancellation too: the directory goes now, while the session is still open
+        await ssh_client.run(f"rm -rf -- {shlex.quote(stage_dir)}", check=False)
         raise
 
 
@@ -733,17 +784,15 @@ async def _report_operation_status(
 
 
 async def upload_secrets_file(
-    ssh_client: asyncssh.SSHClientConnection, auth_token: str, volume_info
+    ssh_client: asyncssh.SSHClientConnection, auth_token: str, volume_info, directory: str
 ) -> str:
-    """Hand the legacy tar backup/restore scripts their credentials as a fresh 0600 file.
+    """Hand the legacy tar backup/restore scripts their credentials as a fresh 0600 file in `directory`, the job's own
+    0700 staging directory (stage_job), so the file goes with it.
 
-    Keeps the values out of the remote command line. The file is
-    created exclusively with mode 0600 inside a 0700 directory; the script deletes it on read.
+    Keeps the values out of the remote command line. The file is created exclusively with mode 0600; the script deletes
+    it on read.
     """
-    path = str(REMOTE_SECRETS_DIRECTORY / f"{uuid4().hex}.json")
-    await ssh_client.run(
-        f"install -d -m 0700 {shlex.quote(str(REMOTE_SECRETS_DIRECTORY))}", check=True
-    )
+    path = f"{directory}/secrets.json"
     async with ssh_client.start_sftp_client() as sftp:
         async with sftp.open(path, "x", asyncssh.SFTPAttrs(permissions=0o600)) as remote_file:
             await remote_file.write(
