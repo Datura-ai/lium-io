@@ -79,6 +79,9 @@ ORIGINAL_KEYS = {
     "gpu.temperature": "temperature",
     "gpu.max_graphics_speed": "max_graphics_speed",
     "gpu.clocks_event_reasons": "clocks_event_reasons",
+    # DAH-7289: liumd only; the PCI ids identify a card whose driver name is generic
+    "gpu.pci_device_id": "pci_device_id",
+    "gpu.pci_sub_device_id": "pci_sub_device_id",
     '<default>': "<default>",
     'c_nvmlMemory_t_total': "total",
     'c_nvmlMemory_t_free': "free",
@@ -335,6 +338,8 @@ class FileEncryptService:
             "gpu.temperature": "",
             "gpu.max_graphics_speed": "",
             "gpu.clocks_event_reasons": "",
+            "gpu.pci_device_id": "",
+            "gpu.pci_sub_device_id": "",
             "gpu_count": "",
             "gpu_driver": "",
             "gpu_cuda_driver": "",

@@ -570,6 +570,20 @@ async def test_the_containerd_store_disk_fields_only_liumd_reads_are_not_a_specs
 
 
 @pytest.mark.asyncio
+async def test_the_gpu_pci_ids_only_liumd_reads_are_not_a_specs_difference(keypair, monkeypatch, verifyx_service):
+    # DAH-7289: machine_scrape is deprecated and gets no PCI ids, so each card would read as a difference
+    liumd_details = [{**LIUMD_GPU_DETAILS[0], "pci_device_id": "0x20B510DE", "pci_sub_device_id": None}]
+    liumd_specs = {**LIUMD_SCRAPE, "gpu": {"count": 1, "details": liumd_details}}
+    state = build_state(specs=SPECS, scrape_specs=PYTHON_SCRAPE)
+    ctx = _ctx(keypair, monkeypatch, verifyx_service, state=state)
+
+    record = await _shadow(ctx, FakeLiumd(specs=liumd_specs))
+
+    assert record["specs_diff"] == []
+    assert record["specs_agree"] is True
+
+
+@pytest.mark.asyncio
 async def test_a_missing_python_needrestart_guard_does_not_beat_the_node_view(
     keypair, monkeypatch, verifyx_service
 ):
