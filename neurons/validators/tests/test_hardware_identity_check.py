@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock
 import pytest
 from neurons.validators.src.services.nvidia_devices import KernelGpuView
 from neurons.validators.src.services.task.checks import hardware_identity
+from neurons.validators.src.services.task.checks.gpu_identity import CARDS_MAX
 from neurons.validators.src.services.task.checks.hardware_identity import (
     BOOT_ID_PATH,
     DMI_ID_PATH,
@@ -360,7 +361,7 @@ def _identity_card(**overrides):
         "pci": "0000:00:1b.0",
         "minor": 0,
         "dev_node_present": True,
-        "sources": {},
+        "sources": {"nvml": {"status": "agree", "uuid": "GPU-a", "pci": "0000:00:1b.0"}},
     }
     card.update(overrides)
     return card
@@ -423,6 +424,57 @@ async def test_identity_mismatch_follows_shadow_and_enforce(
     enforced = await _run(_ctx(context_factory, **kwargs))
     assert enforced.passed is False
     assert reason in enforced.event.what_we_saw["findings"]
+
+
+@pytest.mark.asyncio
+async def test_a_card_with_no_minor_has_no_dev_node_finding(context_factory):
+    result = await _run(
+        _ctx(
+            context_factory,
+            stdout=_stdout(),
+            gpu_identity=_identity(_identity_card(dev_node_present=False, minor=None)),
+        )
+    )
+
+    assert result.passed is True
+    assert result.event.what_we_saw["identity_findings"] == []
+
+
+@pytest.mark.asyncio
+async def test_a_card_nvml_does_not_name_has_no_dev_node_finding(context_factory):
+    card = _identity_card(dev_node_present=False, sources={"nvml": None})
+
+    result = await _run(
+        _ctx(
+            context_factory,
+            stdout=_stdout(),
+            gpu_identity=_identity(card),
+            kernel_minors={"GPU-a": 0},
+            kernel_pcis={"GPU-a": "0000:00:1b.0"},
+        )
+    )
+
+    assert result.passed is True
+    assert result.event.what_we_saw["identity_findings"] == []
+
+
+@pytest.mark.asyncio
+async def test_identity_cards_beyond_the_limit_are_not_walked(context_factory):
+    cards = [_identity_card() for _ in range(CARDS_MAX)]
+    cards.append(_identity_card(uuid="GPU-late"))
+
+    result = await _run(
+        _ctx(
+            context_factory,
+            stdout=_stdout(),
+            gpu_identity=_identity(*cards),
+            kernel_minors={"GPU-a": 0},
+            kernel_pcis={"GPU-a": "0000:00:1b.0"},
+        )
+    )
+
+    assert result.passed is True
+    assert result.event.what_we_saw["identity_findings"] == []
 
 
 @pytest.mark.asyncio

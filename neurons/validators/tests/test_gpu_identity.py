@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from services.task.checks.gpu_identity import evaluate_gpu_identity
+from services.task.checks.gpu_identity import CARDS_MAX, evaluate_gpu_identity
 
 
 def _card(
@@ -131,6 +131,36 @@ def test_a_non_text_claimed_model_is_not_an_exception():
     judged = evaluate_gpu_identity(_report(_card()), 1, claimed_model=7)
 
     assert judged["reasons"] == []
+
+
+def test_an_identity_block_beyond_the_card_limit_is_rejected():
+    cards = [_card(index) for index in range(CARDS_MAX + 1)]
+
+    judged = evaluate_gpu_identity(_report(*cards), CARDS_MAX + 1)
+
+    assert judged["reasons"] == ["cards_over_limit"]
+    assert judged["evidence_count"] == CARDS_MAX + 1
+    assert judged["would_fail"] is True
+
+
+def test_an_identity_block_at_the_card_limit_is_judged():
+    cards = [_card(index) for index in range(CARDS_MAX)]
+
+    judged = evaluate_gpu_identity(_report(*cards), CARDS_MAX)
+
+    assert judged["reasons"] == []
+
+
+def test_a_dev_node_is_judged_only_when_it_is_known():
+    card = _card(dev_node_present=False)
+    card["minor"] = None
+    assert "dev_node_missing" not in _reasons(_report(card))
+
+    card = _card(dev_node_present=False)
+    card["sources"]["nvml"] = {}
+    assert "dev_node_missing" not in _reasons(_report(card))
+
+    assert "dev_node_missing" in _reasons(_report(_card(dev_node_present=False)))
 
 
 def test_a_duplicate_uuid_or_pci_is_a_mismatch():

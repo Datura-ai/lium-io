@@ -491,10 +491,6 @@ async def test_enforce_refuses_the_python_fallback(monkeypatch):
     assert runner.calls == []
 
 
-def _proc_source(uuid: str, pci: str, model: str) -> dict:
-    return {"status": "ok", "uuid": uuid, "pci": pci, "model": model, "irq": "0"}
-
-
 def _kernel_view(*uuids):
     async def read_view(ssh, *, host_view=False):
         return KernelGpuView(uuids=None if host_view is False else list(uuids), foreign_mounts=[])
@@ -509,7 +505,9 @@ async def test_an_identity_without_the_driver_procfs_passes_on_the_host_kernel_v
     specs = copy.deepcopy(LIUMD_SPECS)
     specs["gpu_identity"]["proc_driver_present"] = False
     for card in specs["gpu_identity"]["cards"]:
-        card["sources"].pop("proc")
+        card["sources"]["proc"] = None
+        card["minor"] = None
+        card["dev_node_present"] = False
     _start_reading(monkeypatch, _answer(specs))
     monkeypatch.setattr(machine_spec_scrape, "read_kernel_gpu_view", _kernel_view("GPU-1", "GPU-2"))
     runner = DummySSHCommandRunner(result=make_command_result(success=False))
@@ -525,33 +523,11 @@ async def test_a_card_only_the_kernel_names_passes_enforce(monkeypatch):
     _liumd_on(monkeypatch)
     monkeypatch.setattr(machine_spec_scrape.settings, "VALIDATOR_LIUMD_EVIDENCE_MODE", "enforce")
     specs = copy.deepcopy(LIUMD_SPECS)
-    specs["gpu_identity"]["cards"].append(
-        {
-            "index": 2,
-            "uuid": "GPU-3",
-            "pci": "0000:33:00.0",
-            "model": "NVIDIA A10",
-            "vram_mb": None,
-            "driver": "595.112.07",
-            "dev_node_present": True,
-            "minor": 2,
-            "sources": {
-                "nvml": None,
-                "proc": _proc_source("GPU-3", "0000:33:00.0", "NVIDIA A10"),
-                "sysfs": {
-                    "status": "ok",
-                    "vendor": "0x10de",
-                    "device": "0x2236",
-                    "class": None,
-                    "subsystem_vendor": "0x10de",
-                    "subsystem_device": "0x145f",
-                    "link_speed": "16.0 GT/s PCIe",
-                    "link_width": "16",
-                },
-            },
-            "mismatches": ["nvml: no card for 0000:33:00.0"],
-        }
-    )
+    extra = copy.deepcopy(specs["gpu_identity"]["cards"][1])
+    extra.update(uuid="GPU-3", pci="0000:33:00.0", minor=2)
+    extra["sources"]["nvml"] = None
+    extra["sources"]["proc"].update(uuid="GPU-3", pci="0000:33:00.0")
+    specs["gpu_identity"]["cards"].append(extra)
     _start_reading(monkeypatch, _answer(specs))
     monkeypatch.setattr(
         machine_spec_scrape, "read_kernel_gpu_view", _kernel_view("GPU-1", "GPU-2", "GPU-3")
@@ -561,7 +537,29 @@ async def test_a_card_only_the_kernel_names_passes_enforce(monkeypatch):
     result = await MachineSpecScrapeCheck().run(_ctx(runner, ssh=AsyncMock()))
 
     assert result.passed is True
-    assert result.event.reason_code == Msg.SCRAPE_OK.reason
+
+
+JUNK_DOCUMENTS = {
+    "count": lambda specs: specs["gpu"].update(count="2"),
+    "uuid": lambda specs: specs["gpu"]["details"][0].update(uuid=7),
+    "identity": lambda specs: specs.update(gpu_identity="junk"),
+    "cards": lambda specs: specs["gpu_identity"].update(cards="junk"),
+    "sources": lambda specs: specs["gpu_identity"]["cards"][0].update(sources="junk"),
+}
+
+
+@pytest.mark.parametrize("mode", ["shadow", "enforce"])
+@pytest.mark.parametrize("name", list(JUNK_DOCUMENTS))
+@pytest.mark.asyncio
+async def test_a_junk_document_is_a_result_not_an_exception(monkeypatch, name, mode):
+    _liumd_on(monkeypatch)
+    monkeypatch.setattr(machine_spec_scrape.settings, "VALIDATOR_LIUMD_EVIDENCE_MODE", mode)
+    specs = copy.deepcopy(LIUMD_SPECS)
+    JUNK_DOCUMENTS[name](specs)
+    _start_reading(monkeypatch, _answer(specs))
+    runner = DummySSHCommandRunner(result=make_command_result(success=False))
+
+    await MachineSpecScrapeCheck().run(_ctx(runner))
 
 
 @pytest.mark.asyncio

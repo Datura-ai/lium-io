@@ -59,6 +59,8 @@ def _has_duplicates(values: list[str | None]) -> bool:
 
 DETAIL_MAX = 32
 DETAIL_CHARS = 240
+# no host has this many cards; a longer block is junk and is rejected before it is walked
+CARDS_MAX = 128
 
 
 def _card_label(index: int, card: dict[str, Any]) -> str:
@@ -76,6 +78,19 @@ def _duplicate_groups(cards: list[dict[str, Any]], field: str) -> list[tuple[str
         _original, indexes = groups.setdefault(value.lower(), (value, []))
         indexes.append(index)
     return [(value, indexes) for value, indexes in groups.values() if len(indexes) > 1]
+
+
+def dev_node_missing(card: dict[str, Any]) -> int | None:
+    """The card's minor when the block says its /dev node is missing, else None.
+
+    A block that could not read the driver's procfs has no minor, so liumd leaves
+    `dev_node_present` false: unknown, not missing. A card NVML does not name is not the
+    node's to offer, so its dev node is not judged either.
+    """
+    minor = _as_int(card.get("minor"))
+    if minor is None or card.get("dev_node_present") is not False:
+        return None
+    return minor if _as_dict(_as_dict(card.get("sources")).get("nvml")) else None
 
 
 def evaluate_gpu_identity(
@@ -120,6 +135,12 @@ def evaluate_gpu_identity(
     if not isinstance(cards_value, list):
         judged["reasons"] = ["identity_missing"]
         judged["details"] = ["identity block missing or cards is not a list"]
+        judged["would_fail"] = True
+        return judged
+    if len(cards_value) > CARDS_MAX:
+        judged["evidence_count"] = len(cards_value)
+        judged["reasons"] = ["cards_over_limit"]
+        judged["details"] = [f"identity block names {len(cards_value)} cards, limit {CARDS_MAX}"]
         judged["would_fail"] = True
         return judged
 
@@ -180,12 +201,9 @@ def evaluate_gpu_identity(
         vendor = _as_text(sysfs.get("vendor"))
         if vendor is not None and vendor.lower() != SYSFS_VENDOR:
             add("sysfs_vendor_mismatch", f"{label}: sysfs vendor {vendor}, expected {SYSFS_VENDOR}")
-        if card.get("dev_node_present") is False:
-            minor = card.get("minor")
-            add(
-                "dev_node_missing",
-                f"{label}: /dev/nvidia{minor if minor is not None else '<minor>'} missing",
-            )
+        minor = dev_node_missing(card)
+        if minor is not None:
+            add("dev_node_missing", f"{label}: /dev/nvidia{minor} missing")
         model = _as_text(card.get("model"))
         if claimed_model and model and model.lower() != claimed_model.lower():
             add("claimed_model_mismatch", f"{label}: model {model!r}, claimed {claimed_model!r}")

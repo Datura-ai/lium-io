@@ -12,6 +12,7 @@ from services.nvidia_devices import read_kernel_gpu_view
 from ..messages import HardwareIdentityMessages as Msg, render_message
 from ..pipeline import CheckResult, Context
 from .banned_provider import has_live_rental, kernel_gpu_view, reported_gpu_uuids
+from .gpu_identity import CARDS_MAX, dev_node_missing
 
 logger = logging.getLogger(__name__)
 
@@ -142,8 +143,9 @@ def gpu_identity_kernel_findings(
                 "identity_pci_mismatch",
                 f"{label}: block pci {pci}, kernel pci {kernel_pci}",
             )
-        if card.get("dev_node_present") is False:
-            add("identity_dev_node_missing", f"{label}: /dev/nvidia{card.get('minor')} missing")
+        minor = dev_node_missing(card)
+        if minor is not None:
+            add("identity_dev_node_missing", f"{label}: /dev/nvidia{minor} missing")
     return found, details[:32]
 
 
@@ -230,7 +232,11 @@ class HardwareIdentityCheck:
     async def run(self, ctx: Context) -> CheckResult:
         reported = sorted(set(reported_gpu_uuids(ctx)))
         identity = ctx.state.gpu_identity or {}
-        identity_cards = [card for card in (identity.get("cards") or []) if isinstance(card, dict)]
+        raw_cards = identity.get("cards")
+        identity_cards = [
+            card for card in (raw_cards[:CARDS_MAX] if isinstance(raw_cards, list) else [])
+            if isinstance(card, dict)
+        ]
         view = await kernel_gpu_view(ctx)
         kernel_uuids = view.uuids
         kernel = sorted(set(kernel_uuids)) if kernel_uuids is not None else None

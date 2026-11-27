@@ -640,6 +640,8 @@ class MachineSpecScrapeCheck:
         vloopback = specs.pop("vloopback_check", None)
         gpu_info = specs.get("gpu", {}) or {}
         gpu_count = gpu_info.get("count", 0) or 0
+        if not isinstance(gpu_count, int) or isinstance(gpu_count, bool):
+            gpu_count = 0
         raw_gpu_details = gpu_info.get("details", []) or []
         for detail in raw_gpu_details:
             if isinstance(detail, dict):
@@ -647,7 +649,9 @@ class MachineSpecScrapeCheck:
         gpu_details = list_sxm_on_pcie_adapter_as_pcie(specs, _normalize_gpu_details(raw_gpu_details))
         gpu_model = gpu_details[0].get("name") if gpu_count > 0 and gpu_details else None
         gpu_model_count = f"{gpu_model}:{gpu_count}" if gpu_model is not None else None
-        gpu_uuids = ",".join(detail.get("uuid", "") for detail in gpu_details if detail.get("uuid"))
+        gpu_uuids = ",".join(
+            detail["uuid"] for detail in gpu_details if isinstance(detail.get("uuid"), str) and detail["uuid"]
+        )
         sysbox_runtime = specs.get("sysbox_runtime", False)
         hardware_supports = specs.get("storage_limit_supported", False)
         gpu_splitting_config = ctx.state.rented_data.gpu_splitting_config if ctx.state.rented_data else {}
