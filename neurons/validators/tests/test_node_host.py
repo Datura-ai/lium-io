@@ -297,19 +297,19 @@ async def test_a_node_that_redirects_to_a_non_public_ip_literal_is_not_followed(
 
 
 @pytest.mark.asyncio
-async def test_the_port_probe_does_not_follow_a_redirect():
+async def test_the_port_probe_does_not_follow_a_redirect(monkeypatch):
+    from neurons.validators.src.services.executor_connectivity import port_tester
     from neurons.validators.src.services.executor_connectivity.models import PortPair
-    from neurons.validators.src.services.executor_connectivity.port_tester import PortTester
+
+    # a plain connector, no address rule: the probe's own setting alone keeps it off the redirect
+    monkeypatch.setattr(port_tester, "public_host_connector", lambda **kw: aiohttp.TCPConnector(**kw))
 
     target_hits: list = []
     target, target_port = await _local_server(target_hits)
     node_hits: list = []
     node, node_port = await _local_server(node_hits, redirect_to=f"http://127.0.0.1:{target_port}/")
     try:
-        async with aiohttp.ClientSession() as session:  # no connector rule: the probe's own setting alone
-            ok = await PortTester().test_one(
-                session, "127.0.0.1", PortPair(internal=1, external=node_port), "token"
-            )
+        ok = await port_tester.ProbeEngine().probe("127.0.0.1", PortPair(internal=1, external=node_port), "token")
     finally:
         await node.cleanup()
         await target.cleanup()
@@ -345,9 +345,11 @@ async def _streaming_server(
 
 
 async def _probe(port: int, monkeypatch) -> tuple[bool, list[int]]:
+    from neurons.validators.src.services.executor_connectivity import port_tester
     from neurons.validators.src.services.executor_connectivity.models import PortPair
-    from neurons.validators.src.services.executor_connectivity.port_tester import PortTester
 
+    # a plain connector, no address rule: the probe dials a loopback node here
+    monkeypatch.setattr(port_tester, "public_host_connector", lambda **kw: aiohttp.TCPConnector(**kw))
     real_read = aiohttp.StreamReader.read
     read: list[int] = []
 
@@ -357,8 +359,7 @@ async def _probe(port: int, monkeypatch) -> tuple[bool, list[int]]:
         return data
 
     monkeypatch.setattr(aiohttp.StreamReader, "read", counted)
-    async with aiohttp.ClientSession() as session:
-        ok = await PortTester().test_one(session, "127.0.0.1", PortPair(internal=7, external=port), "token")
+    ok = await port_tester.ProbeEngine().probe("127.0.0.1", PortPair(internal=7, external=port), "token")
     return ok, read
 
 

@@ -4,7 +4,6 @@ import random
 import uuid
 from dataclasses import dataclass, field
 
-import aiohttp
 from asyncssh import SSHClientConnection
 
 from core.docker_utils import bound_host_port
@@ -15,7 +14,6 @@ from services.executor_connectivity.external_probe import ExternalPortProbe
 from services.executor_connectivity.models import BatchResult, ContainerStartResult, PortPair
 from services.executor_connectivity.netcat_script import NetcatScript
 from services.executor_connectivity.port_tester import PortTester
-from services.node_host import public_host_connector
 
 logger = logging.getLogger(__name__)
 
@@ -263,58 +261,57 @@ class BatchVerifier:
                     extra=get_extra_info(log_ctx),
                 )
             )
-            async with aiohttp.ClientSession(connector=public_host_connector(limit=0)) as session:
-                missed_pending = missed_start is not None
+            missed_pending = missed_start is not None
 
-                def missed_ready() -> list[PortPair]:
-                    # never wait on the missed ports' start: the refused ports' re-probes run on schedule
-                    nonlocal missed_pending
-                    if not missed_pending or not missed_start.done():
-                        return []
-                    missed_pending = False
-                    return missed if missed_start.result().ok else []
+            def missed_ready() -> list[PortPair]:
+                # never wait on the missed ports' start: the refused ports' re-probes run on schedule
+                nonlocal missed_pending
+                if not missed_pending or not missed_start.done():
+                    return []
+                missed_pending = False
+                return missed if missed_start.result().ok else []
 
-                successful, failed = await self.port_tester.test_many(session, host, ports_left, token, log_ctx)
-                start_watch.verified = ports_answered_so_far() if successful else None
-                # a loaded host binds its nc listeners late; a refused port's listener is still waiting, so
-                # re-probe the refused ports while the count is below what PortCountCheck needs to list the node;
-                # the published sample alone never ends it: with no host-listener answer the attempt fails below
-                rounds = self.SAMPLE_ONLY_REPROBE_ROUNDS if len(sampled_ok) >= min_ports else self.REPROBE_ROUNDS
+            successful, failed = await self.port_tester.test_many(host, ports_left, token, log_ctx)
+            start_watch.verified = ports_answered_so_far() if successful else None
+            # a loaded host binds its nc listeners late; a refused port's listener is still waiting, so
+            # re-probe the refused ports while the count is below what PortCountCheck needs to list the node;
+            # the published sample alone never ends it: with no host-listener answer the attempt fails below
+            rounds = self.SAMPLE_ONLY_REPROBE_ROUNDS if len(sampled_ok) >= min_ports else self.REPROBE_ROUNDS
 
-                async def reprobe(refused: list[PortPair]) -> list[PortPair]:
-                    nonlocal successful
-                    round_no = 0
-                    while round_no < rounds:
-                        if not refused or (successful and len(sampled_ok) + len(successful) >= min_ports):
-                            break
-                        round_no += 1
-                        await asyncio.sleep(self.REPROBE_DELAY_SEC)
-                        joined = missed_ready()
-                        if joined:
-                            round_no = 0  # their first probe: late listeners joining any round get every re-probe after it
-                        late, refused = await self.port_tester.test_many(
-                            session, host, refused + joined, token, log_ctx
-                        )
-                        successful = successful + late
-                        start_watch.verified = ports_answered_so_far() if successful else None
-                        logger.debug(
-                            _m(f"re-probe {round_no}/{rounds}: {len(late)} late", extra=get_extra_info(log_ctx))
-                        )
-                    return refused
-
-                failed = await reprobe(failed)
-                if missed_pending:
-                    # the re-probes are done, so nothing waits behind the missed ports' start now
-                    await asyncio.wait([missed_start])
-                if ready := missed_ready():
-                    late, still = await self.port_tester.test_many(session, host, ready, token, log_ctx)
+            async def reprobe(refused: list[PortPair]) -> list[PortPair]:
+                nonlocal successful
+                round_no = 0
+                while round_no < rounds:
+                    if not refused or (successful and len(sampled_ok) + len(successful) >= min_ports):
+                        break
+                    round_no += 1
+                    await asyncio.sleep(self.REPROBE_DELAY_SEC)
+                    joined = missed_ready()
+                    if joined:
+                        round_no = 0  # their first probe: late listeners joining any round get every re-probe after it
+                    late, refused = await self.port_tester.test_many(
+                        host, refused + joined, token, log_ctx
+                    )
                     successful = successful + late
                     start_watch.verified = ports_answered_so_far() if successful else None
-                    # their listener started late too: a refused first probe gets the same re-probes
-                    failed = failed + await reprobe(still)
-                logger.info(
-                    _m(f"progress: {len(successful)}/{len(ports)} verified", extra=get_extra_info(log_ctx))
-                )
+                    logger.debug(
+                        _m(f"re-probe {round_no}/{rounds}: {len(late)} late", extra=get_extra_info(log_ctx))
+                    )
+                return refused
+
+            failed = await reprobe(failed)
+            if missed_pending:
+                # the re-probes are done, so nothing waits behind the missed ports' start now
+                await asyncio.wait([missed_start])
+            if ready := missed_ready():
+                late, still = await self.port_tester.test_many(host, ready, token, log_ctx)
+                successful = successful + late
+                start_watch.verified = ports_answered_so_far() if successful else None
+                # their listener started late too: a refused first probe gets the same re-probes
+                failed = failed + await reprobe(still)
+            logger.info(
+                _m(f"progress: {len(successful)}/{len(ports)} verified", extra=get_extra_info(log_ctx))
+            )
 
             if not successful:
                 # DAH-5597: only the host listener decides this tier; a host that drops INPUT but forwards published
@@ -378,8 +375,7 @@ class BatchVerifier:
             remaining = [p for p in sample if p not in (reached or [])]
             if not remaining:
                 return reached, []
-            async with aiohttp.ClientSession(connector=public_host_connector(limit=0)) as session:
-                first_round, _ = await self.port_tester.test_many(session, host, remaining, token, log_ctx)
+            first_round, _ = await self.port_tester.test_many(host, remaining, token, log_ctx)
             return reached, first_round
         finally:
             # shielded: a failed sibling start or the deadline cancels this reading, never the removal of its listener
@@ -416,74 +412,73 @@ class FallbackVerifier:
 
         successful, failed = [], []
 
-        async with aiohttp.ClientSession(connector=public_host_connector()) as session:
-            for idx, port in enumerate(ports_to_test, 1):
-                token = uuid.uuid4().hex
-                name = f"port_test_seq_{token[:8]}"
-                script = NetcatScript.single(port, token)
-                network_flag = f"-p {port.internal}:{port.internal}"
+        for idx, port in enumerate(ports_to_test, 1):
+            token = uuid.uuid4().hex
+            name = f"port_test_seq_{token[:8]}"
+            script = NetcatScript.single(port, token)
+            network_flag = f"-p {port.internal}:{port.internal}"
 
-                started = False
-                try:
-                    start_result = await asyncio.wait_for(
-                        self.runner.run(ssh_client, name, script, network_flag, 10), self.START_TIMEOUT_SEC
-                    )
-                    if not start_result.ok:
-                        logger.debug(
-                            _m(
-                                f"fallback: port {port.internal} failed to start: "
-                                f"status={start_result.status} logs={start_result.logs}",
-                                extra=get_extra_info(log_ctx),
-                            )
-                        )
-                        failed.append(port)
-                        continue
-
-                    started = True
-                    await asyncio.sleep(1.0)
-                    if await self.port_tester.test_one(session, host, port, token):
-                        logger.info(
-                            _m(
-                                f"fallback: port {port.internal} ok ({idx}/{len(ports_to_test)})",
-                                extra=get_extra_info(log_ctx),
-                            )
-                        )
-                        successful.append(port)
-                    else:
-                        failed.append(port)
-
-                except TimeoutError:
-                    # the later ports would hang the same way; ending here lets the round report the port check
-                    logger.warning(
+            started = False
+            try:
+                start_result = await asyncio.wait_for(
+                    self.runner.run(ssh_client, name, script, network_flag, 10), self.START_TIMEOUT_SEC
+                )
+                if not start_result.ok:
+                    logger.debug(
                         _m(
-                            f"fallback: container start timed out after {self.START_TIMEOUT_SEC}s, "
-                            f"{len(ports_to_test) - idx + 1} port(s) left untested",
-                            extra=get_extra_info(log_ctx),
-                        )
-                    )
-                    failed.extend(ports_to_test[idx - 1:])
-                    break
-
-                except Exception as e:
-                    logger.error(
-                        _m(
-                            f"fallback: error testing port {port.internal}: {str(e)[:100]}",
+                            f"fallback: port {port.internal} failed to start: "
+                            f"status={start_result.status} logs={start_result.logs}",
                             extra=get_extra_info(log_ctx),
                         )
                     )
                     failed.append(port)
+                    continue
 
-                finally:
-                    if started:
-                        try:
-                            await self.runner.cleanup(ssh_client, name)
-                        except Exception as e:
-                            logger.warning(
-                                _m(f"fallback: cleanup failed: {str(e)[:50]}", extra=get_extra_info(log_ctx))
-                            )
+                started = True
+                await asyncio.sleep(1.0)
+                if await self.port_tester.test_one(host, port, token):
+                    logger.info(
+                        _m(
+                            f"fallback: port {port.internal} ok ({idx}/{len(ports_to_test)})",
+                            extra=get_extra_info(log_ctx),
+                        )
+                    )
+                    successful.append(port)
+                else:
+                    failed.append(port)
 
-                    if idx < len(ports_to_test):
-                        await asyncio.sleep(0.5)
+            except TimeoutError:
+                # the later ports would hang the same way; ending here lets the round report the port check
+                logger.warning(
+                    _m(
+                        f"fallback: container start timed out after {self.START_TIMEOUT_SEC}s, "
+                        f"{len(ports_to_test) - idx + 1} port(s) left untested",
+                        extra=get_extra_info(log_ctx),
+                    )
+                )
+                failed.extend(ports_to_test[idx - 1:])
+                break
+
+            except Exception as e:
+                logger.error(
+                    _m(
+                        f"fallback: error testing port {port.internal}: {str(e)[:100]}",
+                        extra=get_extra_info(log_ctx),
+                    )
+                )
+                failed.append(port)
+
+            finally:
+                if started:
+                    try:
+                        await self.runner.cleanup(ssh_client, name)
+                    except Exception as e:
+                        logger.warning(
+                            _m(f"fallback: cleanup failed: {str(e)[:50]}", extra=get_extra_info(log_ctx))
+                        )
+
+                if idx < len(ports_to_test):
+                    await asyncio.sleep(0.5)
 
         logger.info(
             _m(f"fallback: {len(successful)}/{len(ports_to_test)} verified", extra=get_extra_info(log_ctx))
@@ -612,8 +607,7 @@ class SemiBatchVerifier:
                 return ok, [*bad, *(port for port in ports if port.internal == busy)]
 
             started = True
-            async with aiohttp.ClientSession(connector=public_host_connector(limit=0)) as session:
-                return await self.port_tester.test_many(session, host, ports, token, log_ctx)
+            return await self.port_tester.test_many(host, ports, token, log_ctx)
 
         except Exception as e:
             logger.error(
