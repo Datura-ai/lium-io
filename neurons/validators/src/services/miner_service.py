@@ -159,11 +159,12 @@ def _get_error_details(error: Exception) -> str:
 
 
 def _is_miner_unreachable_error(error: Exception) -> bool:
-    """A timeout or a refused/dropped connection: the miner is offline, not misbehaving (DAH-3593)."""
+    """A timeout, a refused/dropped connection or an axon address we refuse to dial: the miner is not reachable,
+    not misbehaving (DAH-3593). A refused name arrives wrapped in a ClientConnectionError, a refused literal bare."""
     last_attempt = getattr(error, "last_attempt", None)
     if last_attempt is not None and last_attempt.exception() is not None:
         error = last_attempt.exception()
-    return isinstance(error, (asyncio.TimeoutError, aiohttp.ClientConnectionError))
+    return isinstance(error, (asyncio.TimeoutError, aiohttp.ClientConnectionError, NodeHostError))
 
 
 def _storage_repository_spec(

@@ -10,6 +10,7 @@ from core.config import settings
 from payload_models.payloads import (
     AddSshPublicKeyRequest,
     ContainerCreateRequest,
+    ContainerDeleteRequest,
     ContainerCreated,
     FailedContainerErrorCodes,
     FailedContainerErrorTypes,
@@ -261,6 +262,51 @@ async def test_ssh_key_add_answer_echoes_the_request_command_id(client, answer):
     await client.miner_driver(add)
 
     assert [json.loads(m.model_dump_json())["command_id"] for m in client.message_queue] == ["restore:1"]
+
+
+@pytest.mark.asyncio
+async def test_a_delete_failure_names_the_send_it_answers(client):
+    """DAH-7216: the backend refuses to cancel a delete while a send is unanswered; it matches a failure to its send by
+    this id, so a duplicated or late failure of an earlier send cannot answer a later one."""
+    client.miner_service.handle_container.return_value = FailedContainerRequest(
+        miner_hotkey="miner",
+        executor_id="executor",
+        pod_id="pod",
+        error_type=FailedContainerErrorTypes.ContainerDeletionFailed,
+        msg="Error: Executor unreachable",
+    )
+    delete = ContainerDeleteRequest(
+        command_id="delete:2", miner_hotkey="miner", executor_id="executor", pod_id="pod", container_name="container"
+    )
+
+    await client.miner_driver(delete)
+
+    assert [json.loads(m.model_dump_json())["command_id"] for m in client.message_queue] == ["delete:2"]
+
+
+@pytest.mark.asyncio
+async def test_a_delete_failure_cached_before_the_echo_is_replayed_with_its_send(client):
+    """DAH-7216 (review 6074450903): a validator before the echo cached delete A's failure without an id; after the
+    upgrade a retry of A replayed it id-less, and the backend counted it as the answer to a later send B."""
+    service = client.miner_service.redis_service
+    cached = FailedContainerRequest(
+        miner_hotkey="miner",
+        executor_id="executor",
+        pod_id="pod",
+        error_type=FailedContainerErrorTypes.ContainerDeletionFailed,
+        msg="Error: Executor unreachable",
+    ).model_dump_json(exclude={"command_id"})
+    await service.redis.set(
+        BACKEND_COMMAND_PREFIX + "delete:A", json.dumps({"state": "finished", "responses": [cached]}), ex=900
+    )
+    retry = ContainerDeleteRequest(
+        command_id="delete:A", miner_hotkey="miner", executor_id="executor", pod_id="pod", container_name="container"
+    )
+
+    await client.miner_driver(retry)
+
+    client.miner_service.handle_container.assert_not_awaited()
+    assert [json.loads(m.model_dump_json())["command_id"] for m in client.message_queue] == ["delete:A"]
 
 
 @pytest.mark.asyncio

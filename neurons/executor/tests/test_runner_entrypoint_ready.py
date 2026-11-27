@@ -11,7 +11,7 @@ EXTRA_CASES = """\
 
 def run(tmp_path, monkeypatch, **env):
     monkeypatch.setattr(updater, "DOCKER_STUB", updater.DOCKER_STUB.replace("esac", EXTRA_CASES + "esac"))
-    return updater.run(tmp_path, updater.EXECUTOR, STUB_UPDATER_IMAGE="daturaai/lium-watchtower:1.2.4", **env)
+    return updater.run(tmp_path, updater.EXECUTOR, STUB_UPDATER_IMAGE="daturaai/lium-watchtower:1.2.5", **env)
 
 
 def test_the_update_confirms_the_executor_api_after_the_start(tmp_path, monkeypatch):

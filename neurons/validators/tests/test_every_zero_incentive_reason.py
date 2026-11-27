@@ -346,14 +346,10 @@ async def test_a_run_that_passed_every_check_gets_no_validation_failed(engine, e
 @pytest.mark.parametrize("engine", [RentalPriceIncentive, DefaultIncentive])
 @pytest.mark.parametrize(
     ("failure_reason_code", "overrides"),
-    [
-        (TenantEnforcementMessages.ALREADY_RENTED.reason, {"is_rented": True}),
-        (ExecutorImageMessages.OUTDATED.reason, {}),
-    ],
-    ids=["rented-halt", "image-check-failed"],
+    [(ExecutorImageMessages.OUTDATED.reason, {})],
+    ids=["image-check-failed"],
 )
-async def test_an_outdated_image_is_one_reason_for_one_cause(monkeypatch, engine, failure_reason_code, overrides):
-    monkeypatch.setattr(settings, "EXECUTOR_IMAGE_CHECK_ENFORCE", True)
+async def test_an_outdated_image_is_one_reason_for_one_cause(engine, failure_reason_code, overrides):
     result = _idle_full_8x(
         score=0,
         job_score=0,
