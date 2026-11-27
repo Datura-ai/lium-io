@@ -27,7 +27,7 @@ import socket
 import aiohttp
 from aiohttp.abc import AbstractResolver, ResolveResult
 from aiohttp.resolver import DefaultResolver
-from datura.public_address import is_public_address as _is_public_address
+from datura.public_address import carried_ipv4, is_public_address as _is_public_address
 
 from core.config import settings
 
@@ -47,6 +47,7 @@ def is_public_address(address: str) -> bool:
         ip = ipaddress.ip_address(address.strip("[]").split("%", 1)[0])
     except ValueError:
         return False
+    ip = carried_ipv4(ip) or ip  # a mapped or NAT64 form of an allowed IPv4 is allowed too, as on main
     if any(ip in network for network in ALLOWED_PRIVATE_NETWORKS) and ip.is_private and not (
         ip.is_loopback or ip.is_link_local or ip.is_unspecified
     ):

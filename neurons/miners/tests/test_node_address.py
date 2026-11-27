@@ -58,6 +58,12 @@ def test_a_dev_stack_admits_only_its_own_private_network(monkeypatch):
     assert not is_public_address("127.0.0.1") and not is_public_address("169.254.169.254")
 
 
+@pytest.mark.parametrize("address", ["::ffff:10.20.30.40", "64:ff9b::a14:1e28"])  # secret-scan: allow
+def test_a_dev_stack_admits_the_mapped_and_nat64_forms_of_its_network(monkeypatch, address):
+    monkeypatch.setattr(node_address, "ALLOWED_PRIVATE_NETWORKS", (ipaddress.ip_network("10.20.0.0/16"),))  # secret-scan: allow
+    assert is_public_address(address)
+
+
 def test_public_addresses_are_public():
     assert is_public_address("1.2.3.4") and is_public_address("2001:4860:4860::8888")
     # lium-io#2369 review 5981962325: an IPv6-only host's DNS64 answer for a public A record stays reachable

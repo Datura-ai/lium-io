@@ -129,6 +129,12 @@ def test_a_dev_stack_admits_only_its_own_private_network(monkeypatch):
         node_host._check_literal("10.21.0.1", 2200)  # secret-scan: allow
 
 
+@pytest.mark.parametrize("address", ["::ffff:10.20.30.40", "64:ff9b::a14:1e28"])  # secret-scan: allow
+def test_a_dev_stack_admits_the_mapped_and_nat64_forms_of_its_network(monkeypatch, address):
+    monkeypatch.setattr(node_host, "ALLOWED_PRIVATE_NETWORKS", (ipaddress.ip_network("10.20.0.0/16"),))  # secret-scan: allow
+    assert node_host.is_public_ip(ipaddress.ip_address(address))
+
+
 def test_public_addresses_stay_public():
     assert node_host.is_public_ip(ipaddress.ip_address("8.8.8.8"))
     assert node_host.is_public_ip(ipaddress.ip_address("2001:4860:4860::8888"))

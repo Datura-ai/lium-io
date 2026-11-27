@@ -9,7 +9,7 @@ NAT64_PREFIX = ipaddress.ip_network("64:ff9b::/96")  # RFC 6052 well-known prefi
 TUNNEL_PREFIXES = (ipaddress.ip_network("2002::/16"), ipaddress.ip_network("2001::/32"))
 
 
-def _carried_ipv4(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> ipaddress.IPv4Address | None:
+def carried_ipv4(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> ipaddress.IPv4Address | None:
     """The IPv4 address an IPv6 address stands for, when it is one of the forms that carry one."""
     if ip.version == 4:
         return None
@@ -26,7 +26,7 @@ def is_public_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
     other reserved ranges are not public."""
     if ip.version == 6 and any(ip in prefix for prefix in TUNNEL_PREFIXES):
         return False
-    ip = _carried_ipv4(ip) or ip
+    ip = carried_ipv4(ip) or ip
     return ip.is_global and not ip.is_multicast and not ip.is_reserved and not getattr(ip, "is_site_local", False)
 
 

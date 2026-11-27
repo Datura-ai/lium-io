@@ -25,7 +25,7 @@ from concurrent.futures import ThreadPoolExecutor
 import aiohttp
 import asyncssh
 from aiohttp.abc import AbstractResolver, ResolveResult
-from datura.public_address import is_public_ip as _is_public_ip
+from datura.public_address import carried_ipv4, is_public_ip as _is_public_ip
 
 from core.utils import _m, get_extra_info
 
@@ -215,6 +215,7 @@ ALLOWED_PRIVATE_NETWORKS = tuple(  # comma-separated CIDRs
 
 def is_public_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
     """datura's public-address rule, plus the private network a dev stack names (DAH-7120; unset in production)."""
+    ip = carried_ipv4(ip) or ip  # a mapped or NAT64 form of an allowed IPv4 is allowed too, as on main
     if any(ip in network for network in ALLOWED_PRIVATE_NETWORKS) and ip.is_private and not (
         ip.is_loopback or ip.is_link_local or ip.is_unspecified
     ):
