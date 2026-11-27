@@ -19,13 +19,12 @@ logger = logging.getLogger(__name__)
 PROBE_TIMEOUT = aiohttp.ClientTimeout(sock_connect=3, sock_read=3)
 # a node's answer is "<token>:<port>"; reading more than this lets a node grow the validator's memory
 PROBE_BODY_LIMIT = 256
-# Sockets the probes may hold at once, in total and per node batch. A wave probes every node's ports together, and
-# with no bound it opened them all at once and ran the validator out of file descriptors (Errno 24, 27 Nov), which
-# failed its other sockets too. The total stays a quarter of the soft limit so the rest of the validator keeps its own.
+# Sockets the probes may hold at once. A wave probes every node's ports together, and with no bound it opened them
+# all at once and ran the validator out of file descriptors (Errno 24, 27 Nov), which failed its other sockets too.
+# The bound is a quarter of the soft limit, so the rest of the validator keeps its own. There is no per-node bound:
+# it queued a large node's own probes past its batch deadline (review).
 _FD_SOFT_LIMIT = resource.getrlimit(resource.RLIMIT_NOFILE)[0]
 MAX_PROBE_SOCKETS = 2048 if _FD_SOFT_LIMIT == resource.RLIM_INFINITY else _FD_SOFT_LIMIT // 4
-# one node's dropped probes hold at most this many, so the other nodes' probes still find a socket
-MAX_PROBE_SOCKETS_PER_NODE = 64
 
 
 class PortTester:
@@ -67,9 +66,9 @@ class PortTester:
 
     async def _probe_unbounded(self, host: str, port: PortPair, token: str) -> bool:
         if self._session is None:
-            # the bound is the semaphores (per node in `test_many`, in total in `_probe`): a connector limit is one
-            # queue for every node, so one node's dropped probes would hold it for their whole budget and the rest wait
-            # no cookie jar: a node's Set-Cookie would be kept for the life of the process
+            # the bound is the semaphore in `_probe`, taken before the probe budget starts; a connector limit would
+            # start the budget while the probe waits for a socket.
+            # No cookie jar: a node's Set-Cookie would be kept for the life of the process
             self._session = aiohttp.ClientSession(
                 connector=public_host_connector(limit=0, force_close=True), cookie_jar=aiohttp.DummyCookieJar()
             )
@@ -108,18 +107,15 @@ class PortTester:
         """Test multiple ports concurrently."""
         durations: list[float] = []
 
-        async def timed(node: asyncio.Semaphore, port: PortPair) -> bool:
-            # per call, not per host: several nodes can share one address
-            async with node:
-                started = time.monotonic()
-                try:
-                    return await self._probe(host, port, token)
-                finally:
-                    durations.append(time.monotonic() - started)
+        async def timed(port: PortPair) -> bool:
+            started = time.monotonic()
+            try:
+                return await self._probe(host, port, token)
+            finally:
+                durations.append(time.monotonic() - started)
 
         async def probe_all() -> list[bool]:
-            node = asyncio.Semaphore(MAX_PROBE_SOCKETS_PER_NODE)
-            return await asyncio.gather(*[timed(node, p) for p in ports])
+            return await asyncio.gather(*[timed(p) for p in ports])
 
         wall_started = time.monotonic()
         results = await self._on_probe_loop(probe_all())

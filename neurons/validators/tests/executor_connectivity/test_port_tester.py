@@ -64,7 +64,10 @@ async def test_the_probe_session_keeps_no_cookie_a_node_sends():
 
 
 @pytest.mark.asyncio
-async def test_a_node_whose_probes_hang_never_delays_another_nodes_probes():
+async def test_a_node_whose_probes_hang_never_delays_another_nodes_probes_or_its_own(monkeypatch):
+    # the total bound is a quarter of the FD limit; pinned here so the test does not depend on the host's limit
+    monkeypatch.setattr(port_tester, "MAX_PROBE_SOCKETS", 400)
+
     async def answer(_request):
         return web.Response(text=f"{TOKEN}:1")
 
@@ -74,38 +77,37 @@ async def test_a_node_whose_probes_hang_never_delays_another_nodes_probes():
     runner, port = await _serve(answer)
     tester = PortTester()
     try:
-        hanging_ports = [PortPair(1, silent_port)] * port_tester.MAX_PROBE_SOCKETS_PER_NODE
+        # a large node (review: 297 ports) whose every probe hangs
+        hanging_ports = [PortPair(1, silent_port)] * 300
+        loop = asyncio.get_running_loop()
+        hanging_started = loop.time()
         hanging = asyncio.create_task(tester.test_many("127.0.0.1", hanging_ports, TOKEN))
         await asyncio.sleep(0.2)
-        started = asyncio.get_running_loop().time()
+        started = loop.time()
         ok, failed = await tester.test_many("127.0.0.1", [PortPair(1, port)] * 50, TOKEN)
-        elapsed = asyncio.get_running_loop().time() - started
+        elapsed = loop.time() - started
         assert len(ok) == 50 and not failed
         assert elapsed < 1.5  # the silent node's probes run out at 3 s; nothing here waits for them
         assert await hanging == ([], hanging_ports)
+        # its own probes run together, not in queued rounds: about one read budget, far inside a batch deadline
+        assert loop.time() - hanging_started < 6
     finally:
         silent.close()
         await runner.cleanup()
 
 
 @pytest.mark.asyncio
-async def test_a_wave_over_many_nodes_never_holds_more_sockets_than_the_bounds(monkeypatch):
+async def test_a_wave_over_many_nodes_never_holds_more_sockets_than_the_bound(monkeypatch):
     # DAH-6812: the unbounded wave of 27 Nov opened every node's probes at once and hit the FD limit (Errno 24)
     monkeypatch.setattr(port_tester, "MAX_PROBE_SOCKETS", 6)
-    monkeypatch.setattr(port_tester, "MAX_PROBE_SOCKETS_PER_NODE", 4)
     held = {"total": 0, "peak": 0}
-    per_node: dict[str, int] = {}
-    per_node_peak: dict[str, int] = {}
 
     class Counting(PortTester):
         async def _probe_unbounded(self, host, port, token):
             held["total"] += 1
-            per_node[host] = per_node.get(host, 0) + 1
             held["peak"] = max(held["peak"], held["total"])
-            per_node_peak[host] = max(per_node_peak.get(host, 0), per_node[host])
             await asyncio.sleep(0.02)
             held["total"] -= 1
-            per_node[host] -= 1
             return True
 
     tester = Counting()
@@ -114,4 +116,3 @@ async def test_a_wave_over_many_nodes_never_holds_more_sockets_than_the_bounds(m
 
     assert all(len(ok) == 20 and not failed for ok, failed in results)
     assert held["peak"] == 6
-    assert max(per_node_peak.values()) <= 4
