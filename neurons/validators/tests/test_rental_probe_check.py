@@ -2425,6 +2425,43 @@ async def test_an_unproven_nodes_first_probe_gets_the_cycle_time_and_relists_aft
     assert result.passed is True and result.event.reason_code == Msg.PROBE_OK.reason and redis.stamped()
 
 
+class RedisFailingProofWrites(FakeRedis):
+    """Reads work; every write of the probe proof raises."""
+
+    async def set(self, key: str, value: str, ex: int | None = None):
+        if key.startswith("rental_probe_proven:"):
+            raise ConnectionError("redis write failed")
+        await super().set(key, value, ex)
+
+
+@pytest.mark.asyncio
+async def test_a_failed_proof_write_on_a_deferred_cycle_does_not_repeat_the_deferral():
+    """Stand case e: the proof write raising on the deferred cycle left nothing on record, so the next cycle read the
+    node as never passed and deferred VerifyX again. The pass this process saw is the proof."""
+    redis = RedisFailingProofWrites(last_ok=None)
+    ctx, _, _ = make_probe_context(redis=redis)
+    ctx = ctx.model_copy(update={"state": replace(ctx.state, verifyx_skipped_for_standing_probe_failure=True)})
+    with probe_settings(), renter_path():
+        result = await RentalProbeCheck().run(ctx)
+    assert result.event.reason_code == Msg.CYCLE_WITHOUT_VERIFYX.reason
+    assert f"rental_probe_proven:{EXECUTOR.uuid}" not in redis.store
+    ctx, _, _ = make_probe_context(redis=redis)
+    assert await module.has_standing_failure(ctx) is False
+
+
+@pytest.mark.asyncio
+async def test_a_failed_proof_write_never_turns_a_stamped_pass_unproven():
+    """Stand case f: a pass stamped before the proof key existed, and the proof backfill write raising, read as an
+    unreadable proof (NOT_RUN_ON_VALIDATOR, standing failure). A failed write proves nothing missing: as on main."""
+    redis = RedisFailingProofWrites(last_ok=time.time() - 7 * 3600)
+    ctx, _, _ = make_probe_context(redis=redis, images=())
+    assert await module.has_standing_failure(ctx) is False
+    with probe_settings():
+        result = await RentalProbeCheck().run(ctx)
+    assert result.passed is True and result.event.reason_code == Msg.INCONCLUSIVE.reason
+    assert result.extra_events == []
+
+
 def _early_failure_run(ctx):
     from neurons.validators.src.services.task.messages import DiskSpaceMessages
 

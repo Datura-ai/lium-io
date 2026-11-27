@@ -983,11 +983,12 @@ async def _proven(ctx: Context) -> bool:
     """Has a probe ever passed on the node? Raises when Redis cannot be read."""
     if await ctx.services.redis.get(f"{_REDIS_PROVEN_PREFIX}:{ctx.executor.uuid}") is not None:
         return True
-    if await _last_ok_at(ctx) is None:
-        return False
-    # a pass stamped before the proof key existed
-    await ctx.services.redis.set(f"{_REDIS_PROVEN_PREFIX}:{ctx.executor.uuid}", "1")
-    return True
+    # a pass this process saw whose proof write failed, or one stamped before the proof key existed: the proof is
+    # never cleared, so either is proven, and the write is retried best-effort (a failed write proves nothing missing)
+    if _PROVEN_SEEN.get(ctx.executor.uuid) or await _last_ok_at(ctx) is not None:
+        await _stamp_proven(ctx)
+        return True
+    return False
 
 
 async def _never_passed(ctx: Context) -> _Failure | None:
