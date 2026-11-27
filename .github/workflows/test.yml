@@ -218,11 +218,25 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # a PR's checkout is its merge ref; the first parent is the base it merges into
+          fetch-depth: 2
 
       - name: Set up Python 3.11
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: '3.11'
+
+      - name: Version is set only by a release PR; a wire change carries a fragment
+        # scripts/check_version.py: a release PR is one that deletes a fragment under changes/. A push to main is not checked (its PR was).
+        # HEAD^1 is the commit this PR merges onto, in the queue too (the entry ahead of it, not the queue's base): each PR is judged on
+        # its own diff, so a fragment of a PR ahead in the queue never stands in for a missing one here
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          case "$EVENT_NAME" in
+            pull_request|pull_request_review|merge_group) python scripts/check_version.py HEAD^1 ;;
+          esac
 
       - name: Install
         # the renderer is pinned: the snapshot is pydantic's JSON Schema, and a pydantic release can change it
@@ -267,6 +281,7 @@ jobs:
     timeout-minutes: 60
     permissions:
       contents: read
+      packages: write   # the GHCR layer cache (registry, E2E_CACHE_REF)
     strategy:
       fail-fast: false
       # protocol rides with cycle: it is 27 s, a runner of its own would only add a stack build
@@ -289,12 +304,18 @@ jobs:
           driver-opts: image=moby/buildkit:v0.33.1@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea
       - uses: crazy-max/ghaction-github-runtime@3cb05d89e1f492524af3d41a1c98c83bc3025124 # v3.1.0
         if: contains(fromJSON(needs.route.outputs.shards), matrix.shard)
+      - name: registry for the layer cache
+        if: contains(fromJSON(needs.route.outputs.shards), matrix.shard)
+        env:
+          TOKEN: ${{ github.token }}
+        run: echo "$TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
       - name: build, up, ${{ matrix.suites }}, logs, down — each step under a hard timeout (gate.sh)
         id: gate
         if: contains(fromJSON(needs.route.outputs.shards), matrix.shard)
         timeout-minutes: 55
         env:
-          E2E_CACHE: gha
+          E2E_CACHE: registry
+          E2E_CACHE_REF: ghcr.io/datura-ai/lium-io-e2e-cache
           SUITES: ${{ matrix.suites }}
         run: ./gate.sh
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

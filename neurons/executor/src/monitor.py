@@ -1,11 +1,13 @@
 import docker
 import logging
+import os
 import json
 import threading
 import time
 from datetime import datetime
 from models.pod_log import PodLog
 from services.pod_log_store import append_pod_log
+from services.api_watcher import watch_executor_api_forever
 from services.stale_task_recovery import recover_stale_executor_task
 
 # Set up logging to a file in JSON format (one JSON object per line)
@@ -122,10 +124,20 @@ def recover_executor_forever() -> None:
         time.sleep(60)
 
 
+def _report_api_watch(event: str, reason: str) -> None:
+    log_event(PodLog(event=event, reason=reason, created_at=datetime.utcnow()))
+
+
 def main():
     """Main loop to monitor Docker events."""
     client = docker.from_env()
     threading.Thread(target=recover_executor_forever, daemon=True).start()
+    # DAH-7125: restarts the executor only when its API does not answer over HTTP (replaces healthcheck + autoheal)
+    threading.Thread(
+        target=watch_executor_api_forever,
+        args=(docker.from_env(), int(os.environ.get("INTERNAL_PORT", "8001")), _report_api_watch),
+        daemon=True,
+    ).start()
 
     while True:
         try:

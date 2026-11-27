@@ -77,6 +77,8 @@ class AvailabilityErrorCode(StrEnum):
     NODE_ACCOUNT_MISMATCH = "NODE_ACCOUNT_MISMATCH"
     # DAH-6539: the account read failed or stalled; a reach failure, so silenced with our own outage like one.
     NODE_ACCOUNT_UNVERIFIED = "NODE_ACCOUNT_UNVERIFIED"
+    # DAH-7041: the host answered a kernel.pid_max the create refuses every rental on (HostPidMaxCheck).
+    HOST_PID_MAX_UNUSABLE = "HOST_PID_MAX_UNUSABLE"
 
 
 # Faults the node itself proved: never a sign of our own outage, and never silenced with one.
@@ -91,6 +93,8 @@ NODE_GPU_FAULT_CODES = frozenset(
         AvailabilityErrorCode.GPU_WORK_PROOF_FAILED,
         # read off the machine itself (its host key or account files)
         AvailabilityErrorCode.NODE_ACCOUNT_MISMATCH,
+        # the host's own answer to the read, never a read that got none
+        AvailabilityErrorCode.HOST_PID_MAX_UNUSABLE,
         # only raised for REASONS_THAT_HIDE_AT_ONCE, all read off the node's own report or probe
         AvailabilityErrorCode.VERIFICATION_FAILED,
     }
@@ -261,6 +265,9 @@ def build_rented_executor_not_listed_event(
 
 # The executor's answer to an upload signed more than UPLOAD_NONCE_MAX_AGE_SECONDS (600) away from its own clock.
 STALE_UPLOAD_NONCE = "Stale upload nonce"
+# The miner writes a node's answer as "HTTP <status>: <text>". The executor serves POST /upload_ssh_key at its root
+# and never answers it 404, so a 404 comes from some other server on that address and port, not from the executor.
+NO_EXECUTOR_API_ANSWER = "HTTP 404:"
 
 
 def build_executor_unreachable_by_miner_event(
@@ -274,9 +281,25 @@ def build_executor_unreachable_by_miner_event(
 
     ``refusal`` is the node's own answer when it did answer and turned the key down
     (``refused_executors``): the node is reachable, so the event names the answer, and for a stale
-    nonce the node's clock (22 Nov: 14 refusals were read as "could not reach"). Same
+    nonce the node's clock (22 Nov: 14 refusals were read as "could not reach"). A 404 is no refusal: no
+    executor served the request, so the event says so instead of pointing at the executor's log. Same
     code and score: the node still took no key.
     """
+    if refusal is not None and refusal.startswith(NO_EXECUTOR_API_ANSWER):
+        return build_availability_event(
+            code=AvailabilityErrorCode.EXECUTOR_UNREACHABLE_BY_MINER,
+            reach_source=ReachSource.MINER,
+            reach_target=ReachTarget.EXECUTOR_API,
+            event_text="Miner reached this node's address, but no executor answered there",
+            impact="Score 0 for this cycle; the node is hidden from the market until a cycle installs the key.",
+            remediation=(
+                "The request never reached the executor (HTTP 404 to /upload_ssh_key), so its log shows nothing: "
+                "the address and port the miner has for this node point at something else. Compare the node's "
+                "registered IP and port with the port the executor container publishes (`EXTERNAL_PORT` in `.env`; "
+                "`docker ps` shows it), and check that any router port forward leads to this machine."
+            ),
+            what_we_saw={"executor_uuid": executor_uuid, "miner_hotkey": miner_hotkey, "node_answer": refusal},
+        )
     if refusal is not None:
         if STALE_UPLOAD_NONCE in refusal:
             remediation = (
@@ -430,12 +453,20 @@ class RunningOutageTally:
 
 
 # DAH-5395: the failure reasons that hide the node at once. Any other failed run keeps the backend's usual rule.
-REASONS_THAT_HIDE_AT_ONCE = frozenset({"GPU_DETAILS_MISMATCH", "GPU_UUID_CHANGED", "NVLINK_FAULT"})
+# RENTAL_PROBE_NOT_YET_PROVEN (DAH-7044): a node is first listed by a rental probe that passed.
+REASONS_THAT_HIDE_AT_ONCE = frozenset(
+    {"GPU_DETAILS_MISMATCH", "GPU_UUID_CHANGED", "LOGIN_USER_NOT_ROOT", "NVLINK_FAULT", "RENTAL_PROBE_NOT_YET_PROVEN"}
+)
 
 
 # runs that stop before the checks that re-read the stored restrictions: [] would clear what those checks keep
-# (DAH-6546: a pod left unread after a GPU-set move stops the run, and its rerun looks again)
-REASONS_THAT_KEEP_STORED = frozenset({"GPU_LOST_POD_UNREAD"})
+# (DAH-6546: a pod left unread after a GPU-set move stops the run, and its rerun looks again; DAH-7050: a library
+# mismatch not confirmed)
+# (DAH-7044: an unreadable rental-probe record, or a probe the validator cannot run for a reason on its own side,
+# neither lists an unproven node nor hides a proven one)
+REASONS_THAT_KEEP_STORED = frozenset(
+    {"GPU_LOST_POD_UNREAD", "NVML_DIGEST_UNREAD", "RENTAL_PROBE_PROOF_UNREADABLE", "RENTAL_PROBE_NOT_RUN_ON_VALIDATOR"}
+)
 
 
 def run_availability_errors(ok: bool, events: list[ValidationEvent]) -> list[dict] | None:

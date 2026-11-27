@@ -284,8 +284,9 @@ async def test_a_failed_card_is_stored_and_resampled_every_cycle_until_it_passes
 
     results = await _filler_cycles(context_factory, service, 4, specs=_cards(8))
 
-    # cycle 1 samples the unjudged node (card 0) and fails it; cycles 2-3 resample card 0, the 3rd answers right
-    assert service.gpu_uuids == ["GPU-0", "GPU-0", "GPU-0"]
+    # cycle 1 samples the unjudged node (its out-of-turn card) and fails it; cycles 2-3 resample that card, the 3rd
+    # answers right
+    assert len(service.gpu_uuids) == 3 and len(set(service.gpu_uuids)) == 1
     assert [r.passed for r in results] == [False, False, True, True]
     assert results[1].event.reason_code == Msg.GPU_WORK_PROOF_FAILED.reason
 
@@ -308,7 +309,7 @@ async def test_a_pinned_run_targets_one_card_and_keys_on_it(monkeypatch):
         gpu_uuid="GPU-1",
     )
 
-    assert ssh.run.call_args.args[0].startswith("CUDA_VISIBLE_DEVICES=GPU-1 python ")
+    assert "; CUDA_VISIBLE_DEVICES=GPU-1 " + mvs.executor_payload.run(mvs.executor_payload.MATRIX) + " " in ssh.run.call_args.args[0]
     machine_info = json.loads(wrapper.generateChallenge.call_args.args[2])
     assert machine_info == {"uuids": "GPU-1", "gpu_count": 1, "gpu_model": "NVIDIA H100 80GB HBM3"}
 

@@ -7,6 +7,7 @@ set -e
 #   or: cd lium-io/neurons/executor && sudo bash nvidia_docker_sysbox_setup.sh
 #   sudo bash nvidia_docker_sysbox_setup.sh --check   only the preflight, one PASS/FIX line per requirement; exit 1 on any FIX
 #   sudo bash nvidia_docker_sysbox_setup.sh --install-layer-reset   only (re)install the boot-time layer reset (validators run it)
+#   sudo bash nvidia_docker_sysbox_setup.sh --remove-layer-reset    only take the boot-time layer reset out (validators run it)
 # After sysbox works, install mode also sets up the vloopback volume plugin (pinned by digest,
 # DATA_DIR=<Docker data-root>/loopback) and mounts a 1 GB test volume into a sysbox container; the run exits 1
 # with a doc link when that fails.
@@ -22,7 +23,7 @@ SYSBOX_VERSION="0.7.1"
 # DAH-6804: the boot-time layer reset's version, written into its unit; the validator reinstalls it (--install-layer-reset)
 # on Sysbox hosts whose unit is missing or older. Bump it whenever shift_sysbox_layers_back_at_boot's output changes.
 # 1 is reserved for units written before this marker.
-LAYER_RESET_VERSION=2
+LAYER_RESET_VERSION=3
 # nestybox publishes amd64 and arm64 .debs; arm64 is for GB300 / Grace hosts (check_arch refuses the rest)
 case "$(uname -m)" in
     aarch64|arm64) SYSBOX_ARCH=arm64; SYSBOX_SHA="04ca894ae0b53f0fa54eaacc173ce40363c9a95ea5450f773716a84ef650a69b" ;;
@@ -265,6 +266,12 @@ systemd_env() {
     printf 'Environment=%s\n' "$(systemd_quote "$1=$2")"
 }
 
+layer_reset_step() {
+    # names the step an --install-layer-reset stopped at, for its one answer line
+    LAYER_RESET_FAILED_STEP=$1
+    return 1
+}
+
 shift_sysbox_layers_back_at_boot() {
     # Sysbox chowns a pod's writable layer into its uid range on start and back on a stop it sees. After an unclean
     # stop (power loss, hard reset) the layer stays shifted, and the restart-policy start at boot mounts the image
@@ -281,8 +288,8 @@ shift_sysbox_layers_back_at_boot() {
     bin=$(host_path /usr/local/sbin/lium-sysbox-layer-reset)
     unit=$(host_path /etc/systemd/system/lium-sysbox-layer-reset.service)
     dropin=$(host_path /etc/systemd/system/docker.service.d/lium-sysbox-layer-reset.conf)
-    mkdir -p "$(dirname "$bin")" "$(dirname "$unit")" "$(dirname "$dropin")" || return 1
-    cat > "$bin" <<'PY' || return 1
+    mkdir -p "$(dirname "$bin")" "$(dirname "$unit")" "$(dirname "$dropin")" || layer_reset_step mkdir || return 1
+    cat > "$bin" <<'PY' || layer_reset_step program || return 1
 #!/usr/bin/python3 -I
 # Lium (nvidia_docker_sysbox_setup.sh): shift back the writable layer a sysbox pod kept after an unclean stop, the way
 # sysbox's own stop does. Runs at boot before Docker; --dry-run only prints. Setuid bits and file capabilities kept.
@@ -429,7 +436,12 @@ def journal(entries):
 
 
 def restore(e):
-    os.chmod(e["p"], e["m"])
+    p = e["p"]
+    # Docker may have run since the journal was written: never follow a path a pod replaced with a link
+    if os.path.realpath(p) != p or stat.S_ISLNK(os.lstat(p).st_mode):
+        print(f"skipped ...{p[-80:]}: replaced since journaled", file=sys.stderr, flush=True)
+        return
+    os.chmod(p, e["m"])
     if e["c"]:
         os.setxattr(e["p"], "security.capability", bytes.fromhex(e["c"]), follow_symlinks=False)
 
@@ -463,8 +475,8 @@ def shift_batch(paths, base):
             link = stat.S_ISLNK(st.st_mode)
             changed = 0 if link else shift_acls(path, base)
         except OSError as e:
-            # a renter's path past PATH_MAX on the host (ENAMETOOLONG) stays as it is in that pod and must not hold
-            # Docker down for every pod; any other error fails the unit, so the next boot retries the layer
+            # a renter's path past PATH_MAX on the host (ENAMETOOLONG) stays as it is in that pod and must not fail
+            # the reset for every pod; any other error fails the unit, so the next boot retries the layer
             if e.errno != errno.ENAMETOOLONG:
                 raise
             print(f"skipped ...{path[-80:]}: {e.strerror}", file=sys.stderr, flush=True)
@@ -476,7 +488,9 @@ def shift_batch(paths, base):
                 caps = None if link else xattr(path, "security.capability")
                 todo.append((path, uid, gid, link, stat.S_IMODE(st.st_mode), caps))
         n += changed
-    entries = [{"p": p, "m": m, "c": c.hex() if c else None}
+    # journaled resolved (Docker is down now), so replay's check holds for a data root behind a link and for layers
+    # outside it (containerd's image store)
+    entries = [{"p": os.path.realpath(p), "m": m, "c": c.hex() if c else None}
                for p, _, _, link, m, c in todo if not link and (c or m & (stat.S_ISUID | stat.S_ISGID))]
     if entries:
         journal(entries)
@@ -581,10 +595,10 @@ def main():
 
 main()
 PY
-    chmod 755 "$bin" || return 1
+    chmod 755 "$bin" || layer_reset_step program || return 1
     # the version line goes in last, once the unit is enabled and Docker's drop-in is in place: a cut-off or failed
     # install reads as an old version (no line), so the validator installs again next check
-    cat > "$unit" <<UNIT || return 1
+    cat > "$unit" <<UNIT || layer_reset_step unit || return 1
 [Unit]
 Description=Lium: shift sysbox pods' layers back after an unclean stop
 After=local-fs.target sysbox.service sysbox-mgr.service containerd.service
@@ -597,6 +611,9 @@ Type=oneshot
 RemainAfterExit=yes
 # the walk holds one open directory per level of a layer (PATH_MAX allows ~2048)
 LimitNOFILE=65536
+# a oneshot has no start timeout by default: a reset that hangs must not hold Docker's start for the whole boot. A
+# reset cut off here is finished on the next boot (its journal)
+TimeoutStartSec=15min
 $(systemd_env LIUM_CONTAINERD_ADDRESS "$address")
 $(systemd_env LIUM_DOCKER_DATA_ROOT "$root")
 ExecStart=/usr/bin/python3 -I /usr/local/sbin/lium-sysbox-layer-reset
@@ -608,15 +625,35 @@ UNIT
         systemctl is-active -q docker && touch /run/lium-docker-started  # this boot's Docker already started
         # Docker must never depend on a unit that is not enabled: no drop-in until enable succeeded, none left after
         # a failure (an older install's drop-in included)
-        if ! { systemctl daemon-reload && systemctl enable lium-sysbox-layer-reset.service >/dev/null 2>&1; }; then
-            rm -f "$dropin"; systemctl daemon-reload >/dev/null 2>&1; return 1
-        fi
+        if ! systemctl daemon-reload; then
+            layer_reset_step daemon-reload
+        elif ! systemctl enable lium-sysbox-layer-reset.service >/dev/null; then
+            layer_reset_step enable
+        fi || { rm -f "$dropin"; systemctl daemon-reload >/dev/null 2>&1; return 1; }
     fi
-    # Docker starts only after a successful reset: never a pod on a half-reset layer (the reset log names the failure)
-    if ! printf '[Unit]\nRequires=lium-sysbox-layer-reset.service\nAfter=lium-sysbox-layer-reset.service\n[Service]\nExecStartPost=/bin/touch /run/lium-docker-started\n' \
-        > "$dropin" || ! sed -i "1i # lium-layer-reset-version=$LAYER_RESET_VERSION" "$unit"; then
-        rm -f "$dropin"; [ -n "${SYSBOX_SETUP_HOST_ROOT:-}" ] || systemctl daemon-reload >/dev/null 2>&1; return 1
+    # DAH-7052: Docker starts after the reset (After=), whether it worked or not (Wants=, not Requires=): a reset that
+    # fails or times out costs the pods it did not shift their sudo/apt until the next boot, never Docker and the
+    # executor on the whole host (the reset log names the failure)
+    if ! printf '[Unit]\nWants=lium-sysbox-layer-reset.service\nAfter=lium-sysbox-layer-reset.service\n[Service]\nExecStartPost=/bin/touch /run/lium-docker-started\n' \
+        > "$dropin"; then
+        layer_reset_step drop-in
+    elif ! sed -i "1i # lium-layer-reset-version=$LAYER_RESET_VERSION" "$unit"; then
+        layer_reset_step version-line
+    fi || { rm -f "$dropin"; [ -n "${SYSBOX_SETUP_HOST_ROOT:-}" ] || systemctl daemon-reload >/dev/null 2>&1; return 1; }
+    [ -n "${SYSBOX_SETUP_HOST_ROOT:-}" ] || systemctl daemon-reload || layer_reset_step daemon-reload
+}
+
+remove_layer_reset() {
+    # DAH-7052: the way back from shift_sysbox_layers_back_at_boot. Docker's drop-in goes first (it is what ties
+    # Docker's start to the reset), then the unit is disabled and its files removed, so the scrape reads it as not
+    # installed and the validator stops; a daemon-reload, never a Docker stop or restart, so running pods are untouched
+    local unit
+    unit=$(host_path /etc/systemd/system/lium-sysbox-layer-reset.service)
+    rm -f "$(host_path /etc/systemd/system/docker.service.d/lium-sysbox-layer-reset.conf)" || return 1
+    if [ -z "${SYSBOX_SETUP_HOST_ROOT:-}" ] && [ -e "$unit" ]; then
+        systemctl disable lium-sysbox-layer-reset.service >/dev/null 2>&1 || return 1
     fi
+    rm -f "$unit" "$(host_path /usr/local/sbin/lium-sysbox-layer-reset)" || return 1
     [ -n "${SYSBOX_SETUP_HOST_ROOT:-}" ] || systemctl daemon-reload
 }
 
@@ -1443,26 +1480,46 @@ case "${1:-}" in
     --install-layer-reset)
         # DAH-6804: what the validator runs on Sysbox hosts whose layer reset is missing or old. Installs the unit and
         # Docker's drop-in only: never runs the reset, never restarts Docker, so running pods are not touched. One
-        # result line for the validator. Without python3 the unit's ExecStart fails at boot and the drop-in's
-        # Requires= then keeps Docker down, so it installs nothing there.
+        # result line for the validator. Without python3 the unit's ExecStart could never work, and without systemd
+        # nothing would ever run the unit (the install failed at its daemon-reload on every check), so it installs
+        # nothing there.
         if [ "$(id -u)" != 0 ]; then echo "layer_reset_skipped not_root"
         elif [ ! -x /usr/bin/python3 ]; then echo "layer_reset_skipped no_python3"
         elif ! command -v sysbox-runc >/dev/null 2>&1; then echo "layer_reset_skipped no_sysbox"
-        elif shift_sysbox_layers_back_at_boot >/dev/null 2>&1; then echo "layer_reset_installed $LAYER_RESET_VERSION"
-        else echo "layer_reset_failed install"; fi
+        elif ! command -v systemctl >/dev/null 2>&1; then echo "layer_reset_skipped no_systemd"
+        else
+            # the failing step and the last line it wrote to stderr: one line, printable, bounded
+            err=$(mktemp) || { echo "layer_reset_failed install mktemp"; exit 0; }
+            LAYER_RESET_FAILED_STEP=""
+            if shift_sysbox_layers_back_at_boot >/dev/null 2>"$err"; then echo "layer_reset_installed $LAYER_RESET_VERSION"
+            else
+                why=$(grep -v '^[[:space:]]*$' "$err" | tail -n 1 | tr -d '\n' | tr -c '[:print:]' ' ' | cut -c1-120)
+                echo "layer_reset_failed ${LAYER_RESET_FAILED_STEP:-install} $why"
+            fi
+            rm -f "$err"
+        fi
+        exit 0
+        ;;
+    --remove-layer-reset)
+        # DAH-7052: what the validator runs on hosts with the layer reset when its rollout is set to remove. One result
+        # line, like --install-layer-reset; never stops or restarts Docker, never runs the reset.
+        if [ "$(id -u)" != 0 ]; then echo "layer_reset_skipped not_root"
+        elif remove_layer_reset >/dev/null 2>&1; then echo "layer_reset_removed"
+        else echo "layer_reset_failed remove"; fi
         exit 0
         ;;
     -h|--help)
-        echo "Usage: sudo bash nvidia_docker_sysbox_setup.sh [--check | --install-layer-reset]"
+        echo "Usage: sudo bash nvidia_docker_sysbox_setup.sh [--check | --install-layer-reset | --remove-layer-reset]"
         echo "  (no option)  preflight the host, then install sysbox + NVIDIA container toolkit, configure Docker, verify;"
         echo "               a FIX on root, architecture, kernel or Docker stops the install, any other FIX is printed and the install goes on;"
         echo "               then sets up the vloopback volume plugin and mounts a test volume into a sysbox container (exit 1 if it fails)"
         echo "  --check      preflight only: host requirements and what this script installs, PASS/FIX per line, exit 1 on any FIX"
         echo "  --install-layer-reset  only (re)install the boot-time layer reset unit; runs no reset, restarts nothing"
+        echo "  --remove-layer-reset   only remove the boot-time layer reset unit and Docker's drop-in; restarts nothing"
         echo "Env: SYSBOX_SKIP_KERNEL_CHECK=1, EXECUTOR_PORT, SSH_PORT (see the header of this script)"
         exit 0
         ;;
-    *)  fail "Unknown option: $1 (use --check, --install-layer-reset or --help)"; exit 2 ;;
+    *)  fail "Unknown option: $1 (use --check, --install-layer-reset, --remove-layer-reset or --help)"; exit 2 ;;
 esac
 
 # ── 1. Pre-flight ────────────────────────────────────────

@@ -24,6 +24,7 @@ from neurons.validators.src.services.task.checks.pinned_memory_probe import (
 from neurons.validators.src.services.task.messages import PinnedMemoryProbeMessages as Msg
 from neurons.validators.src.services.task.runner import SSHCommandResult
 
+from services.executor_payload import EXECUTOR_PYTHON
 from tests.helpers import build_context_config, build_services, build_state, default_executor
 
 
@@ -127,7 +128,7 @@ async def test_probe_source_goes_over_stdin_and_a_good_copy_passes(context_facto
     assert result.passed is True
     assert result.event.reason_code == "PINNED_MEMORY_PROBE_OK"
     (call,) = runner.calls
-    assert call["cmd"] == f"{default_executor().python_path} -I -"
+    assert call["cmd"] == f"{EXECUTOR_PYTHON} -I -"
     assert call["stdin_text"] == PROBE_SOURCE
     assert call["timeout"] == PROBE_TIMEOUT_SECONDS
     assert call["retryable"] is False

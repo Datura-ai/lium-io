@@ -18,10 +18,12 @@ SETUP_SCRIPT_PATHS = (
     Path(__file__).resolve().parents[5] / "executor" / SETUP_SCRIPT_NAME,
 )
 # runs the bundled setup script, fed on stdin, in the host mount namespace (as the needrestart guard writes its file)
-INSTALL_COMMAND = (
-    "if command -v nsenter >/dev/null 2>&1; then nsenter -t 1 -m -- bash -s -- --install-layer-reset 2>/dev/null "
+HOST_COMMAND = (
+    "if command -v nsenter >/dev/null 2>&1; then nsenter -t 1 -m -- bash -s -- {option} 2>/dev/null "
     "|| echo layer_reset_failed nsenter_failed; else echo layer_reset_skipped no_nsenter; fi"
 )
+INSTALL_COMMAND = HOST_COMMAND.format(option="--install-layer-reset")
+REMOVE_COMMAND = HOST_COMMAND.format(option="--remove-layer-reset")
 
 
 @cache
@@ -40,8 +42,8 @@ def setup_script() -> tuple[str, int] | None:
 
 def host_may_be_rented(ctx: Context) -> bool:
     """Any pod on this executor's rented list, stopped ones too (a stopped pod is a live rental), or no list this cycle.
-    The install runs `systemctl daemon-reload` and adds a unit that keeps Docker down at boot if the reset fails, so it
-    waits for a cycle that shows the host idle."""
+    Only the removal waits for a cycle that shows the host idle; the install runs on rented hosts too, as it never
+    starts, stops or restarts anything (tests/test_sysbox_setup_layer_reset.py)."""
     rented_data = ctx.state.rented_data
     listed = rented_data.executors.get(ctx.executor.uuid) if rented_data is not None else None
     return rented_data is None or bool(listed and listed.pods)
@@ -52,17 +54,18 @@ def install_wanted(mode: str, miner_hotkey: str) -> bool:
     return mode == "all" or (mode == "allowlist" and miner_hotkey in allowlist)
 
 
-async def install_layer_reset(ssh, script: str) -> str:
-    """"installed <version>", "skipped <reason>" or "failed <reason>". Never raises."""
+async def run_setup_option(ssh, script: str, command: str) -> str:
+    """"installed <version>", "removed", "skipped <reason>" or "failed <reason>". Never raises."""
     try:
-        res = await ssh.run(INSTALL_COMMAND, input=script, timeout=INSTALL_TIMEOUT_SECONDS, check=False)
+        res = await ssh.run(command, input=script, timeout=INSTALL_TIMEOUT_SECONDS, check=False)
     except Exception as exc:  # noqa: BLE001
         return f"failed ssh {exc!r}"[:200]
     lines = (getattr(res, "stdout", "") or "").strip().splitlines()
     if not lines:
         return "failed no_answer"
     verb, _, reason = lines[-1].partition(" ")
-    return f"{verb.removeprefix('layer_reset_')} {reason}".strip()
+    # the host writes this line (a failed install adds its step and stderr): printable ASCII only, bounded
+    return re.sub(r"[^\x20-\x7e]", "?", f"{verb.removeprefix('layer_reset_')} {reason}".strip())[:200]
 
 
 class SysboxLayerResetCheck:
@@ -73,9 +76,11 @@ class SysboxLayerResetCheck:
     (lium-io #2276), but only the setup script installs it and providers rarely re-run that. The scrape reports the
     installed version (``specs.sysbox_layer_reset_version``: 0 none, 1 before the version line, N); below the
     shipped setup script's LAYER_RESET_VERSION this runs that script's ``--install-layer-reset`` on the host, which
-    installs the unit and Docker's drop-in only: it never runs the reset and never restarts Docker. It installs only on
-    a host with no rental (host_may_be_rented); a host rented the whole time gets it at its first idle cycle.
-    SYSBOX_LAYER_RESET_INSTALL rolls it out: off, allowlist, then all. Skipped under dry run. Non-fatal, right after
+    installs the unit and Docker's drop-in only: it never runs the reset, never restarts Docker or Sysbox and never
+    stops, restarts or re-creates a container. It installs on rented hosts too: they are the ones a power loss hurts,
+    and the reset only acts at the next boot, before Docker starts the pods.
+    SYSBOX_LAYER_RESET_INSTALL rolls it out: off, allowlist, then all; remove (DAH-7052) runs the script's
+    ``--remove-layer-reset`` instead on every host that has the unit, at an idle cycle (host_may_be_rented). Skipped under dry run. Non-fatal, right after
     the scrape. The score is not changed.
     """
 
@@ -96,10 +101,19 @@ class SysboxLayerResetCheck:
             # not a Sysbox host (no key), the read failed, or this image ships no setup script
             what["scrape_error"] = specs.get("sysbox_layer_reset_scrape_error")
             return CheckResult(passed=True, event=render_message(Msg.UNKNOWN, ctx=ctx, check_id=self.check_id, what=what))
+        if mode == "remove":
+            if installed == 0:
+                return CheckResult(passed=True, event=render_message(Msg.OK, ctx=ctx, check_id=self.check_id, what=what))
+            if not self.write or host_may_be_rented(ctx):
+                event = render_message(Msg.REMOVE_PENDING, ctx=ctx, check_id=self.check_id, what=what)
+                return CheckResult(passed=True, event=event)
+            what["remove"] = await run_setup_option(ctx.ssh, shipped[0], REMOVE_COMMAND)
+            template = Msg.REMOVED if what["remove"] == "removed" else Msg.REMOVE_FAILED
+            return CheckResult(passed=True, event=render_message(template, ctx=ctx, check_id=self.check_id, what=what))
         if installed >= shipped[1]:
             return CheckResult(passed=True, event=render_message(Msg.OK, ctx=ctx, check_id=self.check_id, what=what))
-        if not (self.write and install_wanted(mode, ctx.miner_hotkey)) or host_may_be_rented(ctx):
+        if not (self.write and install_wanted(mode, ctx.miner_hotkey)):
             return CheckResult(passed=True, event=render_message(Msg.OUTDATED, ctx=ctx, check_id=self.check_id, what=what))
-        what["install"] = await install_layer_reset(ctx.ssh, shipped[0])
+        what["install"] = await run_setup_option(ctx.ssh, shipped[0], INSTALL_COMMAND)
         template = Msg.INSTALLED if what["install"] == f"installed {shipped[1]}" else Msg.INSTALL_FAILED
         return CheckResult(passed=True, event=render_message(template, ctx=ctx, check_id=self.check_id, what=what))

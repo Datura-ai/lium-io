@@ -5,10 +5,12 @@ import json
 import os
 import signal
 import stat
+import time
 import sys
 from collections.abc import Mapping
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
+from storage import restic
 from storage.models import OperationSpecError, StorageOperationSpec
 from storage.reporting import ReportingLeaseExpired, StorageEventReporter
 from storage.restic import (
@@ -18,15 +20,30 @@ from storage.restic import (
     ResticStorageRunner,
     StorageOperationCancelled,
 )
-from storage.workspace import WorkspaceResolutionError, WorkspaceResolver
+from storage.workspace import (
+    LocalWorkspace,
+    NamespaceWorkspace,
+    WorkspaceResolutionError,
+    WorkspaceResolver,
+)
 
-# the validator's cancel marker that outlives the cancel (one per operation); a runner started by any
-# validator release, whatever --cancel-file it was given, stops on it
-PERSISTENT_CANCEL_DIRECTORY = Path("/var/lium-reserve/storage-cancels")
 
 def _cancel_on_sigterm(signum: int, frame: object) -> None:
-    # Raising unwinds through ResticStorageRunner's finally, which removes the helper container.
+    # Raising unwinds through ResticStorageRunner, which stops restic; main reports CANCELLED.
     raise StorageOperationCancelled("storage runner received SIGTERM")
+
+
+def _take_helper_spec() -> str:
+    path = Path(restic.HELPER_SPEC_PATH)
+    deadline = time.monotonic() + restic.HELPER_SPEC_WAIT_SECONDS
+    while not path.exists():
+        if time.monotonic() > deadline:
+            raise RuntimeError("the storage helper's spec never arrived")
+        time.sleep(0.1)
+    try:
+        return path.read_text()
+    finally:
+        path.unlink(missing_ok=True)
 
 
 def main() -> int:
@@ -34,35 +51,44 @@ def main() -> int:
     arguments = _parse_arguments()
     event_writer: JsonEventWriter | None = None
     try:
-        payload = _load_operation(arguments.spec)
+        # in the helper the spec arrives in its tmpfs after the start; removed there once read
+        payload = (
+            _parse_object(_take_helper_spec())
+            if arguments.in_helper
+            else _load_operation(arguments.spec)
+        )
         operation = StorageOperationSpec.from_mapping(payload)
         reporter = (
             StorageEventReporter(operation.operation_id, operation.action, operation.reporter)
             if operation.reporter
             else None
         )
-        markers = [PERSISTENT_CANCEL_DIRECTORY / f"{operation.operation_id}.cancel"]
-        if arguments.cancel_file:
-            markers.append(Path(arguments.cancel_file))
-
-        def cancelled() -> bool:
-            return any(marker.exists() for marker in markers)
-
         event_writer = JsonEventWriter(
             str(operation.operation_id),
             operation.progress_interval_seconds,
             operation.heartbeat_interval_seconds,
             reporter=reporter,
-            cancellation_probe=cancelled,
+            cancellation_probe=(
+                lambda: Path(arguments.cancel_file).exists() if arguments.cancel_file else False
+            ),
         )
-        # a cancel that marked the operation before this runner started: no workspace or restore work
-        if cancelled():
-            raise StorageOperationCancelled("storage operation was cancelled before the runner started")
+        if arguments.in_helper:
+            # the helper's entrypoint: restic as a child, retries and reporting, all outside the executor container
+            workspace = (
+                NamespaceWorkspace(arguments.namespace_pid, PurePosixPath(arguments.workspace))
+                if arguments.namespace_pid
+                else LocalWorkspace(Path(arguments.workspace))
+            )
+            ResticStorageRunner(operation, workspace, event_writer=event_writer).run()
+            return 0
         if operation.action.value == "restore":
             event_writer.stage("PREPARING")
+        # the executor only resolves the workspace and starts the helper; an executor restart leaves the run alone
         workspace = WorkspaceResolver().resolve(operation)
-        ResticStorageRunner(operation, workspace, event_writer=event_writer).run()
-        return 0
+        runner = ResticStorageRunner(operation, workspace, event_writer=event_writer)
+        runner.launch_wrapper_helper(sys.executable, str(Path(__file__).resolve()), json.dumps(payload))
+        # detaching is opt-in (spec "detach", ignored by older executors): an older validator reads this exit as the end
+        return 0 if payload.get("detach") is True else runner.follow_wrapper_helper()
     except StorageOperationCancelled as error:
         if event_writer:
             event_writer.diagnostic(str(error))
@@ -105,6 +131,13 @@ def _parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         "--cancel-file",
         help="local marker created by the validator when cancellation is requested",
+    )
+    parser.add_argument(
+        "--in-helper", action="store_true", help="run the operation (the helper's entrypoint)"
+    )
+    parser.add_argument("--workspace", help="in the helper: the workspace path")
+    parser.add_argument(
+        "--namespace-pid", type=int, help="in the helper: the encrypted rental's PID for nsenter"
     )
     return parser.parse_args()
 

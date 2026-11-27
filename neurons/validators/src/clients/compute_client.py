@@ -106,6 +106,7 @@ from services.redis_service import (
     STREAMING_LOG_CHANNEL,
     NORMALIZED_SCORE_CHANNEL,
     renter_create_id,
+    resumed_create,
 )
 from clients.handlers.backup_handler import BackupHandler
 
@@ -532,6 +533,7 @@ class ComputeClient:
                             pod_ssh=data.get("pod_ssh"),
                             host_runtime_fault=data.get("host_runtime_fault"),
                             rented_pod_faults=data.get("rented_pod_faults"),
+                            idle_checks_passed=data.get("idle_checks_passed"),
                             check_started_at=data.get("check_started_at"),
                             ssh_host_key=data.get("ssh_host_key"),
                         )
@@ -617,6 +619,7 @@ class ComputeClient:
                             reason_code=data.get("reason_code"),
                             check_id=data.get("check_id"),
                             evidence=data.get("evidence"),
+                            unrented_only=data.get("unrented_only") is True,
                         )
 
                         async with self.lock:
@@ -1127,6 +1130,10 @@ class ComputeClient:
                 ))
                 await self._run_miner_job(job_request)
                 return
+            for reply in replies:
+                if isinstance(reply, FailedContainerRequest):
+                    # the cache key is the send it answers; a reply cached before the echo has none (DAH-7216)
+                    reply.command_id = command_id
             async with self.lock:
                 for reply in replies:
                     self.message_queue.append(reply)
@@ -1204,9 +1211,11 @@ class ComputeClient:
             if not await self._write_backend_create_record(pod_id, add):
                 retrying = asyncio.ensure_future(self._retry_backend_create_record(pod_id, add))
             create_id_token = renter_create_id.set(create_id)  # the create lock's owner, see executor_create_exclusion
+            resumed_token = resumed_create.set(resumes > 0)
             try:
                 return await self._drive_miner_job(job_request)
             finally:
+                resumed_create.reset(resumed_token)
                 renter_create_id.reset(create_id_token)
                 if retrying is not None:
                     retrying.cancel()
@@ -1612,6 +1621,10 @@ class ComputeClient:
             response: (
                 ContainerDeleted | FailedContainerRequest
             ) = await self.miner_service.handle_container(job_request)
+            if isinstance(response, FailedContainerRequest):
+                # the backend matches a failure to the delete send it answers (a duplicated or late reply must not
+                # answer a later send, DAH-7216)
+                response.command_id = job_request.command_id
 
             logger.info(
                 _m(

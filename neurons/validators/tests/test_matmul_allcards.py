@@ -10,6 +10,7 @@ own challenge, pinned with CUDA_VISIBLE_DEVICES=<card UUID>, timed in aggregate 
   - a single-card (legacy) executor is never judged by the all-cards path (probe returns None);
   - a multi-card claim the probe cannot run (unsized model, no details, our cipher) fails closed.
 """
+import re
 import json
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -221,6 +222,7 @@ async def test_a_claimed_card_cuda_cannot_see_fails_even_though_its_run_exits_ze
     assert result.success is False
     assert result.error_message.startswith("All-cards GPU work-proof failed")
     assert result.all_cards_no_answer is False
+    assert result.all_cards_wrong_answer is False  # DAH-6332: no card answered wrong
 
 
 @pytest.mark.asyncio
@@ -237,6 +239,11 @@ async def test_a_wrong_answer_on_one_card_is_never_a_no_answer(svc, monkeypatch)
     assert probe.passed is False
     assert probe.per_card[5]["reason"] == "wrong_answer"
     assert probe.no_card_answered is False
+
+    result = await svc.validate_gpu_model_and_process_job(
+        ssh_client=SimpleNamespace(run=run), executor_info=_executor(), default_extra={}, machine_spec=_spec(8)
+    )
+    assert result.all_cards_wrong_answer is True  # DAH-6332
 
 
 @pytest.mark.parametrize(
@@ -321,10 +328,12 @@ def test_only_an_all_cards_failure_with_no_card_answering_is_open_to_the_live_wo
 def _ssh_scripted(answers_by_card: dict[int, list[str]]):
     # each card in `answers_by_card` answers its pinned runs from its list in turn ("timeout" raises the
     # run's timeout); every other card answers right; kills are recorded
-    calls = {"runs": {card: 0 for card in answers_by_card}, "kills": []}
+    calls = {"runs": {card: 0 for card in answers_by_card}, "kills": [], "matmuls": []}
 
     async def run(cmd, *args, **kwargs):
-        if cmd.startswith("pkill"):
+        if "CUDA_VISIBLE_DEVICES=" in cmd:
+            calls["matmuls"].append(cmd)
+        if "pkill -9" in cmd:   # the tagged kill (executor_payload.kill_runs)
             calls["kills"].append(cmd)
             return SimpleNamespace(exit_status=0, stdout="", stderr="")
         if "CUDA_VISIBLE_DEVICES=" in cmd and _card_index(cmd) in answers_by_card:
@@ -353,6 +362,10 @@ async def test_a_timeout_retries_every_card_together_and_a_right_answer_then_pas
     # the whole run again (card 7 answered right the first time and still ran again), after one sweep
     assert calls["runs"] == {0: 2, 7: 2}
     assert len(calls["kills"]) == 1
+    # the retry runs under a fresh tag: the kill's cancel marker would stop every run started under the first one
+    killed = re.search(r"matrix\.([0-9a-f]{16})-cancelled", calls["kills"][0]).group(1)
+    tags = [re.search(r"matrix\.([0-9a-f]{16})-cancelled", cmd).group(1) for cmd in calls["matmuls"]]
+    assert len(set(tags[:8])) == 1 and len(set(tags[8:])) == 1 and tags[0] == killed and tags[8] != killed
 
 
 @pytest.mark.asyncio
@@ -375,6 +388,7 @@ async def test_one_card_that_times_out_again_while_the_others_answer_fails_with_
     assert result.success is False
     assert result.error_message.startswith("All-cards GPU work-proof failed")
     assert result.all_cards_no_answer is False
+    assert result.all_cards_wrong_answer is False  # DAH-6332: no card answered wrong
 
 
 @pytest.mark.asyncio
@@ -453,7 +467,7 @@ async def test_a_cancelled_all_cards_run_kills_the_remote_matmuls_and_stays_canc
     started, kills = asyncio.Event(), []
 
     async def run(cmd, *args, **kwargs):
-        if cmd.startswith("pkill"):
+        if "pkill -9" in cmd:   # the tagged kill (executor_payload.kill_runs)
             kills.append(cmd)
             return SimpleNamespace(exit_status=0, stdout="", stderr="")
         started.set()

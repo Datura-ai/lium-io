@@ -35,6 +35,7 @@ def _install(root) -> None:
         + _function("docker_containerd_address")
         + _function("systemd_quote")
         + _function("systemd_env")
+        + _function("layer_reset_step")
         + _function("shift_sysbox_layers_back_at_boot")
         + "shift_sysbox_layers_back_at_boot\n"
     )
@@ -104,6 +105,8 @@ def test_the_boot_unit_runs_after_sysbox_and_before_docker(tmp_path):
     assert "After=local-fs.target sysbox.service sysbox-mgr.service containerd.service" in unit
     assert "Before=docker.service\n" in unit
     assert "ExecStart=/usr/bin/python3 -I /usr/local/sbin/lium-sysbox-layer-reset" in unit
+    # DAH-7052: a hung reset holds Docker's start 15 minutes at most
+    assert "\nTimeoutStartSec=15min\n" in unit
 
 
 def test_the_unit_carries_the_version_the_validator_compares(tmp_path):
@@ -120,11 +123,12 @@ def _install_on_a_live_host(root, enable_fails: bool) -> subprocess.CompletedPro
     script = (
         f'host_path() {{ echo "{root}$1"; }}\nwarn() {{ echo "WARN $*"; }}\n'
         + f'systemctl() {{ echo "$*" >> "{log}"; [ "$1" = enable ] && {"return 1" if enable_fails else "return 0"}; [ "$1" = is-active ] && return 1; return 0; }}\n'
-        + 'docker() { return 1; }\n'
+        + f'docker() {{ echo "docker $*" >> "{log}"; return 1; }}\n'
         + f"LAYER_RESET_VERSION={_layer_reset_version()}\n"
         + _function("docker_containerd_address")
         + _function("systemd_quote")
         + _function("systemd_env")
+        + _function("layer_reset_step")
         + _function("shift_sysbox_layers_back_at_boot")
         + "shift_sysbox_layers_back_at_boot\n"
     )
@@ -154,11 +158,27 @@ def test_once_enable_works_the_next_install_adds_the_dependency_and_the_version(
 
     assert result.returncode == 0, result.stderr
     assert (tmp_path / "etc/systemd/system/docker.service.d/lium-sysbox-layer-reset.conf").read_text().startswith(
-        "[Unit]\nRequires=lium-sysbox-layer-reset.service\n"
+        "[Unit]\nWants=lium-sysbox-layer-reset.service\nAfter=lium-sysbox-layer-reset.service\n"
     )
     unit = (tmp_path / "etc/systemd/system/lium-sysbox-layer-reset.service").read_text()
     assert unit.splitlines()[0] == f"# lium-layer-reset-version={_layer_reset_version()}"
     assert unit.count("# lium-layer-reset-version=") == 1
+
+
+def test_the_install_on_a_live_host_starts_stops_and_restarts_nothing(tmp_path):
+    # the validator installs it on rented hosts too: every host call it makes is a read, a daemon-reload or an enable
+    # without --now, so running pods, Docker and Sysbox are untouched; the unit and drop-in act from the next boot
+    result = _install_on_a_live_host(tmp_path, enable_fails=False)
+
+    assert result.returncode == 0, result.stderr
+    assert (tmp_path / "systemctl.log").read_text().splitlines() == [
+        "show -p ExecStart --value docker",
+        "docker info --format {{.DockerRootDir}}",
+        "is-active -q docker",
+        "daemon-reload",
+        "enable lium-sysbox-layer-reset.service",
+        "daemon-reload",
+    ]
 
 
 @pytest.mark.skipif(os.getuid() == 0, reason="the not-root answer needs a non-root run")
@@ -176,6 +196,137 @@ def test_install_layer_reset_mode_never_runs_the_reset_or_restarts_docker():
     branch = re.search(r"^    --install-layer-reset\)\n(.*?)^        ;;$", open(SCRIPT).read(), re.S | re.M).group(1)
     assert "shift_sysbox_layers_back_at_boot" in branch
     assert not re.search(r"systemctl (re)?start|systemctl restart|/usr/local/sbin/lium-sysbox-layer-reset|--dry-run", branch)
+
+
+def _install_mode_answer(root, fail: str = "", why: str = "boom") -> str:
+    # the --install-layer-reset branch as the validator runs it (as root, on a live Sysbox host), its files under `root`
+    branch = re.search(r"^    --install-layer-reset\)\n(.*?)^        ;;$", open(SCRIPT).read(), re.S | re.M).group(1)
+    log = root / "systemctl.log"
+    script = (
+        f'host_path() {{ echo "{root}$1"; }}\nid() {{ echo 0; }}\n'
+        + 'command() { [ "$1" = -v ] && { [ "$FAIL:$2" != no-systemd:systemctl ]; return; }; builtin command "$@"; }\n'
+        + f"docker() {{ return 1; }}\nFAIL={fail!r}\nWHY={why!r}\n"
+        + f'systemctl() {{ echo "$1" >> "{log}"; case "$FAIL:$1:$(grep -c . "{log}")" in '
+        + "daemon-reload:daemon-reload:3|enable:enable:*|last-daemon-reload:daemon-reload:5) "
+        + 'echo "$WHY" >&2; return 1;; *:is-active:*) return 1;; esac; return 0; }\n'
+        + 'sed() { [ "$FAIL" = version-line ] && [ "$1" = -i ] && { echo "$WHY" >&2; return 4; }; command sed "$@"; }\n'
+        + f"LAYER_RESET_VERSION={_layer_reset_version()}\n"
+        + _function("docker_containerd_address")
+        + _function("systemd_quote")
+        + _function("systemd_env")
+        + _function("layer_reset_step")
+        + _function("shift_sysbox_layers_back_at_boot")
+        + "case --install-layer-reset in\n    --install-layer-reset)\n" + branch + "        ;;\nesac\n"
+    )
+    env = {k: v for k, v in os.environ.items() if k != "SYSBOX_SETUP_HOST_ROOT"}
+    result = subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=env, timeout=60)
+    assert result.returncode == 0, result.stderr
+    return result.stdout
+
+
+@pytest.mark.skipif(os.getuid() == 0, reason="root writes through the file and directory blockers")
+@pytest.mark.parametrize(
+    ("step", "blocker"),
+    [
+        ("mkdir", "usr/local"),  # a file where a directory must go
+        ("program", "usr/local/sbin/lium-sysbox-layer-reset/x"),  # a directory where the program goes
+        ("unit", "etc/systemd/system/lium-sysbox-layer-reset.service/x"),
+        ("daemon-reload", None),
+        ("enable", None),
+        ("drop-in", "etc/systemd/system/docker.service.d/lium-sysbox-layer-reset.conf/x"),
+        ("version-line", None),
+        ("last-daemon-reload", None),
+    ],
+)
+def test_a_failed_install_answers_its_step_and_why(tmp_path, step, blocker):
+    if blocker:
+        (tmp_path / blocker).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / blocker).write_text("")
+
+    answer = _install_mode_answer(tmp_path, fail="" if blocker else step)
+
+    reported = step.removeprefix("last-")
+    assert answer.startswith(f"layer_reset_failed {reported} ") and answer.count("\n") == 1, answer
+    if not blocker:
+        assert answer == f"layer_reset_failed {reported} boom\n"
+
+
+def test_a_failed_install_reason_is_one_printable_bounded_line(tmp_path):
+    answer = _install_mode_answer(tmp_path, fail="enable", why="\x1b[31mevil\tkey=value " + "x" * 300)
+
+    line = answer.removesuffix("\n")
+    assert line.startswith("layer_reset_failed enable ") and all(" " <= c <= "~" for c in line)
+    assert len(line.removeprefix("layer_reset_failed enable ")) <= 120
+
+
+def test_a_working_install_still_answers_its_version(tmp_path):
+    assert _install_mode_answer(tmp_path) == f"layer_reset_installed {_layer_reset_version()}\n"
+
+
+def test_a_host_without_systemd_is_skipped_and_nothing_is_written(tmp_path):
+    # 27 Nov, 8 Sysbox hosts of one provider: no systemctl, so every check wrote the files and failed at daemon-reload
+    assert _install_mode_answer(tmp_path, fail="no-systemd") == "layer_reset_skipped no_systemd\n"
+    assert not any(tmp_path.iterdir())
+
+
+def _remove_on_a_live_host(root, disable_fails: bool = False) -> subprocess.CompletedProcess:
+    log = root / "systemctl.log"
+    script = (
+        f'host_path() {{ echo "{root}$1"; }}\n'
+        + f'systemctl() {{ echo "$*" >> "{log}"; [ "$1" = disable ] && {"return 1" if disable_fails else "return 0"}; return 0; }}\n'
+        + _function("remove_layer_reset")
+        + "remove_layer_reset\n"
+    )
+    env = {k: v for k, v in os.environ.items() if k != "SYSBOX_SETUP_HOST_ROOT"}
+    return subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=env)
+
+
+def test_remove_takes_the_reset_out_of_dockers_start_and_restarts_nothing(tmp_path):
+    # DAH-7052: an installed host (enable worked), then the way back
+    assert _install_on_a_live_host(tmp_path, enable_fails=False).returncode == 0
+    (tmp_path / "systemctl.log").unlink()
+
+    result = _remove_on_a_live_host(tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    for path in ("etc/systemd/system/docker.service.d/lium-sysbox-layer-reset.conf",
+                 "etc/systemd/system/lium-sysbox-layer-reset.service", "usr/local/sbin/lium-sysbox-layer-reset"):
+        assert not (tmp_path / path).exists(), path
+    assert (tmp_path / "systemctl.log").read_text() == "disable lium-sysbox-layer-reset.service\ndaemon-reload\n"
+
+
+def test_a_failed_disable_still_leaves_docker_independent_of_the_reset(tmp_path):
+    assert _install_on_a_live_host(tmp_path, enable_fails=False).returncode == 0
+
+    result = _remove_on_a_live_host(tmp_path, disable_fails=True)
+
+    assert result.returncode != 0
+    assert not (tmp_path / "etc/systemd/system/docker.service.d/lium-sysbox-layer-reset.conf").exists()
+    # the unit stays, so the scrape still reports it and the validator tries again
+    assert (tmp_path / "etc/systemd/system/lium-sysbox-layer-reset.service").exists()
+
+
+def test_remove_on_a_host_without_the_reset_is_a_no_op(tmp_path):
+    result = _remove_on_a_live_host(tmp_path)
+    assert result.returncode == 0, result.stderr
+    assert (tmp_path / "systemctl.log").read_text() == "daemon-reload\n"
+
+
+@pytest.mark.skipif(os.getuid() == 0, reason="the not-root answer needs a non-root run")
+def test_remove_layer_reset_mode_answers_one_line_without_root(tmp_path):
+    result = subprocess.run(
+        ["bash", SCRIPT, "--remove-layer-reset"], capture_output=True, text=True, timeout=60,
+        env={**os.environ, "SYSBOX_SETUP_HOST_ROOT": str(tmp_path)},
+    )
+    assert (result.returncode, result.stdout) == (0, "layer_reset_skipped not_root\n")
+
+
+def test_remove_layer_reset_mode_never_stops_or_restarts_docker():
+    text = open(SCRIPT).read()
+    branch = re.search(r"^    --remove-layer-reset\)\n(.*?)^        ;;$", text, re.S | re.M).group(1)
+    assert "remove_layer_reset" in branch
+    code = "\n".join(l for l in (branch + _function("remove_layer_reset")).splitlines() if not l.strip().startswith("#"))
+    assert not re.search(r"systemctl (re)?start|systemctl stop|restart|docker (stop|kill|rm)|python3", code)
 
 
 def test_a_shifted_sysbox_layer_is_found_and_a_runc_container_is_left_alone(tmp_path):
@@ -557,6 +708,74 @@ def test_a_reset_cut_off_between_chown_and_restore_gets_the_setuid_bit_and_capab
     assert not os.path.exists(reset["JOURNAL"])
 
 
+
+def test_a_journaled_path_replaced_by_a_link_to_a_host_file_is_left_untouched(tmp_path):
+    reset, fs = _fake_fs(tmp_path)
+    sudo, host = fs.upper / "sudo", tmp_path / "etc/sudoers"
+    host.parent.mkdir(parents=True, exist_ok=True)
+    host.write_text("")
+    host.chmod(0o440)
+    os.makedirs(os.path.dirname(reset["JOURNAL"]), exist_ok=True)
+    with open(reset["JOURNAL"], "w") as f:
+        f.write(json.dumps({"p": str(sudo), "m": 0o4777, "c": ""}) + "\n")
+    sudo.unlink()
+    sudo.symlink_to(host)  # a pod swapped the journaled file for a link while Docker ran after a failed reset
+    reset["os"].chmod = lambda *a: pytest.fail("chmod through a replaced path")
+    reset["replay_journal"]()
+    assert stat.S_IMODE(host.stat().st_mode) == 0o440
+    assert not os.path.exists(reset["JOURNAL"])
+
+
+
+def _keyed_by_resolved_path(reset, fs):
+    """The fake layer's records and calls follow links the way the kernel does, after a parent directory moved."""
+    for records in (fs.modes, fs.owners, fs.xattrs):
+        for path in list(records):
+            records[os.path.realpath(path)] = records.pop(path)
+    for name in ("lstat", "lchown", "chmod", "getxattr", "setxattr"):
+        call = getattr(reset["os"], name)
+        setattr(reset["os"], name, lambda p, *a, _call=call, **kw: _call(os.path.realpath(p), *a, **kw))
+
+
+def test_a_reset_cut_off_under_a_data_root_behind_a_link_gets_the_setuid_bit_back(tmp_path):
+    reset, fs = _fake_fs(tmp_path)
+    (tmp_path / "data").mkdir()
+    shutil.move(str(tmp_path / "var/lib/docker"), str(tmp_path / "data/docker"))
+    (tmp_path / "var/lib/docker").symlink_to(tmp_path / "data/docker")  # Docker's data-root is a link to another disk
+    _keyed_by_resolved_path(reset, fs)
+    sudo = os.path.realpath(fs.upper / "sudo")
+    real = SimpleNamespace(**vars(reset["os"]))
+
+    def cut_off(p, m):
+        if os.path.realpath(p) == sudo:
+            raise InterruptedError()
+        return real.chmod(p, m)
+
+    reset["os"].chmod = cut_off
+    with pytest.raises(InterruptedError):
+        reset["main"]()
+    reset["os"] = real
+    reset["main"]()
+    assert stat.S_IMODE(fs.modes[sudo]) == 0o4755
+    assert fs.xattrs[sudo]["security.capability"] == b"cap-bytes"
+    assert not os.path.exists(reset["JOURNAL"])
+
+
+def test_a_journaled_path_outside_the_data_root_is_replayed(tmp_path):
+    # containerd's image store keeps a pod's layer under /var/lib/containerd, outside Docker's data-root
+    reset, fs = _fake_fs(tmp_path)
+    outside = tmp_path / "var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/7/fs/sudo"
+    outside.parent.mkdir(parents=True)
+    outside.touch()
+    sudo = str(outside)
+    fs.modes[sudo], fs.owners[sudo], fs.xattrs[sudo] = stat.S_IFREG | 0o755, 0, {}  # stripped by the chown
+    os.makedirs(os.path.dirname(reset["JOURNAL"]), exist_ok=True)
+    with open(reset["JOURNAL"], "w") as f:
+        f.write(json.dumps({"p": sudo, "m": 0o4755, "c": ""}) + "\n")
+    reset["replay_journal"]()
+    assert stat.S_IMODE(fs.modes[sudo]) == 0o4755
+    assert not os.path.exists(reset["JOURNAL"])
+
 def test_named_acl_entries_are_shifted_back_also_when_the_owner_already_matches(tmp_path):
     reset, fs = _fake_fs(tmp_path)
     renter, etc = str(fs.upper / "renterfile"), str(fs.upper / "etc")
@@ -570,17 +789,18 @@ def test_named_acl_entries_are_shifted_back_also_when_the_owner_already_matches(
     assert fs.xattrs[etc]["system.posix_acl_default"] == want
 
 
-def test_a_failing_reset_keeps_docker_down_and_a_docker_restart_never_reruns_it(tmp_path):
+def test_a_failing_reset_fails_its_unit_but_not_docker_and_a_docker_restart_never_reruns_it(tmp_path):
     reset, fs = _fake_fs(tmp_path)
 
     def broken(*a):
         raise OSError(5, "Input/output error")
 
     reset["os"].lchown = broken
-    with pytest.raises(OSError):  # the unit fails, and with it Docker's start (Requires=)
+    with pytest.raises(OSError):  # the unit fails; Docker still starts after it (DAH-7052: Wants=, not Requires=)
         reset["main"]()
     dropin = (tmp_path / "etc/systemd/system/docker.service.d/lium-sysbox-layer-reset.conf").read_text()
-    assert "Requires=lium-sysbox-layer-reset.service" in dropin
+    assert "Wants=lium-sysbox-layer-reset.service" in dropin
+    assert "Requires=" not in dropin
     assert "After=lium-sysbox-layer-reset.service" in dropin
     assert "ExecStartPost=/bin/touch /run/lium-docker-started" in dropin
     assert "RemainAfterExit=yes" in (tmp_path / "etc/systemd/system/lium-sysbox-layer-reset.service").read_text()

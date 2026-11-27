@@ -83,12 +83,21 @@ SPOT_RENTAL_INCENTIVE_FACTOR = 0.5
 
 # ── Spec measurements ────────────────────────────────────────────────────────
 
+# liumd prefixes every "cannot find the containerd store's root" scrape error with this
+CONTAINERD_ROOT_UNKNOWN = "containerd root unknown"
+# the one liumd reason whose fix is installing containerd's ctr CLI
+CONTAINERD_NO_CTR = "no ctr on the host"
+
+
 class InsufficientDisk(BaseModel):
     """Measured totals of a machine whose disk is below the required margin over its GPU VRAM."""
 
     vram_gb: float
     disk_gb: float
     rate: float  # required disk-to-VRAM margin the machine failed to clear
+    disk_unknown: bool = False  # the containerd store's root could not be found: disk_gb is not a reading
+    unknown_cause: str = ""  # the scrape's own reason for that, from the marker on
+    needs_ctr: bool = False  # that reason is a missing ctr CLI, the only cause installing ctr fixes
 
 
 class InsufficientRam(BaseModel):
@@ -131,6 +140,8 @@ class PortLimitedRemainder(BaseModel):
     free_split_count: int
     paid_split_count: int  # splits that have a port: their GPUs keep the idle pay
     unpaid_gpu_count: int
+    # the count is this deferred cycle's filler ports (DAH-5851), not a measure of the node's free ports
+    port_check_deferred: bool = False
 
 
 class DiskLimitedRemainder(BaseModel):
@@ -377,6 +388,21 @@ class RentalPriceIncentive(DefaultIncentive):
             if log_if_cannot_measure:
                 self._log_insufficient_disk_unmeasured(result, f"unreadable scrape: {exc!r}")
             return None
+        scrape_error = str(spec.get("hard_disk_scrape_error") or "")
+        marker_at = scrape_error.find(CONTAINERD_ROOT_UNKNOWN)
+        if vram_gb > 0 and marker_at >= 0:
+            # the scrape could not find where Docker's containerd store keeps containers: fail closed,
+            # or hiding the store's root would pass the gate (liumd's CONTAINERD_ROOT_UNKNOWN).
+            # The marker wins over any total: VerifyX later fills totals from another filesystem
+            return InsufficientDisk(
+                vram_gb=round(vram_gb, 1),
+                disk_gb=0.0,
+                rate=MIN_DISK_TO_VRAM_RATE,
+                disk_unknown=True,
+                # miner-supplied text, shown back to that miner: bounded so it cannot flood the log line
+                unknown_cause=scrape_error[marker_at:][:300].rstrip("\"')"),
+                needs_ctr=CONTAINERD_NO_CTR in scrape_error[marker_at:],
+            )
         if vram_gb <= 0 or disk_gb <= 0:
             # either number missing or zeroed: fail open, nobody loses incentive over telemetry
             if log_if_cannot_measure:
@@ -481,7 +507,9 @@ class RentalPriceIncentive(DefaultIncentive):
                     "gpu_model": result.gpu_model,
                     "gpu_count": result.gpu_count,
                     "total_vram_gb": measured.vram_gb,
-                    "total_disk_gb": measured.disk_gb,
+                    "total_disk_gb": None if measured.disk_unknown else measured.disk_gb,
+                    # unknown is not measured-short: a dashboard on this line must not count it as disk-short
+                    "disk_unknown": measured.disk_unknown,
                     "min_disk_to_vram_rate": measured.rate,
                     "enforced": True,
                     "reason": ZeroIncentiveReason.INSUFFICIENT_DISK_FOR_VRAM,
@@ -634,12 +662,16 @@ class RentalPriceIncentive(DefaultIncentive):
         if isinstance(verified, list):
             # a port two mappings both publish can still serve only one renter
             available = min(available, len(set(verified)))
-        # DAH-5851: a deferred port check lists the last completed check's ports but pays only from this cycle's
-        deferred: Any = result.spec.get("deferred_idle_pay_port_count")
-        if isinstance(deferred, int) and not isinstance(deferred, bool):
-            available = min(available, deferred)
         free_gpu_count: int = result.gpu_count + result.port_unpaid_gpu_count
         free_split_count: int = free_gpu_count // result.gpu_splitting_min_count
+        # DAH-5851: a deferred port check lists the last completed check's ports but pays only from this cycle's
+        deferred: Any = result.spec.get("deferred_idle_pay_port_count")
+        # the listed ports would pay every free split: only the deferral limits the pay, not the node's ports
+        port_check_deferred: bool = free_split_count > 0 and available >= max(free_split_count, MIN_PORT_COUNT)
+        if isinstance(deferred, int) and not isinstance(deferred, bool):
+            available = min(available, deferred)
+        else:
+            port_check_deferred = False
         # the rent path refuses any pod below MIN_PORT_COUNT free ports, so below it no split is rentable
         paid_split_count: int = min(free_split_count, available) if available >= MIN_PORT_COUNT else 0
         # free GPUs below one whole split can't be listed or rented, so they get no idle pay either
@@ -654,6 +686,7 @@ class RentalPriceIncentive(DefaultIncentive):
             unpaid_gpu_count=free_gpu_count
             if paid_split_count == 0
             else (free_split_count - paid_split_count) * result.gpu_splitting_min_count,
+            port_check_deferred=port_check_deferred,
         )
 
     @staticmethod
@@ -715,7 +748,9 @@ class RentalPriceIncentive(DefaultIncentive):
                     "paid_split_count": port_limited.paid_split_count,
                     "unpaid_gpu_count": port_limited.unpaid_gpu_count,
                     "enforced": True,
-                    "reason": ZeroIncentiveReason.PORT_LIMITED_REMAINDER,
+                    "reason": ZeroIncentiveReason.PORT_CHECK_DEFERRED_REMAINDER
+                    if port_limited.port_check_deferred
+                    else ZeroIncentiveReason.PORT_LIMITED_REMAINDER,
                     "pool": "rental_partial" if port_limited.paid_split_count else "rental_excluded",
                 },
             )
@@ -1286,21 +1321,6 @@ class RentalPriceIncentive(DefaultIncentive):
         job_result.spot_pay_candidate = True
         return job_result
 
-    @staticmethod
-    def _qualify_spot_node_by_the_secure_decision(job_result: JobResult) -> JobResult:
-        """A spot node that a secure node in its place would be paid for is paid, whether or
-        not a Lium filler runs on it; only the amount differs (_price_spot_node). One a secure node
-        would not be paid for takes the unrented not-paid path in calculate_executor_score."""
-        job_result.eligible_for_rental_share = False
-        job_result.mining_score = 0
-        if job_result.filler_revenue_per_gpu_hour is None:
-            job_result.record_incentive_log(
-                MinerLogLine.no_payout_because_spot_no_filler_revenue_for_gpu_config(job_result)
-            )
-            return job_result
-        job_result.spot_pay_candidate = True
-        return job_result
-
     def _price_spot_node(self, result: JobResult) -> None:
         """Spot rate per GPU = min(FILLER_REVENUE_PAY_FACTOR x filler average,
         SPOT_IDLE_SECURE_RATE_SHARE x the secure rate for this node).
@@ -1519,8 +1539,7 @@ class RentalPriceIncentive(DefaultIncentive):
             logger.info(exclusion.to_internal_log())
             job_result.record_incentive_log(exclusion)
         excluded_from_both_pools: bool = excluded_for_outdated_image or bool(exclusions)
-        on_spot_pay_path: bool = self._on_spot_pay_path(job_result)
-        if on_spot_pay_path and not settings.SPOT_IDLE_PAY_SECURE_DECISION_ENABLED:
+        if self._on_spot_pay_path(job_result):
             # a Spot split remainder is paid only for the free splits a renter could take, as a secure one
             payable: bool = self._limit_split_remainder(
                 job_result, job_result.score > 0 or job_result.job_score > 0, not excluded_from_both_pools
@@ -1639,8 +1658,6 @@ class RentalPriceIncentive(DefaultIncentive):
                 1.0 if job_result.sysbox_runtime else 0.0,
             )
 
-        if on_spot_pay_path and eligible_for_rental_share:
-            return self._qualify_spot_node_by_the_secure_decision(job_result)
         job_result.eligible_for_rental_share = eligible_for_rental_share
         if job_result.eligible_for_rental_share:
             # NOT a penalty: an unrented executor of an eligible GPU model is intentionally

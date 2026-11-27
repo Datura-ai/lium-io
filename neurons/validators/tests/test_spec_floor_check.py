@@ -71,6 +71,46 @@ async def test_implausible_spec_fails_idle_node_fatally(kwargs, finding, context
     assert finding in result.event.what_we_saw["findings"]
 
 
+_REAL = "0" * 31 + "1:" + "a" * 64
+_EMPTY_MD5 = "d41d8cd98f00b204e9800998ecf8427e"
+_EMPTY_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
+
+def _checksums(**overrides):
+    return {"docker": _REAL, "nvidia_smi": _REAL, "libnvidia_ml": _REAL, **overrides}
+
+
+@pytest.mark.parametrize(
+    "checksums",
+    [
+        # md5 of zero bytes in both halves
+        _checksums(docker=f"{_EMPTY_MD5}:{_EMPTY_MD5}", nvidia_smi=f"{_EMPTY_MD5}:{_EMPTY_MD5}"),
+        _checksums(nvidia_smi=f"{_EMPTY_MD5}:{_EMPTY_SHA256}"),
+        _checksums(docker="0" * 31 + "1:" + _EMPTY_SHA256),
+        _checksums(docker=""),
+        {"libnvidia_ml": _REAL},
+        "not-a-dict",
+    ],
+)
+@pytest.mark.asyncio
+async def test_file_checksums_no_real_host_reports_fail_the_node(checksums, context_factory):
+    specs = {**_specs(), "md5_checksums": checksums}
+    ctx = context_factory(state=build_state(specs=specs))
+
+    result = await SpecFloorCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.what_we_saw["findings"] == ["file_checksums"]
+
+
+@pytest.mark.asyncio
+async def test_real_file_checksums_pass(context_factory):
+    specs = {**_specs(), "md5_checksums": _checksums()}
+    ctx = context_factory(state=build_state(specs=specs))
+
+    assert (await SpecFloorCheck().run(ctx)).passed is True
+
+
 @pytest.mark.asyncio
 async def test_one_card_read_twice_in_a_scrape_passes(context_factory):
     # A healthy node's scrape can list one card twice; the kernel-count check owns a short set.

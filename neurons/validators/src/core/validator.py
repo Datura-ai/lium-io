@@ -234,6 +234,7 @@ class Validator:
             backend_client=self.backend_client,
             subtensor_client=self.subtensor_client,
             cycle_inputs=self.express_lane_cycle_inputs,
+            registry_digest=self.fetch_executor_digest_or_none,
         )
         # DAH-5215: re-probes rented pods' SSH between cycles; observe only.
         self.rented_pod_watch = RentedPodWatch(backend_client=self.backend_client)
@@ -466,12 +467,11 @@ class Validator:
 
                 # A fresh job-files directory for this cycle; the ones an express verification
                 # still reads are kept (DAH-2958). The express lane uses the new one from here on.
-                # Built before the cycle and the rollout window count: a failed build (obfuscator exit) retries next tick.
-                # keep the published inputs' directory too: an express tick reads it until the new inputs are published below
-                keep = self.express_lane.directories_in_use()
-                if self.cycle_inputs is not None:
-                    keep.add(self.cycle_inputs.encrypted_files.tmp_directory)
-                encrypted_files = self.file_encrypt_service.ecrypt_miner_job_files(keep_directories=keep)
+                # Prepared before the cycle and the rollout window count: a failed obfuscator run retries next tick.
+                # DAH-5899: the binary is built later, only if a stdin scrape fails.
+                encrypted_files = self.file_encrypt_service.prepare_cycle_job_files(
+                    keep_directories=self.job_file_directories_in_use
+                )
 
                 # DAH-3405: a push between two cycles opens the grace window here, after the last
                 # early return and before the first job of this cycle runs against the new digest,
@@ -491,6 +491,8 @@ class Validator:
                         rollout_earlier_digests=tuple(filter(None, map(normalize_sha256_digest, earlier))),
                     )
 
+                wave_started_at = time.monotonic()
+                wave_cpu_started_at = time.process_time()
                 logger.info(
                     _m(
                         "[sync] Send jobs to miners",
@@ -529,6 +531,8 @@ class Validator:
                     executor_image_snapshot=executor_image_snapshot,
                     job_batch_id=job_batch_id,
                     fleet_known_since=self.first_cycle_started_at,
+                    job_block=job_block,
+                    rollout_window=rollout_window,
                     maintenance_ends={
                         executor_id: window.expiring_at
                         for executor_id, window in (
@@ -688,7 +692,7 @@ class Validator:
                     # DAH-6564: one cycle-end read of the rented list, shared by the carry and the rental-change rule
                     rented_at_end = await self.rented_at_cycle_end(all_job_results)
                     await self.carry_scores_over_renter_gpu_resets(
-                        all_job_results, rented_executors, miner_coldkeys, rented_at_end
+                        all_job_results, rented_executors, miner_coldkeys, rented_at_end, job_block=job_block
                     )
                     total_gpu_model_count_map = settle_cycle_results(
                         all_job_results,
@@ -722,7 +726,7 @@ class Validator:
                     all_job_results, withheld_results = await self.withhold_verdicts_for_rollout(
                         all_job_results, job_block, job_batch_id, rollout_window, rented_executors, rented_at_end
                     )
-                    await remember_rented_scored_results(all_job_results, self.redis_service)
+                    await remember_rented_scored_results(all_job_results, self.redis_service, job_block=job_block)
 
                     # DAH-2622: a miner whose machine passed validation must keep its UID even
                     # when it earned nothing this cycle. Overwrite, never accumulate. A miner with a
@@ -927,6 +931,10 @@ class Validator:
                                     "failed_executors": incentive.failed_executors,
                                     "withheld_executors": len(withheld_results),
                                     "completed_cycles_since_start": self.completed_cycles_since_start,
+                                    "wave_duration_seconds": round(time.monotonic() - wave_started_at, 1),
+                                    "miners": len(miners),
+                                    "timed_out_miners": len(pending),
+                                    "wave_cpu_seconds": round(time.process_time() - wave_cpu_started_at, 1),
                                 }
                             ),
                         ),
@@ -1591,16 +1599,33 @@ class Validator:
         rented_executors: RentedExecutorsResponse | None,
         miner_coldkeys: dict[str, str | None],
         rented_now: RentedExecutorsResponse | None,
+        *,
+        job_block: int,
     ) -> None:
-        """DAH-4658: only a node the backend still lists as rented carries its score: at the cycle end (`rented_now`),
-        or in this cycle's snapshot when the backend did not answer."""
+        """DAH-4658: only a node the backend still lists as rented carries its score over a GPU reset: at the cycle end
+        (`rented_now`), or in this cycle's snapshot when the backend did not answer. DAH-5933: a no-task-time hold carries
+        an idle node's too, and only on the cycle-end read itself."""
         if not has_renter_gpu_reset_holds(all_job_results):
             return
         rented = rented_now or rented_executors
         rented_executor_ids = {str(executor_id).lower() for executor_id in rented.executors} if rented else set()
         await carry_renter_gpu_reset_results(
-            all_job_results, self.redis_service, rented_executor_ids, rented_executors, miner_coldkeys
+            all_job_results,
+            self.redis_service,
+            rented_executor_ids,
+            rented_executors,
+            miner_coldkeys,
+            rented_now,
+            job_block=job_block,
         )
+
+    def job_file_directories_in_use(self) -> set[str]:
+        """The job-file directories to keep: the express lane's, and the published inputs' one, which an express
+        tick reads until the new inputs are published."""
+        keep = set(self.express_lane.directories_in_use())
+        if self.cycle_inputs is not None:
+            keep.add(self.cycle_inputs.encrypted_files.tmp_directory)
+        return keep
 
     async def rented_at_cycle_end(
         self, all_job_results: dict[str, list[JobResult]]

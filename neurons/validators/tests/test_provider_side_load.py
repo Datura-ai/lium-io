@@ -22,6 +22,7 @@ from neurons.validators.src.services.task.checks.provider_side_load import (
     compute_provider_side_load,
     provider_cores_outside_lium,
 )
+from neurons.validators.src.services.task.checks import provider_side_load as provider_side_load_module
 from neurons.validators.src.services.task.pipeline import ContextState
 from neurons.validators.src.services.task.messages import ProviderSideLoadMessages as Msg
 
@@ -63,6 +64,20 @@ def test_provider_side_load_attributes_cpu_and_disk():
     load = compute_provider_side_load(SN13_SPECS, 32, {"pod_renter"})
     assert load.cpu_cores == 8.9  # 33% * 32 cores - 1.58 cores, floored
     assert load.disk_kb == 1528 * GB_KB  # 1700 - (100 + 12 + 60)
+
+
+def test_provider_side_load_on_a_split_store_subtracts_only_docker_bytes_on_data_root():
+    # liumd's split-store reading: data-root holds 900 GB used, 70 GB of it docker's; the store elsewhere is ignored
+    specs = {**SN13_SPECS, "hard_disk": {**SN13_SPECS["hard_disk"], "data_root_used": 900 * GB_KB,
+                                         "data_root_docker_used": 70 * GB_KB}}
+    load = compute_provider_side_load(specs, 32, {"pod_renter"})
+    assert load.disk_kb == 830 * GB_KB
+
+
+def test_provider_side_load_without_split_store_fields_keeps_the_old_formula():
+    assert "data_root_docker_used" not in SN13_SPECS["hard_disk"]
+    load = compute_provider_side_load(SN13_SPECS, 32, {"pod_renter"})
+    assert load.disk_kb == 1528 * GB_KB
 
 
 def test_provider_side_load_clamps_negative_to_zero():
@@ -1053,8 +1068,12 @@ async def test_a_record_older_than_any_backup_is_dropped(context_factory):
         age=5 * 3600,
     )
 
+    ctx.services.redis.delete = AsyncMock()
+
     assert await _provider_cores(ctx) == 8.9
     assert store == set()
+    # the reporter token goes with the record
+    ctx.services.redis.delete.assert_awaited_with(f"storage_reporter:{OPERATION}")
 
 
 @pytest.mark.asyncio
@@ -1132,3 +1151,23 @@ def test_a_helper_record_round_trips():
         StorageHelperRecord(str(OPERATION), 5)
     )
     assert StorageHelperRecord.parse("lium-storage-01234567-89a|5|c2") is None
+
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("status", "reported"), [("RUNNING", True), ("CANCEL_REQUESTED", False)])
+async def test_the_periodic_pass_reports_a_dead_helper_unless_its_job_is_being_cancelled(
+    context_factory, monkeypatch, status, reported
+):
+    report = AsyncMock(return_value=True)
+    monkeypatch.setattr(provider_side_load_module, "report_exited_detached_helper", report)
+    store: set[str] = set()
+    ctx = _with_recorded_helpers(
+        context_factory(state=_rented_state(SN13_SPECS), runner=_helper_runner(BACKUP_HELPER)), OPERATION, records=store
+    )
+    ctx.services.backend.get_storage_operation_active.return_value.status = status
+
+    await _provider_cores(ctx)
+
+    assert report.await_count == (1 if reported else 0)
+    assert (store == set()) is reported

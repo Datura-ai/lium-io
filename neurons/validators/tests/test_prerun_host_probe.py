@@ -5,7 +5,7 @@ volumes, mounted volumes, volume names again, GPU minor map, shared device nodes
 state, the image's encryption label). Now one probe command returns them all; every
 consumer reads its section and keeps its removals / writes as they are. Covered here:
 
-- the probe command carries every section and the exact per-command texts (`PROC_GPU_INFO_CMD`,
+- the probe command carries every section and the exact per-command texts (`HOST_PROC_GPU_INFO_CMD`,
   `POWER_STATE_CMD`, the shared-node loop, the label inspect); `with_power=False` has no nvidia-smi;
 - the parser: every section, a failed section → None, a missing `_RC` / an untagged line / an
   unknown tag → raise, the label's whole-stdout semantics;
@@ -49,8 +49,8 @@ import services.docker_service as ds_module
 from services.host_memory_guard import host_memory_guard_script
 from services.image_flatten import flatten_wait_command
 from services.nvidia_devices import (
+    HOST_PROC_GPU_INFO_CMD,
     MissingRentedGpuError,
-    PROC_GPU_INFO_CMD,
     build_gpu_docker_config_for_executor,
     shared_device_nodes_command,
 )
@@ -336,7 +336,7 @@ async def test_gpu_config_failed_proc_section_queries_live():
     probe = _probe(gpu_minor_map_stdout=None, shared_nodes=("/dev/nvidiactl",))
     ssh = _ssh(_ssh_result(stdout="GPU-1, 0\n"))
     config = await build_gpu_docker_config_for_executor(ssh, ["GPU-1"], host_probe=probe)
-    assert _cmds(ssh) == [PROC_GPU_INFO_CMD]
+    assert _cmds(ssh) == [HOST_PROC_GPU_INFO_CMD]
     assert [d.path_on_host for d in config.device_mounts] == ["/dev/nvidia0", "/dev/nvidiactl"]
 
 
@@ -841,7 +841,7 @@ async def test_only_a_customer_create_removes_fillers_at_ssh_connect(
 ):
     svc = svc_fixture
     ssh_client = _wire_customer_create_over_the_host(svc, monkeypatch, probe=_probe_with_containers(container))
-    monkeypatch.setattr(svc, "_run_bootstrap_restore", AsyncMock())
+    monkeypatch.setattr(svc, "_run_bootstrap_restore", AsyncMock(side_effect=lambda **kwargs: kwargs["ssh_client"]))
     payload = _deploy_payload(**payload_fields)
     payload.bootstrap_restore = Mock(restore_log_id="restore-log") if bootstrap_restore else None
 
@@ -872,7 +872,7 @@ async def test_uncapped_pod_gets_gpu_power_back_while_its_volume_is_created(
     """DAH-3980: the live power query overlaps the volume create, unless a restore runs first."""
     svc = svc_fixture
     _wire_early_probes(svc, monkeypatch, image_present=True)
-    monkeypatch.setattr(svc, "_run_bootstrap_restore", AsyncMock())
+    monkeypatch.setattr(svc, "_run_bootstrap_restore", AsyncMock(side_effect=lambda **kwargs: kwargs["ssh_client"]))
     raise_low = AsyncMock(return_value=0)
     monkeypatch.setattr("services.docker_service.raise_low_power_limits_to_default", raise_low)
     raised_at_volume_creation: list[int] = []

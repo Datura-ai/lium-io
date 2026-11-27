@@ -5,15 +5,16 @@ import json
 import logging
 import shlex
 import time
-import weakref
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 from typing import TYPE_CHECKING
-from uuid import UUID, uuid4
+from uuid import UUID
 
 import aiohttp
 import asyncssh
+
+from services import executor_payload
 
 if TYPE_CHECKING:
     from services.redis_service import RedisService
@@ -21,11 +22,13 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 REMOTE_OPERATION_DIRECTORY = PurePosixPath("/root/app/storage-operations")
+# the executor image's own runner: its presence marks an image that supports storage operations. It is never run; the
+# validator runs its own copy (executor_payload.STORAGE)
 REMOTE_RUNNER_PATH = "/root/app/src/storage_runner.py"
-REMOTE_SECRETS_DIRECTORY = PurePosixPath("/root/app/storage-secrets")
-# cancel markers and the per-operation launch/cancel lock live on the executor's reserve_data volume:
-# /root/app's overlay upper is wiped on every executor start, and a marker must outlive a restart
-REMOTE_CANCEL_DIRECTORY = PurePosixPath("/var/lium-reserve/storage-cancels")
+# Helpers with this label run storage_runner.py as their entrypoint: they run restic, retry and report by themselves
+# and outlive the executor container, so their docker state is the operation's state.
+WRAPPER_LABEL = "lium.storage-wrapper"
+KILLED_EXIT = 137
 
 # DAH-6148: an operation runs restic in a `lium-storage-<operation id[:12]>` helper container on
 # the node, and reruns it under the same name when it renews credentials or retries an upload.
@@ -35,6 +38,7 @@ REMOTE_CANCEL_DIRECTORY = PurePosixPath("/var/lium-reserve/storage-cancels")
 # cap: never a container that only wears the prefix, and never one after its operation ended.
 STORAGE_HELPER_PREFIX = "lium-storage-"
 STARTED_STORAGE_HELPERS_PREFIX = "started_storage_helpers:"
+STORAGE_REPORTER_PREFIX = "storage_reporter:"
 # a docker container name cannot hold ":", so no container's name or id ever matches this key
 STORAGE_HELPER_KEY_MARK = "helper:"
 # the backend fails a backup still open after 4 h (BACKUP_AUTH_TOKEN_EXPIRY_HOURS): no helper
@@ -90,15 +94,29 @@ async def _raw_records(redis: RedisService, executor_id: str) -> list[str]:
     return [m.decode() if isinstance(m, bytes) else str(m) for m in members or ()]
 
 
+def _reporter_key(operation_id: UUID | str) -> str:
+    return f"{STORAGE_REPORTER_PREFIX}{UUID(str(operation_id))}"
+
+
 async def note_started_storage_helper(
-    redis: RedisService, executor_id: str, operation_id: UUID | str
+    redis: RedisService,
+    executor_id: str,
+    operation_id: UUID | str,
+    spec: Mapping[str, object] | None = None,
 ) -> None:
-    """Records the operation starting its helper on this executor."""
+    """Records the operation starting its helper on this executor, and the reporter this validator built
+    for it: a later report on the operation (killed helper, cancel) never takes its target from the node."""
 
     async def note() -> None:
-        record = StorageHelperRecord(str(operation_id), int(time.time()))
+        record = StorageHelperRecord(str(UUID(str(operation_id))), int(time.time()))
         await redis.sadd(_key(executor_id), record.format())
         await redis.expire(_key(executor_id), STARTED_STORAGE_HELPERS_TTL_SECONDS)
+        if spec and isinstance(spec.get("reporter"), Mapping):
+            await redis.set(
+                _reporter_key(operation_id),
+                json.dumps({"action": spec.get("action"), "reporter": spec["reporter"]}),
+                ex=STARTED_STORAGE_HELPERS_TTL_SECONDS,
+            )
 
     await _redis_call(f"record {operation_id} on {executor_id}", note)
 
@@ -112,8 +130,9 @@ async def forget_storage_helper(
     async def forget() -> None:
         for raw in await _raw_records(redis, executor_id):
             record = StorageHelperRecord.parse(raw)
-            if record and record.operation_id == str(operation_id):
+            if record and record.operation_id == str(UUID(str(operation_id))):
                 await redis.srem(_key(executor_id), raw)
+        await redis.delete(_reporter_key(operation_id))
 
     await _redis_call(f"forget {operation_id} on {executor_id}", forget)
 
@@ -160,6 +179,8 @@ async def settle_excused_storage_helper_keys(
     async def drop_ended_records() -> None:
         for raw in ended:
             await redis.srem(_key(executor_id), raw)
+            if record := records.get(raw):
+                await redis.delete(_reporter_key(record.operation_id))
 
     if ended:
         await _redis_call(f"drop ended helpers of {executor_id}", drop_ended_records)
@@ -170,10 +191,6 @@ class StorageOperationLaunchError(RuntimeError):
     pass
 
 
-class StorageOperationCancelledBeforeLaunch(StorageOperationLaunchError):
-    pass
-
-
 @dataclass(frozen=True)
 class StorageOperationFiles:
     spec: PurePosixPath
@@ -181,10 +198,8 @@ class StorageOperationFiles:
     pid: PurePosixPath
     status: PurePosixPath
     cancel: PurePosixPath
-    lock: PurePosixPath
-    start: PurePosixPath
-    part: PurePosixPath
-    legacy_cancel: PurePosixPath
+    # the operation's helper container: it, not the files above, outlives an executor restart
+    helper: str = ""
 
     @classmethod
     def for_operation(cls, operation_id: UUID) -> StorageOperationFiles:
@@ -194,16 +209,13 @@ class StorageOperationFiles:
             log=REMOTE_OPERATION_DIRECTORY / f"{stem}.log",
             pid=REMOTE_OPERATION_DIRECTORY / f"{stem}.pid",
             status=REMOTE_OPERATION_DIRECTORY / f"{stem}.status",
-            cancel=REMOTE_CANCEL_DIRECTORY / f"{stem}.cancel",
-            # one lock per operation: a slow launch or cancel of one operation never holds up another's
-            lock=REMOTE_CANCEL_DIRECTORY / f"{stem}.lock",
-            # the recorded process's start time: with the PID it names one process, never one that reused the PID
-            start=REMOTE_OPERATION_DIRECTORY / f"{stem}.start",
-            # the spec while the launch receives it; one name per operation, so a cut launch's copy is overwritten
-            part=REMOTE_OPERATION_DIRECTORY / f"{stem}.json.part",
-            # the marker a runner started by an earlier validator release watches
-            legacy_cancel=REMOTE_OPERATION_DIRECTORY / f"{stem}.cancel",
+            cancel=REMOTE_OPERATION_DIRECTORY / f"{stem}.cancel",
+            helper=helper_container_name(operation_id),
         )
+
+
+def helper_container_name(operation_id: UUID) -> str:
+    return f"lium-storage-{str(operation_id)[:12]}"
 
 
 async def supports_storage_operation(
@@ -211,31 +223,23 @@ async def supports_storage_operation(
     engine: object,
 ) -> bool:
     required_binary = "/usr/local/bin/restic" if engine == "restic" else "/usr/bin/aws"
+    # the interpreter the validator runs the operation with must start, or the run would end before it could report
     result = await ssh_client.run(
-        f"test -r {shlex.quote(REMOTE_RUNNER_PATH)} && test -x {shlex.quote(required_binary)}",
+        f"test -r {shlex.quote(REMOTE_RUNNER_PATH)} && test -x {shlex.quote(required_binary)} && "
+        f"{shlex.quote(executor_payload.EXECUTOR_PYTHON)} -I -c ''",
         check=False,
     )
     return result.exit_status == 0
 
 
-# Asks the executor's own storage models whether `workspace.bootstrap` exists (DAH-3274). An
-# executor image from before it drops the unknown key and refuses the non-empty target the
-# pod's entrypoint has already written to, so the create must stop before `docker run`.
-# Exit 0 = the field exists, exit 3 = the models import but have no such field (an old image);
-# any other status is the probe itself failing (no python at that path = 127, an import error =
-# 1, …) and is reported as such, not read as an old image (review, taiberium).
-# DAH-2002: the same probe for `workspace.exclude_patterns`; an old image would back up what the excludes skip.
-# An image with no `storage` package at all predates every field, so it is an old image too (exit 3);
-# any other import error re-raises, so its traceback reaches the probe's stderr.
+# Asks the storage models the operation will run with, the validator's copy staged on the executor and loaded by the
+# executor's interpreter, whether `workspace.bootstrap` exists (DAH-3274) or `workspace.exclude_patterns` (DAH-2002).
+# Exit 0 = the field exists, exit 3 = the models import but have no such field; any other status is the probe itself
+# failing (no python at that path = 127, an import error = 1, …) and is reported as such (review, taiberium).
 _WORKSPACE_FIELD_PROBE = (
     "import sys\n"
-    "sys.path.insert(0, '/root/app/src')\n"
-    "try:\n"
-    "    from storage.models import WorkspaceSpec\n"
-    "except ModuleNotFoundError as e:\n"
-    "    if e.name not in ('storage', 'storage.models'):\n"
-    "        raise\n"
-    "    sys.exit(3)\n"
+    "sys.path.insert(0, sys.argv[2])\n"
+    "from storage.models import WorkspaceSpec\n"
     "sys.exit(0 if sys.argv[1] in WorkspaceSpec.__dataclass_fields__ else 3)"
 )
 _BOOTSTRAP_PROBE_FIELD_MISSING = 3
@@ -253,13 +257,16 @@ async def supports_workspace_field(
     python_path: str,
     field: str,
 ) -> bool:
-    """True when the executor's models know `workspace.<field>`, False when they do not.
+    """True when the storage models the operation runs with know `workspace.<field>`, False when they do not.
 
     Raises RuntimeError, with the exit status and the tail of stderr, when the probe could not
-    answer — the caller must not take that for an old executor image.
+    answer — the caller must not take that for a missing field.
     """
     result = await ssh_client.run(
-        f"{shlex.quote(python_path)} -c {shlex.quote(_WORKSPACE_FIELD_PROBE)} {shlex.quote(field)}",
+        f"{executor_payload.unpack('storage', cleanup=True)}; "
+        # -I: only the standard library and the staged directory the probe adds are importable
+        f"{shlex.quote(python_path)} -I -c {shlex.quote(_WORKSPACE_FIELD_PROBE)} {shlex.quote(field)} \"$d\"",
+        input=executor_payload.archive(executor_payload.STORAGE).decode(),
         check=False,
     )
     if result.exit_status == 0:
@@ -274,13 +281,6 @@ async def supports_workspace_field(
     )
 
 
-# A repeated backend dispatch of one operation reaches this validator while the first is still between its state
-# checks and its launch; both would pass the checks, and the second would rewrite the PID and spec the first's wrapper
-# checks. In-process, like the rest of an operation's dispatch: launches of one operation run one after another, so a
-# repeat finds the first launch recorded and returns it.
-_launch_locks: weakref.WeakValueDictionary[UUID, asyncio.Lock] = weakref.WeakValueDictionary()
-
-
 async def start_storage_operation(
     ssh_client: asyncssh.SSHClientConnection,
     python_path: str,
@@ -289,24 +289,8 @@ async def start_storage_operation(
     *,
     retain_terminal_artifacts: bool,
 ) -> StorageOperationFiles:
-    lock = _launch_locks.get(operation_id)
-    if lock is None:
-        lock = _launch_locks[operation_id] = asyncio.Lock()
-    async with lock:
-        return await _start_storage_operation(
-            ssh_client, python_path, operation_id, spec, retain_terminal_artifacts=retain_terminal_artifacts
-        )
-
-
-async def _start_storage_operation(
-    ssh_client: asyncssh.SSHClientConnection,
-    python_path: str,
-    operation_id: UUID,
-    spec: Mapping[str, object],
-    *,
-    retain_terminal_artifacts: bool,
-) -> StorageOperationFiles:
     files = StorageOperationFiles.for_operation(operation_id)
+    stage_dir = None
     try:
         engine = spec.get("engine")
         if not await supports_storage_operation(ssh_client, engine):
@@ -314,13 +298,9 @@ async def _start_storage_operation(
                 f"executor does not support the requested {engine or 'storage'} operation"
             )
         await ssh_client.run(
-            f"install -d -m 0700 {shlex.quote(str(REMOTE_OPERATION_DIRECTORY))} "
-            f"{shlex.quote(str(REMOTE_CANCEL_DIRECTORY))}",
+            f"install -d -m 0700 {shlex.quote(str(REMOTE_OPERATION_DIRECTORY))}",
             check=True,
         )
-        # the cancel marker outlives the cancel: a dispatch that reaches the node after it never runs
-        if await _remote_file_exists(ssh_client, files.cancel):
-            raise StorageOperationCancelledBeforeLaunch("storage operation was cancelled before launch")
         existing_state = await _operation_state(ssh_client, files)
         if existing_state == "STARTING" and await _remote_file_exists(ssh_client, files.spec):
             # A repeated backend dispatch can arrive while the first wrapper is between
@@ -330,6 +310,14 @@ async def _start_storage_operation(
                 existing_state = await _operation_state(ssh_client, files)
                 if existing_state != "STARTING":
                     break
+        if existing_state == f"STATUS:{KILLED_EXIT}":
+            await report_killed_helper(
+                operation_id, spec
+            )  # a killed helper could not report for itself
+        if existing_state.startswith("STATUS:") and not retain_terminal_artifacts:
+            # an online job's finished helper (its files are gone already): a new dispatch runs it again
+            await _remove_operation_artifacts(ssh_client, files)
+            existing_state = "STARTING"
         if existing_state == "RUNNING" or existing_state.startswith("STATUS:"):
             return files
         if await _runner_alive(ssh_client, files):
@@ -337,21 +325,42 @@ async def _start_storage_operation(
             # its helper; a second runner would interrupt it.
             # A helper whose runner died is an orphan: it is removed below and the run relaunched.
             return files
-        # The spec (it holds the repository credentials) goes over the launch command's stdin and is written only
-        # under the operation's lock, after the operation has been checked again there, to one file per operation
-        # that the launch's own exit, the next launch and the artifact cleanup all remove: a launch cut at any
-        # point leaves no copy under a name nothing cleans.
-        payload = json.dumps(dict(spec), separators=(",", ":"), sort_keys=True)
-        runner = " ".join(
-            shlex.quote(item)
-            for item in [
-                python_path,
-                REMOTE_RUNNER_PATH,
-                "--spec",
-                str(files.spec),
-                "--cancel-file",
-                str(files.cancel),
-            ]
+        if existing_state in {"EXITED", "INVALID"} or await _remote_file_exists(
+            ssh_client, files.spec
+        ):
+            await _remove_operation_artifacts(ssh_client, files)
+        await _remove_stale_helper_container(ssh_client, operation_id)
+
+        # the validator's own runner, staged and checked before the spec (which carries the repository credentials) is
+        # written; its imports are tried with the launch's interpreter and flags, so a runner that cannot start fails
+        # this dispatch, which still reports, instead of ending before it reads its operation
+        staged = await ssh_client.run(
+            f"{executor_payload.unpack('storage')}; {executor_payload.verify(executor_payload.STORAGE)}; "
+            # -I: the check sees only the standard library and the staged directory it adds, never the working directory
+            f"{shlex.quote(python_path)} -I -c {shlex.quote(_RUNNER_IMPORT_PROBE)} \"$d\" || "
+            '{ rm -rf -- "$d"; exit 1; }; printf "%s" "$d"',
+            input=executor_payload.archive(executor_payload.STORAGE).decode(),
+            check=False,
+        )
+        if staged.exit_status != 0:
+            stderr = staged.stderr if isinstance(staged.stderr, str) else ""
+            tail = " ".join(stderr.strip().splitlines()[-2:])[-300:]
+            raise StorageOperationLaunchError(
+                f"storage runner cannot start on the executor (exit {staged.exit_status}{': ' + tail if tail else ''})"
+            )
+        stage_dir = _staged_directory(staged.stdout)
+
+        async with ssh_client.start_sftp_client() as sftp:
+            async with sftp.open(str(files.spec), "w") as remote_spec:
+                await remote_spec.write(
+                    json.dumps({**spec, "detach": True}, separators=(",", ":"), sort_keys=True)
+                )
+            await sftp.chmod(str(files.spec), 0o600)
+
+        # -E -s: the runner imports only the staged files and the standard library
+        runner = (
+            f'{shlex.quote(python_path)} -E -s "$D"/{executor_payload.STORAGE[0]} '
+            f"--spec {shlex.quote(str(files.spec))} --cancel-file {shlex.quote(str(files.cancel))}"
         )
         terminal_cleanup = (
             ""
@@ -363,82 +372,63 @@ async def _start_storage_operation(
         )
         # Bootstrap callers consume the terminal files; detached online jobs
         # remove them themselves after the runner has finished reporting.
-        lock_path = shlex.quote(str(files.lock))
-        pid_path = shlex.quote(str(files.pid))
-        # The wrapper takes the operation's lock before it starts the runner, so it runs only after the
-        # launch has recorded its PID, and never once a cancel has marked the operation. It holds the
-        # lock until the runner has started (the runner does not inherit it), so a cancel's marker
-        # either stops the runner here or comes after it started, as for any running operation.
-        # fd 8 is the launch's own second handle on the lock, opened before the wrapper starts, so the wrapper opens
-        # nothing that could fail. It waits without a deadline: only this operation's launch and cancel take this
-        # lock, each for a check and a write, so a deadline could only drop a recorded run nobody would report.
         wrapper = (
-            "flock 8 && locked=1; "
-            # only the wrapper the launch recorded as the operation's process group owns its files: one whose PID
-            # write failed, or that another launch's record replaced, writes, removes and starts nothing
-            f'[ "$(cat {pid_path} 2>/dev/null)" = "$$" ] || exit 0; '
-            f"rm -f {shlex.quote(str(files.status))}; "
-            f'if [ -n "$locked" ] && ! test -e {shlex.quote(str(files.cancel))}; then '
-            f"{runner} 8>&- & child=$!; "
-            "trap 'kill -TERM \"$child\" 2>/dev/null || true' TERM INT; exec 8>&-; "
+            f"rm -f {shlex.quote(str(files.status))} {shlex.quote(str(files.cancel))}; "
+            f"{runner} & child=$!; "
+            f"printf '%s\\n' \"$child\" > {shlex.quote(str(files.pid))}; "
+            "trap 'kill -TERM \"$child\" 2>/dev/null || true' TERM INT; "
             'wait "$child"; result=$?; '
-            "else exec 8>&-; result=5; fi; "
             f"printf '%s\\n' \"$result\" > {shlex.quote(str(files.status))}; "
-            f"rm -f {shlex.quote(str(files.spec))} {pid_path} {shlex.quote(str(files.start))}{terminal_cleanup}"
+            'rm -rf -- "$D"; '
+            f"rm -f {shlex.quote(str(files.spec))} {shlex.quote(str(files.pid))} "
+            f"{shlex.quote(str(files.cancel))}{terminal_cleanup}"
         )
-        # Under the operation's lock (the cancel takes it too): refuse if a cancel has marked it, else
-        # start the wrapper as its own process group and record that group before releasing the
-        # lock, so a cancel that comes after always finds every process of the operation.
-        # The wrapper must not inherit the held lock (9>&-).
-        part_path = shlex.quote(str(files.part))
-        start_path = shlex.quote(str(files.start))
         launch_command = (
-            _owned_shell_function(files)
-            # a cut session (HUP) or a kill ends the shell through its EXIT trap, which removes the partial spec
-            # only the lock holder owns the partial spec: a launch still waiting for the lock removes nothing
-            + "trap 'exit 1' HUP INT TERM PIPE; "
-            # no deadline: a busy lock is another launch or cancel of this operation, whose outcome this launch reads
-            # once it holds the lock (an incumbent run returns it), so a busy lock is never reported as a failure
-            f"command exec 9>>{lock_path} 2>/dev/null && flock 9 || exit 6; trap 'rm -f {part_path}' EXIT; "
-            # the wrapper's handle on the lock (fd 8): a failed open fails this launch, which reports it
-            f"command exec 8<{lock_path} 2>/dev/null || exit 6; "
-            f"if test -e {shlex.quote(str(files.cancel))}; then rm -f {shlex.quote(str(files.spec))}; exit 5; fi; "
-            # another launch (this or another validator process) got there first: a live recorded wrapper (or a
-            # runner recorded before process groups) is the operation, and a written status is its result;
-            # their PID, spec and status stay as they are
-            f"test -s {shlex.quote(str(files.status))} && exit 0; "
-            f'if p=$(cat {pid_path} 2>/dev/null) && [ -n "$p" ] && owned "$p" '
-            '&& { kill -0 -"$p" 2>/dev/null || kill -0 "$p" 2>/dev/null; }; then exit 0; fi; '
-            # nothing of the operation runs: a dead run's files and its orphaned helper go, then this spec is written
-            f"rm -f {' '.join(shlex.quote(str(path)) for path in (files.status, files.log, files.pid, files.start))} "
-            f"{shlex.quote(str(files.spec))}; "
-            f"/usr/bin/docker rm -f -- {shlex.quote(storage_helper_name(operation_id))} >/dev/null 2>&1; "
-            # all of it or nothing: a session cut mid-transfer ends stdin early, and that spec must not run
-            f"{{ (umask 077; cat > {part_path}) && test \"$(wc -c < {part_path})\" -eq {len(payload.encode())}; }} || exit 9; "
-            f"mv {part_path} {shlex.quote(str(files.spec))} || exit 8; "
-            f"setsid nohup /bin/sh -c {shlex.quote(wrapper)} "
-            f"> {shlex.quote(str(files.log))} 2>&1 < /dev/null 9>&- & exec 8<&-; "
-            # the start time first: a PID file is never there without the start time that names its process
-            "wrapper=$!; started_at=$(sed 's/.*) //' /proc/\"$wrapper\"/stat 2>/dev/null | cut -d' ' -f20); "
-            f"if ! {{ test -n \"$started_at\" && printf '%s\\n' \"$started_at\" > {start_path} "
-            f"&& printf '%s\\n' \"$wrapper\" > {pid_path}; }}; then "
-            # the wrapper is still waiting for this lock, so nothing of the operation has run yet
-            'kill -KILL -"$wrapper" 2>/dev/null; '
-            f"rm -f {shlex.quote(str(files.spec))} {pid_path} {start_path}; exit 7; fi"
+            f"D={shlex.quote(stage_dir)} nohup /bin/sh -c {shlex.quote(wrapper)} "
+            f"> {shlex.quote(str(files.log))} 2>&1 < /dev/null &"
         )
-        launched = await ssh_client.run(launch_command, check=False, input=payload)
-        if launched.exit_status == 5:
-            raise StorageOperationCancelledBeforeLaunch("storage operation was cancelled before launch")
-        if launched.exit_status != 0:
-            raise StorageOperationLaunchError(f"storage operation launch failed (exit {launched.exit_status})")
+        await ssh_client.run(launch_command, check=True)
         return files
     except Exception as error:
-        if isinstance(error, StorageOperationCancelledBeforeLaunch):
-            # a cancel that reached the node before this launch's spec had no reporter to report with; the
-            # backend ignores a second report on a log the cancel already made terminal
-            await _report_cancelled(operation_id, spec)
-        else:
-            await report_launch_failure(operation_id, spec, error)
+        if stage_dir is not None:
+            # the launch did not start the wrapper that removes it
+            await ssh_client.run(f"rm -rf -- {shlex.quote(stage_dir)}", check=False)
+        await report_launch_failure(operation_id, spec, error)
+        raise
+
+
+_RUNNER_IMPORT_PROBE = "import sys\nsys.path.insert(0, sys.argv[1])\nimport storage_runner"
+
+
+def _staged_directory(stdout: object) -> str:
+    try:
+        return executor_payload.staged_directory("storage", stdout)
+    except ValueError as error:
+        raise StorageOperationLaunchError(str(error)) from None
+
+
+async def run_job_with_secrets(
+    ssh_client: asyncssh.SSHClientConnection,
+    purpose: str,
+    files: tuple[str, ...],
+    auth_token: str,
+    volume_info,
+    argv: Callable[[str], list[str]],
+    log: str | None = None,
+    **run_kwargs,
+) -> None:
+    """Stage a legacy tar job, then hand it its credentials file (upload_secrets_file) and start it: the credentials reach
+    the node only once the job that reads and deletes them is in place. A failed start removes both."""
+    staged = await ssh_client.run(executor_payload.stage_job(purpose, files), check=True)
+    stage_dir = executor_payload.staged_directory(purpose, staged.stdout)
+    try:
+        # inside the job's own private directory: whatever fails (the upload's close, the start, the job), removing that
+        # directory removes the credentials, and the job's shell removes it when it ends
+        secrets_file = await upload_secrets_file(ssh_client, auth_token, volume_info, stage_dir)
+        await ssh_client.run(executor_payload.run_job(stage_dir, files, argv(secrets_file), log=log), check=True, **run_kwargs)
+    except BaseException:
+        # a cancellation too: the directory goes now, while the session is still open
+        await ssh_client.run(f"rm -rf -- {shlex.quote(stage_dir)}", check=False)
         raise
 
 
@@ -453,36 +443,36 @@ async def wait_for_storage_operation(
     while True:
         # Healthy large operations have no wall-clock deadline; only terminal
         # status or loss of the supervised runner ends this wait.
-        state, run = await _observe_operation(ssh_client, files)
+        state = await _operation_state(ssh_client, files)
         if state.startswith("STATUS:"):
             try:
                 exit_code = int(state.removeprefix("STATUS:").strip())
             except ValueError as error:
-                await _remove_operation_artifacts(ssh_client, files, run)
+                await _remove_operation_artifacts(ssh_client, files)
                 raise StorageOperationLaunchError(
                     "storage operation returned an invalid status"
                 ) from error
             if exit_code != 0:
-                detail = await _tail_operation_log(ssh_client, files.log)
-                await _remove_operation_artifacts(ssh_client, files, run)
+                detail = await _tail_operation_log(ssh_client, files.log, files.helper)
+                await _remove_operation_artifacts(ssh_client, files)
                 raise StorageOperationLaunchError(
                     f"storage operation failed with exit {exit_code}: {detail}"
                 )
-            await _remove_operation_artifacts(ssh_client, files, run)
+            await _remove_operation_artifacts(ssh_client, files)
             return
         if state == "RUNNING":
             runner_seen = True
         elif state in {"EXITED", "INVALID"} or runner_seen:
-            detail = await _tail_operation_log(ssh_client, files.log)
-            await _remove_operation_artifacts(ssh_client, files, run)
+            detail = await _tail_operation_log(ssh_client, files.log, files.helper)
+            await _remove_operation_artifacts(ssh_client, files)
             raise StorageOperationLaunchError(
                 f"storage operation runner disappeared without a terminal status: {detail}"
             )
         else:
             starting_polls += 1
             if starting_polls >= launch_grace_polls:
-                detail = await _tail_operation_log(ssh_client, files.log)
-                await _remove_operation_artifacts(ssh_client, files, run)
+                detail = await _tail_operation_log(ssh_client, files.log, files.helper)
+                await _remove_operation_artifacts(ssh_client, files)
                 raise StorageOperationLaunchError(
                     f"storage operation runner did not start: {detail}"
                 )
@@ -493,128 +483,96 @@ async def _operation_state(
     ssh_client: asyncssh.SSHClientConnection,
     files: StorageOperationFiles,
 ) -> str:
-    return (await _observe_operation(ssh_client, files))[0]
+    result = await ssh_client.run(_operation_state_command(files), check=False)
+    return (result.stdout or "").strip()
 
 
-async def _observe_operation(
-    ssh_client: asyncssh.SSHClientConnection,
-    files: StorageOperationFiles,
-) -> tuple[str, str]:
-    """The operation's state, and the run recorded with it (its PID and start time, empty when none is)."""
+async def report_exited_detached_helper(
+    run: Callable[[str], Awaitable[str | None]], redis: RedisService, operation_id: str
+) -> bool:
+    """The runner reports before it exits, so a helper that exited non-zero while the backend still has its
+    job open lost its report (killed whole, crash): the periodic pass reports it, through the reporter this
+    validator stored at launch, never one read from the node. True when it did."""
+    files = StorageOperationFiles.for_operation(UUID(operation_id))
+    state = ((await run(_operation_state_command(files))) or "").strip()
+    exit_code = state.removeprefix("STATUS:").strip()
+    if not state.startswith("STATUS:") or exit_code in ("0", "130"):
+        # 0 and 130 (cancelled): the runner reported for itself, and its report may just not have landed yet
+        return False
+    spec = await _held_reporter_spec(redis, operation_id)
+    if spec is None or not await _report_operation_status(
+        UUID(operation_id),
+        spec,
+        status="FAILED",
+        stage="BACKUP" if spec.get("action") == "backup" else "RESTORING",
+        message=(
+            "Storage helper was killed (often out of memory)"
+            if exit_code == str(KILLED_EXIT)
+            else f"Storage helper exited with code {exit_code[:20]} without reporting"
+        ),
+        attempts=3,
+    ):
+        return False
+    await run(_remove_operation_artifacts_command(files))
+    return True
+
+
+def _operation_state_command(files: StorageOperationFiles) -> str:
     status_path = shlex.quote(str(files.status))
     pid_path = shlex.quote(str(files.pid))
-    command = (
-        _owned_shell_function(files)
-        # the run is read once, before the state, and the state is judged on that read: a launch that records a new
-        # run meanwhile can never pair its identity with the old run's state (a launch writes the start time before
-        # the PID, so a mixed read names no run and its cleanup removes nothing)
-        + f"pid=$(cat {pid_path} 2>/dev/null); start=$(cat {shlex.quote(str(files.start))} 2>/dev/null); "
-        f"if test -s {status_path}; then printf 'STATUS:'; cat {status_path}; "
-        'elif test -n "$pid"; then '
-        "case \"$pid\" in (*[!0-9]*) echo INVALID;; "
-        '(*) if owned "$pid" && kill -0 "$pid" 2>/dev/null; then echo RUNNING; else echo EXITED; fi;; esac; '
-        "else echo STARTING; fi; "
-        # the same text the cleanup's `$(cat pid start)` reads for this run
-        f"printf '%s' {_RUN_MARK}; "
-        'for value in "$pid" "$start"; do test -z "$value" || printf \'%s\\n\' "$value"; done'
+    helper = shlex.quote(files.helper)
+    inspect_format = (
+        f'{{{{index .Config.Labels "{WRAPPER_LABEL}"}}}} {{{{.State.Status}}}} '
+        "{{.State.ExitCode}} {{.State.OOMKilled}}"
     )
-    result = await ssh_client.run(command, check=False)
-    state, _, run = (result.stdout or "").partition(_RUN_MARK)
-    # compared with the shell's `$(cat …)`, which drops trailing newlines
-    return state.strip(), run.rstrip("\n")
-
-
-_RUN_MARK = "--run--"
+    return (
+        # a helper running storage_runner.py is the operation: it survives an executor restart, the files do not.
+        # A killed one cannot report: OOMKilled reads as exit 137.
+        f"if state=$(/usr/bin/docker inspect -f {shlex.quote(inspect_format)} {helper} 2>/dev/null) "
+        '&& test "${state%% *}" = 1; then set -- $state; '
+        'case "$2" in (exited|dead) if test "$4" = true; then echo STATUS:137; else echo "STATUS:$3"; fi;; '
+        "(*) echo RUNNING;; esac; "
+        f"elif test -s {status_path}; then printf 'STATUS:'; cat {status_path}; "
+        # executors before the wrapper helper: their runner is a process in the executor container
+        f"elif test -s {pid_path}; then pid=$(cat {pid_path}); "
+        "case \"$pid\" in (*[!0-9]*|'') echo INVALID;; "
+        '(*) if kill -0 "$pid" 2>/dev/null; then echo RUNNING; else echo EXITED; fi;; esac; '
+        "else echo STARTING; fi"
+    )
 
 
 async def cancel_storage_operation(
     ssh_client: asyncssh.SSHClientConnection,
+    redis: RedisService,
     operation_id: UUID,
-    reporter: Mapping[str, object] | None = None,
 ) -> None:
     files = StorageOperationFiles.for_operation(operation_id)
-    # once the runner has read it, the spec holds only the reporter (DAH-6463)
-    spec = await _read_operation_spec(ssh_client, files.spec)
-    # no runner or spec on the node holds the reporter: confirm with the one the cancel request carries (2.21.0)
-    if reporter and not (spec and isinstance(spec.get("reporter"), Mapping)):
-        spec = {"reporter": reporter}
-    helper_name = storage_helper_name(operation_id)
-    cancel_path = shlex.quote(str(files.cancel))
-    pid_path = shlex.quote(str(files.pid))
-    # Let the runner terminate its Restic process and helper first. Direct
-    # process termination is only a bounded fallback for an unresponsive runner.
-    # the marker is what stops a later launch, so a cancel that cannot write it fails, but only
-    # after it has still stopped the runner and helper
-    # under the operation's lock, so a launch either sees this marker or has recorded its process group
-    # first; the PID is that group's leader, so every check and signal below covers the whole group
-    lock_path = shlex.quote(str(files.lock))
-    spec_path = shlex.quote(str(files.spec))
-    start_path = shlex.quote(str(files.start))
+    # the node's files are the provider's to write: the report goes where this validator's own record says
+    spec = await _held_reporter_spec(redis, operation_id)
+    helper = shlex.quote(files.helper)
+    legacy_runner = shlex.quote(
+        f"[-]-spec {files.spec}"
+    )  # "[-]" keeps pgrep from matching this shell
+    # Targets are named, never a stored PID (the executor shares the host's PID namespace, so a stale PID
+    # could be an unrelated process). SIGTERM to the helper: its storage_runner.py stops restic and reports CANCELLED.
     command = (
-        _owned_shell_function(files)
-        + "marked=0; "
-        # `command`: a failed open of the lock fails the step instead of ending the shell before the stop fallback
-        f"{{ install -d -m 0700 {shlex.quote(str(REMOTE_CANCEL_DIRECTORY))} && command exec 9>>{lock_path} 2>/dev/null "
-        f"&& flock -w 30 9 && touch {cancel_path}; }} || marked=4; "
-        # read under the lock: a launch that took it first has written its PID by now; release it before
-        # the bounded wait, so the operation's wrapper, which waits on it without a deadline, never waits behind it
-        f"pid=$(cat {pid_path} 2>/dev/null); exec 9>&-; "
-        # no PID after the lock is either nothing running or an earlier release's launch (this release writes
-        # both under the lock): its wrapper removes the old marker before it starts the runner and records the PID,
-        # so the marker is written only once the PID is there. The spec is no sign the run is gone (its runner
-        # unlinks it on read): while a process of the operation runs without a PID, the cancel waits, and fails
-        # if the bounded wait ends first, as nothing it could write would reach that runner
-        f"spec_alive() {{ pgrep -f -- {shlex.quote(f'[-]-spec {files.spec}')} >/dev/null; }}; "
-        f'if test -z "$pid" && ! test -s {start_path}; then attempt=0; '
-        f'while test -z "$pid" && {{ test -e {spec_path} || spec_alive; }} && test "$attempt" -lt 100; do '
-        f"sleep 0.25; attempt=$((attempt + 1)); pid=$(cat {pid_path} 2>/dev/null); done; "
-        # the failure still stops and removes the helper; no PID was verified, so nothing is signalled
-        'if test -z "$pid" && spec_alive; then '
-        f"/usr/bin/docker stop --time 5 {shlex.quote(helper_name)} >/dev/null 2>&1 || true; "
-        f"/usr/bin/docker rm -f -- {shlex.quote(helper_name)} >/dev/null 2>&1 || true; "
-        "exit 3; fi; "
-        # nothing runs yet, but a launch from an earlier validator release can still arrive; it removes the
-        # old marker, so only a runner that checks the persistent marker stops it. Fail (retryable) until it does,
-        # still stopping and removing a helper an old runner left behind, as it holds the repository credentials
-        f'if test -z "$pid" && ! grep -qF -- {shlex.quote(str(REMOTE_CANCEL_DIRECTORY))} '
-        f"{shlex.quote(REMOTE_RUNNER_PATH)} 2>/dev/null; then "
-        f"/usr/bin/docker stop --time 5 {shlex.quote(helper_name)} >/dev/null 2>&1 || true; "
-        f"/usr/bin/docker rm -f -- {shlex.quote(helper_name)} >/dev/null 2>&1 || true; "
-        "exit 5; fi; fi; "
-        # a PID recorded without a start time comes from an earlier release, whose runner watches the old marker
-        f'if test -n "$pid" && ! test -s {start_path}; then '
-        f"touch {shlex.quote(str(files.legacy_cancel))} || marked=4; fi; "
-        "case \"$pid\" in (*[!0-9]*) exit 2;; esac; "
-        # a recorded PID the host has since given to another process is not signalled; only the helper is removed.
-        # A signal needs the recorded start time to match (`started`): a PID recorded without one (before this
-        # release) is only waited for, as its runner stops on the marker itself
-        'if test -n "$pid" && owned "$pid"; then '
-        # an operation launched before process groups recorded its runner's PID, which leads no group; owned is
-        # checked again before every signal, as the PID can be reused while this waits
-        'alive() { owned "$pid" && { kill -0 -"$pid" 2>/dev/null || kill -0 "$pid" 2>/dev/null; }; }; '
-        'attempt=0; while alive && test "$attempt" -lt 100; do '
+        f"touch {shlex.quote(str(files.cancel))}; "
+        f"/usr/bin/docker kill --signal TERM {helper} >/dev/null 2>&1 || true; "
+        f'attempt=0; while test "$(/usr/bin/docker inspect -f {{{{.State.Running}}}} {helper} 2>/dev/null)" = true '
+        '&& test "$attempt" -lt 120; do sleep 0.25; attempt=$((attempt + 1)); done; '
+        # an executor before the wrapper helper: its runner is a process found by its command line
+        f"pkill -TERM -f -- {legacy_runner} 2>/dev/null; "
+        f'attempt=0; while pgrep -f -- {legacy_runner} >/dev/null && test "$attempt" -lt 100; do '
         "sleep 0.25; attempt=$((attempt + 1)); done; "
-        'if alive; then '
-        f"/usr/bin/docker stop --time 5 {shlex.quote(helper_name)} >/dev/null 2>&1 || true; "
-        'started "$pid" && { kill -TERM -"$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null; }; sleep 2; '
-        'if alive && started "$pid"; then kill -KILL -"$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true; '
-        'attempt=0; while alive && test "$attempt" -lt 20; do '
-        "sleep 0.1; attempt=$((attempt + 1)); done; fi; "
+        f"pkill -KILL -f -- {legacy_runner} 2>/dev/null; "
+        f"/usr/bin/docker stop --time 5 {helper} >/dev/null 2>&1 || true; "
         # the stopped helper still holds the repository credentials; remove it, not just stop it
-        f"/usr/bin/docker rm -f -- {shlex.quote(helper_name)} >/dev/null 2>&1 || true; "
-        "fi; "
-        'alive && exit 3 || true; '
-        "else "
-        f"/usr/bin/docker stop --time 5 {shlex.quote(helper_name)} >/dev/null 2>&1 || true; "
-        f"/usr/bin/docker rm -f -- {shlex.quote(helper_name)} >/dev/null 2>&1 || true; "
-        "fi; "
-        'exit "$marked"'
+        f"/usr/bin/docker rm -f -- {helper} >/dev/null 2>&1 || true; "
+        f'attempt=0; while pgrep -f -- {legacy_runner} >/dev/null && test "$attempt" -lt 40; do '
+        "sleep 0.25; attempt=$((attempt + 1)); done; "
+        f"! pgrep -f -- {legacy_runner} >/dev/null"
     )
     result = await ssh_client.run(command, check=False)
-    if result.exit_status == 2:
-        raise StorageOperationLaunchError("storage operation had an invalid process ID")
-    if result.exit_status == 5:
-        raise StorageOperationLaunchError("executor storage runner is not updated yet; retry the cancel after its update")
     if result.exit_status != 0:
         raise StorageOperationLaunchError("failed to cancel storage operation")
     if spec:
@@ -622,43 +580,17 @@ async def cancel_storage_operation(
     await _remove_operation_artifacts(ssh_client, files)
 
 
-async def _read_operation_spec(
-    ssh_client: asyncssh.SSHClientConnection,
-    spec_path: PurePosixPath,
-) -> Mapping[str, object] | None:
-    result = await ssh_client.run(
-        f"cat {shlex.quote(str(spec_path))}",
-        check=False,
-    )
-    if result.exit_status != 0:
-        return None
+async def _held_reporter_spec(redis: RedisService, operation_id: UUID | str) -> Mapping[str, object] | None:
+    """The reporter this validator stored when it launched the operation; None when it holds none."""
     try:
-        value = json.loads(result.stdout or "")
-    except json.JSONDecodeError:
+        raw = await asyncio.wait_for(
+            redis.get(_reporter_key(operation_id)), timeout=_STARTED_STORAGE_HELPERS_REDIS_TIMEOUT_SEC
+        )
+        value = json.loads(raw or "")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Storage operation %s: no held reporter: %s", operation_id, exc)
         return None
     return value if isinstance(value, Mapping) else None
-
-
-def _owned_shell_function(files: StorageOperationFiles) -> str:
-    """Shell `started PID` and `owned PID`.
-
-    `started`: the PID's process started at the time the launch recorded with it, so it is the process the launch
-    started and not one the host gave the PID to since. Only this allows a signal.
-
-    `owned`: the PID is still the operation's for a state read or a launch's check. A PID with no process is owned:
-    Linux does not reuse a PID while a process group of that ID is alive, so a group found under it is still the
-    operation's. With a recorded start time it must match; a PID recorded without one (before this release) is
-    owned while its command line carries the operation's spec path, as every process of the operation does."""
-    start = shlex.quote(str(files.start))
-    return (
-        f'started() {{ s=$(cat {start} 2>/dev/null) && test -n "$s" '
-        "&& test \"$(sed 's/.*) //' /proc/\"$1\"/stat 2>/dev/null | cut -d' ' -f20)\" = \"$s\"; }; "
-        'owned() { test ! -e /proc/"$1" || started "$1" || { ! test -s '
-        + start
-        + " && tr '\\000' ' ' < /proc/\"$1\"/cmdline 2>/dev/null | grep -qF -- "
-        + shlex.quote(str(files.spec))
-        + "; }; }; "
-    )
 
 
 async def _remote_file_exists(
@@ -675,6 +607,7 @@ async def _runner_alive(
 ) -> bool:
     # "[-]-spec" keeps pgrep from matching this command's own shell
     runner_pattern = f"[-]-spec {files.spec}"
+    # an executor before the wrapper helper (a running wrapper helper already reads as RUNNING)
     result = await ssh_client.run(
         f"pgrep -f -- {shlex.quote(runner_pattern)} >/dev/null",
         check=False,
@@ -682,12 +615,44 @@ async def _runner_alive(
     return result.exit_status == 0
 
 
+async def _remove_stale_helper_container(
+    ssh_client: asyncssh.SSHClientConnection,
+    operation_id: UUID,
+) -> None:
+    helper_name = storage_helper_name(operation_id)
+    await ssh_client.run(
+        f"/usr/bin/docker rm -f -- {shlex.quote(helper_name)} >/dev/null 2>&1 || true",
+        check=False,
+    )
+
+
+async def remove_finished_helpers_mounting(
+    ssh_client: asyncssh.SSHClientConnection,
+    volume_name: str,
+) -> None:
+    """An exited plain-volume helper is kept for its exit status, and so keeps the pod volume in use:
+    a pod delete removes it first, or the volume (renter data) would stay on the host."""
+    listing = (
+        f"/usr/bin/docker ps -aq --filter label={WRAPPER_LABEL} --filter status=exited"
+        f" --filter volume={shlex.quote(volume_name)}"
+    )
+    await ssh_client.run(
+        f'ids=$({listing}); test -z "$ids" || /usr/bin/docker rm -f $ids >/dev/null 2>&1 || true',
+        check=False,
+    )
+
+
 async def _tail_operation_log(
     ssh_client: asyncssh.SSHClientConnection,
     log_path: PurePosixPath,
+    helper: str = "",
 ) -> str:
+    # the launcher's log, then the wrapper helper's own (redacted) event log, which outlives an executor restart
+    fallback = (
+        f" 2>/dev/null; /usr/bin/docker logs --tail 20 {shlex.quote(helper)} 2>&1" if helper else ""
+    )
     result = await ssh_client.run(
-        f"tail -n 20 {shlex.quote(str(log_path))}",
+        f"tail -n 20 {shlex.quote(str(log_path))}{fallback}",
         check=False,
     )
     compact = " ".join((result.stdout or result.stderr or "no operation log").split())
@@ -697,32 +662,22 @@ async def _tail_operation_log(
 async def _remove_operation_artifacts(
     ssh_client: asyncssh.SSHClientConnection,
     files: StorageOperationFiles,
-    observed_run: str | None = None,
 ) -> None:
-    """Removes the operation's files under its lock, so never a launch's spec while it is being received.
+    await ssh_client.run(_remove_operation_artifacts_command(files), check=False)
 
-    `observed_run` is the run (PID and start time) a waiter saw end: once another launch has recorded a different
-    run, the files are that run's and stay. A run that ended clears its record, so no record also matches. None (a
-    cancel, whose marker stops every later launch) removes unconditionally."""
-    owner_check = (
-        ""
-        if observed_run is None
-        else f'run=$(cat {shlex.quote(str(files.pid))} {shlex.quote(str(files.start))} 2>/dev/null); '
-        f'test -z "$run" || test "$run" = {shlex.quote(observed_run)} || exit 0; '
-    )
-    await ssh_client.run(
-        # no lock, no removal: the next launch clears a dead run's files under the lock itself
-        f"command exec 9>>{shlex.quote(str(files.lock))} 2>/dev/null && flock 9 || exit 0; "
-        + owner_check
-        + "rm -f "
+
+def _remove_operation_artifacts_command(files: StorageOperationFiles) -> str:
+    return (
+        "rm -f "
         + " ".join(
             shlex.quote(str(path))
-            # the cancel marker stays: the operation id is never reused, and a late launch must see it
-            # and so does the operation's lock file: removing it while a launch or cancel waits on it would split the lock
-            # shortcut: one empty lock per operation and marker per cancelled one stay on the reserve volume; sweep old ones if they pile up
-            for path in (files.status, files.log, files.pid, files.start, files.spec, files.part, files.legacy_cancel)
-        ),
-        check=False,
+            for path in (files.status, files.log, files.pid, files.spec, files.cancel)
+        )
+        + (
+            f"; /usr/bin/docker rm -f -- {shlex.quote(files.helper)} >/dev/null 2>&1 || true"
+            if files.helper
+            else ""
+        )
     )
 
 
@@ -737,6 +692,31 @@ async def report_launch_failure(
         status="FAILED",
         stage="LAUNCH",
         message=f"Storage runner launch failed: {type(error).__name__}: {error}",
+    )
+
+
+async def report_killed_helper(operation_id: UUID, spec: Mapping[str, object]) -> None:
+    await _report_operation_status(
+        operation_id,
+        spec,
+        status="FAILED",
+        # the stage the helper was in: the executor reports backups under BACKUP and restores under RESTORING
+        stage="BACKUP" if spec.get("action") == "backup" else "RESTORING",
+        message="Storage helper was killed (often out of memory)",
+        attempts=3,
+    )
+
+
+async def report_storage_operation_failed(
+    operation_id: UUID, spec: Mapping[str, object], message: str
+) -> None:
+    await _report_operation_status(
+        operation_id,
+        spec,
+        status="FAILED",
+        stage="BACKUP" if spec.get("action") == "backup" else "RESTORING",
+        message=message,
+        attempts=3,
     )
 
 
@@ -803,14 +783,16 @@ async def _report_operation_status(
     return False
 
 
-async def upload_secrets_file(ssh_client: asyncssh.SSHClientConnection, auth_token: str, volume_info) -> str:
-    """Hand the legacy tar backup/restore scripts their credentials as a fresh 0600 file.
+async def upload_secrets_file(
+    ssh_client: asyncssh.SSHClientConnection, auth_token: str, volume_info, directory: str
+) -> str:
+    """Hand the legacy tar backup/restore scripts their credentials as a fresh 0600 file in `directory`, the job's own
+    0700 staging directory (stage_job), so the file goes with it.
 
-    Keeps the values out of the remote command line. The file is
-    created exclusively with mode 0600 inside a 0700 directory; the script deletes it on read.
+    Keeps the values out of the remote command line. The file is created exclusively with mode 0600; the script deletes
+    it on read.
     """
-    path = str(REMOTE_SECRETS_DIRECTORY / f"{uuid4().hex}.json")
-    await ssh_client.run(f"install -d -m 0700 {shlex.quote(str(REMOTE_SECRETS_DIRECTORY))}", check=True)
+    path = f"{directory}/secrets.json"
     async with ssh_client.start_sftp_client() as sftp:
         async with sftp.open(path, "x", asyncssh.SFTPAttrs(permissions=0o600)) as remote_file:
             await remote_file.write(

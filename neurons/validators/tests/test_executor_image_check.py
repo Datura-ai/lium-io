@@ -2,7 +2,6 @@ from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
-from core.config import settings
 from protocol.vc_protocol.compute_requests import (
     RentedExecutor,
     RentedExecutorsResponse,
@@ -15,22 +14,13 @@ from services.executor_image_policy import (
 )
 from services.default_docker_image_digest_service import executor_build_published as real_executor_build_published
 from services.task.checks.executor_image import ExecutorImageCheck
+from services.task.messages import ExecutorImageMessages as Msg
 from services.task.score_calculator import calculate_scores
 
 from tests.helpers import build_context_config, build_state, make_context
 
 EXECUTOR_DIGEST = f"sha256:{'a' * 64}"
 STALE_DIGEST = f"sha256:{'c' * 64}"
-
-
-@pytest.fixture
-def enforce(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(settings, "EXECUTOR_IMAGE_CHECK_ENFORCE", True)
-
-
-@pytest.fixture
-def warn_only(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(settings, "EXECUTOR_IMAGE_CHECK_ENFORCE", False)
 
 
 def policy() -> ExpectedImageSnapshot:
@@ -69,7 +59,7 @@ def specs(*, executor_digest: str = EXECUTOR_DIGEST) -> dict:
 
 
 @pytest.mark.asyncio
-async def test_unrented_outdated_executor_fails_validation(enforce):
+async def test_unrented_outdated_executor_fails_validation():
     context = make_context(
         config=build_context_config(executor_image_snapshot=policy()),
         state=build_state(
@@ -82,16 +72,30 @@ async def test_unrented_outdated_executor_fails_validation(enforce):
 
     assert result.passed is False
     assert result.updates["state"].executor_image_report.status is ImageVerdict.OUTDATED
-    assert "unavailable for rent" in result.event.impact
+    assert result.event.impact == Msg.OUTDATED.impact
     assert result.event.severity == "error"
-    assert result.event.context["executor_image_check_enforced"] is True
-    assert "earns no incentive" in result.event.remediation
+    assert "off the rent list" in result.event.remediation
+    assert "a rented node keeps its rental and incentive" in result.event.remediation
 
 
 @pytest.mark.asyncio
-async def test_unobservable_executor_digest_is_unofficial(
-    enforce, no_registry_lookup_for_executor_build
-):
+async def test_rented_outdated_executor_passes_and_keeps_its_incentive():
+    # DAH-6845: the renter's pod is untouched; the node leaves the rent list only once the rental ends
+    context = make_context(
+        config=build_context_config(executor_image_snapshot=policy()),
+        state=build_state(specs=specs(executor_digest=STALE_DIGEST), rented_data=rented_data()),
+    )
+
+    result = await ExecutorImageCheck().run(context)
+
+    assert result.passed is True
+    assert result.updates["state"].executor_image_report.status is ImageVerdict.OUTDATED
+    assert result.event.impact == "Rental and incentive continue; update the image before the rental ends"
+    assert result.event.severity == "warning"  # not an ERROR line every cycle for a node that keeps its incentive
+
+
+@pytest.mark.asyncio
+async def test_unobservable_executor_digest_is_unofficial(no_registry_lookup_for_executor_build):
     no_registry_lookup_for_executor_build.side_effect = real_executor_build_published
     context = make_context(
         config=build_context_config(executor_image_snapshot=policy()),
@@ -108,33 +112,31 @@ async def test_unobservable_executor_digest_is_unofficial(
     assert result.event.reason_code == "EXECUTOR_IMAGE_UNOFFICIAL"
 
 
-@pytest.mark.parametrize(
-    ("rented", "expected_job_score"),
-    [(False, 0.0), (True, 1.0)],
-)
-def test_score_calculator_zeroes_outdated_executor(
-    enforce,
-    rented: bool,
-    expected_job_score: float,
-):
+def test_score_calculator_zeroes_an_outdated_free_node():
     report = policy().report(STALE_DIGEST)
     context = make_context(
-        state=build_state(
-            gpu_model="NVIDIA H200",
-            executor_image_report=report,
-        ),
-        collateral_deposited=True,
+        state=build_state(gpu_model="NVIDIA H200", executor_image_report=report), collateral_deposited=True
     )
 
-    actual_score, job_score, warning = calculate_scores(context, rented)
+    actual_score, job_score, warning = calculate_scores(context, False)
 
-    assert actual_score == 0.0
-    assert job_score == expected_job_score
+    assert (actual_score, job_score) == (0.0, 0.0)
     assert "Required executor image is outdated" in warning
 
 
+def test_score_calculator_leaves_an_outdated_rented_node_its_score():
+    report = replace(policy().report(STALE_DIGEST), rented_when_read=True)
+    outdated_read_while_rented = make_context(
+        state=build_state(gpu_model="NVIDIA H200", executor_image_report=report), collateral_deposited=True
+    )
+    current = make_context(state=build_state(gpu_model="NVIDIA H200"), collateral_deposited=True)
+
+    assert calculate_scores(outdated_read_while_rented, True) == calculate_scores(current, True)
+    assert calculate_scores(outdated_read_while_rented, True)[0] > 0
+
+
 @pytest.mark.asyncio
-async def test_outdated_executor_under_another_miners_rental_on_a_different_endpoint_fails(enforce):
+async def test_outdated_executor_under_another_miners_rental_on_a_different_endpoint_fails():
     # DAH-4263: another miner's rental on a different endpoint is not this node's rental.
     context = make_context(
         config=build_context_config(executor_image_snapshot=policy()),
@@ -150,8 +152,8 @@ async def test_outdated_executor_under_another_miners_rental_on_a_different_endp
 
 
 @pytest.mark.asyncio
-async def test_unrented_executor_on_a_build_we_never_published_fails_even_warn_only(
-    warn_only, no_registry_lookup_for_executor_build
+async def test_unrented_executor_on_a_build_we_never_published_fails(
+    no_registry_lookup_for_executor_build
 ):
     no_registry_lookup_for_executor_build.return_value = False
     context = make_context(
@@ -169,8 +171,8 @@ async def test_unrented_executor_on_a_build_we_never_published_fails_even_warn_o
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(("published", "build"), [(True, "official"), (None, "unknown")])
-async def test_an_outdated_build_not_known_unofficial_is_only_logged(
-    warn_only, no_registry_lookup_for_executor_build, caplog, published, build
+async def test_an_outdated_build_not_known_unofficial_is_logged(
+    no_registry_lookup_for_executor_build, caplog, published, build
 ):
     no_registry_lookup_for_executor_build.return_value = published
     context = make_context(
@@ -181,7 +183,7 @@ async def test_an_outdated_build_not_known_unofficial_is_only_logged(
     with caplog.at_level("INFO"):
         result = await ExecutorImageCheck().run(context)
 
-    assert result.passed is True
+    assert result.passed is False  # a free node on an old image
     assert result.updates["state"].executor_image_report.status is ImageVerdict.OUTDATED
     logged = [r for r in caplog.records if "EXECUTOR_BUILD" in r.getMessage()]
     assert len(logged) == 1 and logged[0].levelname == "INFO"
@@ -189,21 +191,25 @@ async def test_an_outdated_build_not_known_unofficial_is_only_logged(
 
 
 @pytest.mark.asyncio
-async def test_older_published_build_stays_a_warning(warn_only, no_registry_lookup_for_executor_build):
+@pytest.mark.parametrize("rented", [False, True])
+async def test_an_older_published_build_fails_only_a_free_node(no_registry_lookup_for_executor_build, rented):
     no_registry_lookup_for_executor_build.return_value = True
     context = make_context(
         config=build_context_config(executor_image_snapshot=policy()),
-        state=build_state(specs=specs(executor_digest=STALE_DIGEST), rented_data=SimpleNamespace(executors={})),
+        state=build_state(
+            specs=specs(executor_digest=STALE_DIGEST),
+            rented_data=rented_data() if rented else SimpleNamespace(executors={}),
+        ),
     )
 
     result = await ExecutorImageCheck().run(context)
 
-    assert result.passed is True
+    assert result.passed is rented
     assert result.updates["state"].executor_image_report.status is ImageVerdict.OUTDATED
 
 
 @pytest.mark.asyncio
-async def test_current_build_needs_no_registry_lookup(warn_only, no_registry_lookup_for_executor_build):
+async def test_current_build_needs_no_registry_lookup(no_registry_lookup_for_executor_build):
     context = make_context(
         config=build_context_config(executor_image_snapshot=policy()),
         state=build_state(specs=specs(), rented_data=SimpleNamespace(executors={})),
@@ -216,7 +222,7 @@ async def test_current_build_needs_no_registry_lookup(warn_only, no_registry_loo
 
 
 @pytest.mark.parametrize("rented", [False, True])
-def test_score_calculator_zeroes_an_unofficial_build_even_warn_only(warn_only, rented: bool):
+def test_score_calculator_zeroes_an_unofficial_build_rented_or_not(rented: bool):
     report = replace(policy().report(STALE_DIGEST), status=ImageVerdict.UNOFFICIAL)
     context = make_context(
         state=build_state(gpu_model="NVIDIA H200", executor_image_report=report),
@@ -229,7 +235,7 @@ def test_score_calculator_zeroes_an_unofficial_build_even_warn_only(warn_only, r
 
 
 @pytest.mark.asyncio
-async def test_with_enforcement_the_previous_release_in_its_grace_passes_and_keeps_incentive(enforce):
+async def test_the_previous_release_in_its_grace_passes_and_keeps_incentive():
     # DAH-6560: CURRENT feeds the image check and the incentive, not only the portal card
     in_grace = replace(policy(), rollout_previous_digest=STALE_DIGEST)
     context = make_context(
@@ -249,3 +255,48 @@ async def test_with_enforcement_the_previous_release_in_its_grace_passes_and_kee
     assert "outdated" not in (warning or "")
     # after the grace the same node is OUTDATED again
     assert policy().report(STALE_DIGEST).status is ImageVerdict.OUTDATED
+
+
+@pytest.mark.asyncio
+async def test_a_rental_ending_after_the_image_was_read_keeps_the_node_its_score():
+    # DAH-6845 review: the outdated reading was taken while rented; the rental ending before the cycle's score must
+    # not turn it into a free-node exclusion, the next cycle reads the image again on a free node
+    context = make_context(
+        config=build_context_config(executor_image_snapshot=policy()),
+        state=build_state(specs=specs(executor_digest=STALE_DIGEST), rented_data=rented_data()),
+    )
+
+    result = await ExecutorImageCheck().run(context)
+    report = result.updates["state"].executor_image_report
+    rental_ended = make_context(
+        state=build_state(gpu_model="NVIDIA H200", executor_image_report=report), collateral_deposited=True
+    )
+    current = make_context(state=build_state(gpu_model="NVIDIA H200"), collateral_deposited=True)
+
+    assert result.passed is True
+    assert report.status is ImageVerdict.OUTDATED and report.rented_when_read is True
+    assert report.as_dict()["rented_when_read"] is True
+    assert calculate_scores(rental_ended, False) == calculate_scores(current, False)
+    assert "outdated" not in (calculate_scores(rental_ended, False)[2] or "")
+
+
+@pytest.mark.asyncio
+async def test_an_outdated_image_read_on_a_free_node_records_it_free():
+    context = make_context(
+        config=build_context_config(executor_image_snapshot=policy()),
+        state=build_state(specs=specs(executor_digest=STALE_DIGEST), rented_data=SimpleNamespace(executors={})),
+    )
+
+    result = await ExecutorImageCheck().run(context)
+
+    assert result.passed is False
+    assert result.updates["state"].executor_image_report.rented_when_read is False
+
+
+def test_only_an_outdated_image_text_says_a_rented_node_keeps_its_incentive():
+    # an UNOFFICIAL build earns nothing, rented or not: its no-pay line must not promise the incentive
+    from services.executor_image_policy import outdated_image_remediation
+
+    assert "keeps its rental and incentive" in outdated_image_remediation("executor:latest", "OUTDATED")
+    unofficial = outdated_image_remediation("executor:latest", "UNOFFICIAL")
+    assert "incentive" not in unofficial and unofficial.endswith("stopped-updating.")

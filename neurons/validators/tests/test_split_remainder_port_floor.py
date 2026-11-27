@@ -396,3 +396,18 @@ async def test_partial_log_line_carries_the_split_counts(caplog):
     assert (extra["available_port_count"], extra["required_port_count"]) == (5, 8)
     assert (extra["free_split_count"], extra["paid_split_count"], extra["unpaid_gpu_count"]) == (8, 5, 3)
     assert extra["pool"] == "rental_partial"
+
+
+@pytest.mark.asyncio
+async def test_a_deferred_cycle_names_the_deferral_not_too_few_ports():
+    # the prod case: 3 free one-GPU splits listed on 300 ports, a port check deferred for disk pressure,
+    # idle pay counted from the filler's 2 ports (DAH-5851). The node's ports are not short.
+    job, _ = await _score_split(300, gpu_count=8, rented=5, spec_extra={"deferred_idle_pay_port_count": 2})
+    assert _reason_codes(job) == [ZeroIncentiveReason.PORT_CHECK_DEFERRED_REMAINDER.value]
+
+
+@pytest.mark.asyncio
+async def test_a_deferred_cycle_on_a_node_short_of_ports_stays_port_limited():
+    # the last completed check itself found too few ports: that is the node's ports, deferral or not
+    job, _ = await _score_split(2, gpu_count=8, rented=5, spec_extra={"deferred_idle_pay_port_count": 1})
+    assert _reason_codes(job) == [ZeroIncentiveReason.PORT_LIMITED_REMAINDER.value]

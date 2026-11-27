@@ -7,6 +7,9 @@ so most regressions here are of the "rents when it must not" or "penalises when 
 from __future__ import annotations
 
 import asyncio
+import re
+import subprocess
+import sys
 import time
 from contextlib import contextmanager
 from dataclasses import replace
@@ -26,6 +29,8 @@ from neurons.validators.src.services.task.checks.rental_probe import (
     RentalProbeCheck,
 )
 from neurons.validators.src.services.task.messages import RentalProbeMessages as Msg
+from neurons.validators.src.services.task.messages import render_message
+from neurons.validators.src.services.task.availability import run_availability_errors
 from neurons.validators.src.services.task.pipeline import (
     Pipeline,
     updates_with_clear_verified_job_evidence,
@@ -61,10 +66,49 @@ IMAGE = DefaultDockerImage(docker_image="daturaai/pytorch", docker_image_tag="2.
 GPU_DETAILS = [{"uuid": "GPU-aaaa", "name": "RTX 5090"}, {"uuid": "GPU-bbbb", "name": "RTX 5090"}]
 # a NAT'd node: the container binds 20001 on the host, renters reach it on 30001
 PORT_PAIRS = [(20001, 30001), (20002, 30002), (20003, 30003)]
-SMI_TWO_GPUS = (
+SMI_TWO_GPUS_LISTING = (
     "GPU 0: NVIDIA GeForce RTX 5090 (UUID: GPU-aaaa)\n"
     "GPU 1: NVIDIA GeForce RTX 5090 (UUID: GPU-bbbb)\n"
 )
+
+
+def gpu_list_output(
+    listing: str = SMI_TWO_GPUS_LISTING,
+    *,
+    nodes: tuple[int, ...] = (0, 1),
+    aliases: tuple[tuple[int, int], ...] = (),
+    minors: tuple[tuple[str, int], ...] = (("GPU-aaaa", 0), ("GPU-bbbb", 1)),
+    cuda: str = "2",
+    mig: tuple[str, ...] = ("Disabled", "Disabled"),
+) -> str:
+    """What the probe's GPU_LIST_COMMAND prints inside the renter container. A digit `cuda` is how many of
+    the listed cards CUDA brings up, each as itself; any other `cuda` is printed as given."""
+    if cuda.isdigit():
+        cuda = cuda_devices(listing, int(cuda))
+    return (
+        listing
+        + "--gpu-device-nodes--\n"
+        # the probe prints each node with its device number (hex major:minor); an alias names one card twice
+        + "".join(f"/dev/nvidia{n} c3:{n:x}\n" for n in nodes)
+        + "".join(f"/dev/nvidia{n} c3:{minor:x}\n" for n, minor in aliases)
+        + "--gpu-minors--\n"
+        + "".join(f"{u}, {m}\n" for u, m in minors)
+        + "--gpu-mig-mode--\n"
+        + "".join(f"{mode}\n" for mode in mig)
+        + "--cuda-devices--\n"
+        + (f"{cuda.rstrip()}\n" if cuda else "")
+    )
+
+
+def cuda_devices(listing: str, n: int, source: str = "cuda", memory: int = 24000) -> str:
+    """The CUDA script's lines for the first n cards of an nvidia-smi listing, each working as listed."""
+    cards = re.findall(r"^GPU \d+: (.+?) \(UUID: (GPU-[0-9a-fA-F-]+)\)", listing, re.MULTILINE)[:n]
+    return f"{source}\tcount\t{n}\n" + "".join(
+        f"{source}\t{i}\tok\t{uuid}\t{memory}\t{name}\n" for i, (name, uuid) in enumerate(cards)
+    )
+
+
+SMI_TWO_GPUS = gpu_list_output()
 
 
 @contextmanager
@@ -154,10 +198,14 @@ class FakeCreateLock:
         self.redis.create_lock_events.append("released")
 
 
+# a node with a pass on record, due for its next probe (the usual idle node); None: no pass on record
+_DUE = object()
+
+
 class FakeRedis:
     def __init__(
         self,
-        last_ok: float | None = None,
+        last_ok: float | None | object = _DUE,
         *,
         renting=False,
         broken: bool = False,
@@ -166,8 +214,11 @@ class FakeRedis:
         create_lock_broken: bool = False,
     ):
         self.store: dict[str, str] = {}
+        if last_ok is _DUE:
+            last_ok = time.time() - 7 * 3600
         if last_ok is not None:
             self.store[f"rental_probe_ok:{EXECUTOR.uuid}"] = str(last_ok)
+        self._stamp_before = self.store.get(f"rental_probe_ok:{EXECUTOR.uuid}")
         if failed_step is not None:
             self.store[f"rental_probe_failed:{EXECUTOR.uuid}"] = f"{failed_step}:"
         self.removed_pending: list[tuple[str, str, str]] = []
@@ -223,7 +274,9 @@ class FakeRedis:
         self.removed_pending.append((miner_hotkey, executor_id, pod_id))
 
     def stamped(self) -> bool:
-        return f"rental_probe_ok:{EXECUTOR.uuid}" in self.store
+        # stamped by this probe: the pass on record a test starts with does not count
+        stamp = self.store.get(f"rental_probe_ok:{EXECUTOR.uuid}")
+        return stamp is not None and stamp != self._stamp_before
 
     def standing_failure(self) -> str | None:
         raw = self.store.get(f"rental_probe_failed:{EXECUTOR.uuid}")
@@ -657,7 +710,13 @@ async def test_a_probe_that_clears_a_standing_failure_in_a_cycle_without_verifyx
         result = await RentalProbeCheck().run(ctx)
     assert result.passed is False and result.event.reason_code == Msg.CYCLE_WITHOUT_VERIFYX.reason
     assert "clear_verified_job_info" not in result.updates
-    assert redis.standing_failure() is None and redis.stamped()
+    # the dropped pass is not stamped, so the next cycle (VerifyX runs) probes in full instead of waiting an interval
+    assert redis.standing_failure() is None and not redis.stamped()
+    ctx, docker, _ = make_probe_context(redis=redis)
+    with probe_settings(), renter_path():
+        result = await RentalProbeCheck().run(ctx)
+    assert result.passed is True and result.event.reason_code == Msg.PROBE_OK.reason
+    assert result.updates.get("idle_check_passed") is True and redis.stamped()
 
 
 @pytest.mark.asyncio
@@ -670,7 +729,7 @@ async def test_a_probe_that_clears_a_standing_failure_in_a_cycle_without_the_all
     with probe_settings(), renter_path():
         result = await RentalProbeCheck().run(ctx)
     assert result.passed is False and result.event.reason_code == Msg.CYCLE_WITHOUT_ALLCARDS.reason
-    assert redis.standing_failure() is None and redis.stamped()
+    assert redis.standing_failure() is None and not redis.stamped()   # the dropped pass is not stamped
 
 
 @pytest.mark.asyncio
@@ -839,7 +898,7 @@ async def test_success_records_every_step_tears_down_and_stamps_the_interval():
     assert redis.expiries[f"rental_probe_ok:{EXECUTOR.uuid}"] == module._REDIS_STAMP_TTL_SECONDS
     probe_pod_id = docker.create_calls[0][0].pod_id
     assert redis.removed_pending == [(MINER, EXECUTOR.uuid, probe_pod_id)]
-    assert result.updates == {}
+    assert result.updates == {"idle_check_passed": True}  # DAH-6784: the full check ran and passed
 
 
 @pytest.mark.asyncio
@@ -1180,7 +1239,17 @@ async def test_gpu_count_mismatch_fails_at_gpu_count():
         step for step in result.event.what_we_saw["probe_steps"] if step["step"] == STEP_SSH_LOGIN
     )
     assert login["ok"] is True
-    assert "nvidia-smi -L did not run" in result.event.what_we_saw["probe_steps"][-2]["detail"]
+    assert "the GPU check in the container did not run over the SSH session" in (
+        result.event.what_we_saw["probe_steps"][-2]["detail"]
+    )
+
+    # review: a timeout names the GPU check as a whole and its limit, not `nvidia-smi -L`
+    ctx, docker, _ = make_probe_context()
+    with probe_settings(), renter_path(command_error=asyncssh.TimeoutError(None, None, None, None, None, None, "", "")):
+        result = await RentalProbeCheck().run(ctx)
+    assert result.passed is False and result.event.what_we_saw["failed_step"] == STEP_GPU_COUNT
+    detail = result.event.what_we_saw["probe_steps"][-2]["detail"]
+    assert detail == "the GPU check in the container did not finish within 120 s" and "nvidia-smi -L" not in detail
 
 
 @pytest.mark.asyncio
@@ -1396,8 +1465,22 @@ async def test_unreadable_state_rents_nothing():
     ctx, docker, _ = make_probe_context(redis=FakeRedis(broken=True))
     with probe_settings(), renter_path():
         result = await RentalProbeCheck().run(ctx)
-    assert result.event.reason_code == Msg.SKIPPED.reason
-    assert result.event.what_we_saw["reason"] == "interval state unreadable"
+    assert result.event.reason_code == Msg.PROOF_UNREADABLE.reason
+    assert result.event.what_we_saw["no_verdict_this_cycle"] == "skipped: interval state unreadable"
+    assert docker.create_calls == []
+
+
+@pytest.mark.asyncio
+async def test_an_unreadable_pass_record_neither_scores_nor_lists_the_node():
+    """Regression (DAH-7044 review): an unreadable pass record was decided as if a pass were on record,
+    so the cycle skipped with a pass and a node no probe had passed on could be scored and listed."""
+    ctx, docker, _ = make_probe_context(redis=FakeRedis(broken=True))
+    with probe_settings():
+        result = await RentalProbeCheck().run(ctx)
+    assert result.passed is False and result.event.reason_code == Msg.PROOF_UNREADABLE.reason
+    assert result.updates == {"score": 0.0, "job_score": 0.0}
+    # the backend keeps the stored listing state: no hide of a proven node, no listing of an unproven one
+    assert run_availability_errors(False, [result.event]) is None
     assert docker.create_calls == []
 
 
@@ -1575,7 +1658,8 @@ def test_the_probe_runs_last_before_scoring_and_never_in_dry_run():
     """Regression: the probe is placed before the port or rented checks it depends on, or the dry-run
     pipeline (staging, DRY_RUN=true) starts creating containers on providers' nodes."""
     ids = [type(check).__name__ for check in pipeline_factory.PipelineFactory.build_checks()]
-    assert ids.index("RentalProbeCheck") == ids.index("RentalVerificationCheck") + 1
+    # DAH-5933: the rental verification moved ahead of VerifyX; the probe stays after every GPU check
+    assert ids.index("RentalProbeCheck") == ids.index("CachedTemplateVerificationCheck") + 1
     # DAH-5320: only the shadow idle disk write sits between the probe and scoring
     assert ids.index("RentalProbeCheck") == ids.index("IdleDiskWriteCheck") - 1
     # DAH-5462: then VerifyX's cold-sample retry, in the time every other check left
@@ -1608,6 +1692,8 @@ async def test_pipeline_carries_the_failed_step_to_the_reset_evidence():
     assert last_ctx.clear_verified_job_info is True
     assert last_ctx.clear_verified_job_evidence["reason_code"] == "RENTAL_PROBE_FAILED"
     assert last_ctx.clear_verified_job_evidence["failed_step"] == STEP_SSHD_LISTEN
+    assert last_ctx.clear_verified_job_unrented_only is True
+    assert "unrented_only" not in last_ctx.clear_verified_job_evidence
     assert last_ctx.score == 0.0 and last_ctx.job_score == 0.0
     # the pipeline writes its own per-check `steps` summary onto the last event; the probe's records must
     # survive it under their own key, since this event is what the portal shows the provider
@@ -1878,3 +1964,543 @@ async def test_the_teardown_wait_never_outlasts_the_job():
     assert asyncio.get_running_loop().time() - started < 1
     assert not task.done()
     task.cancel()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "make_ctx, late, no_verdict",
+    [
+        (
+            lambda redis: make_probe_context(redis=redis, image_present=False),
+            0,
+            "skipped: default renter image is not pulled on the node",
+        ),
+        (lambda redis: make_probe_context(redis=redis), 650, "skipped: too little cycle time left"),
+    ],
+)
+async def test_a_node_no_probe_has_passed_on_is_not_listed_by_a_cycle_without_a_verdict(
+    make_ctx, late, no_verdict
+):
+    """Regression: a node no probe had passed on was listed with score 1.0 through cycles that reached
+    no verdict, and renters' pods then failed at create. A node is first listed by a probe that passed."""
+    redis = FakeRedis(last_ok=None)
+    ctx, docker, _ = make_ctx(redis)
+    ctx = ctx.model_copy(update={"started_at_monotonic": time.monotonic() - late})
+    with probe_settings():
+        result = await RentalProbeCheck().run(ctx)
+    assert result.passed is False and result.event.reason_code == Msg.NOT_YET_PROVEN.reason
+    assert result.event.what_we_saw["no_verdict_this_cycle"] == no_verdict
+    # nothing failed: the score is held at 0, the verified job is not cleared, no failure is recorded
+    assert result.updates == {"score": 0.0, "job_score": 0.0}
+    assert redis.standing_failure() is None and not redis.stamped()
+    assert docker.create_calls == []
+    # hidden at once (DAH-7044 review): a zero score alone leaves a node the backend holds listed
+    errors = run_availability_errors(False, [*result.extra_events, result.event])
+    assert [e["reason_code"] for e in errors] == ["VERIFICATION_FAILED"]
+    assert errors[0]["what_we_saw"]["failed_reason"] == Msg.NOT_YET_PROVEN.reason
+    # the hold is the result's own, not inferred from the run's last event: events reported after it (a passing
+    # check, network figures) leave it in place
+    later = render_message(Msg.SKIPPED, ctx=ctx, check_id="executor.validate.later", what={})
+    errors = run_availability_errors(False, [*result.extra_events, result.event, later])
+    assert [e["reason_code"] for e in errors] == ["VERIFICATION_FAILED"]
+
+
+@pytest.mark.asyncio
+async def test_a_node_the_validator_cannot_probe_keeps_its_stored_listing():
+    """Review of lio#2442: the validator has no default renter image for the node's GPU and driver, so the probe
+    never starts. Nothing is wrong with the node: it is not hidden as unproven, its listing stays as stored."""
+    redis = FakeRedis(last_ok=None)
+    ctx, docker, _ = make_probe_context(redis=redis, images=())
+    with probe_settings():
+        result = await RentalProbeCheck().run(ctx)
+    assert result.event.reason_code == Msg.NOT_RUN_ON_VALIDATOR.reason
+    assert result.event.what_we_saw["no_verdict_this_cycle"] == (
+        "inconclusive: no default renter image for this GPU and driver"
+    )
+    assert result.updates == {"score": 0.0, "job_score": 0.0} and result.extra_events == []
+    assert run_availability_errors(False, [result.event]) is None
+    assert redis.standing_failure() is None and not redis.stamped() and docker.create_calls == []
+
+
+@pytest.mark.asyncio
+async def test_a_node_with_a_pass_on_record_keeps_a_cycle_without_a_verdict_unpenalised():
+    ctx, _, _ = make_probe_context(redis=FakeRedis(last_ok=time.time() - 7 * 3600), images=())
+    with probe_settings():
+        result = await RentalProbeCheck().run(ctx)
+    assert result.passed is True and result.event.reason_code == Msg.INCONCLUSIVE.reason
+
+
+@pytest.mark.asyncio
+async def test_a_node_no_probe_has_passed_on_is_listed_by_its_first_pass():
+    redis = FakeRedis(last_ok=None)
+    ctx, _, _ = make_probe_context(redis=redis, images=())
+    with probe_settings():
+        assert (await RentalProbeCheck().run(ctx)).passed is False
+    ctx, _, _ = make_probe_context(redis=redis)
+    with probe_settings(), renter_path():
+        result = await RentalProbeCheck().run(ctx)
+    assert result.passed is True and result.event.reason_code == Msg.PROBE_OK.reason
+    assert redis.stamped()
+
+
+@pytest.mark.asyncio
+async def test_a_rented_node_no_probe_has_passed_on_is_left_alone():
+    ctx, _, _ = make_probe_context(redis=FakeRedis(last_ok=None), rented=rented_data(pods=1))
+    with probe_settings():
+        result = await RentalProbeCheck().run(ctx)
+    assert result.passed is True and result.updates == {}
+
+
+def _gpu_step(output: str, gpus: int | None = None, exit_status: int = 0, stderr: str = ""):
+    ctx, _, _ = make_probe_context()
+    if gpus is not None:
+        # the listing is the container's nvidia-smi one, as on a real node
+        details = [{"uuid": u} for u in re.findall(r"\(UUID: (GPU-[0-9a-fA-F-]+)\)", output)]
+        ctx = ctx.model_copy(update={"state": replace(ctx.state, gpu_count=gpus, gpu_details=details)})
+    outcome = module._ProbeOutcome()
+    smi = MagicMock(stdout=output, stderr=stderr, exit_status=exit_status)
+    module._step_gpu_count(ctx, outcome, module._Login(result=smi, command_seconds=0.5))
+    return outcome
+
+
+def test_gpu_count_step_fails_listed_gpus_the_container_has_no_device_node_for():
+    """Regression: nvidia-smi -L in the renter container lists every advertised card while only
+    /dev/nvidia0 was handed to it, so a renter's CUDA sees one GPU and the probe passed."""
+    outcome = _gpu_step(gpu_list_output(nodes=(0,), cuda="1"))
+    assert outcome.failed_step == STEP_GPU_COUNT
+    assert "1 usable GPU device node(s)" in outcome.steps[-1].detail
+    # the kernel lists both cards under one minor: one device node opens only one card
+    outcome = _gpu_step(gpu_list_output(minors=(("GPU-aaaa", 0), ("GPU-bbbb", 0)), cuda=""))
+    assert outcome.failed_step == STEP_GPU_COUNT
+
+
+def test_gpu_count_step_fails_when_cuda_sees_fewer_gpus_than_listed():
+    outcome = _gpu_step(gpu_list_output(cuda="1"))
+    assert outcome.failed_step == STEP_GPU_COUNT
+    assert "CUDA confirmed 1 as working devices of the listed model (1 listed GPU(s) are no CUDA device)" in (
+        outcome.steps[-1].detail
+    )
+    outcome = _gpu_step(gpu_list_output(cuda="error 100"))
+    assert outcome.failed_step == STEP_GPU_COUNT
+    assert "CUDA failed to start (error 100)" in outcome.steps[-1].detail
+
+
+def test_gpu_count_step_passes_every_device_node_and_cuda_count():
+    outcome = _gpu_step(gpu_list_output())
+    assert outcome.failed_step is None and outcome.steps[-1].ok is True
+    # an image without python3 gives no CUDA reading; the device nodes still decide
+    outcome = _gpu_step(gpu_list_output(cuda=""))
+    assert outcome.failed_step is None
+    # unreadable minors in the container: every GPU device node counts
+    outcome = _gpu_step(gpu_list_output(minors=()))
+    assert outcome.failed_step is None
+    # output without the command's sections is nothing usable
+    outcome = _gpu_step(SMI_TWO_GPUS_LISTING)
+    assert outcome.failed_step == STEP_GPU_COUNT
+
+
+@pytest.mark.asyncio
+async def test_probe_fails_a_renter_container_that_can_open_one_of_two_listed_gpus():
+    ctx, docker, _ = make_probe_context()
+    with probe_settings(), renter_path(smi_stdout=gpu_list_output(nodes=(0,), cuda="1")) as seen:
+        result = await RentalProbeCheck().run(ctx)
+    assert result.passed is False
+    assert result.event.what_we_saw["failed_step"] == STEP_GPU_COUNT
+    assert seen["conn"].commands[0] == module.GPU_LIST_COMMAND
+
+
+def test_gpu_count_step_lets_the_device_nodes_decide_on_mig_cards():
+    """CUDA enumerates MIG instances, not cards: with MIG on, a CUDA count unlike the card count is no
+    shortfall, and the device nodes still decide."""
+    outcome = _gpu_step(gpu_list_output(mig=("Enabled", "Disabled"), cuda="7"))
+    assert outcome.failed_step is None
+    outcome = _gpu_step(gpu_list_output(mig=("Enabled", "Enabled"), cuda="error 100"))
+    assert outcome.failed_step is None
+    outcome = _gpu_step(gpu_list_output(nodes=(0,), mig=("Enabled", "Enabled"), cuda="1"))
+    assert outcome.failed_step == STEP_GPU_COUNT
+    # a card without MIG support prints [N/A]: CUDA still counts
+    outcome = _gpu_step(gpu_list_output(mig=("[N/A]", "[N/A]"), cuda="1"))
+    assert outcome.failed_step == STEP_GPU_COUNT
+
+
+def test_gpu_count_without_a_cuda_reading_is_decided_by_the_device_nodes():
+    """An image without python3 prints nothing under the CUDA mark: no CUDA reading is
+    no pass by itself; the device nodes of the listed cards still decide."""
+    eight = tuple((f"GPU-{i}", i) for i in range(8))
+    listing = "".join(f"GPU {i}: NVIDIA H100 (UUID: GPU-{i})\n" for i in range(8))
+    one_node = module._usable_gpus(
+        gpu_list_output(listing, nodes=(0,), minors=eight, cuda="", mig=("Disabled",) * 8)
+    )
+    assert one_node.cuda_confirmed is None and one_node.cuda_error is None
+    assert one_node.short_of(8) == (
+        "1 of 8 GPU(s) confirmed usable: the container has 1 usable GPU device node(s) (/dev/nvidiaN)"
+    )
+    all_nodes = module._usable_gpus(
+        gpu_list_output(listing, nodes=tuple(range(8)), minors=eight, cuda="", mig=("Disabled",) * 8)
+    )
+    assert all_nodes.short_of(8) is None
+    assert _gpu_step(gpu_list_output(nodes=(0,), cuda="")).failed_step == STEP_GPU_COUNT
+    assert _gpu_step(gpu_list_output(cuda="")).failed_step is None
+
+
+# b79a5aca (8x RTX PRO 6000), real run 22 Nov: the nvidia-smi index is not the kernel minor
+B79A_UUIDS = (
+    "GPU-387f548b-c862-4bbd-5278-937ab2a27111",
+    "GPU-880613b1-43ab-d0fa-834c-57c9d2575632",
+    "GPU-eb01c9cc-24e4-c6cc-2069-b938b9dd081b",
+    "GPU-c37646d3-489b-f908-e710-614efdc4e071",
+    "GPU-ca5fa561-09e7-4f3e-ff76-de6be57a5028",
+    "GPU-70635d8f-b358-3ef7-72f7-0730c61cd0c0",
+    "GPU-932dbdf5-31ff-b429-8a4c-d0efa6ee0281",
+    "GPU-b918ddb9-aded-4789-8a8b-3e8fbe2729a4",
+)
+B79A_MINORS = (2, 3, 0, 1, 6, 7, 4, 5)
+
+
+def _smi_listing(uuids) -> str:
+    return "".join(f"GPU {i}: NVIDIA RTX PRO 6000 Blackwell Server Edition (UUID: {u})\n" for i, u in enumerate(uuids))
+
+
+def test_gpu_count_links_cards_by_uuid_to_kernel_minor_not_by_index():
+    """Real b79a5aca output passes; a one-card container whose nvidia-smi GPU 0 is kernel minor 2 needs
+    /dev/nvidia2, and /dev/nvidia0 (index match) is not its card."""
+    whole = module._usable_gpus(
+        gpu_list_output(
+            _smi_listing(B79A_UUIDS),
+            nodes=tuple(range(8)),
+            minors=tuple(zip(B79A_UUIDS, B79A_MINORS)),
+            cuda="8",
+            mig=("Disabled",) * 8,
+        )
+    )
+    assert whole.short_of(8) is None
+    one_card = dict(
+        minors=tuple(zip(B79A_UUIDS, B79A_MINORS)), cuda="1", mig=("Disabled",)
+    )
+    by_index = module._usable_gpus(gpu_list_output(_smi_listing(B79A_UUIDS[:1]), nodes=(0,), **one_card))
+    assert by_index.short_of(1) == (
+        "0 of 1 GPU(s) confirmed usable: the container has 0 usable GPU device node(s) (/dev/nvidiaN)"
+    )
+    by_minor = module._usable_gpus(gpu_list_output(_smi_listing(B79A_UUIDS[:1]), nodes=(2,), **one_card))
+    assert by_minor.short_of(1) is None
+
+
+def test_gpu_count_fails_nvidia_smi_uuids_the_kernel_does_not_list():
+    """0a8f24a9 shape, real run 22 Nov: nvidia-smi reports 8 UUIDs, the kernel lists one other card,
+    one device node, CUDA 1."""
+    fake = tuple(f"GPU-0000000{i}-0000-0000-0000-000000000000" for i in range(8))
+    shape = module._usable_gpus(
+        gpu_list_output(
+            _smi_listing(fake),
+            nodes=(0,),
+            minors=(("GPU-ad5fa337-0000-0000-0000-000000000000", 0),),
+            cuda="1",
+            mig=("Disabled",) * 8,
+        )
+    )
+    assert shape.unknown_uuids == 8
+    assert shape.short_of(8) == (
+        "0 of 8 GPU(s) confirmed usable: the container has 8 nvidia-smi GPU UUID(s) the kernel driver "
+        "does not know; the container has 0 usable GPU device node(s) (/dev/nvidiaN); CUDA confirmed 1 as "
+        "working devices of the listed model (7 listed GPU(s) are no CUDA device)"
+    )
+
+
+def test_gpu_count_reports_the_usable_count_when_listed_uuids_are_missing_from_the_kernel():
+    """Review 23 Nov: 8 listed, 7 UUIDs absent from the kernel inventory, one device node, CUDA 1. The
+    failure named the unknown UUIDs but not how many GPUs the container can use."""
+    eight = tuple(f"GPU-0000000{i}-0000-0000-0000-000000000000" for i in range(8))
+    listing = "".join(f"GPU {i}: NVIDIA H100 (UUID: {u})\n" for i, u in enumerate(eight))
+    mig = ("Disabled",) * 8
+    outcome = _gpu_step(
+        gpu_list_output(listing, nodes=(0,), minors=((eight[0], 0),), cuda="1", mig=mig), gpus=8
+    )
+    assert outcome.failed_step == STEP_GPU_COUNT
+    detail = outcome.steps[-1].detail
+    assert "nvidia-smi -L listed 8 but 1 of 8 GPU(s) confirmed usable" in detail
+    assert "7 nvidia-smi GPU UUID(s) the kernel driver does not know" in detail
+    # control: all eight device nodes and UUID mappings restored
+    whole = gpu_list_output(
+        listing, nodes=tuple(range(8)), minors=tuple(zip(eight, range(8))), cuda="8", mig=mig
+    )
+    outcome = _gpu_step(whole, gpus=8)
+    assert outcome.failed_step is None and outcome.steps[-1].ok is True
+
+
+def test_gpu_count_keeps_the_usable_count_in_the_record_with_long_diagnostic_output():
+    """Review 23 Nov: a nonzero exit with over 600 characters of diagnostic output. The recorded detail
+    kept only the output's tail and lost the usable count."""
+    eight = tuple(f"GPU-0000000{i}-0000-0000-0000-000000000000" for i in range(8))
+    listing = "".join(f"GPU {i}: NVIDIA H100 (UUID: {u})\n" for i, u in enumerate(eight))
+    mig = ("Disabled",) * 8
+    one = gpu_list_output(listing, nodes=(0,), minors=tuple(zip(eight, range(8))), cuda="1", mig=mig)
+    outcome = _gpu_step(one, gpus=8, exit_status=1, stderr="x" * 700 + " last line")
+    assert outcome.failed_step == STEP_GPU_COUNT
+    detail = outcome.steps[-1].as_record()["detail"]
+    assert "1 of 8 GPU(s) confirmed usable" in detail
+    assert detail.endswith(" last line") and len(detail) <= module._TAIL_CHARS
+
+
+def test_gpu_count_reports_the_usable_count_when_nvidia_smi_lists_too_few():
+    outcome = _gpu_step(gpu_list_output(_smi_listing(B79A_UUIDS[:1]), nodes=(0,), cuda="1"))
+    assert outcome.failed_step == STEP_GPU_COUNT
+    assert "nvidia-smi -L listed 1 (exit 0), 0 of 2 GPU(s) confirmed usable" in outcome.steps[-1].detail
+
+
+def test_gpu_count_fails_output_cut_short_before_the_cuda_section():
+    """A missing CUDA mark means the output was cut short and fails, unlike an empty CUDA section (an image
+    without python3), where the device nodes decide."""
+    full = gpu_list_output()
+    assert _gpu_step(full).failed_step is None
+    truncated = full.partition("--cuda-devices--")[0]
+    outcome = _gpu_step(truncated)
+    assert outcome.failed_step == STEP_GPU_COUNT
+    detail = outcome.steps[-1].detail
+    assert detail.endswith(
+        "but 0 of 2 GPU(s) confirmed usable: the probe output ended before the CUDA section"
+    )
+    assert "CUDA failed to start" not in detail
+    assert _gpu_step(full.partition("--gpu-mig-mode--")[0]).failed_step == STEP_GPU_COUNT
+
+
+def test_gpu_count_fails_when_libcuda_cannot_be_loaded():
+    """The CUDA script itself, run with libcuda.so.1 unloadable, must print a reading that fails the step,
+    MIG or not: no renter process can use a GPU without it."""
+    script = "import ctypes\ndef refuse(*a, **k):\n    raise OSError\nctypes.CDLL = refuse\n" + module._CUDA_DEVICES_PY
+    printed = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, check=True).stdout
+    for mig in (("Disabled", "Disabled"), ("Enabled", "Enabled")):
+        outcome = _gpu_step(gpu_list_output(cuda=printed.strip(), mig=mig))
+        assert outcome.failed_step == STEP_GPU_COUNT
+        assert "CUDA failed to start (libcuda.so.1 not found)" in outcome.steps[-1].detail
+
+
+def test_gpu_count_counts_device_nodes_by_device_number_not_name():
+    """Two node names for one card are one usable GPU; a node that is not an NVIDIA device is none."""
+    assert "stat -Lc" in module.GPU_LIST_COMMAND
+    assert _gpu_step(gpu_list_output(minors=(), cuda="")).failed_step is None
+    aliased = _gpu_step(gpu_list_output(nodes=(0,), aliases=((1, 0),), minors=(), cuda=""))
+    assert aliased.failed_step == STEP_GPU_COUNT
+    assert "1 usable GPU device node(s)" in aliased.steps[-1].detail
+    other = gpu_list_output(nodes=(0,), minors=(), cuda="").replace(
+        "--gpu-minors--", "/dev/nvidia1 1:3\n--gpu-minors--"
+    )
+    assert _gpu_step(other).failed_step == STEP_GPU_COUNT
+
+
+def test_gpu_count_reads_cuda_with_the_image_cuda_visible_devices_unset():
+    """An image default CUDA_VISIBLE_DEVICES=0 narrows nothing a renter cannot undo; the count must not
+    read it as a missing card."""
+    assert "env -u CUDA_VISIBLE_DEVICES python3 -c" in module.GPU_LIST_COMMAND
+    assert module.GPU_LIST_COMMAND.index("--gpu-mig-mode--") < module.GPU_LIST_COMMAND.index(
+        "--cuda-devices--"
+    )
+
+
+def test_the_gpu_check_has_time_for_all_its_calls():
+    # review: the step runs two nvidia-smi calls, the device-node listing, a context and a write on every CUDA
+    # device and PyTorch's import and a kernel on every device under one limit
+    assert module._GPU_CHECK_TIMEOUT_SECONDS == 120
+
+
+# A node of this shape: 8 listed cards, every device node and kernel minor in place, but CUDA cannot use
+# them as listed
+SHAPE_UUIDS = tuple(f"GPU-{i}{i}{i}{i}{i}{i}{i}{i}-1111-2222-3333-444444444444" for i in range(8))
+SHAPE_LISTING = "".join(
+    f"GPU {i}: NVIDIA GeForce RTX 4090 (UUID: {u})\n" for i, u in enumerate(SHAPE_UUIDS)
+)
+SHAPE_DETAILS = [{"uuid": u, "name": "NVIDIA GeForce RTX 4090", "capacity": "24564"} for u in SHAPE_UUIDS]
+
+
+def _shape_step(cuda: str, beside_fillers: bool = False):
+    ctx = make_probe_context()[0]
+    state = replace(ctx.state, gpu_count=8, gpu_details=SHAPE_DETAILS)
+    ctx = ctx.model_copy(update={"state": state})
+    output = gpu_list_output(
+        SHAPE_LISTING,
+        nodes=tuple(range(8)),
+        minors=tuple(zip(SHAPE_UUIDS, range(8))),
+        cuda=cuda,
+        mig=("Disabled",) * 8,
+    )
+    outcome = module._ProbeOutcome()
+    module._step_gpu_count(
+        ctx, outcome, module._Login(result=MagicMock(stdout=output, stderr="", exit_status=0)), beside_fillers
+    )
+    return outcome
+
+
+def test_gpu_count_passes_every_listed_card_working_as_itself_under_cuda_and_pytorch():
+    cuda = cuda_devices(SHAPE_LISTING, 8) + cuda_devices(SHAPE_LISTING, 8, source="torch")
+    outcome = _shape_step(cuda)
+    assert outcome.failed_step is None and outcome.steps[-1].ok is True
+
+
+def test_gpu_count_fails_a_node_whose_cuda_devices_are_not_its_listed_gpus():
+    """Regression: nvidia-smi, the device nodes and the CUDA device count all said 8, the
+    probe passed, and a renter's PyTorch saw one device of another model."""
+    other = "cuda\t0\tok\t" + SHAPE_UUIDS[0] + "\t48541\tNVIDIA RTX A6000\n"
+    # the driver API: one device of another model, the others take no context
+    driver = "cuda\tcount\t8\n" + other + "".join(f"cuda\t{i}\terror\tcuCtxCreate_v2 101\n" for i in range(1, 8))
+    detail = _shape_step(driver).steps[-1].detail
+    assert "0 of 8 GPU(s) confirmed usable" in detail
+    assert f"CUDA device 0 ({SHAPE_UUIDS[0]}) is a 'NVIDIA RTX A6000', listed as 'NVIDIA GeForce RTX 4090'" in detail
+    assert "CUDA device 1 failed: cuCtxCreate_v2 101" in detail
+    # the driver API brings up all eight as listed, PyTorch (what a renter runs) sees one device of another model
+    torch_one = "torch\tcount\t1\n" + other.replace("cuda\t", "torch\t", 1)
+    outcome = _shape_step(cuda_devices(SHAPE_LISTING, 8) + torch_one)
+    assert outcome.failed_step == STEP_GPU_COUNT
+    detail = outcome.steps[-1].detail
+    assert "0 of 8 GPU(s) confirmed usable" in detail
+    assert "PyTorch device 0" in detail and "7 listed GPU(s) are no PyTorch device" in detail
+
+
+def test_gpu_count_fails_cuda_devices_with_the_wrong_memory_or_one_uuid_twice():
+    wrong_memory = cuda_devices(SHAPE_LISTING, 8).replace(f"{SHAPE_UUIDS[3]}\t24000", f"{SHAPE_UUIDS[3]}\t48541")
+    detail = _shape_step(wrong_memory).steps[-1].detail
+    assert "7 of 8 GPU(s) confirmed usable" in detail
+    assert f"CUDA device 3 ({SHAPE_UUIDS[3]}) has 48541 MiB, listed with 24564 MiB" in detail
+    # every device reports the first card's UUID: one card, not eight
+    one_uuid = "cuda\tcount\t8\n" + "".join(
+        f"cuda\t{i}\tok\t{SHAPE_UUIDS[0]}\t24000\tNVIDIA GeForce RTX 4090\n" for i in range(8)
+    )
+    detail = _shape_step(one_uuid).steps[-1].detail
+    unreadable = cuda_devices(SHAPE_LISTING, 8).replace(f"{SHAPE_UUIDS[2]}\t24000", f"{SHAPE_UUIDS[2]}\tlots")
+    assert "reported no readable memory size" in _shape_step(unreadable).steps[-1].detail
+    # one card behind eight devices counts once
+    assert "1 of 8 GPU(s) confirmed usable" in detail
+    assert "CUDA reports 1 GPU UUID(s) on more than one device" in detail
+    assert "7 listed GPU(s) are no CUDA device" in detail
+
+
+def test_gpu_count_keeps_the_confirmed_count_in_a_long_failure_record():
+    """The record keeps a detail's last _TAIL_CHARS: a long diagnostic is cut at its end, not its count."""
+    long_name = "NVIDIA " + "X" * 400
+    devices = cuda_devices(SHAPE_LISTING, 8)
+    for uuid in SHAPE_UUIDS[:4]:
+        devices = devices.replace(f"{uuid}\t24000\tNVIDIA GeForce RTX 4090", f"{uuid}\t24000\t{long_name}")
+    outcome = _shape_step(devices)
+    assert outcome.failed_step == STEP_GPU_COUNT
+    detail = outcome.steps[-1].as_record()["detail"]
+    assert detail.startswith("expected 8 GPU(s), nvidia-smi -L listed 8 but 4 of 8 GPU(s) confirmed usable")
+
+
+def test_gpu_count_keeps_the_usable_count_when_every_cuda_device_fails():
+    failing = "cuda\tcount\t8\n" + "".join(f"cuda\t{i}\terror\tcuCtxCreate_v2 101\n" for i in range(8))
+    detail = _shape_step(failing).steps[-1].as_record()["detail"]
+    assert "0 of 8 GPU(s) confirmed usable" in detail and "; 6 more)" in detail
+
+
+_FAKE_LIBCUDA = """
+import ctypes, sys
+sys.modules['torch'] = None
+UUIDS = {uuids!r}
+BROKEN = {broken!r}
+class _Fake:
+    def cuInit(self, flags): return 0
+    def cuDeviceGetCount(self, ref): ref._obj.value = len(UUIDS); return 0
+    def cuDeviceGet(self, ref, i): ref._obj.value = i; return 0
+    def cuDeviceGetName(self, buf, size, dev): buf.value = b'NVIDIA GeForce RTX 4090'; return 0
+    def cuDeviceTotalMem_v2(self, ref, dev): ref._obj.value = 24217 << 20; return 0
+    def cuDeviceGetUuid(self, raw, dev):
+        raw[:] = list(bytes.fromhex(UUIDS[dev.value][4:].replace('-', ''))); return 0
+    def cuCtxCreate_v2(self, ref, flags, dev):
+        if dev.value in BROKEN: return 101
+        self.dev = dev.value
+        ref._obj.value = 1; return 0
+    def cuMemAlloc_v2(self, ref, size):
+        # a device whose memory another process holds: CUDA_ERROR_OUT_OF_MEMORY
+        if self.dev in globals().get('FULL', ()): return 2
+        ref._obj.value = 1 << 20; return 0
+    def cuMemsetD32_v2(self, ptr, value, n): self.value = value.value; return 0
+    def cuMemcpyDtoH_v2(self, dst, src, n):
+        for j in range(len(dst)): dst[j] = self.value
+        return 0
+    def cuCtxSynchronize(self): return 0
+    def cuCtxDestroy_v2(self, ctx): return 0
+ctypes.CDLL = lambda name: _Fake()
+"""
+
+
+def test_the_cuda_script_brings_up_each_device_and_prints_what_the_step_reads():
+    """The script itself, over a stand-in libcuda: eight working cards pass, a card that takes no context
+    is named."""
+    for broken, verdict in (((), None), ((5,), STEP_GPU_COUNT)):
+        script = _FAKE_LIBCUDA.format(uuids=list(SHAPE_UUIDS), broken=list(broken)) + module._CUDA_DEVICES_PY
+        printed = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, check=True).stdout
+        outcome = _shape_step(printed)
+        assert outcome.failed_step == verdict, outcome.steps[-1].detail
+    assert "CUDA device 5 failed: cuCtxCreate_v2 101" in outcome.steps[-1].detail
+
+
+_FAKE_TORCH = """
+import types
+class _Props:
+    def __init__(self, raw, name, mib):
+        self.uuid = types.SimpleNamespace(bytes=raw)
+        self.name = name
+        self.total_memory = mib << 20
+class _Tensor:
+    def __init__(self, value): self.value = value
+    def __mul__(self, k): return _Tensor(self.value * k)
+    def sum(self): return self
+    def item(self): return self.value
+_SEEN = {seen!r}
+torch = types.ModuleType('torch')
+torch.version = types.SimpleNamespace(cuda='12.8')
+torch._C = types.SimpleNamespace(_CudaDeviceProperties=types.SimpleNamespace(uuid=None))
+torch.int64 = 'int64'
+torch.cuda = types.SimpleNamespace(
+    device_count=lambda: len(_SEEN),
+    get_device_properties=lambda i: _Props(
+        bytes.fromhex(_SEEN[i][0][4:].replace('-', '')), _SEEN[i][1], _SEEN[i][2]
+    ),
+)
+def _arange(n, device, dtype):
+    if int(device.split(':')[1]) in globals().get('FULL', ()):
+        raise RuntimeError('CUDA out of memory. Tried to allocate 8.00 MiB')
+    return _Tensor(n * (n - 1) // 2)
+torch.arange = _arange
+sys.modules['torch'] = torch
+"""
+
+
+def test_the_cuda_script_checks_each_device_pytorch_sees():
+    """The script's PyTorch half, over a stand-in torch: all eight cards as listed pass; one device of
+    another model fails."""
+    as_listed = [(u, "NVIDIA GeForce RTX 4090", 24217) for u in SHAPE_UUIDS]
+    for seen, verdict in ((as_listed, None), ([(SHAPE_UUIDS[0], "NVIDIA RTX A6000", 48541)], STEP_GPU_COUNT)):
+        script = (
+            _FAKE_LIBCUDA.format(uuids=list(SHAPE_UUIDS), broken=[])
+            + _FAKE_TORCH.format(seen=seen)
+            + module._CUDA_DEVICES_PY
+        )
+        printed = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, check=True).stdout
+        assert "torch\tcount\t" in printed
+        outcome = _shape_step(printed)
+        assert outcome.failed_step == verdict, outcome.steps[-1].detail
+    assert "PyTorch device 0" in outcome.steps[-1].detail
+
+
+def test_a_device_whose_memory_a_filler_holds_passes_on_its_identity_only_beside_a_filler():
+    """A Lium filler beside the probe can hold nearly all of a card's memory: the work there runs out of
+    memory, so that device is judged on its identity alone, and only when the probe runs beside a filler."""
+    as_listed = [(u, "NVIDIA GeForce RTX 4090", 24217) for u in SHAPE_UUIDS]
+    script = (
+        "FULL = [2, 6]\n"
+        + _FAKE_LIBCUDA.format(uuids=list(SHAPE_UUIDS), broken=[])
+        + _FAKE_TORCH.format(seen=as_listed)
+        + module._CUDA_DEVICES_PY
+    )
+    printed = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, check=True).stdout
+    assert f"cuda\t2\tbusy\t{SHAPE_UUIDS[2]}\t" in printed and f"torch\t6\tbusy\t{SHAPE_UUIDS[6]}\t" in printed
+    assert _shape_step(printed, beside_fillers=True).failed_step is None
+    detail = _shape_step(printed).steps[-1].detail
+    assert "6 of 8 GPU(s) confirmed usable" in detail and "no filler runs beside" in detail
+    # the identity still has to match: a busy device of another model fails beside a filler too
+    other = printed.replace(
+        f"cuda\t2\tbusy\t{SHAPE_UUIDS[2]}\t24217\tNVIDIA GeForce RTX 4090",
+        f"cuda\t2\tbusy\t{SHAPE_UUIDS[2]}\t48541\tNVIDIA RTX A6000",
+    )
+    assert other != printed
+    detail = _shape_step(other, beside_fillers=True).steps[-1].detail
+    assert "7 of 8 GPU(s) confirmed usable" in detail and "is a 'NVIDIA RTX A6000'" in detail

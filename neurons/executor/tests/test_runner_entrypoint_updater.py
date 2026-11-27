@@ -38,6 +38,7 @@ DOCKER_STUB = textwrap.dedent(
         "inspect --format {{.Config.Image}} "*) echo "$STUB_UPDATER_IMAGE" ;;
         "inspect --format {{.State.Running}} "*) echo "${STUB_RUNNING-true}" ;;
         "inspect --format {{.Name}} wt1") echo "/executor-watchtower-1" ;;
+        "inspect --format {{range .Config.Env}}{{println .}}{{end}} wt1") printf '%s' "${STUB_UPDATER_ENV-}" ;;
         "inspect --format {{range "*" wt1") printf '%s\\n' com.docker.compose.config-hash=abc \\
             com.docker.compose.oneoff=False com.docker.compose.project=executor \\
             com.docker.compose.service=watchtower org.opencontainers.image.title=watchtower ;;
@@ -59,7 +60,7 @@ def run(tmp_path, script, **env):
     # the log-follow loop never ends; a `sleep` that fails ends the script after one round
     (bin_dir / "sleep").write_text("#!/bin/sh\nexit 7\n")
     (bin_dir / "sleep").chmod(0o755)
-    for tool in ("sh", "tail", "timeout", "sed", "head"):
+    for tool in ("sh", "tail", "timeout", "sed", "head", "tr"):
         os.symlink(shutil.which(tool), bin_dir / tool)
     calls = tmp_path / "calls"
     calls.touch()
@@ -90,15 +91,17 @@ def updater_run(calls):
 @pytest.mark.parametrize(
     "script, old, new, args",
     [
-        (EXECUTOR, "nickfedor/watchtower", "daturaai/lium-watchtower:1.2.4", ""),
-        (EXECUTOR, "containrrr/watchtower:latest", "daturaai/lium-watchtower:1.2.4", ""),
-        (EXECUTOR, "daturaai/lium-watchtower:1.1.0-staging", "daturaai/lium-watchtower:1.2.4-staging", ""),
+        (EXECUTOR, "nickfedor/watchtower", "daturaai/lium-watchtower:1.2.5", ""),
+        (EXECUTOR, "containrrr/watchtower:latest", "daturaai/lium-watchtower:1.2.5", ""),
+        (EXECUTOR, "daturaai/lium-watchtower:1.1.0-staging", "daturaai/lium-watchtower:1.2.5-staging", ""),
         # DAH-5053: 1.2.2 is the first amd64+arm64 build; a 1.2.1 updater is replaced
-        (EXECUTOR, "daturaai/lium-watchtower:1.2.1", "daturaai/lium-watchtower:1.2.4", ""),
+        (EXECUTOR, "daturaai/lium-watchtower:1.2.1", "daturaai/lium-watchtower:1.2.5", ""),
         # DAH-5942: 1.2.3 never runs a runner that compose only created; a 1.2.2 updater is replaced
-        (EXECUTOR, "daturaai/lium-watchtower:1.2.2", "daturaai/lium-watchtower:1.2.4", ""),
+        (EXECUTOR, "daturaai/lium-watchtower:1.2.2", "daturaai/lium-watchtower:1.2.5", ""),
         # DAH-6836: 1.2.4 trusts the validator named in the subnet owner's signed message; a 1.2.3 updater is replaced
-        (EXECUTOR, "daturaai/lium-watchtower:1.2.3", "daturaai/lium-watchtower:1.2.4", ""),
+        (EXECUTOR, "daturaai/lium-watchtower:1.2.3", "daturaai/lium-watchtower:1.2.5", ""),
+        # 1.2.5: a disabled updater stays up idle instead of exiting into a restart loop; a 1.2.4 updater is replaced
+        (EXECUTOR, "daturaai/lium-watchtower:1.2.4", "daturaai/lium-watchtower:1.2.5", ""),
         (MINER, "containrrr/watchtower:latest", NICKFEDOR, " --interval 60 --cleanup --label-enable"),
         (MINER, "nickfedor/watchtower", NICKFEDOR, " --interval 60 --cleanup --label-enable"),
     ],
@@ -119,9 +122,9 @@ def test_an_old_updater_is_replaced_before_the_stack_starts(tmp_path, script, ol
 @pytest.mark.parametrize(
     "staging, current, want",
     [
-        ("1", "nickfedor/watchtower", "daturaai/lium-watchtower:1.2.4-staging"),
-        ("1", "daturaai/lium-watchtower:1.2.4", "daturaai/lium-watchtower:1.2.4-staging"),
-        ("", "nickfedor/watchtower", "daturaai/lium-watchtower:1.2.4"),
+        ("1", "nickfedor/watchtower", "daturaai/lium-watchtower:1.2.5-staging"),
+        ("1", "daturaai/lium-watchtower:1.2.5", "daturaai/lium-watchtower:1.2.5-staging"),
+        ("", "nickfedor/watchtower", "daturaai/lium-watchtower:1.2.5"),
     ],
 )
 def test_a_dev_runner_installs_the_staging_updater_whatever_its_stack_runs(tmp_path, staging, current, want):
@@ -132,7 +135,7 @@ def test_a_dev_runner_installs_the_staging_updater_whatever_its_stack_runs(tmp_p
 
 @pytest.mark.parametrize(
     "script, current",
-    [(EXECUTOR, "daturaai/lium-watchtower:1.2.4"), (EXECUTOR, "daturaai/lium-watchtower:1.2.4-staging"), (MINER, NICKFEDOR)],
+    [(EXECUTOR, "daturaai/lium-watchtower:1.2.5"), (EXECUTOR, "daturaai/lium-watchtower:1.2.5-staging"), (MINER, NICKFEDOR)],
 )
 def test_a_current_updater_is_left_alone(tmp_path, script, current):
     _, calls = run(tmp_path, script, STUB_UPDATER_IMAGE=current)
@@ -155,6 +158,29 @@ def test_no_single_updater_in_the_runners_project_means_nothing_is_created(tmp_p
     _, calls = run(tmp_path, EXECUTOR, STUB_UPDATER_IMAGE="nickfedor/watchtower", **env)
 
     assert not updater_run(calls)
+
+
+def test_the_providers_runtime_settings_go_to_the_new_updater(tmp_path):
+    # a 1.2.3 updater the provider turned off (watchtower/README.md) and slowed down; image env (PATH) stays behind
+    env = "PATH=/usr/local/bin\nWATCHTOWER_ENABLED=false\nWATCHTOWER_INTERVAL=3600\nWATCHTOWER_ENV_FILE_PATH=/a b/.env\n"
+    _, calls = run(tmp_path, EXECUTOR, STUB_UPDATER_IMAGE="daturaai/lium-watchtower:1.2.3", STUB_UPDATER_ENV=env)
+
+    assert updater_run(calls) == [
+        "run --detach --name executor-watchtower-1 --restart unless-stopped -v /var/run/docker.sock:/var/run/docker.sock"
+        f"{COMPOSE_LABELS} --env WATCHTOWER_ENABLED=false --env WATCHTOWER_INTERVAL=3600"
+        " --env WATCHTOWER_ENV_FILE_PATH=/a b/.env daturaai/lium-watchtower:1.2.5"
+    ]
+
+
+def test_settings_in_any_case_go_to_the_new_updater_as_written(tmp_path):
+    # the updater reads its settings' names in any case, so a lower- or mixed-case opt-out must survive the swap
+    env = "watchtower_enabled=false\nWaTcHtOwEr_InTeRvAl=3600\nWATCHTOWER_ENABLED_EXTRA=1\nwatchtower_image\n"
+    _, calls = run(tmp_path, EXECUTOR, STUB_UPDATER_IMAGE="daturaai/lium-watchtower:1.2.3", STUB_UPDATER_ENV=env)
+
+    assert updater_run(calls) == [
+        "run --detach --name executor-watchtower-1 --restart unless-stopped -v /var/run/docker.sock:/var/run/docker.sock"
+        f"{COMPOSE_LABELS} --env watchtower_enabled=false --env WaTcHtOwEr_InTeRvAl=3600 daturaai/lium-watchtower:1.2.5"
+    ]
 
 
 def test_an_updater_that_cannot_be_pulled_is_kept(tmp_path):

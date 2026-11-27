@@ -1,20 +1,26 @@
+import asyncio
+import logging
 import os
+import re
 import secrets
 import shutil
 import string
 import subprocess
 import sys
 import tempfile
-from collections.abc import Iterable
+import time
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated
 
-import PyInstaller.__main__
 from core.config import settings
 from fastapi import Depends
 from payload_models.payloads import MinerJobEnryptedFiles
 
 from services.ssh_service import SSHService
+
+logger = logging.getLogger(__name__)
 
 # Where each cycle's job files (the frozen scrape) are written: one `cycle-*` directory per cycle.
 JOB_FILES_ROOT = Path(__file__).parent / "temp"
@@ -118,10 +124,19 @@ ORIGINAL_KEYS = {
     'hard_disk_volumes': "volumes",
     'hard_disk_scrape_error': "hard_disk_scrape_error",
     'hard_disk_docker_scrape_error': "hard_disk_docker_scrape_error",
+    'hard_disk_content_scrape_error': "hard_disk_content_scrape_error",
     # DAH-3674: nvme | ssd | hdd | unknown for the disk under docker's data root
     'hard_disk_disk_type': "disk_type",
     # DAH-5045: used size of the engy_cache_* volumes, in GB
     'hard_disk_engy_cache_used_gb': "engy_cache_used_gb",
+    # the part of that cache counted as free disk (a non-filler container's mount stays used)
+    'hard_disk_engy_cache_released_gb': "engy_cache_released_gb",
+    # data-root's own used kB: the docker breakdown is measured there, whatever disk the reading above folds in
+    'hard_disk_data_root_used': "data_root_used",
+    # the part of the docker breakdown on data-root's filesystem: all of it, or volumes only when the store is apart
+    'hard_disk_data_root_docker_used': "data_root_docker_used",
+    # data-root's own free kB, only when a store apart folds in: a volume grow takes from data-root alone
+    'hard_disk_data_root_free': "data_root_free",
     # DAH-5059: kB per container name (writable layer + its anonymous volumes) and per volume name
     'hard_disk_by_container': "by_container",
     'hard_disk_by_volume': "by_volume",
@@ -248,6 +263,13 @@ ORIGINAL_KEYS = {
 }
 
 
+
+@dataclass(frozen=True)
+class ObfuscatedScrape:
+    source: str
+    all_keys: dict[str, str]
+    encryption_key: str
+
 class FileEncryptService:
     def __init__(
         self,
@@ -264,22 +286,8 @@ class FileEncryptService:
 
     def make_binary_file(self, tmp_directory: str, file_path: str):
         file_name = os.path.basename(file_path)
-
-        PyInstaller.__main__.run(
-            [
-                file_path,
-                "--onefile",
-                "--noconsole",
-                "--log-level=ERROR",
-                "--distpath",
-                tmp_directory,
-                "--name",
-                file_name,
-            ]
-        )
-
-        subprocess.run(["rm", "-rf", "build", f"{file_name}.spec"])
-
+        with tempfile.TemporaryDirectory() as work:
+            subprocess.run(_pyinstaller_command(file_path, tmp_directory, work, file_name), check=True)
         return file_name
 
     def make_binary_file_with_nuitka(self, tmp_directory: str, file_path: str):
@@ -367,8 +375,13 @@ class FileEncryptService:
             'hard_disk_volumes': "",
             'hard_disk_scrape_error': "",
             'hard_disk_docker_scrape_error': "",
+            'hard_disk_content_scrape_error': "",
             'hard_disk_disk_type': "",
             'hard_disk_engy_cache_used_gb': "",
+            'hard_disk_engy_cache_released_gb': "",
+            'hard_disk_data_root_used': "",
+            'hard_disk_data_root_docker_used': "",
+            'hard_disk_data_root_free': "",
             'hard_disk_by_container': "",
             'hard_disk_by_volume': "",
             'hard_disk_unsized_containers': "",
@@ -528,6 +541,53 @@ class FileEncryptService:
                 entry.unlink()
         return Path(tempfile.mkdtemp(prefix="cycle-", dir=root))
 
+    def prepare_cycle_job_files(self, keep_directories: Callable[[], Iterable[str]]) -> MinerJobEnryptedFiles:
+        """DAH-5899: this cycle's keys and obfuscated source, with the frozen scrape left unbuilt. A normal cycle
+        delivers the source over stdin and never needs the binary; `machine_scrape_binary_build` freezes it on the first failed
+        stdin scrape. Earlier cycles' directories go only once that build is done (empty ones go now)."""
+        # first: a failed obfuscator run leaves the earlier cycles' directories as they are
+        scrape = self._obfuscated_scrape()
+        root = JOB_FILES_ROOT
+        root.mkdir(exist_ok=True)
+        kept = {Path(path).resolve() for path in keep_directories()}
+        for entry in root.iterdir():
+            try:
+                if entry.is_dir() and entry.resolve() not in kept and not any(entry.iterdir()):
+                    entry.rmdir()
+            except FileNotFoundError:  # a build's cleanup removed it first
+                continue
+        directory = Path(tempfile.mkdtemp(prefix=f"cycle-{time.time_ns():020d}-", dir=root))
+        file_name = f"tmp{secrets.token_hex(4)}"
+        return MinerJobEnryptedFiles(
+            encrypt_key=scrape.encryption_key,
+            all_keys=scrape.all_keys,
+            tmp_directory=str(directory),
+            machine_scrape_file_name=file_name,
+            machine_scrape_source=scrape.source,
+            machine_scrape_binary_build=ScrapeBinaryBuild(directory, file_name, scrape.source, keep_directories),
+        )
+
+    def _obfuscated_scrape(self) -> ObfuscatedScrape:
+        """The obfuscated scrape source, its key mapping and its encryption key."""
+        machine_scrape_file_path = str(Path(__file__).parent / ".." / "miner_jobs/machine_scrape.py")
+        obfuscator_machine_scrape_file_path = str(Path(__file__).parent / ".." / "miner_jobs/obfuscator.py")
+        obfuscated_machine_scrape_file_path = str(
+            Path(__file__).parent / ".." / "miner_jobs/obfuscated_machine_scrape.py"
+        )
+        command = [sys.executable, obfuscator_machine_scrape_file_path, machine_scrape_file_path]
+        # a failed run must not leave the previous build's output to be read below
+        Path(obfuscated_machine_scrape_file_path).unlink(missing_ok=True)
+        subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)  # noqa
+        with open(obfuscated_machine_scrape_file_path) as file:
+            obfuscated_content = file.read()
+        all_keys, encryption_key = self.generate_key_mappings()
+        for key, value in all_keys.items():
+            obfuscated_content = obfuscated_content.replace(key, value)
+        obfuscated_content = with_vloopback_check_switch(
+            obfuscated_content, settings.VLOOPBACK_SCRAPE_CHECK_ENABLED
+        )
+        return ObfuscatedScrape(source=obfuscated_content, all_keys=all_keys, encryption_key=encryption_key)
+
     def ecrypt_miner_job_files(self, keep_directories: Iterable[str] = ()):
         """
         Encrypts and obfuscates miner job files for secure execution.
@@ -542,39 +602,13 @@ class FileEncryptService:
 
         Returns: MinerJobEnryptedFiles
         """
-        # file pathes
-        machine_scrape_file_path = str(
-            Path(__file__).parent / ".." / "miner_jobs/machine_scrape.py"
-        )
-        obfuscator_machine_scrape_file_path = str(
-            Path(__file__).parent / ".." / "miner_jobs/obfuscator.py"
-        )
-        obfuscated_machine_scrape_file_path = str(
-            Path(__file__).parent / ".." / "miner_jobs/obfuscated_machine_scrape.py"
-        )
-
-        # run obfuscator.py to generate obfuscated_machine_scrape.py
-        command = [sys.executable, obfuscator_machine_scrape_file_path, machine_scrape_file_path]
-        # a failed run must not leave the previous build's output to be read below
-        Path(obfuscated_machine_scrape_file_path).unlink(missing_ok=True)
-        subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)  # noqa
+        scrape = self._obfuscated_scrape()
         # after the run: a failed one leaves the previous cycle's directory in place
         tmp_directory = self.fresh_job_files_directory(keep_directories)
 
-        with open(obfuscated_machine_scrape_file_path) as file:
-            obfuscated_content = file.read()
-
-        # replace dictionary keys with random names
-        all_keys, encryption_key = self.generate_key_mappings()
-        for key, value in all_keys.items():
-            obfuscated_content = obfuscated_content.replace(key, value)
-        obfuscated_content = with_vloopback_check_switch(
-            obfuscated_content, settings.VLOOPBACK_SCRAPE_CHECK_ENABLED
-        )
-
         # build binary with nuitka
         with tempfile.NamedTemporaryFile(delete=True) as machine_scrape_file:
-            machine_scrape_file.write(obfuscated_content.encode("utf-8"))
+            machine_scrape_file.write(scrape.source.encode("utf-8"))
             machine_scrape_file.flush()
             os.fsync(machine_scrape_file.fileno())
             
@@ -592,9 +626,82 @@ class FileEncryptService:
             #     )
 
         return MinerJobEnryptedFiles(
-            encrypt_key=encryption_key,
-            all_keys=all_keys,
+            encrypt_key=scrape.encryption_key,
+            all_keys=scrape.all_keys,
             tmp_directory=str(tmp_directory),
             machine_scrape_file_name=machine_scrape_file_name,
-            machine_scrape_source=obfuscated_content,
+            machine_scrape_source=scrape.source,
         )
+
+
+def _pyinstaller_command(source_path: str, dist_directory: str, work_directory: str, name: str) -> list[str]:
+    # a child process: an in-process PyInstaller run held the event loop for the whole build (DAH-5899)
+    return [
+        sys.executable, "-m", "PyInstaller", source_path, "--onefile", "--noconsole", "--log-level=ERROR",
+        "--distpath", dist_directory, "--workpath", work_directory, "--specpath", work_directory, "--name", name,
+    ]
+
+
+def _cycle_started_ns(path: Path) -> int:
+    """The creation time in a `cycle-<ns>-*` name; 0 for any other entry (an older name format)."""
+    match = re.match(r"cycle-(\d{20})-", path.name)
+    return int(match.group(1)) if match else 0
+
+
+class ScrapeBinaryBuild:
+    """DAH-5899: one cycle's frozen scrape, built at most once, on the first call to `ensure`."""
+
+    def __init__(self, directory: Path, file_name: str, source: str, keep_directories: Callable[[], Iterable[str]]):
+        self.directory = directory
+        self.file_name = file_name
+        self.source = source
+        self.keep_directories = keep_directories
+        self._build: asyncio.Task | None = None
+
+    async def ensure(self, wait_seconds: float) -> None:
+        """Returns once the binary is in `directory`; concurrent callers wait on the same build, and a failed
+        build fails every caller of this cycle: a failure that repeats (a broken source, a full disk) would
+        otherwise cost one PyInstaller run per node. Raises TimeoutError after `wait_seconds`; the build goes on."""
+        if self._build is None:
+            self._build = asyncio.create_task(self._run())
+            self._build.add_done_callback(self._log_failure)
+        # shielded: one verification giving up must not cancel the build the others wait on
+        await asyncio.wait_for(asyncio.shield(self._build), wait_seconds)
+
+    def _log_failure(self, build: asyncio.Task) -> None:
+        # the build owns its failure: every waiter may have timed out and left before it ended
+        if not build.cancelled() and build.exception() is not None:
+            logger.error("[job-files] scrape binary build failed for %s: %r", self.directory.name, build.exception())
+
+    async def _run(self) -> None:
+        started = asyncio.get_running_loop().time()
+        with tempfile.TemporaryDirectory() as work:
+            source_path = os.path.join(work, f"{self.file_name}.py")
+            with open(source_path, "w") as file:
+                file.write(self.source)
+            process = await asyncio.create_subprocess_exec(
+                *_pyinstaller_command(source_path, str(self.directory), work, self.file_name),
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _, stderr = await process.communicate()
+        if process.returncode != 0:
+            raise RuntimeError(f"scrape build exited {process.returncode}: {stderr.decode(errors='replace')[-400:]}")
+        kept = {Path(path).resolve() for path in self.keep_directories()}
+        await asyncio.to_thread(self._remove_earlier_directories, kept)
+        logger.info(
+            "[job-files] scrape binary built in %.1fs for %s",
+            asyncio.get_running_loop().time() - started,
+            self.directory.name,
+        )
+
+    def _remove_earlier_directories(self, kept: set[Path]) -> None:
+        # only older cycles: a late build of the last cycle must not remove the new cycle's directory
+        own_cycle_started_ns = _cycle_started_ns(self.directory)
+        for entry in JOB_FILES_ROOT.iterdir():
+            if entry.resolve() in kept or _cycle_started_ns(entry) >= own_cycle_started_ns:
+                continue
+            if entry.is_dir():
+                shutil.rmtree(entry, ignore_errors=True)
+            else:
+                entry.unlink(missing_ok=True)

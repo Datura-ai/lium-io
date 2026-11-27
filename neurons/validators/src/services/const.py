@@ -377,6 +377,9 @@ ENGY_CACHE_MIN_FREE_BESIDE_GB = 2000
 # by file, but what is still missing is charged like a download.
 ENGY_CACHE_COMPLETE_SHARE = 0.98
 FILLER_CONTAINER_GRACE_MINUTES = 15
+# DAH-7071: a filler_ container created this long before the cycle's rented list was read, and absent
+# from it, is no live run: the backend writes the run row before it creates the container.
+FILLER_LIST_READ_MARGIN_MINUTES = 2
 # DAH-2757: how long after a rental closes a BROKEN pod's container still counts as ours. The
 # container lives until the sweep above collects it, so the bound follows that grace with one cycle
 # of margin. It must stay SHORT: the pod row itself survives 24 h, and an exemption that long would
