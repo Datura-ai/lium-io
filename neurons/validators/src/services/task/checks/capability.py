@@ -78,10 +78,7 @@ class CapabilityCheck:
         due_card: int | None = None
         if filler_container:
             seen, mismatches = await stored_gpu_model_verdict(ctx)
-            if not seen:
-                due_card = await _full_check_due_card(ctx)
-                if due_card is not None:
-                    stopped_filler = await _stop_filler_for_full_check(ctx)
+            stopped_filler, due_card = await _stop_filler_when_full_check_due(ctx, seen)
         if filler_container and not stopped_filler:
             what_filler: dict = {"filler_container": filler_container}
             cycle = _filler_cycle_index(ctx)
@@ -116,8 +113,12 @@ class CapabilityCheck:
                     await _store_gpu_model_verdict(ctx, mismatches, GPU_MODEL_NO_VERDICT_TTL_SECONDS)
                 elif not seen and sample.get("error_kind") in ("no_answer", "wrong_answer"):
                     # a broken card answers the same way every time and an interrupted sample comes back
-                    # empty: neither is a verdict, so the full check gets one with the filler stopped
-                    await _mark_full_check_due(ctx, card)
+                    # empty: neither is a verdict, so the full check gets one with Lium's filler stopped; a filler
+                    # not ours to stop keeps the once-a-day pace
+                    if _lium_filler(ctx):
+                        await _mark_full_check_due(ctx, card)
+                    else:
+                        await _store_gpu_model_verdict(ctx, mismatches, GPU_MODEL_NO_VERDICT_TTL_SECONDS)
             if mismatches:
                 # the node earns nothing, so Lium's filler no longer runs on it (as SshdBootstrapCheck)
                 rented_data = ctx.state.rented_data
@@ -240,10 +241,10 @@ class CapabilityCheck:
         if stopped_filler:
             failure_details["stopped_fillers_for_full_check"] = stopped_filler
 
-        # after the stop the backend still lists the filler, so a no-answer is the card's own, not a waiver
-        if _probe_gave_no_answer(result) and not stopped_filler:
+        if _probe_gave_no_answer(result):
             lium_workload = await lium_workload_live_now(ctx)
-            if lium_workload is not None:
+            # after the stop the backend still lists the stopped filler: that one is no waiver, a filler placed since is
+            if lium_workload is not None and not set(lium_workload.container_names) <= set(stopped_filler):
                 event = render_message(
                     Msg.RENTED_SKIPPED,
                     ctx=ctx,
@@ -592,6 +593,21 @@ async def _judge_due_card(
     if read_ok:
         await _store_gpu_model_verdict(ctx, stored, GPU_MODEL_NO_VERDICT_TTL_SECONDS, measured_ok)
     return mismatches
+
+
+def _lium_filler(ctx: Context) -> bool:
+    rented_data = ctx.state.rented_data
+    return rented_data is not None and rented_data.get_default_job_owner(ctx.executor.uuid) == DEFAULT_JOB_OWNER_LIUM
+
+
+async def _stop_filler_when_full_check_due(ctx: Context, seen: bool) -> tuple[list[str], int | None]:
+    """(the fillers stopped for the full check, the card whose sample failed); ([], None) when no check is due."""
+    if seen:
+        return [], None
+    due_card = await _full_check_due_card(ctx)
+    if due_card is None:
+        return [], None
+    return await _stop_filler_for_full_check(ctx), due_card
 
 
 async def _stop_filler_for_full_check(ctx: Context) -> list[str]:
