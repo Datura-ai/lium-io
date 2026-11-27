@@ -138,8 +138,9 @@ CONNECTOR_LEAD_LOCK_KEY = "lock:connector-lead"
 # reconnect (12-14 s at 15 s, 29 Oct); 6 s keeps that under the backend's 10 s rent wait (lium-platform DAH-5174).
 CONNECTOR_LEAD_LOCK_TTL_SECONDS = 6
 CONNECTOR_READY_FILE = "/tmp/connector-ready"  # the deployment's readinessProbe
-# a renewal's interval: a release slower than that is a Redis fault, and the lock then just expires in its TTL
-LEAD_RELEASE_TIMEOUT_SECONDS = CONNECTOR_LEAD_LOCK_TTL_SECONDS / 3
+# the lead lock is renewed this often; it also bounds the release at SIGTERM: a release slower than that is a Redis
+# fault, and the lock then just expires in its TTL
+LEAD_RENEWAL_INTERVAL_SECONDS = CONNECTOR_LEAD_LOCK_TTL_SECONDS / 3
 # after a rollout's SIGTERM, in-flight creates, deletes and GPU resets and their replies finish up to this: above a
 # delete's 30 s container stop grace plus the volume wipe (~33 s), and inside the deployment's 60 s termination grace
 SIGTERM_DRAIN_SECONDS = 50
@@ -1460,7 +1461,7 @@ class ComputeClient:
             self._lead_task.cancel()
         if self._lead_lock is not None:
             try:
-                await asyncio.wait_for(self._lead_lock.release(), LEAD_RELEASE_TIMEOUT_SECONDS)
+                await asyncio.wait_for(self._lead_lock.release(), LEAD_RENEWAL_INTERVAL_SECONDS)
             except Exception as exc:
                 logger.warning(
                     _m("Could not release the connector lead; it expires", extra={**extra, "error": str(exc)})
@@ -1495,7 +1496,7 @@ class ComputeClient:
     async def _keep_connector_lead(self, lock: aioredis.lock.Lock) -> None:
         extra = get_extra_info(self.logging_extra)
         while True:
-            await asyncio.sleep(CONNECTOR_LEAD_LOCK_TTL_SECONDS / 3)
+            await asyncio.sleep(LEAD_RENEWAL_INTERVAL_SECONDS)
             try:
                 await lock.reacquire()
             except redis.exceptions.LockNotOwnedError:

@@ -33,6 +33,7 @@ def _client(server: FakeServer) -> ComputeClient:
 async def test_a_new_connector_waits_until_the_old_one_stops_leading(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(compute_client, "CONNECTOR_READY_FILE", str(tmp_path / "ready"))
     monkeypatch.setattr(compute_client, "CONNECTOR_LEAD_LOCK_TTL_SECONDS", 1)
+    monkeypatch.setattr(compute_client, "LEAD_RENEWAL_INTERVAL_SECONDS", 1 / 3)
     # shortcut: fakeredis runs no Lua without lupa (not a dependency); renew with a plain PEXPIRE here
     monkeypatch.setattr(
         aioredis.lock.Lock,
