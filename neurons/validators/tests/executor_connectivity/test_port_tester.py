@@ -241,3 +241,37 @@ async def test_a_wave_over_many_nodes_never_holds_more_sockets_than_the_bound():
 
     assert all(all(ok) and len(ok) == 20 for ok, _ in results)
     assert held["peak"] == 6
+
+
+def test_a_reply_the_validator_has_not_read_yet_never_stalls_the_probe_process():
+    # a reply bigger than the pipe buffer (~64 KB) that the busy validator has not read yet: the probe process must
+    # keep taking requests instead of freezing in a blocking write (review)
+    import json
+
+    class Engine:
+        def __init__(self):
+            self.calls = threading.Semaphore(0)
+
+        async def probe_many(self, host, ports, token):
+            self.calls.release()
+            return [True] * 20000, [0.0] * 20000
+
+    engine = Engine()
+    req_r, req_w = os.pipe()
+    rep_r, rep_w = os.pipe()
+    requests, replies = os.fdopen(req_r, "rb", buffering=0), os.fdopen(rep_w, "wb", buffering=0)
+    child = threading.Thread(target=asyncio.run, args=(port_tester._serve(engine, requests, replies),), daemon=True)
+    child.start()
+
+    def send(wave_id):
+        os.write(req_w, json.dumps({"id": wave_id, "host": "h", "ports": [[1, 1]], "token": TOKEN}).encode() + b"\n")
+
+    try:
+        send(1)
+        assert engine.calls.acquire(timeout=5)
+        send(2)  # the first reply is still unread
+        assert engine.calls.acquire(timeout=5)
+    finally:
+        os.close(req_w)
+        os.close(rep_r)
+        child.join(5)

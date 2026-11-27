@@ -116,16 +116,21 @@ def child_main(max_sockets: int, requests: BinaryIO, replies: BinaryIO) -> None:
 
 
 async def _serve(engine: ProbeEngine, requests: BinaryIO, replies: BinaryIO) -> None:
+    loop = asyncio.get_running_loop()
     reader = asyncio.StreamReader(limit=_PIPE_LIMIT)
-    await asyncio.get_running_loop().connect_read_pipe(lambda: asyncio.StreamReaderProtocol(reader), requests)
+    await loop.connect_read_pipe(lambda: asyncio.StreamReaderProtocol(reader), requests)
+    # Replies go out through the loop: a blocking write froze every probe once the pipe buffer (~64 KB) was full,
+    # which is when the validator is busy and reads late (review)
+    transport, protocol = await loop.connect_write_pipe(asyncio.streams.FlowControlMixin, replies)
+    writer = asyncio.StreamWriter(transport, protocol, None, loop)
     waves: dict[int, asyncio.Task] = {}
 
     async def run(request: dict) -> None:
         try:
             ports = [PortPair(*p) for p in request["ports"]]
             ok, durations = await engine.probe_many(request["host"], ports, request["token"])
-            # shortcut: a blocking write; a reply is a few KB and the validator reads every line as it comes
-            replies.write(json.dumps({"id": request["id"], "ok": ok, "durations": durations}).encode() + b"\n")
+            writer.write(json.dumps({"id": request["id"], "ok": ok, "durations": durations}).encode() + b"\n")
+            await writer.drain()
         finally:
             waves.pop(request["id"], None)
 
