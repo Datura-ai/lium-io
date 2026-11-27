@@ -143,22 +143,24 @@ def _reset_command(uuids: list[str], pod_gpu_uuids: set[str] | None, results: st
     -rac/-rmc batch outlasted the runner's budget, so the call gave no answer at all and no GPU had a verdict (prod
     25 Nov). The kill is per nvidia-smi and nothing wraps the batch: uutils timeout (Ubuntu 26.04) signals only its
     direct child and GNU timeout gives each inner timeout its own process group, so an outer kill left resets running
-    (lio#2362). `wait` returns only once every reset has exited. A killed reset echoes 137. Each line is appended to
-    the host file `results` the moment its reset ends and the file is printed at the end, so if the call overruns the
-    runner's budget (its answer lost), the GPUs that answered are read back from it and only the others are unknown;
-    the file stays unless the print reached the caller."""
+    (lio#2362). `wait` returns only once every reset has exited. A killed reset echoes 137. Each line goes to stdout
+    and is appended to the host file `results` (tee -a) the moment its reset ends, so a call that answers never depends
+    on the file (a host whose /tmp cannot be written still answers, review); if the call overruns the runner's budget
+    (its answer lost), the GPUs that answered are read back from the file and only the others are unknown. The file
+    goes once every reset has exited."""
     per_reset = f"timeout -s KILL {PER_RESET_TIMEOUT_SECONDS:g}"
     quoted = shlex.quote(results)
     jobs = []
     for uuid in uuids:
         rgc = build_clock_command("reset", uuid, pod_gpu_uuids=pod_gpu_uuids)
-        steps = [f"{per_reset} {rgc} >/dev/null 2>&1; echo {shlex.quote(uuid)} $? >> {quoted}"] + [
+        # tee's own error (an unwritable file) goes to /dev/null: the line still reaches stdout
+        steps = [f"{per_reset} {rgc} >/dev/null 2>&1; echo {shlex.quote(uuid)} $? | tee -a {quoted} 2>/dev/null"] + [
             f"{per_reset} nvidia-smi -i {shlex.quote(uuid)} {flag} >/dev/null 2>&1; "
-            f"echo {shlex.quote(uuid)} {flag} $? >> {quoted}"
+            f"echo {shlex.quote(uuid)} {flag} $? | tee -a {quoted} 2>/dev/null"
             for flag in _APP_MEM_FLAGS
         ]
         jobs.append("( " + "; ".join(steps) + " ) &")
-    return f"sh -c {shlex.quote(' '.join(jobs) + f' wait; cat {quoted} && rm -f {quoted}')}"
+    return f"sh -c {shlex.quote(' '.join(jobs) + f' wait; rm -f {quoted}')}"
 
 
 def _app_mem_outcome(code: str, rgc_exit: str | None) -> str:

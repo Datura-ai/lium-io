@@ -583,6 +583,8 @@ class GpuResetErrorCode(enum.Enum):
     ClockLockNotSupported = "ClockLockNotSupported"
     # 2.16.0: the host GPU listing failed, timed out or came back empty: the GPUs are gone from the host driver
     GpusLostOnHost = "GpusLostOnHost"
+    # 2.18.0: a clock reset (-rac/-rmc after a successful -rgc) gave no answer, so it could not be confirmed
+    ResetUnconfirmed = "ResetUnconfirmed"
 
 
 class GpuResetOutcome(pydantic.BaseModel):

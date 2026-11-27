@@ -70,7 +70,7 @@ class FakeHost:
             return make_command_result(True, self.files.pop(cmd.split()[1], ""))
         if " -rgc " in cmd:  # the batched resets: "<uuid> <exit>" per GPU, then "<uuid> <flag> <exit>" per -rac/-rmc
             if self.rgc_exit is None:  # the whole call times out: the runner answers -1, no output
-                path = re.search(r">> (\S+);", cmd).group(1)
+                path = re.search(r"tee -a (\S+) ", cmd).group(1)
                 self.files[path] = "".join(f"{u} 0\n{u} -rac 0\n{u} -rmc 0\n" for u in self.answered)
                 return make_command_result(False, "", exit_code=-1)
             lines = [f"{u} {self.rgc_exit}" for u in _reset_uuids(cmd)]
@@ -288,17 +288,18 @@ async def test_a_create_resets_graphics_application_and_memory_clocks_of_every_g
     _assert_invariants(host, [U[0], U[1]])
     (cmd,) = host.commands
     t = f"timeout -s KILL {PER_RESET_TIMEOUT_SECONDS:g}"
-    f = re.search(r">> (/tmp/lium-gpu-clock-reset-[0-9a-f]{16});", cmd).group(1)
+    f = re.search(r"tee -a (/tmp/lium-gpu-clock-reset-[0-9a-f]{16}) ", cmd).group(1)
     jobs = " ".join(
-        f"( {t} nvidia-smi -i {u} -rgc >/dev/null 2>&1; echo {u} $? >> {f}; "
+        f"( {t} nvidia-smi -i {u} -rgc >/dev/null 2>&1; echo {u} $? | tee -a {f} 2>/dev/null; "
         + "; ".join(
-            f"{t} nvidia-smi -i {u} {flag} >/dev/null 2>&1; echo {u} {flag} $? >> {f}" for flag in ("-rac", "-rmc")
+            f"{t} nvidia-smi -i {u} {flag} >/dev/null 2>&1; echo {u} {flag} $? | tee -a {f} 2>/dev/null"
+            for flag in ("-rac", "-rmc")
         )
         + " ) &"
         for u in (U[0], U[1])
     )
-    # each line goes to the host file as its reset ends; printed (then removed) once every reset is done
-    assert cmd == f"sh -c '{jobs} wait; cat {f} && rm -f {f}'"
+    # each line goes to stdout and the host file as its reset ends; the file goes once every reset is done
+    assert cmd == f"sh -c '{jobs} wait; rm -f {f}'"
     # the runner waits past one GPU's three resets, so a stalled one is killed on the host before the call is given up
     assert host.timeouts[0] > 3 * PER_RESET_TIMEOUT_SECONDS
 
@@ -326,6 +327,22 @@ async def test_the_resets_of_an_8_gpu_node_run_in_parallel_and_answer_whatever_t
     lines = sorted(out.decode().split("\n")[:-1])
     assert lines == sorted([f"{u} 0" for u in uuids] + [f"{u} {flag} 0" for u in uuids for flag in ("-rac", "-rmc")])
     assert elapsed < 6, f"{elapsed:.1f} s: the resets ran one after another"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("results", ["results", "missing-dir/results"])
+async def test_every_line_reaches_stdout_whether_or_not_the_host_file_can_be_written(tmp_path, results):
+    """Review (lio#2499): a host whose /tmp cannot be written still answers every reset; no file is left either way."""
+    env = _fake_nvidia_smi(tmp_path, "exit 0\n")
+    path = tmp_path / results
+    proc = await asyncio.create_subprocess_shell(
+        gpu_clocks._reset_command([U[0], U[1]], None, str(path)), stdout=asyncio.subprocess.PIPE, env=env
+    )
+    out, _ = await proc.communicate()
+    expected = [f"{u} 0" for u in (U[0], U[1])] + [f"{u} {flag} 0" for u in (U[0], U[1]) for flag in ("-rac", "-rmc")]
+    assert sorted(out.decode().split("\n")[:-1]) == sorted(expected)
+    assert proc.returncode == 0
+    assert not path.exists()
 
 
 def _alive(pid: int) -> bool:
