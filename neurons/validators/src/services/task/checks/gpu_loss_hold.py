@@ -41,10 +41,11 @@ from __future__ import annotations
 import json
 import logging
 import shlex
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 
 import asyncssh
+from protocol.vc_protocol.validator_requests import ContainerState, PodContainerState
 from services.gpu_reset import container_gpu_uuids
 from services.redis_service import GPU_ANCHOR_KEY
 
@@ -68,6 +69,13 @@ from .rented_gpu_drop import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _with_pod_states(result: CheckResult, ctx: Context, pod_states: list[PodContainerState]) -> CheckResult:
+    if not pod_states:
+        return result
+    state = replace(ctx.state, pod_states=[*ctx.state.pod_states, *pod_states])
+    return result.model_copy(update={"updates": {**result.updates, "state": state}})
 
 GPU_LOSS_HOLD_KEY_PREFIX = "gpu_loss_hold"
 # A weak first sighting waits this long for the next cycle (15 min apart) to confirm it.
@@ -211,7 +219,7 @@ class GpuLossHoldCheck:
 
         if set_changed and pods:
             # the node may take its new cards, but a pod made for the old ones has no GPU: it stays unavailable
-            stranded = await self._pods_without_their_gpus(ctx, pods, listed)
+            stranded, pod_states = await self._pods_without_their_gpus(ctx, pods, listed)
             if stranded is not None:
                 if mark is not None and replaced_all:
                     await self._forget(ctx, key)
@@ -222,16 +230,17 @@ class GpuLossHoldCheck:
                     event = render_message(
                         Msg.POD_UNREAD, ctx=ctx, check_id=self.check_id, what={"faults": ["pod_unread"], **stranded}
                     )
-                    return CheckResult(passed=False, event=event, fatal=True)
+                    return _with_pod_states(CheckResult(passed=False, event=event, fatal=True), ctx, pod_states)
                 stamp = now.isoformat()
                 # fatal: the cycle scores 0 (no passing report for a pod with no GPU) and nothing re-anchors yet
-                return self._lost(
+                lost = self._lost(
                     ctx,
                     DropMark(True, stamp, stamp),
                     {"faults": ["pod_gpus_gone"], **stranded},
                     fatal=True,
                     template=Msg.POD_GPUS_GONE,
                 )
+                return _with_pod_states(lost, ctx, pod_states)
         if mark is None:
             return CheckResult(
                 passed=True, event=render_message(Msg.OK, ctx=ctx, check_id=self.check_id)
@@ -259,8 +268,11 @@ class GpuLossHoldCheck:
         )
 
     @staticmethod
-    async def _pods_without_their_gpus(ctx: Context, pods: list, listed: list[str]) -> dict | None:
-        """The pods whose container still names GPUs the host no longer lists; None when every one is served.
+    async def _pods_without_their_gpus(
+        ctx: Context, pods: list, listed: list[str]
+    ) -> tuple[dict | None, list[PodContainerState]]:
+        """The pods whose container still names GPUs the host no longer lists (None when every one is served), and
+        the container state the same read saw for each pod.
 
         The host's own docker record of each container (as the GPU reset reads it), never the inside of a pod.
         A container that cannot be read is not served either way (`pods_unread`, with docker's exit status and stderr):
@@ -268,20 +280,25 @@ class GpuLossHoldCheck:
         """
         names = [pod.container_name for pod in pods if pod.container_name]
         if not names:
-            return None
+            return None, []
         try:
             res = await ctx.ssh.run(
-                "/usr/bin/docker inspect --format '{{json .Name}} {{json .HostConfig.DeviceRequests}}' "
+                "/usr/bin/docker inspect --format "
+                "'{{json .Name}} {{json .State.Status}} {{json .HostConfig.DeviceRequests}}' "
                 + " ".join(shlex.quote(name) for name in names),
                 timeout=30,
             )
         except (asyncssh.Error, OSError) as exc:
-            return {"missing_uuids": [], "pods_unread": names, "inspect_error": str(exc)[:300]}
+            return {"missing_uuids": [], "pods_unread": names, "inspect_error": str(exc)[:300]}, []
         read: dict[str, list] = {}
+        status: dict[str, str] = {}
         for line in (getattr(res, "stdout", "") or "").splitlines():
-            name, _, requests = line.partition(" ")
+            name, _, rest = line.partition(" ")
+            state, _, requests = rest.partition(" ")
             try:
-                read[json.loads(name).lstrip("/")] = json.loads(requests) or []
+                name = json.loads(name).lstrip("/")
+                read[name] = json.loads(requests) or []
+                status[name] = json.loads(state)
             except (ValueError, AttributeError):
                 continue
         unread = [name for name in names if name not in read]
@@ -289,12 +306,27 @@ class GpuLossHoldCheck:
             {uuid for requests in read.values() for uuid in container_gpu_uuids(requests, [])} - set(listed)
         )
         if not gone and not unread:
-            return None
+            return None, []
         stranded = {"missing_uuids": gone, "pods_unread": unread}
+        stderr = str(getattr(res, "stderr", "") or "")
         if unread:
             stranded["inspect_exit_status"] = getattr(res, "exit_status", None)
-            stranded["inspect_stderr"] = str(getattr(res, "stderr", "") or "")[:300]
-        return stranded
+            stranded["inspect_stderr"] = stderr[:300]
+        # the cycle stops here, before the rented-pod check reads the containers: without these the backend never
+        # learns the pod's container is down, and a REBOOT_FAILED pod is never retried
+        # (DAH-6228 needs a fresh exited or absent reading; DAH-7308)
+        observed_at = datetime.now(UTC)
+        pod_states = []
+        for pod in pods:
+            name = pod.container_name
+            if name in status:
+                seen = ContainerState.RUNNING if status[name] == "running" else ContainerState.EXITED
+            elif name and f"No such object: {name}" in stderr:
+                seen = ContainerState.ABSENT
+            else:
+                continue  # not observed: say nothing rather than unknown over an earlier reading
+            pod_states.append(PodContainerState(pod_id=pod.pod_id, container_state=seen, observed_at=observed_at))
+        return stranded, pod_states
 
     def _lost(self, ctx: Context, mark: DropMark, what: dict, *, fatal: bool, template=Msg.LOST) -> CheckResult:
         event = render_message(
