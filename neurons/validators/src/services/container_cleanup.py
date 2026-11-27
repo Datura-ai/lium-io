@@ -490,10 +490,10 @@ class ContainerCleanup:
                 if age_minutes and age_minutes > removal_age:
                     if legacy and not await self._legacy_ended(lium_workload_ended, stripped_name):
                         continue
-                    if not legacy and removal_age < self.stale_threshold_minutes:
-                        # a filler whose create callback comes late is missing from the list while it runs:
-                        # before the fixed grace, only the backend's record that it ended lets it go, and
-                        # that one lookup also confirms the removal, so it reserves no second one
+                    if not legacy and age_minutes <= self.stale_threshold_minutes:
+                        # a filler younger than the fixed grace may be a run whose create callback comes late:
+                        # only the backend's record that it ended lets it go, and that one lookup also confirms
+                        # the removal, so it reserves no second one; past the grace the fixed rule applies
                         if not await self._legacy_ended(lium_workload_ended, stripped_name):
                             continue
                     elif (

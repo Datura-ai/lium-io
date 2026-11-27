@@ -16,7 +16,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from protocol.vc_protocol.compute_requests import RentedExecutor, RentedExecutorsResponse, RentedPod
-from services.const import EDIT_PARKED_SUFFIX
+from services.const import EDIT_PARKED_SUFFIX, FILLER_CONTAINER_GRACE_MINUTES
 from services.container_cleanup import (
     RENTED_LIST_EMPTY,
     RENTED_LIST_UNAVAILABLE,
@@ -1675,7 +1675,7 @@ async def test_an_unlisted_filler_older_than_the_rented_list_goes_at_once_and_a_
     created after the read, which may be a run the list does not show yet. pod_ keeps its grace."""
     import time
 
-    from services.const import FILLER_CONTAINER_GRACE_MINUTES, FILLER_LIST_READ_MARGIN_MINUTES
+    from services.const import FILLER_LIST_READ_MARGIN_MINUTES
 
     read_minutes_ago = 3
     before_read = "filler_00000000-0000-4000-8000-0000000000b1"
@@ -1706,3 +1706,37 @@ async def test_an_unlisted_filler_older_than_the_rented_list_goes_at_once_and_a_
     assert not any(name in c for c in rm_calls for name in (after_read, young_pod, late_callback))
     # the early path's backend lookup is the removal's lookup: no second slot is reserved for it
     assert before_read not in [call.args[0] for call in reserve.call_args_list]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "age_minutes, ended, removed",
+    [
+        (FILLER_CONTAINER_GRACE_MINUTES + 60, RuntimeError("no answer"), True),
+        (FILLER_CONTAINER_GRACE_MINUTES + 60, False, True),
+        (FILLER_CONTAINER_GRACE_MINUTES - 5, RuntimeError("no answer"), False),
+        (FILLER_CONTAINER_GRACE_MINUTES - 5, False, False),
+        (FILLER_CONTAINER_GRACE_MINUTES - 5, True, True),
+    ],
+)
+async def test_an_unlisted_filler_is_gated_by_its_own_age(age_minutes, ended, removed):
+    """DAH-7071: below the fixed grace an unlisted filler goes only when the backend says its run ended;
+    past the grace it goes by the fixed rule whatever the backend answers, so it can never stay forever."""
+    import time
+
+    filler = "filler_00000000-0000-4000-8000-0000000000c1"
+    ssh, rm_calls = _make_ssh_mock(containers=[filler, LIVE_FILLER], ages_by_name={filler: age_minutes, LIVE_FILLER: 600})
+    lookup = AsyncMock(side_effect=ended) if isinstance(ended, Exception) else AsyncMock(return_value=ended)
+    rented_data = _real_rented_data(EXECUTOR_UUID, [LIVE_POD], fillers=[LIVE_FILLER])
+    rented_data.read_at = time.time() - 60
+
+    _, removed_names, _ = await ContainerCleanup().cleanup(
+        ssh_client=ssh,
+        rented_data=rented_data,
+        executor_uuid=EXECUTOR_UUID,
+        lium_workload_ended=lookup,
+        reserve_removal=MagicMock(return_value=True),
+    )
+
+    assert removed_names == ([filler] if removed else [])
+    assert not any(LIVE_FILLER in c for c in rm_calls)
