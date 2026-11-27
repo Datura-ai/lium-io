@@ -108,6 +108,9 @@ class RentedExecutorsResponse(pydantic.BaseModel):
     # executor_id → its maintenance window; the validator fails a node whose cycle started inside it
     maintenance_windows_by_executor: dict[str, MaintenanceWindow] = {}
     default_job_owner_by_executor: dict[str, str] = {}  # executor_id → "miner" | "lium"
+    # DAH-7117: executor_id → the names in all_filler_containers_by_executor whose filler Lium started (never the
+    # provider's default job); empty = not known (an older backend), not "none is Lium's"
+    lium_filler_containers_by_executor: dict[str, list[str]] = {}
     manual_rental_executors: dict[str, ManualRentalInfo] = {}
     # average filler revenue per GPU configuration, read by the spot-node pay and the secure floor
     filler_revenue_by_gpu_config: list[FillerRevenueByGpuConfig] = []

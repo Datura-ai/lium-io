@@ -76,3 +76,10 @@ def test_self_rent_arrived_in_2_1_and_is_false_from_an_older_backend() -> None:
     )
     assert older.executors[executor].self_rent is False
     assert newer.executors[executor].self_rent is True
+
+
+def test_lium_filler_containers_are_empty_from_an_older_backend_and_parse_when_sent() -> None:
+    assert RentedExecutorsResponse.model_validate(OLDER_BACKEND_REPLY).lium_filler_containers_by_executor == {}
+    sent = {"7a6b5c4d-3e2f-4a1b-9c8d-7e6f5a4b3c2d": ["filler_22222222"]}
+    reply = RentedExecutorsResponse.model_validate({**OLDER_BACKEND_REPLY, "lium_filler_containers_by_executor": sent})
+    assert reply.lium_filler_containers_by_executor == sent
