@@ -212,6 +212,11 @@ class RentalVerificationCheck:
 
         # Use the first verified port
         container_port = verified_ports[0]
+        # DAH-6946: verified_ports holds outside ports only; on a node with RENTING_PORT_MAPPINGS the router forwards
+        # the outside port to a different host port, and the test container must listen there, as a rental's does
+        host_port = dict((external, internal) for internal, external in ctx.state.verified_port_pairs).get(
+            container_port, container_port
+        )
 
         # The UUIDs this cycle's scrape saw. The backend probes for exactly these instead of
         # `--gpus all`, so a host advertising cards it cannot hand over fails here rather than in a
@@ -257,6 +262,7 @@ class RentalVerificationCheck:
                 miner_port=ctx.miner_port,
                 miner_hotkey=miner_hotkey,
                 container_port=container_port,
+                host_port=host_port,
                 executor_id=executor.uuid,
                 rental_in_progress=has_customer_rental,
                 gpu_uuids=gpu_uuids,
