@@ -597,18 +597,20 @@ async def _judge_due_card(
 
 
 async def _stop_filler_for_count_proof(ctx: Context) -> list[str]:
-    """While a filler runs, the node never gets the all-cards work proof, the only check that every card it reports
-    answers, so a node can list more cards than it has. On the node's sample turn (once a day per node) Lium's filler
-    stops and the full check runs on the idle cards instead of the one-card sample; the default job places a filler
-    again afterwards. Only with all-cards enforcement on: otherwise the proof decides nothing and the stop would cost
-    filler time for nothing. Another owner's filler is not ours to stop: that node keeps its sample.
-    Returns the stopped filler names, or [] when the filler path runs as before."""
+    """On the node's sample turn Lium's filler stops and the full check runs on the idle cards instead of the
+    one-card sample; the default job places a filler again afterwards. Only with all-cards enforcement on. Another
+    owner's filler is not ours to stop: that node keeps its sample. Returns the stopped filler names, or [] when the
+    filler path runs as before."""
     rented_data = ctx.state.rented_data
     if (
         settings.DRY_RUN
         or not allcards_enforced()
         or rented_data.get_default_job_owner(ctx.executor.uuid) != DEFAULT_JOB_OWNER_LIUM
     ):
+        return []
+    # a failed Redis read comes back as a stored pass; with Redis down the stop could not be marked as ours either
+    _, _, _, read_ok = await _read_gpu_model_verdict(ctx)
+    if not read_ok:
         return []
     return await remove_lium_fillers(ctx, rented_data.get_filler_containers(ctx.executor.uuid))
 

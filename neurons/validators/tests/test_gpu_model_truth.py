@@ -297,7 +297,6 @@ async def test_another_owners_filler_is_never_stopped_for_the_full_check(context
 async def test_a_judged_filler_node_gets_the_all_cards_proof_on_its_sample_turn(
     context_factory, monkeypatch, enforced, full_check
 ):
-    # 27 Nov: 8-card filler nodes hashed about one card each and were never count-proven while the filler ran
     monkeypatch.setattr(capability.settings, "MATMUL_ALLCARDS_CHECK_ENABLED", enforced)
     monkeypatch.setattr(capability.settings, "MATMUL_ALLCARDS_ENFORCEMENT_ENABLED", enforced)
     redis = FakeRedis()
@@ -317,6 +316,21 @@ async def test_a_judged_filler_node_gets_the_all_cards_proof_on_its_sample_turn(
     assert result.event.what_we_saw["stopped_fillers_for_full_check"] == ["filler_active"]
     # a failed proof is the node's own: the stopped filler the backend still lists waives nothing
     assert result.passed is (full_check is not None)
+
+
+@pytest.mark.asyncio
+async def test_a_redis_outage_never_stops_the_filler_for_the_all_cards_proof(context_factory, monkeypatch):
+    monkeypatch.setattr(capability.settings, "MATMUL_ALLCARDS_CHECK_ENABLED", True)
+    monkeypatch.setattr(capability.settings, "MATMUL_ALLCARDS_ENFORCEMENT_ENABLED", True)
+    monkeypatch.setattr(capability, "_filler_matmul_sample_due", lambda ctx, cycle: True)
+
+    ctx, service = _filler_ctx(context_factory, FakeRedis(failing=True), REAL_H100[1])
+    ctx = _lium_filler(ctx)
+    result = await CapabilityCheck().run(ctx)
+
+    assert result.passed is True
+    assert "stopped_fillers_for_full_check" not in result.event.what_we_saw
+    ctx.ssh.run.assert_not_awaited()
 
 
 @pytest.mark.asyncio
