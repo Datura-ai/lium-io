@@ -592,8 +592,13 @@ def test_the_cold_retry_runs_after_every_other_check_right_before_scoring(fast_p
     names = [type(c).__name__ for c in checks]
     assert names.index("VerifyXCheck") < names.index("VerifyXColdRetryCheck") == names.index("ScoreCheck") - 1
     # review 5771536147: the retry check judges the disk of the sample it keeps, so nothing but scoring follows it
-    # (the idle egress guard, DAH-6442, runs after scoring and judges nothing)
-    assert names[names.index("VerifyXColdRetryCheck") + 1 :] == ["ScoreCheck", "RentalEgressGuardCheck", "FinalizeCheck"]
+    # (the idle egress guard, DAH-6442, and the s3fs plugin copy, DAH-6697, run after scoring and judge nothing)
+    assert names[names.index("VerifyXColdRetryCheck") + 1 :] == [
+        "ScoreCheck",
+        "RentalEgressGuardCheck",
+        "S3fsPluginCopyCheck",
+        "FinalizeCheck",
+    ]
     assert not any(isinstance(c, ParallelStage) for c in checks[names.index("VerifyXColdRetryCheck") :])
 
 

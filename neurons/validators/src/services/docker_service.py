@@ -173,6 +173,7 @@ from services.image_flatten import (
     flatten_sized_mark_command,
     wait_for_node_flatten,
 )
+from services.s3fs_plugin_copy import S3FS_PLUGIN_COPY_DESCRIPTION, S3FS_PLUGIN_DIFF_ID, s3fs_plugin_command
 from services.loopback_plugin_setup import (
     LOOPBACK_PLUGIN_BUILDS,
     current_loopback_plugin_alias,
@@ -374,12 +375,9 @@ FILLER_STILL_RUNNING_EVENT = "FILLER_STILL_RUNNING"
 # image-managed Jupyter path is only safe while the mapped docker port is this one.
 IMAGE_JUPYTER_DOCKER_PORT = 8888
 
-# our build of the s3fs volume plugin (s3fs_volume_plugin/, .github/workflows/s3fs_volume_plugin.yml): the published
-# mochoa/s3fs-volume-plugin carries s3fs 1.86, whose retried requests go out unsigned, so S3 refuses a renter's read
-# after a network blip and it fails with an I/O error
-S3FS_PLUGIN_IMAGE = "daturaai/compute-subnet-validator:s3fs-volume-plugin"
-S3FS_PLUGIN_INSTALL_RETRIES = 2
-S3FS_PLUGIN_INSTALL_RETRY_WAIT_SECONDS = 5
+# the s3fs volume plugin is our build (s3fs_volume_plugin/, .github/workflows/s3fs_volume_plugin.yml), pinned by digest in
+# services/s3fs_plugin_copy.py: the published mochoa/s3fs-volume-plugin carries s3fs 1.86, whose retried requests go out
+# unsigned, so S3 refuses a renter's read after a network blip and it fails with an I/O error
 
 
 LEGACY_S3FS_PLUGIN_ALIAS = "s3fs"
@@ -406,9 +404,15 @@ def _published_ports(
     )
 
 
-def _s3fs_plugin_is_current(reference: str) -> bool:
-    # `docker plugin create` records the name without the registry, a pull with it
-    return reference.removeprefix("docker.io/") == S3FS_PLUGIN_IMAGE
+def _s3fs_plugin_is_current(inspected: str) -> bool:
+    """Whether an instance (`docker plugin inspect` of [.Config.Rootfs.DiffIds, .Config.Description], as JSON) is the
+    pinned build: installed by tag it carries the pinned layer; made from the node's copy (`docker plugin create`, which
+    recomputes the layer digest) it carries the description the copy writes. By content, not name."""
+    try:
+        diff_ids, description = json.loads(inspected)
+    except (ValueError, TypeError):
+        return False
+    return diff_ids == [S3FS_PLUGIN_DIFF_ID] or description == S3FS_PLUGIN_COPY_DESCRIPTION
 
 
 def _s3fs_plugin_alias(volume_name: str) -> str:
@@ -8421,18 +8425,10 @@ class DockerService:
         volume_info: ExternalVolumeInfo,
         mount_options: str,
     ) -> list[asyncssh.SSHCompletedProcess]:
-        """Install and configure the plugin instance that serves this one volume."""
-        install_command: str = (
-            f"/usr/bin/docker plugin install {S3FS_PLUGIN_IMAGE} "
-            f"--alias {plugin_alias} --grant-all-permissions --disable"
-        )
-        # the install pulls the plugin from Docker Hub every time; one TLS timeout there failed the whole rental
-        install_result = await ssh_client.run(install_command)
-        for _ in range(S3FS_PLUGIN_INSTALL_RETRIES):
-            if install_result.exit_status == 0 or "already exists" in (install_result.stderr or ""):
-                break
-            await asyncio.sleep(S3FS_PLUGIN_INSTALL_RETRY_WAIT_SECONDS)
-            install_result = await ssh_client.run(install_command)
+        """Create the plugin instance that serves this one volume from the node's local plugin copy and configure it.
+
+        DAH-6466: no registry round trip here; only a node without the copy yet makes one, once."""
+        install_result = await ssh_client.run(s3fs_plugin_command(plugin_alias))
         commands: list[str] = [
             f"/usr/bin/docker plugin disable {plugin_alias} -f",
             # backend-sent keys and options: each assignment is one quoted word
@@ -8454,10 +8450,11 @@ class DockerService:
         would only reconfigure ("already exists") and leave serving the rental. None when nothing of another build is
         left; else why it stays, and the rental fails rather than run on it."""
         installed = await ssh_client.run(
-            f"/usr/bin/docker plugin inspect --format '{{{{.PluginReference}}}}' {plugin_alias}"
+            f"/usr/bin/docker plugin inspect --format "
+            f"'[{{{{json .Config.Rootfs.DiffIds}}}},{{{{json .Config.Description}}}}]' {plugin_alias}"
         )
-        reference = (installed.stdout or "").strip() if installed.exit_status == 0 else ""
-        if not reference or _s3fs_plugin_is_current(reference):
+        layers = (installed.stdout or "").strip() if installed.exit_status == 0 else ""
+        if not layers or _s3fs_plugin_is_current(layers):
             return None
         # a container that references the volume, running or stopped (an edit/reboot parks the pod's one), keeps the
         # instance in use: disabling it would leave that pod without its Volume, so the old build serves it until no
@@ -8475,7 +8472,7 @@ class DockerService:
         if removed.exit_status == 0:
             return None
         return (
-            f"the s3fs plugin instance {plugin_alias} of an older build ({reference}) could not be removed: "
+            f"the s3fs plugin instance {plugin_alias} of an older build ({layers}) could not be removed: "
             f"{(removed.stderr or '').strip() or f'exit {removed.exit_status}'}"
         )
 

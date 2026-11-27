@@ -1,8 +1,9 @@
 name: "CD: s3fs volume plugin"
 
 # Builds neurons/validators/s3fs_volume_plugin and pushes it as the Docker plugin
-# daturaai/compute-subnet-validator:s3fs-volume-plugin, the plugin the validator installs for every Volume
-# (S3FS_PLUGIN_IMAGE). A tag of the validator repository, because the lium-io-publish OIDC ruleset already covers
+# daturaai/compute-subnet-validator:s3fs-volume-plugin, the plugin the validator installs for every Volume. The
+# validator pins it by digest (neurons/validators/src/services/s3fs_plugin_copy.py), so a republish needs that pin
+# updated in the same change. A tag of the validator repository, because the lium-io-publish OIDC ruleset already covers
 # it. Published from main when its inputs change. The published mochoa/s3fs-volume-plugin carries s3fs 1.86, whose
 # retries go out unsigned, so a rental's reads fail after a network blip (s3fs_volume_plugin/Dockerfile).
 

@@ -1368,6 +1368,32 @@ class StaleContainerCleanupMessages:
     )
 
 
+class S3fsPluginCopyMessages:
+    """DAH-6466: the node's local s3fs plugin copy, staged outside any rental. Never changes the score."""
+
+    STAGED = MessageTemplate(
+        event="s3fs plugin copy is on the node",
+        reason="S3FS_PLUGIN_COPY_STAGED",
+        severity="info",
+        category="prep",
+        impact="Proceed",
+    )
+    NOT_STAGED = MessageTemplate(
+        event="s3fs plugin copy could not be staged; the next Volume rental stages it",
+        reason="S3FS_PLUGIN_COPY_NOT_STAGED",
+        severity="info",
+        category="prep",
+        impact="Proceed",
+    )
+    SKIPPED = MessageTemplate(
+        event="s3fs plugin copy staging skipped",
+        reason="S3FS_PLUGIN_COPY_SKIPPED",
+        severity="info",
+        category="prep",
+        impact="Proceed",
+    )
+
+
 class CustomBuildOrphanSweepMessages:
     """DAH-2211 — Phase 3.4(ii) — periodic GC of `lium-build-*` image+scratch
     orphans left behind by validator crashes / aborted releases. The happy

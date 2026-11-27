@@ -28,6 +28,7 @@ from payload_models.payloads import (
 import services.docker_service as docker_service_module
 from helpers import no_host_start_lock, shared_pod_start_stop_lock
 from services.docker_service import LEGACY_S3FS_PLUGIN_ALIAS, DockerService, _is_vloopback_driver, _s3fs_plugin_alias
+from services.s3fs_plugin_copy import s3fs_plugin_command
 from services.rental_docker_sdk import (
     ContainerExecResult,
     ContainerStateSnapshot,
@@ -540,7 +541,7 @@ async def test_fresh_create_fails_when_sysbox_cannot_align_the_volume_owner(
     # container, so the mount owner cannot be aligned. A fresh rental fails
     # before the container exists instead of starting on runc.
     ssh_client = InstalledPluginSSHClient(
-        f"docker.io/{docker_service_module.S3FS_PLUGIN_IMAGE}", stdout="sysbox:231072:1048576"
+        OUR_LAYERS, stdout="sysbox:231072:1048576"
     )
     _patch_create_harness(monkeypatch, docker_service, ssh_client)
     plugin_spy = AsyncMock()
@@ -683,7 +684,9 @@ async def test_create_s3fs_volume_uses_a_plugin_instance_of_its_own(
     )
 
     alias = "s3fs-celium-volume-safe"
-    assert any(f"--alias {alias} " in command for command in ssh_client.commands)
+    # DAH-6466: the instance is made from the node's local plugin copy, with no `plugin install` of its own
+    assert s3fs_plugin_command(alias) in ssh_client.commands
+    assert not any(command.startswith("/usr/bin/docker plugin install") for command in ssh_client.commands)
     assert any(f"plugin set {alias} AWSACCESSKEYID=" in command for command in ssh_client.commands)
     assert any(f"plugin enable {alias}" in command for command in ssh_client.commands)
     assert f"volume create -d {alias} " in stream_logs.await_args.kwargs["command"]
@@ -701,46 +704,23 @@ async def test_create_s3fs_volume_uses_a_plugin_instance_of_its_own(
     assert not any(command.startswith(forbidden) for command in ssh_client.commands)
 
 
-class InstallFailsSSHClient(RecordingSSHClient):
-    def __init__(self, install_failures: int, install_stderr: str):
-        super().__init__()
-        self.install_failures = install_failures
-        self.install_stderr = install_stderr
-
+class CopyFailsSSHClient(RecordingSSHClient):
     async def run(self, command, *args, **kwargs):
         self.commands.append(command)
-        if "plugin install" in command and self.install_failures:
-            self.install_failures -= 1
-            return SimpleNamespace(stdout="", stderr=self.install_stderr, exit_status=1)
+        if command == s3fs_plugin_command("s3fs-celium-volume-safe"):
+            return SimpleNamespace(stdout="", stderr="plugin install failed: connection reset by peer", exit_status=1)
         return SimpleNamespace(stdout="", stderr="", exit_status=0)
 
 
-def _s3fs_install_count(ssh_client) -> int:
-    return sum("plugin install" in command for command in ssh_client.commands)
-
-
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("install_failures", "install_stderr", "expected_installs"),
-    [
-        # a Docker Hub TLS timeout on the plugin pull (node 72d90b60, 15 Nov) is tried again
-        (1, 'failed to do request: Get "https://registry-1.docker.io/v2/": net/http: TLS handshake timeout', 2),
-        # the retries stop after two
-        (5, "net/http: TLS handshake timeout", 3),
-        # an instance already installed for this volume is not pulled again
-        (1, "Error response from daemon: plugin s3fs-celium-volume-safe:latest already exists", 1),
-    ],
-)
-async def test_create_s3fs_volume_retries_a_failed_plugin_install(
-    docker_service,
-    monkeypatch,
-    install_failures,
-    install_stderr,
-    expected_installs,
-):
-    ssh_client = InstallFailsSSHClient(install_failures, install_stderr)
-    monkeypatch.setattr(docker_service, "execute_and_stream_logs", AsyncMock(return_value=(True, "")))
-    monkeypatch.setattr(docker_service_module, "S3FS_PLUGIN_INSTALL_RETRY_WAIT_SECONDS", 0)
+async def test_create_s3fs_volume_reports_why_the_instance_could_not_be_made(docker_service, monkeypatch):
+    # a node without the plugin copy whose registry path is down: the failure log names the install, as before
+    ssh_client = CopyFailsSSHClient()
+    monkeypatch.setattr(
+        docker_service, "execute_and_stream_logs", AsyncMock(return_value=(False, "plugin not found"))
+    )
+    warning = Mock()
+    monkeypatch.setattr(docker_service_module.logger, "warning", warning)
 
     result = await docker_service.create_s3fs_volume(
         ssh_client=ssh_client,
@@ -750,14 +730,22 @@ async def test_create_s3fs_volume_retries_a_failed_plugin_install(
         sysbox_subuid_base=None,
     )
 
-    assert result == (True, "")
-    assert _s3fs_install_count(ssh_client) == expected_installs
-    # the instance is still configured and enabled after the retried install
-    assert any("plugin enable s3fs-celium-volume-safe" in command for command in ssh_client.commands)
+    assert result[0] is False
+    assert "Step 0: exit=1, stdout=, stderr=plugin install failed: connection reset by peer" in str(warning.call_args.args[0])
+
+
+# `docker plugin inspect` [.Config.Rootfs.DiffIds, .Config.Description] of an instance of our build installed by tag,
+# of one `docker plugin create` made from the node's copy (create recomputes the layer digest from the directory, so it
+# never equals the registry's), and of the mochoa build (s3fs 1.86)
+OUR_LAYERS = json.dumps([[docker_service_module.S3FS_PLUGIN_DIFF_ID], "s3fs volume plugin"])
+OUR_COPY = json.dumps([["sha256:" + "c" * 64], docker_service_module.S3FS_PLUGIN_COPY_DESCRIPTION])
+MOCHOA_LAYERS = json.dumps(
+    [["sha256:adb3d068dfc915b2495c679c13681166bd0a333d3766a7393fd45294dd75bd48"], "S3FS plugin for Docker"]
+)
 
 
 class InstalledPluginSSHClient(RecordingSSHClient):
-    # answers `plugin inspect` with the installed instance's reference, `docker ps` with the containers holding the
+    # answers `plugin inspect` with the installed instance's layers, `docker ps` with the containers holding the
     # volume, `plugin rm` with plugin_rm_exit, every other command with `stdout`
     # `disabled`: the instance was left disabled, so `volume rm` fails (and the volume keeps it in use) until enabled
     def __init__(self, reference: str, stdout: str = "", plugin_rm_exit: int = 0, holders: str = "", disabled=False):
@@ -769,7 +757,7 @@ class InstalledPluginSSHClient(RecordingSSHClient):
 
     async def run(self, command, *args, **kwargs):
         self.commands.append(command)
-        if "plugin inspect --format '{{.PluginReference}}'" in command:
+        if "plugin inspect --format '[{{json .Config.Rootfs.DiffIds}},{{json .Config.Description}}]'" in command:
             return SimpleNamespace(stdout=self.reference + "\n", stderr="", exit_status=0)
         if command.startswith("/usr/bin/docker ps -aq --filter volume="):
             return SimpleNamespace(stdout=self.holders, stderr="", exit_status=0)
@@ -788,11 +776,16 @@ class InstalledPluginSSHClient(RecordingSSHClient):
     ("reference", "current"),
     [
         # the mochoa build (s3fs 1.86: retries go out unsigned)
-        ("docker.io/mochoa/s3fs-volume-plugin:latest", False),
-        (f"docker.io/{docker_service_module.S3FS_PLUGIN_IMAGE}", True),
-        # `docker plugin create` records the name without the registry
-        (docker_service_module.S3FS_PLUGIN_IMAGE, True),
-        (f"docker.io/{docker_service_module.S3FS_PLUGIN_IMAGE}-old", False),
+        (MOCHOA_LAYERS, False),
+        # ours, installed by tag (the pinned layer) or made from the node's copy (the copy's description)
+        (OUR_LAYERS, True),
+        (OUR_COPY, True),
+        # a copy description of another pinned build
+        (json.dumps([["sha256:" + "c" * 64], "lium s3fs plugin copy of sha256:" + "0" * 64]), False),
+        (json.dumps([[docker_service_module.S3FS_PLUGIN_DIFF_ID, "sha256:" + "0" * 64], ""]), False),
+        (json.dumps([docker_service_module.S3FS_PLUGIN_DIFF_ID]), False),
+        ("", False),
+        ("not json", False),
     ],
 )
 def test_only_our_plugin_build_counts_as_current(reference, current):
@@ -806,7 +799,7 @@ async def test_an_instance_of_another_build_is_removed_with_its_volume_or_the_re
 ):
     # review on #2397: `plugin rm` failed while the old volume kept the instance in use, the install accepted
     # "already exists", and the rental ran on the old build
-    ssh_client = InstalledPluginSSHClient("docker.io/mochoa/s3fs-volume-plugin:latest", plugin_rm_exit=0 if removed else 1)
+    ssh_client = InstalledPluginSSHClient(MOCHOA_LAYERS, plugin_rm_exit=0 if removed else 1)
     stream_logs = AsyncMock(return_value=(True, ""))
     monkeypatch.setattr(docker_service, "execute_and_stream_logs", stream_logs)
 
@@ -839,7 +832,7 @@ async def test_an_instance_of_another_build_is_removed_with_its_volume_or_the_re
 async def test_an_instance_of_another_build_left_disabled_is_still_replaced(docker_service, monkeypatch):
     # review on #2397: the old instance was force-disabled with its volume kept; Docker refused `volume rm` on the
     # disabled driver, so `plugin rm` failed and the rental stopped before the install
-    ssh_client = InstalledPluginSSHClient("docker.io/mochoa/s3fs-volume-plugin:latest", disabled=True)
+    ssh_client = InstalledPluginSSHClient(MOCHOA_LAYERS, disabled=True)
     monkeypatch.setattr(docker_service, "execute_and_stream_logs", AsyncMock(return_value=(True, "")))
 
     is_success, message = await docker_service.create_s3fs_volume(
@@ -858,7 +851,7 @@ async def test_an_instance_of_another_build_left_disabled_is_still_replaced(dock
 async def test_an_instance_of_another_build_stays_while_a_container_references_its_volume(docker_service, monkeypatch):
     # review on #2397: an edit/reboot parks the pod's stopped container, which keeps the volume; `plugin rm` then
     # failed after `disable -f` and the pod came back without its Volume
-    ssh_client = InstalledPluginSSHClient("docker.io/mochoa/s3fs-volume-plugin:latest", holders="0123456789ab\n")
+    ssh_client = InstalledPluginSSHClient(MOCHOA_LAYERS, holders="0123456789ab\n")
     monkeypatch.setattr(docker_service, "execute_and_stream_logs", AsyncMock(return_value=(True, "")))
 
     is_success, _ = await docker_service.create_s3fs_volume(
@@ -961,7 +954,6 @@ def test_only_v2_is_installed_or_enabled_and_only_s3fs_instances_are_disabled_re
     assert set(targets) == {"{plugin_alias}"}
     installed_or_enabled = re.findall(r"""docker plugin (?:install|enable) ([^\s"']+)""", source)
     assert set(installed_or_enabled) == {
-        "{S3FS_PLUGIN_IMAGE}",
         "{plugin_alias}",
         "{LEGACY_S3FS_PLUGIN_ALIAS}",
     }

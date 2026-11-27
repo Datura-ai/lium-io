@@ -183,6 +183,7 @@ class TaskService:
 
         `first_pass` (DAH-3011): the caller knows this is the executor's first, unscored verification
         (the express lane, DAH-2958). The wave never sets it.
+        `deadline_monotonic`: the caller's own deadline when sooner than the task timeout (an express recheck's).
         """
         task_started_at = time.monotonic()
         attestation_digest = None
