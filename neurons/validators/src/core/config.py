@@ -679,6 +679,9 @@ class Settings(BaseSettings):
     # per-card rate the average is built from; 24 left a lone 1-GPU Spot node unpaid for its first
     # day of Default Job and after every restart.
     FILLER_REVENUE_MIN_GPU_HOURS: float = Field(env="FILLER_REVENUE_MIN_GPU_HOURS", default=2.0)
+    # DAH-7118: credit a node's last pass for a cycle whose only change was a Lium filler starting on it. False: the
+    # cycle is withheld as before and each credit it would have given is logged ("would credit")
+    RENTAL_CHANGE_CARRY_ENABLED: bool = Field(env="RENTAL_CHANGE_CARRY_ENABLED", default=False)
     # The same threshold for a secure node (the secure floor): kept at 24 GPU-hours, since its
     # top-up is bounded by the remaining burn allocation, not by what the fillers earned.
     SECURE_FILLER_REVENUE_MIN_GPU_HOURS: float = Field(

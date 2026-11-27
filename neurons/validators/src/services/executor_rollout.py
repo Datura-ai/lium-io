@@ -58,6 +58,7 @@ from services.task.messages import (
     TenantEnforcementMessages,
     UploadFilesMessages,
 )
+from services.const import DEFAULT_JOB_OWNER_LIUM
 from services.task.models import VALIDATOR_REDIS_UNAVAILABLE, JobResult
 from services.task.result_handler import rental_gpu_count
 
@@ -690,7 +691,12 @@ async def withhold_rental_change_verdicts(
         for result in results:
             field = f"{miner_hotkey}:{result.executor_info.uuid}"
             change = None
-            if result.is_successful and not result.carried_for_renter_gpu_reset:
+            if result.carried_for_rental_change:
+                # DAH-7118: a credited cycle counts toward the cap like a withheld one, and is no pass
+                batches = state.get(field, {}).get("batches", [])
+                state[field] = {"batches": list(dict.fromkeys([*batches, result.job_batch_id])), "at": now}
+                writes.hset(RENTAL_CHANGE_STATE_KEY, field, json.dumps(state[field]))
+            elif result.is_successful and not result.carried_for_renter_gpu_reset:
                 if field in state:
                     writes.hdel(RENTAL_CHANGE_STATE_KEY, field)
                     state.pop(field)
@@ -886,25 +892,14 @@ async def carry_renter_gpu_reset_results(
             rented_gpu_count = rental_gpu_count(rental_at_end) if rented_now else 0
             if no_task_time and in_redis and not await _spend_kept_result(redis_service, miner_hotkey, held):
                 continue
-            results[index] = previous.model_copy(
-                update={
-                    "executor_info": held.executor_info,
-                    "job_batch_id": held.job_batch_id,
-                    "carried_for_renter_gpu_reset": True,
-                    **{field: getattr(held, field) for field in _FRESH_PAY_FIELDS},
-                    "is_provider_banned": _banned_now(
-                        rented_data, miner_hotkey, miner_coldkeys.get(miner_hotkey), previous, held
-                    ),
-                    "filler_revenue_per_gpu_hour": _filler_revenue_now(rented_data, previous),
-                    "filler_revenue_usd_per_hour": (
-                        rented_data.get_filler_revenue_usd_per_hour(
-                            BASE_GPU_MAP.get(previous.gpu_model or ""), settings.FILLER_REVENUE_MIN_GPU_HOURS
-                        )
-                        if rented_data
-                        else previous.filler_revenue_usd_per_hour
-                    ),
-                    "rented_gpu_count": rented_gpu_count or previous.rented_gpu_count,
-                }
+            results[index] = _carried_row(
+                previous,
+                held,
+                rented_data,
+                miner_hotkey,
+                miner_coldkeys.get(miner_hotkey),
+                carried_for_renter_gpu_reset=True,
+                rented_gpu_count=rented_gpu_count or previous.rented_gpu_count,
             )
             logger.info(
                 _m(
@@ -922,6 +917,132 @@ async def carry_renter_gpu_reset_results(
                     },
                 )
             )
+
+
+def _carried_row(
+    previous: JobResult,
+    held: JobResult,
+    rented_data: RentedExecutorsResponse | None,
+    miner_hotkey: str,
+    miner_coldkey: str | None,
+    **update,
+) -> JobResult:
+    """The kept result standing in for this cycle's: scored as in the cycle it came from, with this cycle's pay flags,
+    a fresh ban lookup and this cycle's filler averages."""
+    return previous.model_copy(
+        update={
+            "executor_info": held.executor_info,
+            "job_batch_id": held.job_batch_id,
+            **{field: getattr(held, field) for field in _FRESH_PAY_FIELDS},
+            "is_provider_banned": _banned_now(rented_data, miner_hotkey, miner_coldkey, previous, held),
+            "filler_revenue_per_gpu_hour": _filler_revenue_now(rented_data, previous),
+            "filler_revenue_usd_per_hour": (
+                rented_data.get_filler_revenue_usd_per_hour(
+                    BASE_GPU_MAP.get(previous.gpu_model or ""), settings.FILLER_REVENUE_MIN_GPU_HOURS
+                )
+                if rented_data
+                else previous.filler_revenue_usd_per_hour
+            ),
+            **update,
+        }
+    )
+
+
+def _only_lium_filler_started(
+    result: JobResult, before: frozenset[str], after: frozenset[str], at_end: RentedExecutorsResponse
+) -> bool:
+    """DAH-7118: the node went from no filler to fillers the backend owns as Lium's, and nothing else changed. A diff
+    proves occupancy changed, not who changed it: only an added, positively Lium filler explains the failure.
+    shortcut: 0 -> Lium fillers only (the node-wide default_job_owner), until the backend names each Lium filler."""
+    if not before <= after or any(not entry.startswith("filler:") for entry in after - before):
+        return False
+    if any(entry.startswith("filler:") for entry in before):
+        return False
+    return at_end.get_default_job_owner(str(result.executor_info.uuid)) == DEFAULT_JOB_OWNER_LIUM
+
+
+async def carry_rental_change_passes(
+    job_results: dict[str, list[JobResult]],
+    redis_service: RedisService,
+    rented_at_start: RentedExecutorsResponse | None,
+    rented_at_end: RentedExecutorsResponse | None,
+    miner_coldkeys: dict[str, str | None],
+    published_early: set[str],
+    rollout_window: RolloutWindow,
+    *,
+    job_block: int,
+) -> None:
+    """DAH-7118: a failure `withhold_rental_change_verdicts` would withhold, on a node whose only change during the
+    cycle was a Lium filler starting, takes the node's pass of the cycle right before (rented: the vouched Redis copy;
+    idle: `_take_idle_pass`), in place, before duplicates and GPU counts are settled. Lium started the filler; the
+    provider does not lose the cycle for it. A rollout or session-lost hold comes first, and the rental-change cap
+    still applies (a credit counts toward it). The pass must be a real one (not a carry), with the same rental state
+    (`rental_state_unchanged`), used once: the credited row is never kept or vouched for again. Anything else is
+    withheld as before. RENTAL_CHANGE_CARRY_ENABLED off: logs "would credit" and consumes nothing."""
+    if rented_at_start is None or rented_at_end is None or not has_rental_change_candidates(job_results):
+        return
+    try:
+        state = {
+            (field.decode() if isinstance(field, bytes) else field): json.loads(raw)
+            for field, raw in (await redis_service.hgetall(RENTAL_CHANGE_STATE_KEY)).items()
+        }
+    except Exception as exc:
+        logger.warning(_m("Rental-change credit: state unreadable; every such cycle is withheld", extra={"error": str(exc)}))
+        return
+    enabled = settings.RENTAL_CHANGE_CARRY_ENABLED
+    for miner_hotkey, results in job_results.items():
+        for index, failed in enumerate(results):
+            if failed.session_lost_in_port_check or rollout_grace_reason(failed, rollout_window, job_block):
+                continue
+            change = _rental_change(failed, miner_hotkey, rented_at_start, rented_at_end, published_early)
+            if change is None or not _only_lium_filler_started(failed, *change, rented_at_end):
+                continue
+            uuid = str(failed.executor_info.uuid)
+            field = f"{miner_hotkey}:{failed.executor_info.uuid}"
+            if len(state.get(field, {}).get("batches", [])) >= MAX_RENTAL_CHANGE_WITHHELD_CYCLES:
+                continue
+            # a carry vouches for a rented pass too: only a node the cycle before really passed is credited
+            if (miner_hotkey, failed.executor_info.uuid) not in _passed_last_cycle:
+                continue
+            previous = _take_idle_pass(miner_hotkey, failed, job_block, take=enabled)
+            if previous is None:
+                previous = await _last_scored_result(redis_service, miner_hotkey, failed, job_block, take=enabled)
+            if previous is None:
+                continue
+            rental_at_start = rental_owned_by(
+                rented_at_start.executors.get(uuid), miner_hotkey, failed.executor_info.address, failed.executor_info.port
+            )
+            rental_at_end = rental_owned_by(
+                rented_at_end.executors.get(uuid), miner_hotkey, failed.executor_info.address, failed.executor_info.port
+            )
+            if not rental_state_unchanged(failed, previous, rental_at_start, rental_at_end):
+                continue
+            extra = {
+                "miner_hotkey": miner_hotkey,
+                "executor_uuid": failed.executor_info.uuid,
+                "job_batch_id": failed.job_batch_id,
+                "reason_code": failed.failure_reason_code,
+                "carried_from_job_batch_id": previous.job_batch_id,
+                "carried_score": previous.score,
+                "started": sorted(change[1] - change[0]),
+            }
+            if not enabled:
+                logger.info(_m("Rental-change credit: would credit the last pass (RENTAL_CHANGE_CARRY_ENABLED off)", extra=extra))
+                continue
+            results[index] = _carried_row(
+                previous,
+                failed,
+                rented_at_end,
+                miner_hotkey,
+                miner_coldkeys.get(miner_hotkey),
+                carried_for_rental_change=True,
+                # the end state: a Lium filler runs on the node now; no rented GPU was added
+                default_job_owner=DEFAULT_JOB_OWNER_LIUM,
+                has_lium_filler=True,
+                is_in_maintenance=failed.is_in_maintenance,
+                rented_gpu_count=previous.rented_gpu_count,
+            )
+            logger.info(_m("Score carried: only a Lium filler started on the node during the cycle", extra=extra))
 
 
 def _banned_now(
@@ -976,19 +1097,22 @@ async def _spend_kept_result(redis_service: RedisService, miner_hotkey: str, hel
 # DAH-5933: each node's idle pass of the last cycle, in this process only and never in Redis: taking or dropping one
 # cannot fail, and a restart starts with none (the next held cycle is withheld). (result, job block it was scored on)
 _idle_passes: dict[tuple[str, str], tuple[JobResult, int]] = {}
+# DAH-7118: the nodes the last cycle scored a real pass for (not a carried result), in this process only
+_passed_last_cycle: set[tuple[str, str]] = set()
 
 
-def _take_idle_pass(miner_hotkey: str, held: JobResult, job_block: int) -> JobResult | None:
+def _take_idle_pass(miner_hotkey: str, held: JobResult, job_block: int, *, take: bool = True) -> JobResult | None:
     """The node's idle pass kept by the cycle right before this one, or None. Taken on read, so whatever this cycle
-    decides, no later cycle finds it; only a pass this cycle scores is kept for the next."""
-    kept = _idle_passes.pop((miner_hotkey, held.executor_info.uuid), None)
+    decides, no later cycle finds it; only a pass this cycle scores is kept for the next. take=False only looks."""
+    node = (miner_hotkey, held.executor_info.uuid)
+    kept = _idle_passes.pop(node, None) if take else _idle_passes.get(node)
     if kept is None or kept[1] < job_block - settings.BLOCKS_FOR_JOB:
         return None
     return kept[0]
 
 
 async def _last_scored_result(
-    redis_service: RedisService, miner_hotkey: str, held: JobResult, job_block: int
+    redis_service: RedisService, miner_hotkey: str, held: JobResult, job_block: int, *, take: bool = True
 ) -> JobResult | None:
     """The node's kept rented result (an idle one is `_take_idle_pass`'s), or None: none, unreadable, or not vouched
     for by the cycle right before this one (the held result is then withheld, as before). Eligibility is a fact of
@@ -996,14 +1120,16 @@ async def _last_scored_result(
     results (`remember_rented_scored_results`). A cycle that dropped it, withheld the node, or wrote nothing at all
     (a Redis outage, a restart) leaves no vouch, so a row such a cycle could not delete is never read as eligible
     again. The read takes the vouch it finds, so a cycle that shares the job block of the one before it cannot
-    leave that cycle's vouch behind."""
+    leave that cycle's vouch behind. take=False only looks: the vouch stays."""
     try:
         # the read spends the vouch: only this cycle's own write can vouch for the next one, so a cycle that drops the
         # result (on any job block) and cannot delete it leaves nothing a later cycle accepts
-        raw, vouch = await redis_service.read_and_take(
-            last_scored_result_key(miner_hotkey, held.executor_info.uuid),
-            last_scored_result_vouch_key(miner_hotkey, held.executor_info.uuid),
-        )
+        key = last_scored_result_key(miner_hotkey, held.executor_info.uuid)
+        vouch_key = last_scored_result_vouch_key(miner_hotkey, held.executor_info.uuid)
+        if take:
+            raw, vouch = await redis_service.read_and_take(key, vouch_key)
+        else:
+            raw, vouch = await redis_service.mget([key, vouch_key])
         if not raw:
             return None
         # a cycle an operator asks for runs on the job block of the cycle before it, so the vouch may be this block too
@@ -1042,14 +1168,22 @@ async def remember_rented_scored_results(
     """
     writes = RedisWrites()
     idle_passes: dict[tuple[str, str], tuple[JobResult, int]] = {}
+    passed: set[tuple[str, str]] = set()
     for miner_hotkey, results in job_results.items():
         for result in results:
             vouch = last_scored_result_vouch_key(miner_hotkey, result.executor_info.uuid)
+            if result.carried_for_rental_change:
+                # DAH-7118: a credited pass is used once: the next cycle finds nothing to carry
+                writes.delete(last_scored_result_key(miner_hotkey, result.executor_info.uuid))
+                writes.delete(vouch)
+                continue
             if result.carried_for_renter_gpu_reset:
                 if result.is_rented:
                     writes.set(vouch, str(job_block), ex=LAST_SCORED_RESULT_TTL_SECONDS)
                 continue
             key = last_scored_result_key(miner_hotkey, result.executor_info.uuid)
+            if result.is_successful:
+                passed.add((miner_hotkey, result.executor_info.uuid))
             if result.is_rented and result.is_successful:
                 writes.set(key, result.model_dump_json(), ex=LAST_SCORED_RESULT_TTL_SECONDS)
                 writes.set(vouch, str(job_block), ex=LAST_SCORED_RESULT_TTL_SECONDS)
@@ -1061,6 +1195,8 @@ async def remember_rented_scored_results(
                 idle_passes[(miner_hotkey, result.executor_info.uuid)] = (result.model_copy(deep=True), job_block)
     _idle_passes.clear()
     _idle_passes.update(idle_passes)
+    _passed_last_cycle.clear()
+    _passed_last_cycle.update(passed)
     try:
         await redis_service.write_atomically(writes)
     except Exception as exc:

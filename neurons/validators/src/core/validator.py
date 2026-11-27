@@ -27,6 +27,7 @@ from services.executor_rollout import (
     ExecutorRolloutTracker,
     RolloutWindow,
     WithheldVerdict,
+    carry_rental_change_passes,
     carry_renter_gpu_reset_results,
     has_renter_gpu_reset_holds,
     remember_rented_scored_results,
@@ -140,11 +141,13 @@ def settle_cycle_results(
 
 def specs_to_publish(results: list[JobResult]) -> list[JobResult]:
     """All but a zeroed duplicate under the keeper's own executor UUID (that backend row hears the keeper) and a
-    result carried over a renter GPU reset (the backend keeps the row it has)."""
+    result carried over a renter GPU reset or a Lium filler start (the backend keeps the row it has)."""
     return [
         result
         for result in results
-        if not result.duplicate_shares_kept_row and not result.carried_for_renter_gpu_reset
+        if not result.duplicate_shares_kept_row
+        and not result.carried_for_renter_gpu_reset
+        and not result.carried_for_rental_change
     ]
 
 
@@ -694,6 +697,18 @@ class Validator:
                     await self.carry_scores_over_renter_gpu_resets(
                         all_job_results, rented_executors, miner_coldkeys, rented_at_end, job_block=job_block
                     )
+                    # DAH-7118: after the reset carry, before duplicates and GPU counts are settled
+                    tally = self.miner_service.outage_tally
+                    await carry_rental_change_passes(
+                        all_job_results,
+                        self.redis_service,
+                        rented_executors,
+                        rented_at_end,
+                        miner_coldkeys,
+                        tally.published_early if tally else set(),
+                        rollout_window,
+                        job_block=job_block,
+                    )
                     total_gpu_model_count_map = settle_cycle_results(
                         all_job_results,
                         {**self.default_extra, "job_batch_id": job_batch_id},
@@ -736,7 +751,11 @@ class Validator:
                     self.active_hotkeys = {
                         miner_hotkey
                         for miner_hotkey, results in all_job_results.items()
-                        if any(result.is_successful or result.duplicate_kept_by for result in results)
+                        # DAH-7118: a credited pass alone does not keep the miner active, as a withheld cycle would not
+                        if any(
+                            (result.is_successful and not result.carried_for_rental_change) or result.duplicate_kept_by
+                            for result in results
+                        )
                     } | session_kept_hotkeys(withheld_results)
 
                     incentive = IncentiveFactory.create(
