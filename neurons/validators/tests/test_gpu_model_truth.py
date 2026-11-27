@@ -768,3 +768,46 @@ async def test_an_out_of_turn_retry_moves_to_the_next_card_each_cycle(context_fa
         await CapabilityCheck().run(ctx)
 
     assert picked == [1, 0]  # a day-step index at the turn would pick card 1 again
+
+
+@pytest.mark.asyncio
+async def test_a_full_check_with_no_answer_after_the_stop_fails_without_the_workload_waiver(
+    context_factory, sample_never_due, monkeypatch
+):
+    # review: the backend still lists the stopped filler, so a no-answer must not read as Lium's workload
+    waiver = AsyncMock(return_value=SimpleNamespace(kind="filler", container_names=["filler_active"], snapshot=None))
+    monkeypatch.setattr(capability, "lium_workload_live_now", waiver)
+    redis = FakeRedis()
+    await redis.set(capability._full_check_due_key(_filler_ctx(context_factory, redis, None)[0]), "0")
+
+    ctx, service = _filler_ctx(context_factory, redis, None, success=False, failure=TIMED_OUT)
+    result = await CapabilityCheck().run(_lium_filler(ctx))
+
+    assert service.budgets == [None]
+    assert result.passed is False
+    assert result.event.reason_code != Msg.RENTED_SKIPPED.reason
+    assert result.event.what_we_saw["stopped_fillers_for_full_check"] == ["filler_active"]
+    waiver.assert_not_awaited()
+
+
+TWO_H100 = {"gpu": {"count": 2, "details": [{"name": REAL_H100[0], "uuid": "GPU-0"}, {"name": REAL_H100[0], "uuid": "GPU-1"}]}}
+H100_AND_ADA = {
+    "gpu": {"count": 2, "details": [{"name": REAL_H100[0], "uuid": "GPU-0"}, {"name": FAKED[2][0], "uuid": "GPU-1"}]}
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("specs, passed", [(TWO_H100, True), (H100_AND_ADA, False)], ids=["real", "faked"])
+async def test_the_card_whose_sample_failed_is_judged_after_the_stop(context_factory, sample_never_due, specs, passed):
+    # review: with all-cards off the full check proves card 0 only, so the marked card is run on its own
+    redis = FakeRedis()
+    ctx, service = _filler_ctx(context_factory, redis, REAL_H100[1], specs=specs)
+    await redis.set(capability._full_check_due_key(ctx), "1")
+
+    result = await CapabilityCheck().run(_lium_filler(ctx))
+
+    assert service.budgets == [None, capability.settings.FILLER_MATMUL_SAMPLE_VRAM_MB]
+    assert service.gpu_uuids[1] == "GPU-1"
+    assert result.passed is passed
+    assert result.event.what_we_saw["stopped_fillers_for_full_check"] == ["filler_active"]
+    assert redis.ttl[_verdict_key()] == capability.GPU_MODEL_VERDICT_TTL_SECONDS
