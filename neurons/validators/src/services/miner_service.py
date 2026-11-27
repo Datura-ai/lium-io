@@ -111,6 +111,7 @@ from services.storage_operations import (
     forget_storage_helper,
     note_started_storage_helper,
     start_storage_operation,
+    storage_dispatch_holds_volume,
     supports_workspace_field,
 )
 from services.storage_operations import run_job_with_secrets
@@ -1788,6 +1789,11 @@ class MinerService:
 
     async def handle_backup_container_req(self, executor_info: ExecutorSSHInfo, payload: BackupContainerRequest, pkey: SSHKey, docker_service: DockerService):
         """Handle backup container request."""
+        # DAH-7077: the delete's wipe never runs between this dispatch and the operation's spec on the executor
+        async with storage_dispatch_holds_volume(self.redis_service, payload.source_volume, payload.backup_log_id):
+            return await self._handle_backup_container_req(executor_info, payload, pkey, docker_service)
+
+    async def _handle_backup_container_req(self, executor_info: ExecutorSSHInfo, payload: BackupContainerRequest, pkey: SSHKey, docker_service: DockerService):
         async with asyncssh.connect(
             host=executor_info.address,
             port=executor_info.ssh_port,
@@ -1851,6 +1857,10 @@ class MinerService:
 
     async def handle_restore_container_req(self, executor_info: ExecutorSSHInfo, payload: RestoreContainerRequest, pkey: SSHKey, docker_service: DockerService):
         """Handle restore container request."""
+        async with storage_dispatch_holds_volume(self.redis_service, payload.target_volume, payload.restore_log_id):
+            return await self._handle_restore_container_req(executor_info, payload, pkey, docker_service)
+
+    async def _handle_restore_container_req(self, executor_info: ExecutorSSHInfo, payload: RestoreContainerRequest, pkey: SSHKey, docker_service: DockerService):
         async with asyncssh.connect(
             host=executor_info.address,
             port=executor_info.ssh_port,

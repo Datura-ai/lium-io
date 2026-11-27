@@ -7,9 +7,11 @@ pages at the last close instead of flushing them at the unmount (Kosta85's node,
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import shlex
 import subprocess
+import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock
 from uuid import uuid4
@@ -25,6 +27,8 @@ from payload_models.payloads import (
 )
 
 import services.docker_service as docker_service_module
+from services.storage_operations import REMOTE_OPERATION_DIRECTORY, StorageVolumeBeingWiped, storage_dispatch_holds_volume
+from tests.test_storage_volume_lock import VolumeLockRedis
 from core.config import settings
 from core.docker_utils import DockerCommand
 from services.docker_service import (
@@ -101,6 +105,9 @@ def _wire_delete(docker_service, monkeypatch, ssh_answers) -> list:
     monkeypatch.setattr(docker_service, "_prepare_known_hosts_policy", AsyncMock(return_value=None))
     docker_service.ssh_service.decrypt_payload = Mock(return_value="private-key")
     docker_service.redis_service.remove_rented_machine = AsyncMock()
+    lock_redis = VolumeLockRedis()
+    for call in ("add_volume_hold", "remove_volume_hold"):
+        setattr(docker_service.redis_service, call, getattr(lock_redis, call))
     monkeypatch.setattr(settings, "POD_VOLUME_WIPE_BEFORE_STOP_ENABLED", True)
     return order
 
@@ -151,11 +158,22 @@ def _run_wipe(
     *,
     users: str = "pod_dirty",
     fail: str = "",
+    operation_volumes: tuple[str, ...] = (),
+    volume_markers: tuple[str, ...] = (),
 ) -> subprocess.CompletedProcess:
     """Runs the wipe command under sh against a docker stub whose answers come from the arguments;
     `users` is what `docker ps` lists on the volume, `fail` names the stub call that exits nonzero
     (inspect, ps, info, plugin). Returns the process."""
     host_root = tmp_path / "host"
+    operations = tmp_path / "storage-operations"
+    operations.mkdir(exist_ok=True)
+    for i, name in enumerate(operation_volumes):
+        spec = {"action": "backup", "workspace": {"volume_name": name}}
+        (operations / f"op{i}.json").write_text(json.dumps(spec, separators=(",", ":"), sort_keys=True))
+    for i, name in enumerate(volume_markers):
+        # a running operation: the runner has stripped its spec to the reporter, the marker stays
+        (operations / f"run{i}.json").write_text(json.dumps({"reporter": {"resource": "backup"}}))
+        (operations / f"run{i}.volume").write_text(f"{name}\n")
     docker = tmp_path / "docker"
     docker.write_text(
         "#!/bin/sh\n"
@@ -173,6 +191,7 @@ def _run_wipe(
         _wipe_volume_cmd(volume, "pod_dirty")
         .replace("/usr/bin/docker", str(docker))
         .replace("/proc/1/root", str(host_root))
+        .replace(str(REMOTE_OPERATION_DIRECTORY), str(operations))
     )
     return subprocess.run(["sh", "-c", command], capture_output=True, text=True)
 
@@ -220,6 +239,69 @@ def test_wipe_removes_only_the_volumes_files_under_its_expected_host_dir(
     assert not files[wiped_dir].exists()
     assert all(files[other].exists() for other in _OTHER_DIRS)
     assert (tmp_path / "host" / wiped_dir.lstrip("/")).is_dir()
+
+
+@pytest.mark.parametrize("driver, mountpoint", [("local", _LOCAL_MOUNT), ("vloopback:v3", "/mnt/volume_dirty")])
+def test_wipe_leaves_a_volume_whose_backup_is_starting(tmp_path, driver, mountpoint):
+    # DAH-7077: the backup's spec names the volume before its helper mounts it
+    wiped_dir = _LOCAL_MOUNT if driver == "local" else _VLOOPBACK_HOST_DIR
+    files = _host_files(tmp_path, wiped_dir)
+
+    completed = _run_wipe(tmp_path, "volume_dirty", driver, mountpoint, operation_volumes=("other", "volume_dirty"))
+
+    assert completed.returncode == 7
+    assert completed.stdout.strip() == "volume has a storage operation"
+    assert files[wiped_dir].exists()
+
+
+def test_wipe_leaves_a_volume_whose_running_operation_stripped_its_spec(tmp_path):
+    # Pixel's review: the runner rewrites the spec without the workspace once it has read it
+    files = _host_files(tmp_path, _LOCAL_MOUNT)
+
+    completed = _run_wipe(tmp_path, "volume_dirty", "local", _LOCAL_MOUNT, volume_markers=("volume_dirty",))
+
+    assert completed.returncode == 7
+    assert files[_LOCAL_MOUNT].exists()
+
+
+@pytest.mark.parametrize("flag", ["--source-volume", "--target-volume"])
+def test_wipe_leaves_a_volume_a_legacy_tar_job_runs_on(tmp_path, flag):
+    files = _host_files(tmp_path, _LOCAL_MOUNT)
+    job = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)", flag, "volume_dirty", "--backup-path", "/x"]
+    )
+    try:
+        completed = _run_wipe(tmp_path, "volume_dirty", "local", _LOCAL_MOUNT)
+    finally:
+        job.kill()
+        job.wait()
+
+    assert completed.returncode == 7
+    assert files[_LOCAL_MOUNT].exists()
+
+
+def test_wipe_runs_when_only_another_volume_has_a_marker_or_legacy_job(tmp_path):
+    files = _host_files(tmp_path, _LOCAL_MOUNT)
+    job = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)", "--source-volume", "volume_dirty_2", "--backup-path", "/x"]
+    )
+    try:
+        completed = _run_wipe(tmp_path, "volume_dirty", "local", _LOCAL_MOUNT, volume_markers=("volume_dirty_2",))
+    finally:
+        job.kill()
+        job.wait()
+
+    assert completed.returncode == 0, completed.stderr
+    assert not files[_LOCAL_MOUNT].exists()
+
+
+def test_wipe_runs_when_only_another_volume_has_a_storage_operation(tmp_path):
+    files = _host_files(tmp_path, _LOCAL_MOUNT)
+
+    completed = _run_wipe(tmp_path, "volume_dirty", "local", _LOCAL_MOUNT, operation_volumes=("volume_dirty_2",))
+
+    assert completed.returncode == 0, completed.stderr
+    assert not files[_LOCAL_MOUNT].exists()
 
 
 @pytest.mark.parametrize(
@@ -478,6 +560,69 @@ async def test_delete_answers_in_progress_until_the_kept_edit_containers_are_rem
 
     assert isinstance(retried, ContainerDeleted)
     assert ("remove_volume", "volume_dirty") in order
+
+
+# DAH-7077: the volume lock between a storage dispatch and the wipe
+@pytest.mark.asyncio
+async def test_delete_skips_the_wipe_while_a_backup_dispatch_holds_the_volume(docker_service, monkeypatch):
+    order = _wire_delete(docker_service, monkeypatch, _host_answers())
+    lock_redis = docker_service.redis_service.add_volume_hold.__self__
+    payload = _delete_payload()
+
+    async with storage_dispatch_holds_volume(lock_redis, payload.local_volume, uuid4()):
+        result = await _delete(docker_service, payload)
+
+    assert isinstance(result, ContainerDeleted)
+    assert not any(step == ("ssh", _bounded(WIPE_CMD, _VOLUME_WIPE_TIMEOUT_SEC)) for step in order)
+    assert ("remove", payload.container_name) in order
+
+
+@pytest.mark.parametrize(
+    "ssh_answers, dispatch_refused",
+    [
+        (_host_answers(), True),
+        (_host_answers(wipe=_make_ssh_command_result(exit_status=7, stdout="volume has a storage operation")), False),
+    ],
+    ids=["wiped", "wipe-skipped-on-the-node"],
+)
+@pytest.mark.asyncio
+async def test_a_wipe_that_ran_keeps_the_volume_from_any_later_backup(
+    docker_service, monkeypatch, ssh_answers, dispatch_refused
+):
+    _wire_delete(docker_service, monkeypatch, ssh_answers)
+    lock_redis = docker_service.redis_service.add_volume_hold.__self__
+    payload = _delete_payload()
+
+    await _delete(docker_service, payload)
+
+    if dispatch_refused:
+        with pytest.raises(StorageVolumeBeingWiped):
+            async with storage_dispatch_holds_volume(lock_redis, payload.local_volume, uuid4()):
+                pass
+    else:
+        async with storage_dispatch_holds_volume(lock_redis, payload.local_volume, uuid4()):
+            pass
+
+
+@pytest.mark.asyncio
+async def test_a_failed_lock_release_never_fails_the_delete(docker_service, monkeypatch):
+    # Pixel's review: Redis failing on the release of a skipped wipe must leave the normal stop path
+    order = _wire_delete(
+        docker_service,
+        monkeypatch,
+        _host_answers(wipe=_make_ssh_command_result(exit_status=7, stdout="volume has a storage operation")),
+    )
+
+    async def broken_delete(*args, **kwargs):
+        raise ConnectionError("redis down")
+
+    monkeypatch.setattr(docker_service.redis_service, "remove_volume_hold", broken_delete)
+    payload = _delete_payload()
+
+    result = await _delete(docker_service, payload)
+
+    assert isinstance(result, ContainerDeleted)
+    assert ("remove", payload.container_name) in order
 
 
 @pytest.mark.asyncio

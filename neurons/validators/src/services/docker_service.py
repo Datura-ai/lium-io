@@ -249,8 +249,12 @@ from services.rental_docker_sdk import (
 )
 from services.ssh_connect_timing import connect_with_phase_timing
 from services.storage_operations import (
+    REMOTE_OPERATION_DIRECTORY,
     StorageOperationLaunchError,
     forget_storage_helper,
+    new_wipe_token,
+    release_storage_volume_lock,
+    take_storage_volume_lock,
     note_started_storage_helper,
     run_job_with_secrets,
     remove_finished_helpers_mounting,
@@ -3668,8 +3672,12 @@ def _wipe_volume_cmd(local_volume: str, *container_names: str) -> str:
     # from the validated name and each lookup must answer, so a failed or empty answer can never
     # widen the rm to the host root or to the other volumes (review, 27.10). A volume another
     # container still mounts (a running backup's lium-storage-* helper) is left alone: exit 6.
-    # Only `container_names` may mount it (docker names never hold a space).
+    # Only `container_names` may mount it (docker names never hold a space). A backup or restore
+    # on the volume holds it from launch to the wrapper's end, before and after its helper mounts it:
+    # its `<op>.volume` marker names it (the spec loses the name once the runner reads it), and a
+    # legacy tar job names it on its command line, so exit 7 (DAH-7077).
     volume = shlex.quote(local_volume)
+    specs = shlex.quote(str(REMOTE_OPERATION_DIRECTORY))
     allowed = shlex.quote(f" {' '.join(container_names)} ")
     docker = "/usr/bin/docker"
     return (
@@ -3677,6 +3685,9 @@ def _wipe_volume_cmd(local_volume: str, *container_names: str) -> str:
         'd=${dm%% *}; m=${dm#* }; '
         f"users=$({docker} ps -a --filter volume=\"$v\" --format '{{{{.Names}}}}') || exit 2; "
         f'ok={allowed}; for u in $users; do case "$ok" in *" $u "*) ;; *) echo "volume in use by $u"; exit 6;; esac; done; '
+        f'{{ grep -qsxF -- "$v" {specs}/*.volume || grep -qsF "\\"volume_name\\":\\"$v\\"" {specs}/*.json || '
+        'pgrep -f -- "[-]-source-volume $v --" >/dev/null || pgrep -f -- "[-]-target-volume $v --" >/dev/null; } && '
+        '{ echo "volume has a storage operation"; exit 7; }; '
         'case "$d" in '
         'local) case "$m" in */volumes/"$v"/_data) p=$m;; *) echo "unexpected mountpoint $m"; exit 5;; esac;; '
         f'vloopback|vloopback:*) [ "$m" = "/mnt/$v" ] || {{ echo "unexpected mountpoint $m"; exit 5; }}; '
@@ -14954,6 +14965,7 @@ class DockerService:
         connect_ssh: Callable[[], AbstractAsyncContextManager[asyncssh.SSHClientConnection]],
         payload: ContainerDeleteRequest,
         log: _BoundLog,
+        token: str,
         stage: str,
     ) -> None:
         # DAH-5101: a pod whose volume holds gigabytes of unwritten data stalls its delete for as
@@ -14962,6 +14974,35 @@ class DockerService:
         # its files are unlinked first (_wipe_volume_cmd). Never fatal: a failure leaves the delete
         # as it always was.
         fields = dict(container_name=payload.container_name, local_volume=payload.local_volume, stage=stage)
+        # DAH-7077: a backup or restore dispatched on the volume holds it until its marker is on the executor;
+        # the command's marker check covers it from there. The wipe's own token, taken only when no dispatch
+        # holds the volume, refuses every dispatch from now on.
+        try:
+            locked = await take_storage_volume_lock(self.redis_service, payload.local_volume, token, exclusive=True)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Skipped the volume wipe: its storage lock could not be read", error=f"{type(exc).__name__}: {exc}", **fields)
+            return
+        if not locked:
+            log.info("Skipped the volume wipe: a backup or restore is starting on it", **fields)
+            return
+        wiped = False
+        try:
+            wiped = await self._run_volume_wipe(connect_ssh, payload, log, fields)
+        finally:
+            if not wiped:
+                # the volume keeps its files: a backup may start on it again
+                try:
+                    await release_storage_volume_lock(self.redis_service, payload.local_volume, token)
+                except Exception as exc:  # noqa: BLE001 -- never fatal; the lock's TTL ends it
+                    log.warning("Releasing the volume's storage lock failed", error=f"{type(exc).__name__}: {exc}", **fields)
+
+    async def _run_volume_wipe(
+        self,
+        connect_ssh: Callable[[], AbstractAsyncContextManager[asyncssh.SSHClientConnection]],
+        payload: ContainerDeleteRequest,
+        log: _BoundLog,
+        fields: dict,
+    ) -> bool:
         started = time.monotonic()
         try:
             result = await _run_on_own_ssh_connection(
@@ -14977,7 +15018,7 @@ class DockerService:
                 error=f"{type(exc).__name__}: {exc}",
                 **fields,
             )
-            return
+            return False
         fields["duration_ms"] = int((time.monotonic() - started) * 1000)
         fields["result"] = (result.stdout or "").strip()
         if getattr(result, "exit_status", 0) != 0:
@@ -14987,8 +15028,9 @@ class DockerService:
                 stderr=(result.stderr or "").strip(),
                 **fields,
             )
-        else:
-            log.info("Wiped the volume's files", **fields)
+            return False
+        log.info("Wiped the volume's files", **fields)
+        return True
 
     async def _terminate_and_wait(
         self,
@@ -15419,10 +15461,11 @@ class DockerService:
                     image_id = await docker_client.container_image_id(container=payload.container_name)
 
                 if self._wipes_volume_before_stop(payload):
-                    await self._wipe_volume(connect_ssh, payload, log, stage="before the stop")
+                    wipe_token = new_wipe_token()
+                    await self._wipe_volume(connect_ssh, payload, log, wipe_token, stage="before the stop")
                     stopped = not await self._terminate_and_wait(connect_ssh, payload, log)
                     if not stopped:
-                        await self._wipe_volume(connect_ssh, payload, log, stage="before the kill")
+                        await self._wipe_volume(connect_ssh, payload, log, wipe_token, stage="before the kill")
                 else:
                     stopped = await self._stop_container_gracefully(docker_client, payload, log)
 

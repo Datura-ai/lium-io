@@ -31,6 +31,7 @@ from workspace_mount import (
 from services import docker_service as docker_service_module
 from services import executor_payload
 from services import miner_service as miner_service_module
+from tests.test_storage_volume_lock import VolumeLockRedis
 
 
 def _restore_args() -> SimpleNamespace:
@@ -370,9 +371,9 @@ async def test_restic_backup_with_excludes_stops_on_an_executor_that_cannot_appl
     payload.exclude_patterns = [".ssh"]
 
     with pytest.raises(RuntimeError, match="exclude_patterns"):
-        await MinerService.__new__(MinerService).handle_backup_container_req(
-            _executor_info(), payload, Mock(), _docker_service_with_pinned_hosts()
-        )
+        miner = MinerService.__new__(MinerService)
+        miner.redis_service = VolumeLockRedis()
+        await miner.handle_backup_container_req(_executor_info(), payload, Mock(), _docker_service_with_pinned_hosts())
     start.assert_not_awaited()
 
 

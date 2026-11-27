@@ -241,6 +241,21 @@ EXECUTOR_CREATE_LOCK_TIMEOUT = 360  # TTL (seconds)
 EXECUTOR_CREATE_LOCK_BLOCKING_TIMEOUT = 360  # a renter's create waits at most this long
 
 
+# DAH-7077: one sorted set of holder tokens per volume, each scored by its own deadline: a token whose holder
+# died (a validator crash or restart) lapses and is dropped before the next decision; a wipe's token starts
+# with "wipe:" and holds the volume alone
+_ADD_VOLUME_HOLD = """
+local now = tonumber(ARGV[4])
+redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', now)
+for _, holder in ipairs(redis.call('ZRANGE', KEYS[1], 0, -1)) do
+  if holder ~= ARGV[1] and (ARGV[2] == '1' or string.sub(holder, 1, 5) == 'wipe:') then return 0 end
+end
+redis.call('ZADD', KEYS[1], now + tonumber(ARGV[3]), ARGV[1])
+redis.call('EXPIRE', KEYS[1], ARGV[3])
+return 1
+"""
+
+
 def _executor_create_lock_key(executor_id: str) -> str:
     return f"lock:executor-create:{executor_id}"
 
@@ -910,6 +925,17 @@ class RedisService:
     async def set(self, key: str, value: str, ex: int | None = None):
         """Set a key-value pair in Redis; `ex` is the key's lifetime in seconds (none = no expiry)."""
         await self.redis.set(key, value, ex=ex)
+
+    async def add_volume_hold(self, key: str, token: str, exclusive: bool, ex: int, now: float | None = None) -> bool:
+        """Adds `token` with a deadline `ex` seconds on (or renews its own) in one atomic step and returns True,
+        unless another live token that is a wipe holds the volume, or `exclusive` is asked and any other live
+        token does. Tokens past their deadline are dropped first."""
+        now = time.time() if now is None else now
+        return bool(await self.redis.eval(_ADD_VOLUME_HOLD, 1, key, token, "1" if exclusive else "0", ex, now))
+
+    async def remove_volume_hold(self, key: str, token: str) -> None:
+        """Drops only this token: the other holders keep the volume."""
+        await self.redis.zrem(key, token)
 
     async def get(self, key: str):
         """Get a value by key from Redis."""

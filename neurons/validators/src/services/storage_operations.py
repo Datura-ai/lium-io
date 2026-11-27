@@ -5,11 +5,12 @@ import json
 import logging
 import shlex
 import time
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 from typing import TYPE_CHECKING
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import aiohttp
 import asyncssh
@@ -45,6 +46,11 @@ STORAGE_HELPER_KEY_MARK = "helper:"
 # legitimately outlives that, so no record does either
 STARTED_STORAGE_HELPERS_TTL_SECONDS = 4 * 3600
 _STARTED_STORAGE_HELPERS_REDIS_TIMEOUT_SEC = 2
+# DAH-7077: one lock per volume between a storage dispatch and the delete's wipe. A dispatch holds it until its
+# spec is on the executor (the wipe's own spec check covers the run from there); a wipe that ran keeps it, as
+# the volume is going away. The TTL only clears a holder that died.
+STORAGE_VOLUME_LOCK_PREFIX = "storage_volume_holders:"
+STORAGE_VOLUME_LOCK_TTL_SECONDS = 3600
 
 
 def storage_helper_name(operation_id: UUID | str) -> str:
@@ -72,6 +78,52 @@ class StorageHelperRecord:
             return cls(str(UUID(operation_id)), int(started))
         except ValueError:
             return None
+
+
+class StorageVolumeBeingWiped(RuntimeError):
+    """The volume's pod is being deleted and its files are being unlinked: no storage operation may start on it."""
+
+
+def _volume_lock_key(volume: str) -> str:
+    return f"{STORAGE_VOLUME_LOCK_PREFIX}{volume}"
+
+
+def new_wipe_token() -> str:
+    """One token per delete, passed to both its wipes: the second (before the kill) runs under the hold the first kept."""
+    return f"wipe:{uuid4().hex}"
+
+
+async def take_storage_volume_lock(redis: RedisService, volume: str, token: str, *, exclusive: bool) -> bool:
+    """True when `token` now holds the volume. Every acquire brings its own token, so one attempt's release can
+    never drop another's hold; a wipe (`exclusive`) holds it only when nothing else does, and refuses every
+    dispatch while it does."""
+    return await redis.add_volume_hold(_volume_lock_key(volume), token, exclusive, STORAGE_VOLUME_LOCK_TTL_SECONDS)
+
+
+async def release_storage_volume_lock(redis: RedisService, volume: str, token: str) -> None:
+    await redis.remove_volume_hold(_volume_lock_key(volume), token)
+
+
+@asynccontextmanager
+async def storage_dispatch_holds_volume(
+    redis: RedisService, volume: str | None, operation_id: UUID | str
+) -> AsyncIterator[None]:
+    """Holds the volume against the delete's wipe from the dispatch until its marker is on the executor (the block's end)."""
+    if not volume:
+        yield
+        return
+    # each attempt its own token: a failed retry releases only itself (review, Pixel)
+    token = f"operation:{operation_id}:{uuid4().hex}"
+    if not await take_storage_volume_lock(redis, volume, token, exclusive=False):
+        raise StorageVolumeBeingWiped(f"the pod is being deleted; volume {volume} is being wiped")
+    try:
+        yield
+    finally:
+        try:
+            await release_storage_volume_lock(redis, volume, token)
+        except Exception as exc:  # noqa: BLE001
+            # the operation already started: a lost release only lets the token lapse at its deadline
+            logger.warning("Storage volume %s: releasing hold %s failed: %s", volume, token, exc)
 
 
 def _key(executor_id: str) -> str:
@@ -198,6 +250,9 @@ class StorageOperationFiles:
     pid: PurePosixPath
     status: PurePosixPath
     cancel: PurePosixPath
+    # the volume the operation works on, for the delete's wipe (DAH-7077): the runner strips the
+    # spec once it has read it, so the spec cannot say which volume a running operation holds
+    volume: PurePosixPath
     # the operation's helper container: it, not the files above, outlives an executor restart
     helper: str = ""
 
@@ -210,6 +265,7 @@ class StorageOperationFiles:
             pid=REMOTE_OPERATION_DIRECTORY / f"{stem}.pid",
             status=REMOTE_OPERATION_DIRECTORY / f"{stem}.status",
             cancel=REMOTE_OPERATION_DIRECTORY / f"{stem}.cancel",
+            volume=REMOTE_OPERATION_DIRECTORY / f"{stem}.volume",
             helper=helper_container_name(operation_id),
         )
 
@@ -331,6 +387,8 @@ async def start_storage_operation(
             await _remove_operation_artifacts(ssh_client, files)
         await _remove_stale_helper_container(ssh_client, operation_id)
 
+        workspace = spec.get("workspace")
+        volume = workspace.get("volume_name") if isinstance(workspace, Mapping) else None
         # the validator's own runner, staged and checked before the spec (which carries the repository credentials) is
         # written; its imports are tried with the launch's interpreter and flags, so a runner that cannot start fails
         # this dispatch, which still reports, instead of ending before it reads its operation
@@ -351,6 +409,10 @@ async def start_storage_operation(
         stage_dir = _staged_directory(staged.stdout)
 
         async with ssh_client.start_sftp_client() as sftp:
+            if volume:
+                # written before the runner exists, removed by the wrapper only after it exits
+                async with sftp.open(str(files.volume), "w") as remote_volume:
+                    await remote_volume.write(f"{volume}\n")
             async with sftp.open(str(files.spec), "w") as remote_spec:
                 await remote_spec.write(
                     json.dumps({**spec, "detach": True}, separators=(",", ":"), sort_keys=True)
@@ -381,7 +443,7 @@ async def start_storage_operation(
             f"printf '%s\\n' \"$result\" > {shlex.quote(str(files.status))}; "
             'rm -rf -- "$D"; '
             f"rm -f {shlex.quote(str(files.spec))} {shlex.quote(str(files.pid))} "
-            f"{shlex.quote(str(files.cancel))}{terminal_cleanup}"
+            f"{shlex.quote(str(files.cancel))} {shlex.quote(str(files.volume))}{terminal_cleanup}"
         )
         launch_command = (
             f"D={shlex.quote(stage_dir)} nohup /bin/sh -c {shlex.quote(wrapper)} "
@@ -671,7 +733,7 @@ def _remove_operation_artifacts_command(files: StorageOperationFiles) -> str:
         "rm -f "
         + " ".join(
             shlex.quote(str(path))
-            for path in (files.status, files.log, files.pid, files.spec, files.cancel)
+            for path in (files.status, files.log, files.pid, files.spec, files.cancel, files.volume)
         )
         + (
             f"; /usr/bin/docker rm -f -- {shlex.quote(files.helper)} >/dev/null 2>&1 || true"
