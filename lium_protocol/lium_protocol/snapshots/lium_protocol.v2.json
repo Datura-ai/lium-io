@@ -2910,7 +2910,8 @@
         "NoJupyterPortMapping",
         "AttestationError",
         "ContainerVanished",
-        "ExecutorUnreachable"
+        "ExecutorUnreachable",
+        "PodDownNotHostFault"
       ],
       "title": "FailedContainerErrorCodes",
       "type": "string"

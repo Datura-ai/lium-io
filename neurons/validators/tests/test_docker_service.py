@@ -13,7 +13,8 @@ import subprocess
 import sys
 import tempfile
 import time
-from unittest.mock import AsyncMock, Mock, MagicMock, call, patch
+from types import SimpleNamespace
+from unittest.mock import ANY, AsyncMock, Mock, MagicMock, call, patch
 from uuid import uuid4, UUID
 
 import asyncssh
@@ -52,9 +53,11 @@ from services.rental_docker_sdk import (
     ContainerRunSpec,
     ContainerStateSnapshot,
     RentalDockerOperationError,
+    RentalPodBridgeGone,
     RentalDockerTransportNotReopened,
     _wrap_error_message,
     build_gpu_docker_config,
+    rental_network_for,
 )
 from payload_models.payloads import (
     AddSshPublicKeyRequest,
@@ -85,7 +88,7 @@ import redis.asyncio as aioredis
 import redis.exceptions
 
 from helpers import no_host_start_lock, shared_pod_start_stop_lock
-from services.redis_service import RedisService
+from services.redis_service import RENTAL_PROBE_FAILED_PREFIX, RedisService
 
 
 FAKE_SSH_HOST_KEY = "ssh-ed25519 AAAATESTKEY"
@@ -239,7 +242,7 @@ class _FakeRentalDockerClient:
             restart_count=0, error=None, oom_killed=False,
         )
 
-    async def start(self, *, container_name: str, network: str | None = None) -> None:
+    async def start(self, *, container_name: str, network: str | None = None, network_id: str | None = None) -> None:
         self.started_containers.append(container_name)
         self.start_networks.append(network)
         if self.start_error is not None:
@@ -3141,7 +3144,7 @@ async def test_start_container_restarts_ssh_after_docker_start(docker_service, m
     assert docker_service.rental_docker_client_factory.client.started_containers == [
         "cid"  # started by the id read before the start
     ]
-    assert docker_service.rental_docker_client_factory.client.start_networks == ["lium-rentals"]
+    assert docker_service.rental_docker_client_factory.client.start_networks == ["lium-rentals-pod_test"]  # its own bridge (DAH-6737)
     docker_service.install_open_ssh_server_and_start_ssh_service_with_rental_docker.assert_awaited_once_with(
         docker_client=docker_service.rental_docker_client_factory.client,
         container_name="cid",  # the run it started, by id
@@ -3168,8 +3171,17 @@ async def test_start_container_sdk_failure_returns_failed_request_without_shell_
         "SDK start failed"
     )
     monkeypatch.setattr("services.docker_service.asyncssh.import_private_key", Mock(return_value="pkey"))
-    connect_mock = Mock(side_effect=AssertionError("asyncssh fallback is not allowed"))
+    # the session opens only to guard the pod's bridge before the start (DAH-6737); never a shell start
+    shell: list[str] = []
+
+    async def _run(cmd, *args, **kwargs):
+        shell.append(cmd)
+        return Mock(exit_status=0, stdout="", stderr="")
+
+    ssh = Mock(run=_run)
+    connect_mock = Mock(return_value=contextlib.nullcontext(ssh))
     monkeypatch.setattr("services.docker_service.asyncssh.connect", connect_mock)
+    monkeypatch.setattr("services.docker_service.public_host_sock", AsyncMock(return_value={}))
 
     payload = ContainerStartRequest(
         miner_hotkey="miner-hotkey",
@@ -3199,10 +3211,60 @@ async def test_start_container_sdk_failure_returns_failed_request_without_shell_
     )
 
     assert isinstance(result, FailedContainerRequest)
-    assert connect_mock.call_count == 0
+    assert not [cmd for cmd in shell if "docker start" in cmd]
     assert docker_service.rental_docker_client_factory.client.started_containers == [
         "cid"  # started by the id read before the start
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error", "code"),
+    [
+        (docker_service_module.RentalEgressGuardRefused("not applied"), FailedContainerErrorCodes.ExecutorUnreachable),
+        ("running", FailedContainerErrorCodes.UnknownError),
+        (Exception("SDK start failed"), FailedContainerErrorCodes.UnknownError),
+        # the guarded bridge vanished on the host before the start; the stopped pod stays down, the host's (review on
+        # lium-platform#3246: a provider deleting it never gets the neutral code)
+        (RentalPodBridgeGone("Docker network lium-rentals-pod_test is gone"), FailedContainerErrorCodes.ExecutorUnreachable),
+    ],
+    ids=["guard-refused-pod-down", "guard-refused-pod-running", "docker-failure", "bridge-gone-pod-down"],
+)
+async def test_a_guard_refused_restart_of_a_pod_that_is_down_replies_the_host_fault_code(
+    docker_service, monkeypatch, error, code
+):
+    # F-9: a reboot the guard refused started nothing; the backend bills no host fault (ExecutorUnreachable)
+    if error == "running":
+        error = docker_service_module.RentalEgressGuardRefused("not applied")
+        error.pod_running = True  # Docker took the start of a running pod as a no-op: it still runs
+    docker_service.ssh_service.decrypt_payload.return_value = "private-key"
+    docker_service._prepare_known_hosts_policy = AsyncMock(return_value=None)
+    docker_service.start_existing_container = AsyncMock(side_effect=error)
+    payload = ContainerStartRequest(
+        miner_hotkey="miner-hotkey",
+        miner_address="127.0.0.1",
+        miner_port=8000,
+        executor_id=str(uuid4()),
+        pod_id="pod-id",
+        container_name="pod_test",
+        local_volume_path="/root",
+    )
+    executor_info = ExecutorSSHInfo(
+        uuid=str(uuid4()),
+        address="127.0.0.1",
+        port=8001,
+        ssh_username="root",
+        ssh_port=2200,
+        python_path="/usr/bin/python3",
+        root_dir="/root/app",
+        ssh_host_key=FAKE_SSH_HOST_KEY,
+    )
+
+    result = await docker_service.start_container(
+        payload, executor_info, Mock(ss58_address="validator-hotkey"), "encrypted-private-key"
+    )
+
+    assert isinstance(result, FailedContainerRequest) and result.error_code == code
 
 
 @pytest.mark.asyncio
@@ -3255,6 +3317,84 @@ async def test_start_existing_container_repairs_a_stale_vloopback_mountpoint_and
         docker_service._restore_mount_and_sshd_after_start.assert_not_awaited()
     assert client.start.await_count == starts
     docker_service._repair_stale_mountpoint_of_container_volume.assert_awaited_once_with(ssh_client, "cid", {})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bridge_lost", [False, True])
+async def test_a_stopped_pod_start_keeps_its_bridge_from_every_reaper_from_the_guard_through_the_start(
+    docker_service, monkeypatch, bridge_lost
+):
+    # DAH-6737 review (F-38, and the gateway review at 129a43b): between the guard (which records the bridge ID) and the
+    # start (after which the container references the bridge), a stopped pod's bridge is unreferenced; its host-side
+    # reservation, taken by the guard, is released only after the start, so no validator process's reaper removes it.
+    # A bridge lost after the guard passed holds the node until a rental probe passes, as a refused guard does.
+    from services.rental_docker_sdk import rental_network_for
+
+    held = []
+
+    async def guard(**kwargs):
+        hold = kwargs["hold"]
+        held.append(("guard", hold.network))
+
+        @contextlib.asynccontextmanager
+        async def session():
+            yield Mock()
+
+        # the guard passed: the hold is released on a connection of its own
+        hold.connect = session
+        hold.guarded = True
+        return "guarded-id"
+
+    async def start(**kwargs):
+        held.append(("start", kwargs["network"]))
+        if bridge_lost:
+            raise RentalPodBridgeGone("Docker network gone since its egress drop was applied")
+
+    async def release(ssh, network, token):
+        held.append(("release", network))
+
+    monkeypatch.setattr("services.task.checks.rental_egress_guard.release_pod_bridge", release)
+    docker_service._stop_after_failed_start = AsyncMock()
+
+    monkeypatch.setattr("services.docker_service.asyncssh.import_private_key", Mock(return_value="pkey"))
+    monkeypatch.setattr(
+        "services.docker_service.asyncssh.connect", Mock(return_value=DummySSHConnectionManager(AsyncMock()))
+    )
+    monkeypatch.setattr(docker_service, "_guard_pod_network_before_start", guard)
+    docker_service.rental_docker_client_factory.client.start = AsyncMock(side_effect=start)
+    docker_service._restore_mount_and_sshd_after_start = AsyncMock()
+    executor_info = ExecutorSSHInfo(
+        uuid=str(uuid4()),
+        address="127.0.0.1",
+        port=8001,
+        ssh_username="root",
+        ssh_port=2200,
+        python_path="/usr/bin/python3",
+        root_dir="/root/app",
+        ssh_host_key=FAKE_SSH_HOST_KEY,
+    )
+
+    started = docker_service.start_existing_container(
+        executor_info=executor_info,
+        private_key="private-key",
+        known_hosts_policy=None,
+        container_name="pod_test",
+        local_volume_path="/root",
+        pod_id="pod-id",
+        default_extra={},
+    )
+    if bridge_lost:
+        with pytest.raises(RentalPodBridgeGone):
+            await started
+    else:
+        await started
+
+    net = rental_network_for("pod_test")
+    assert held == [("guard", net), ("start", net), ("release", net)]
+    probe_holds = [
+        c for c in docker_service.redis_service.set.await_args_list if RENTAL_PROBE_FAILED_PREFIX in str(c.args[:1])
+    ]
+    assert bool(probe_holds) is bridge_lost
 
 
 @pytest.mark.asyncio
@@ -3485,14 +3625,14 @@ async def test_a_cancel_waits_for_the_docker_start_still_in_flight_before_stoppi
         client.started_containers.append("pod_test")
         client.running = True
 
-    async def start(*, container_name, network=None):
+    async def start(*, container_name, network=None, network_id=None):
         # the SDK call runs in a thread a cancel cannot stop: model it as work that outlives the await
         in_flight.set()
         await asyncio.shield(asyncio.ensure_future(_thread_start()))
 
     client.start = start
     task = asyncio.ensure_future(_start_existing(docker_service))
-    await in_flight.wait()
+    await asyncio.wait_for(in_flight.wait(), 5)  # a fake signature mismatch fails here, not hangs
     task.cancel()
     await asyncio.sleep(0)
     release.set()
@@ -3503,6 +3643,22 @@ async def test_a_cancel_waits_for_the_docker_start_still_in_flight_before_stoppi
     assert client.started_containers == ["pod_test"]
     assert client.stopped_containers == ["cid"]
     assert client.running is False
+
+
+@pytest.mark.asyncio
+async def test_a_refused_egress_guard_starts_nothing_and_stops_nothing(docker_service, monkeypatch, pod_bridge_guarded_on_fake_hosts):
+    # DAH-6737: the guard runs before the start and outside its cleanup: a refusal leaves the pod exactly as it was
+    monkeypatch.setattr("services.docker_service.asyncssh.import_private_key", Mock(return_value="pkey"))
+    client = docker_service.rental_docker_client_factory.client
+    client.running = False
+    pod_bridge_guarded_on_fake_hosts.side_effect = docker_service_module.RentalEgressGuardRefused("not applied")
+
+    with pytest.raises(docker_service_module.RentalEgressGuardRefused) as refused:
+        await _start_existing(docker_service)
+
+    assert refused.value.pod_running is False  # the pod is down: its reply carries the host-fault code (F-9)
+    assert pod_bridge_guarded_on_fake_hosts.await_args.kwargs["network"] == rental_network_for("pod_test")
+    assert client.started_containers == [] and client.stopped_containers == []
 
 
 @pytest.mark.asyncio
@@ -11807,6 +11963,27 @@ async def _create_failing_at_add_public_keys(
     return result
 
 
+@pytest.mark.asyncio
+async def test_a_create_the_egress_guard_refused_replies_the_host_fault_code(
+    docker_service, monkeypatch, pod_bridge_guarded_on_fake_hosts
+):
+    # F-9: refused before `docker run`, nothing of the pod started: a reboot's recreate is not billed (ExecutorUnreachable)
+    _patch_create_container_happy_path(docker_service, monkeypatch)
+    pod_bridge_guarded_on_fake_hosts.side_effect = docker_service_module.RentalEgressGuardRefused("not applied")
+    monkeypatch.setattr(docker_service, "cleanup_failed_container_creation", AsyncMock(return_value=False))
+    payload = _filler_create_payload()
+
+    result = await docker_service.create_container(
+        payload=payload,
+        executor_info=_filler_executor_info(payload),
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.error_code == FailedContainerErrorCodes.ExecutorUnreachable
+
+
 def _failure_error_field(result: FailedContainerRequest) -> str:
     """The `error` the backend reads from `detail` (headline >>> json extra)."""
     return json.loads(result.detail.split(" >>> ", 1)[1])["error"]
@@ -12742,6 +12919,357 @@ async def test_generate_portMappings_keeps_held_ports_when_no_other_port_is_free
     )
 
     assert {mapping[2] for mapping in result} == {20000}
+
+
+@pytest.mark.real_egress_guard
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["create", "start"])
+@pytest.mark.parametrize("outcome", ["applied", "error", "raises", "bridge_gone_after_the_guard"])
+async def test_a_pod_never_starts_on_a_bridge_without_the_egress_drop(docker_service, monkeypatch, path, outcome):
+    # DAH-6737: the bridge exists and the host-locked egress guard ran before the first start, on create and on the
+    # start that moves a stopped pod onto its own bridge; when the guard did not apply, nothing starts (fail closed)
+    events: list = []
+
+    async def guard(ssh, attempts=None, required_network_id=None):
+        # gateway review at 129a43b: the pod's own bridge is required in the rules, so a template-only apply refuses
+        events.append(("guard", required_network_id))
+        if outcome == "raises":
+            raise RuntimeError("inventory unknown")
+        return {}, ("DOCKER-USER chain not found" if outcome == "error" else None)
+
+    monkeypatch.setattr("services.task.checks.rental_egress_guard.apply_rental_egress_guard", guard)
+
+    class Client:
+        async def ensure_network(self, name):
+            events.append(("ensure_network", name))
+            return "guarded-id"
+
+        # the SDK's own check (test_rental_docker_sdk): the bridge bound by the guarded ID is gone
+        async def run_container(self, spec):
+            events.append(("run_container", spec.network, spec.network_id))
+            if outcome == "bridge_gone_after_the_guard":
+                raise RentalPodBridgeGone("Docker network gone since its egress drop was applied")
+            return "cid"
+
+        async def start(self, *, container_name, network=None, network_id=None):
+            events.append(("start", network, network_id))
+            if outcome == "bridge_gone_after_the_guard":
+                raise RentalPodBridgeGone("Docker network gone since its egress drop was applied")
+
+        async def container_identity(self, *, container_name):
+            return "cid@2026-11-19T00:00:00Z"
+
+        async def inspect_container_state(self, *, container_name):
+            return SimpleNamespace(running=False, restarting=False)
+
+    net = rental_network_for("pod_a")
+    docker_service._restore_mount_and_sshd_after_start = AsyncMock()
+    docker_service._pod_start_exclusion = lambda *args: contextlib.nullcontext()
+    if path == "create":
+        spec = ContainerRunSpec(name="pod_a", image="img", network=net)
+        bring_up = docker_service._run_rental_docker_create_attempts(
+            docker_client=Client(),
+            ssh_client=Mock(),
+            run_spec=spec,
+            container_name="pod_a",
+            default_extra={},
+            flatten_lease=None,
+        )
+    else:
+        bring_up = docker_service._bring_up_existing_container(
+            executor_info=Mock(uuid="exec-1"),
+            private_key="private-key",
+            docker_client=Client(),
+            ssh_client=Mock(),
+            container_name="pod_a",
+            local_volume_path=None,
+            pod_id="p",
+            default_extra={},
+        )
+    started = (("run_container" if path == "create" else "start"), net, "guarded-id")
+    if outcome == "applied":
+        await bring_up
+        # F-28: the pod is created on, or moved to, the ID the guard applied the drop to
+        assert events == [("ensure_network", net), ("guard", "guarded-id"), started]
+    elif outcome == "bridge_gone_after_the_guard":
+        with pytest.raises(RentalPodBridgeGone):
+            await bring_up
+        assert events == [("ensure_network", net), ("guard", "guarded-id"), started]
+        assert docker_service_module.is_host_fault_create_failure("docker_run", RentalPodBridgeGone("x"))
+    else:
+        with pytest.raises(docker_service_module.RentalEgressGuardRefused) as refused:
+            await bring_up
+        assert events == [("ensure_network", net), ("guard", "guarded-id")]
+        # a host fault for a create: its failure handler holds the node until a rental probe passes on it
+        assert docker_service_module.is_host_fault_create_failure("docker_run", refused.value)
+    if path == "start":
+        # finding 3: the edit's undo stamps no hold; its failure handler decides with the reply's code
+        assert not [
+            c for c in docker_service.redis_service.set.await_args_list if RENTAL_PROBE_FAILED_PREFIX in str(c.args[:1])
+        ]
+
+
+@pytest.mark.real_egress_guard
+@pytest.mark.asyncio
+async def test_a_reboot_the_guard_refused_holds_the_node_where_it_refused(docker_service, monkeypatch):
+    # F-11: start_existing_container has no create failure handler, so it passes executor_uuid and the guard stamps
+    async def guard(ssh, attempts=None, required_network_id=None):
+        return {}, "DOCKER-USER chain not found"
+
+    monkeypatch.setattr("services.task.checks.rental_egress_guard.apply_rental_egress_guard", guard)
+    client = Mock(ensure_network=AsyncMock(return_value="guarded-id"))
+
+    with pytest.raises(docker_service_module.RentalEgressGuardRefused):
+        await docker_service._guard_pod_network_before_start(
+            docker_client=client,
+            ssh_client=Mock(),
+            network=rental_network_for("pod_a"),
+            default_extra={},
+            executor_uuid="exec-1",
+        )
+    docker_service.redis_service.set.assert_any_await(f"{RENTAL_PROBE_FAILED_PREFIX}:exec-1", ANY)
+
+
+@pytest.mark.real_egress_guard
+@pytest.mark.asyncio
+async def test_a_bridge_reservation_that_stalls_is_the_guards_refusal(docker_service, monkeypatch):
+    # gateway review at 98b4318: one deadline covers the whole guard, the reservation included, so a stall there is
+    # a guard refusal the edit's undo records, not its own outer timeout
+    monkeypatch.setattr(docker_service_module, "PRE_START_GUARD_SECONDS", 0.05)
+
+    async def stalled_reserve(ssh, network, token):
+        await asyncio.sleep(5)
+
+    monkeypatch.setattr("services.task.checks.rental_egress_guard.reserve_pod_bridge", stalled_reserve)
+    client = Mock(ensure_network=AsyncMock(return_value="guarded-id"))
+
+    with pytest.raises(docker_service_module.RentalEgressGuardRefused):
+        await docker_service._guard_pod_network_before_start(
+            docker_client=client,
+            ssh_client=Mock(),
+            network=rental_network_for("pod_a"),
+            default_extra={},
+            hold=docker_service_module._PodBridgeHold(rental_network_for("pod_a")),
+        )
+    client.ensure_network.assert_not_awaited()
+
+
+class _OneSessionSSH:
+    """A connection with MaxSessions=1: a command opened while another runs on it is refused."""
+
+    def __init__(self):
+        self.busy = False
+
+    @contextlib.asynccontextmanager
+    async def session(self):
+        if self.busy:
+            raise RuntimeError("open failed: administratively prohibited")
+        self.busy = True
+        try:
+            yield
+        finally:
+            self.busy = False
+
+
+@pytest.mark.real_egress_guard
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["create", "start"])
+async def test_a_bridge_renewal_never_takes_the_session_the_guards_inventory_needs(docker_service, monkeypatch, path):
+    # gateway review at 3b3c86b on lium-io#2352: on a node with MaxSessions=1, ensure_network returns while a renewal
+    # would be in flight. Nothing is renewed before the guard passed (the reservation is 10 min, the guard at most 3),
+    # so the guard's inventory gets the session and the pod starts once
+    monkeypatch.setattr("services.task.checks.rental_egress_guard.BRIDGE_RESERVATION_RENEW_SECONDS", 0.01)
+    borrowed = _OneSessionSSH()
+    events: list = []
+
+    async def renew(ssh, network, token):
+        async with ssh.session():
+            events.append("renew")
+            await asyncio.sleep(0.2)
+
+    async def guard(ssh, attempts=None, required_network_id=None):
+        async with ssh.session():
+            events.append("inventory")
+        return {}, None
+
+    monkeypatch.setattr("services.task.checks.rental_egress_guard.renew_pod_bridge", renew)
+    monkeypatch.setattr("services.task.checks.rental_egress_guard.apply_rental_egress_guard", guard)
+
+    class Client:
+        async def ensure_network(self, name):
+            await asyncio.sleep(0.05)  # several renewal periods
+            return "guarded-id"
+
+        async def run_container(self, spec):
+            events.append("start")
+            return "cid"
+
+        async def start(self, *, container_name, network=None, network_id=None):
+            events.append("start")
+
+        async def container_identity(self, *, container_name):
+            return "cid@2026-11-21T00:00:00Z"
+
+        async def inspect_container_state(self, *, container_name):
+            return SimpleNamespace(running=False, restarting=False)
+
+    docker_service._restore_mount_and_sshd_after_start = AsyncMock()
+    docker_service._pod_start_exclusion = lambda *args: contextlib.nullcontext()
+    if path == "create":
+        await docker_service._run_rental_docker_create_with_port_retry(
+            docker_client=Client(),
+            ssh_client=borrowed,
+            run_spec=ContainerRunSpec(name="pod_a", image="img", network=rental_network_for("pod_a")),
+            container_name="pod_a",
+            default_extra={},
+        )
+    else:
+        await docker_service._bring_up_existing_container(
+            executor_info=Mock(uuid="exec-1"),
+            private_key="private-key",
+            docker_client=Client(),
+            ssh_client=borrowed,
+            container_name="pod_a",
+            local_volume_path=None,
+            pod_id="p",
+            default_extra={},
+        )
+
+    assert [e for e in events if e != "renew"] == ["inventory", "start"]
+
+
+@pytest.mark.real_egress_guard
+@pytest.mark.asyncio
+async def test_a_guarded_bridge_is_renewed_and_released_on_connections_of_its_own(docker_service, monkeypatch):
+    # gateway review at 3b3c86b: once the guard passed, renewals and the release dial their own pinned connection,
+    # each bounded and aborted at its deadline, never a session of the connection the create runs on
+    monkeypatch.setattr("services.task.checks.rental_egress_guard.BRIDGE_RESERVATION_RENEW_SECONDS", 0.01)
+    monkeypatch.setattr(docker_service_module, "BRIDGE_HOLD_COMMAND_SECONDS", 0.05)
+    borrowed, own_sessions, on = Mock(), [], []
+
+    @contextlib.asynccontextmanager
+    async def own_ssh():
+        own_sessions.append(Mock())
+        yield own_sessions[-1]
+
+    async def renew(ssh, network, token):
+        on.append(("renew", ssh))
+        await asyncio.Event().wait()  # a host that stopped answering
+
+    async def release(ssh, network, token):
+        on.append(("release", ssh))
+        await asyncio.Event().wait()
+
+    async def guard(ssh, attempts=None, required_network_id=None):
+        on.append(("inventory", ssh))
+        return {}, None
+
+    monkeypatch.setattr("services.task.checks.rental_egress_guard.renew_pod_bridge", renew)
+    monkeypatch.setattr("services.task.checks.rental_egress_guard.release_pod_bridge", release)
+    monkeypatch.setattr("services.task.checks.rental_egress_guard.apply_rental_egress_guard", guard)
+
+    class Client:
+        async def ensure_network(self, name):
+            return "guarded-id"
+
+        async def run_container(self, spec):
+            await asyncio.sleep(0.1)  # a renewal stalls meanwhile
+            return "cid"
+
+    await asyncio.wait_for(
+        docker_service._run_rental_docker_create_with_port_retry(
+            docker_client=Client(),
+            ssh_client=borrowed,
+            run_spec=ContainerRunSpec(name="pod_a", image="img", network=rental_network_for("pod_a")),
+            container_name="pod_a",
+            default_extra={},
+            connect_own_ssh=own_ssh,
+        ),
+        2,
+    )
+
+    kinds = [kind for kind, _ in on]
+    assert kinds[0] == "inventory" and "renew" in kinds and kinds[-1] == "release"
+    assert all(ssh is not borrowed for _, ssh in on)
+    # the guard's connection closed normally; every stalled renewal and the release were aborted at their deadline
+    assert [ssh for _, ssh in on] == own_sessions
+    assert not own_sessions[0].abort.called and all(own.abort.called for own in own_sessions[1:])
+
+
+@pytest.mark.asyncio
+async def test_a_held_bridge_reservation_is_renewed_until_its_release(monkeypatch):
+    # gateway review at 98b4318: a reservation expires unless its live holder renews it
+    monkeypatch.setattr("services.task.checks.rental_egress_guard.BRIDGE_RESERVATION_RENEW_SECONDS", 0.01)
+    calls: list = []
+
+    async def renew(ssh, network, token):
+        calls.append("renew")
+
+    async def release(ssh, network, token):
+        calls.append("release")
+
+    monkeypatch.setattr("services.task.checks.rental_egress_guard.renew_pod_bridge", renew)
+    monkeypatch.setattr("services.task.checks.rental_egress_guard.release_pod_bridge", release)
+    async with docker_service_module._pod_bridge_held(
+        rental_network_for("pod_a"), lambda: contextlib.nullcontext(Mock())
+    ) as hold:
+        hold.guarded = True
+        await asyncio.sleep(0.05)
+    renewed = len(calls) - 1
+    await asyncio.sleep(0.03)
+
+    assert renewed >= 2 and calls[-1] == "release" and len(calls) == renewed + 1  # none after the release
+
+
+@pytest.mark.asyncio
+async def test_a_hold_with_no_time_left_before_its_callers_deadline_is_left_to_expire(monkeypatch):
+    # gateway review at 2b4ddb8 on lium-io#2352: no release is dialed once the caller's deadline is within the margin
+    calls: list = []
+
+    async def release(ssh, network, token):
+        calls.append("release")
+
+    monkeypatch.setattr("services.task.checks.rental_egress_guard.release_pod_bridge", release)
+    deadline = asyncio.get_running_loop().time() + docker_service_module._PRE_START_GUARD_DEADLINE_MARGIN_SECONDS
+    async with docker_service_module._pod_bridge_held(
+        rental_network_for("pod_a"), lambda: contextlib.nullcontext(Mock()), deadline
+    ) as hold:
+        hold.guarded = True
+
+    assert calls == []
+
+
+@pytest.mark.real_egress_guard
+@pytest.mark.asyncio
+async def test_a_slow_guard_never_uses_up_the_port_retry_budget(docker_service, monkeypatch):
+    # the port retries' budget starts after the guard: a guard as slow as the budget still leaves its retry
+    monkeypatch.setattr(docker_service_module, "_PORT_ALLOCATED_RETRY_BUDGET_SEC", 0.2)
+    monkeypatch.setattr(docker_service_module, "_PORT_ALLOCATED_RETRY_SLEEP_SEC", 0)
+    real_sleep = asyncio.sleep
+
+    async def slow_guard(**kwargs):
+        await real_sleep(0.3)
+
+    monkeypatch.setattr(docker_service, "_guard_pod_network_before_start", slow_guard)
+    runs: list = []
+
+    class Client:
+        async def run_container(self, spec):
+            runs.append(spec.network)
+            if len(runs) == 1:
+                raise Exception(_PORT_ALLOCATED_ERR)
+            return "cid"
+
+    container_id = await docker_service._run_rental_docker_create_attempts(
+        docker_client=Client(),
+        ssh_client=Mock(),
+        run_spec=ContainerRunSpec(name="pod_a", image="img", network=rental_network_for("pod_a")),
+        container_name="pod_a",
+        default_extra={},
+        flatten_lease=None,
+    )
+
+    assert container_id == "cid" and len(runs) == 2
 
 
 @pytest.mark.asyncio

@@ -163,9 +163,14 @@ class OutgoingMessages(list[DeliveryStamps]):
         self.appended.set()
 
 
-# DAH-5592: the backend's billing exemption for a failed reboot (lium-platform utils/reboot_fault.py PROVIDER_ERROR_CODES)
+# DAH-5592: the backend's billing exemption for a failed reboot (its PROVIDER_ERROR_CODES), and DAH-6737's pod our own
+# step left down: each stops the renter's billing, so a reply the backend lost is kept and sent again on a new socket
 HOST_FAULT_ERROR_CODES = frozenset(
-    {FailedContainerErrorCodes.ExecutorUnreachable.value, FailedContainerErrorCodes.InvalidExecutorId.value}
+    {
+        FailedContainerErrorCodes.ExecutorUnreachable.value,
+        FailedContainerErrorCodes.InvalidExecutorId.value,
+        FailedContainerErrorCodes.PodDownNotHostFault.value,
+    }
 )
 
 

@@ -86,15 +86,29 @@ _DOCKER_EXECUTOR_MAX_WORKERS = 32
 _DOCKER_EXECUTOR = ThreadPoolExecutor(
     max_workers=_DOCKER_EXECUTOR_MAX_WORKERS, thread_name_prefix="docker-sdk"
 )
-# DAH-3199: every rental on a host shares this user-defined bridge instead of docker0. The daemon's
-# default bridge allows inter-container traffic, and a pod holds NET_ADMIN, so two rentals on a split
-# host could otherwise reach each other's unpublished ports. Docker enforces ICC=false with a FORWARD
-# drop between ports of this bridge; published ports still arrive through the host and NAT egress is
-# untouched. One network per host — nothing to remove at teardown.
+# DAH-3199: rentals run on user-defined bridges with inter-container traffic off, never on docker0.
+# DAH-6737: each rental container gets a bridge of its own (rental_network_for), so no two tenants share
+# a link: the host is the only other station on it. `lium-rentals` stays as the host's template (its
+# MTU, set by the provider, is copied into every rental's own bridge) and as the network the
+# validator's own probes measure on. Published ports still arrive through the host and NAT egress is
+# untouched.
 RENTAL_NETWORK_NAME = "lium-rentals"
 RENTAL_NETWORK_ICC_OPTION = "com.docker.network.bridge.enable_icc"
+RENTAL_NETWORK_MTU_OPTION = "com.docker.network.driver.mtu"
 RENTAL_NETWORK_OPTIONS = {RENTAL_NETWORK_ICC_OPTION: "false"}
 RENTAL_NETWORK_LABELS = {"io.lium.purpose": "rental-isolation"}
+# marks a rental's own bridge; only these are ever removed, and only once no container references them
+POD_NETWORK_LABEL = "io.lium.network"
+POD_NETWORK_LABELS = {**RENTAL_NETWORK_LABELS, POD_NETWORK_LABEL: "pod"}
+
+
+def rental_network_for(container_name: str) -> str:
+    """The bridge of this rental container alone (DAH-6737); a renamed-aside edit original keeps sharing it."""
+    return f"{RENTAL_NETWORK_NAME}-{container_name}"
+
+
+def is_rental_network(name: str) -> bool:
+    return name == RENTAL_NETWORK_NAME or name.startswith(f"{RENTAL_NETWORK_NAME}-")
 # a filler create sweeps only unmounted volumes with this label: a customer's volume never has it
 FILLER_VOLUME_LABELS = {"io.lium.workload": "filler"}
 logger = logging.getLogger(__name__)
@@ -121,6 +135,22 @@ class RentalDockerOperationError(RuntimeError):
 
 class InflightCreateNameStillHeld(RentalDockerOperationError):
     """The resume waited _INFLIGHT_CREATE_DEADLINE_SECONDS and dockerd still held the pod's name: the create fails."""
+
+
+def created_container_id(exc: BaseException) -> str | None:
+    """The ID of the container a failed run created, set on the failure by `_run_container_sync`."""
+    return next((e.container_id for e in _iter_exception_chain(exc) if getattr(e, "container_id", None)), None)
+
+
+class RentalPodBridgeGone(RentalDockerOperationError):
+    """The pod's own bridge was removed on the host after its egress drop was applied (our reaper keeps it, see
+    rental_egress_guard.reserve_pod_bridge): the start is refused, never made on a bridge the drop was not confirmed on
+    (DAH-6737)."""
+
+
+class RentalPodNetworkMoveFailed(RentalDockerOperationError):
+    """Docker refused moving a stopped pod off its old network onto its own: the pod is left stopped; the host's
+    Docker refused it (DAH-6737)."""
 
 
 class ContainerNameTakenOnRetry(RentalDockerOperationError):
@@ -408,6 +438,9 @@ class ContainerRunSpec:
     entrypoint: str | None = None
     # None keeps the daemon's default bridge (the CVM quote broker talks over unix sockets only)
     network: str | None = None
+    # the ID of the pod's own bridge its egress drop was applied to (DAH-6737): the container is bound to this ID, so
+    # a same-name bridge made since (no drop on it) is never the one it runs on
+    network_id: str | None = None
     # DAH-5117: LIUM_POD_ID_LABEL for a pod or filler, so the stale cleanup knows the container is Lium's
     labels: dict[str, str] = field(default_factory=dict)
     # runs in the Docker thread right before the create call (on the resume, once the container exists);
@@ -761,18 +794,30 @@ class RentalDockerSdkClient:
             exit_code = None
         return f"exit_code={exit_code}"
 
-    async def start(self, *, container_name: str, network: str | None = None) -> None:
+    async def ensure_network(self, name: str) -> str:
+        """The rental network `name` exists with ICC off (and the template with it), as before a create or start; its ID."""
+        return await _in_docker_thread(self._ensure_rental_network_sync, name)
+
+    async def start(self, *, container_name: str, network: str | None = None, network_id: str | None = None) -> None:
         # starting a running container answers 304, so a second start after a drop is safe
         if network:
-            await _in_docker_thread(self._move_stopped_container_to_network_sync, container_name, network)
-        await self._retry_once_on_transport_drop(
-            operation="start",
-            attempt=lambda: self._call_api(
-                container_name,
-                operation_label="start",
-                api_method=self._api_client.start,
-            ),
-        )
+            await _in_docker_thread(
+                self._move_stopped_container_to_network_sync, container_name, network, network_id
+            )
+        try:
+            await self._retry_once_on_transport_drop(
+                operation="start",
+                attempt=lambda: self._call_api(
+                    container_name,
+                    operation_label="start",
+                    api_method=self._api_client.start,
+                ),
+            )
+        except RentalDockerOperationError:
+            if network and network != RENTAL_NETWORK_NAME:
+                # the bridge removed between the move and the start: the same refusal, the host's
+                await _in_docker_thread(self._guarded_pod_network_sync, network, network_id)
+            raise
 
     async def stop(self, *, container_name: str, stop_grace_seconds: int | None = None) -> None:
         # stop_grace_seconds is the SIGTERM grace window: dockerd waits this many seconds for
@@ -1186,8 +1231,12 @@ class RentalDockerSdkClient:
         return None
 
     def _run_container_sync(self, spec: ContainerRunSpec, *, adopt_existing: bool = False) -> str | None:
-        if spec.network:
+        if spec.network == RENTAL_NETWORK_NAME:
             self._ensure_rental_network_sync(spec.network)
+        elif spec.network:
+            # a pod's own bridge is created only before its egress drop is applied (ensure_network): one gone since
+            # fails this attempt, never comes back here as a bridge the drop was not confirmed on (DAH-6737)
+            _require_icc_off(spec.network, self._guarded_pod_network_sync(spec.network, spec.network_id))
         created = None
         adopted_id = self._adopt_container_by_name_sync(spec) if adopt_existing else None
         if adopted_id is None:
@@ -1198,39 +1247,55 @@ class RentalDockerSdkClient:
             # runs below, once a container exists for the caller's removal by name to find.
             if spec.before_create is not None and not adopt_existing:
                 spec.before_create()
-            created = self._api_client.create_container(
-                image=spec.image,
-                command=list(spec.command) or None,
-                detach=True,
-                ports=_container_ports(spec.ports) or None,
-                environment=spec.environment or None,
-                volumes=_container_volumes(spec.volumes) or None,
-                name=spec.name,
-                entrypoint=spec.entrypoint or None,
-                host_config=host_config,
-                labels={
-                    **spec.labels,
-                    **({RENTAL_CPU_COUNT_LABEL: str(spec.cpu_count)} if spec.cpu_count else {}),
-                }
-                or None,
-            )
+            try:
+                created = self._api_client.create_container(
+                    image=spec.image,
+                    command=list(spec.command) or None,
+                    detach=True,
+                    ports=_container_ports(spec.ports) or None,
+                    environment=spec.environment or None,
+                    volumes=_container_volumes(spec.volumes) or None,
+                    name=spec.name,
+                    entrypoint=spec.entrypoint or None,
+                    host_config=host_config,
+                    labels={
+                        **spec.labels,
+                        **({RENTAL_CPU_COUNT_LABEL: str(spec.cpu_count)} if spec.cpu_count else {}),
+                    }
+                    or None,
+                )
+            except Exception:
+                if spec.network and spec.network != RENTAL_NETWORK_NAME:
+                    # the bridge removed between the check above and the create: the same refusal, the host's
+                    self._guarded_pod_network_sync(spec.network, spec.network_id)
+                raise
         if spec.before_create is not None and adopt_existing:
             spec.before_create()
-        if spec.before_start is not None:
-            spec.before_start(
-                [
-                    name.lstrip("/")
-                    for container in self._api_client.containers(all=True)
-                    for name in container.get("Names") or ()
-                ]
-            )
-        if spec.before_start_call is not None:
-            spec.before_start_call()
         container_id = created.get("Id") if isinstance(created, dict) else adopted_id
         container_id = container_id if isinstance(container_id, str) and container_id else None
-        # A create with a start check starts the container it checked, by ID, never a same-name successor.
-        # Others keep the name: a failed start leaves no ID for the cleanup, which then removes by name.
-        self._api_client.start(container_id if spec.before_start is not None and container_id else spec.name)
+        # Started by ID, never a same-name successor (a restored container that took the name since the create); a
+        # failure carries the ID (created_container_id), so its cleanup removes this container, never the successor.
+        try:
+            if spec.before_start is not None:
+                spec.before_start(
+                    [
+                        name.lstrip("/")
+                        for container in self._api_client.containers(all=True)
+                        for name in container.get("Names") or ()
+                    ]
+                )
+            if spec.before_start_call is not None:
+                spec.before_start_call()
+            try:
+                self._api_client.start(container_id or spec.name)
+            except Exception:
+                if spec.network and spec.network != RENTAL_NETWORK_NAME:
+                    self._guarded_pod_network_sync(spec.network, spec.network_id)
+                raise
+        except Exception as exc:
+            if container_id:
+                exc.container_id = container_id
+            raise
         return container_id
 
     def _adopt_container_by_name_sync(self, spec: ContainerRunSpec) -> str | None:
@@ -1249,6 +1314,13 @@ class RentalDockerSdkClient:
             raise
         config = info.get("Config") if isinstance(info, dict) else None
         existing_image = config.get("Image") if isinstance(config, dict) else None
+        mode = (info.get("HostConfig") or {}).get("NetworkMode") if isinstance(info, dict) else None
+        if spec.network_id and mode != spec.network_id:
+            # created on another bridge than the one this create guarded (a restored container under the name)
+            raise ContainerNameTakenOnRetry(
+                "Docker SDK run container refused after a transport retry: a container named "
+                f"{spec.name} already exists on network {mode!r}, not the guarded {spec.network_id!r}"
+            )
         if existing_image == spec.image:
             existing_id = info.get("Id")
             return existing_id if isinstance(existing_id, str) else ""
@@ -1257,7 +1329,7 @@ class RentalDockerSdkClient:
             f"{spec.name} already exists with image {existing_image!r}, not {spec.image!r}"
         )
 
-    def _ensure_rental_network_sync(self, name: str) -> None:
+    def _ensure_rental_network_sync(self, name: str) -> str:
         """The container's network exists on the host and has inter-container traffic off.
 
         Runs before every rental `create_container`, so the isolation holds on a host that has never
@@ -1265,15 +1337,27 @@ class RentalDockerSdkClient:
         same host (the loser's `create_network` conflicts and the network is inspected again). A
         network of that name whose options do not turn ICC off is refused rather than used: running
         the pod on it would silently restore the docker0 behaviour this network exists to end.
+
+        A rental's own bridge (DAH-6737) is created from the `lium-rentals` template, which is ensured
+        first. The bridges of ended rentals are removed under the host lock before the pod's guard
+        (rental_egress_guard.reserve_pod_bridge), never here.
         """
+        options, labels = dict(RENTAL_NETWORK_OPTIONS), dict(RENTAL_NETWORK_LABELS)
+        if name != RENTAL_NETWORK_NAME:
+            self._ensure_rental_network_sync(RENTAL_NETWORK_NAME)
+            labels = dict(POD_NETWORK_LABELS)
         network = self._inspect_network_or_none(name)
         if network is None:
+            if name != RENTAL_NETWORK_NAME:
+                template = self._inspect_network_or_none(RENTAL_NETWORK_NAME) or {}
+                if mtu := (template.get("Options") or {}).get(RENTAL_NETWORK_MTU_OPTION):
+                    options[RENTAL_NETWORK_MTU_OPTION] = mtu
             try:
                 self._api_client.create_network(
                     name,
                     driver="bridge",
-                    options=dict(RENTAL_NETWORK_OPTIONS),
-                    labels=dict(RENTAL_NETWORK_LABELS),
+                    options=options,
+                    labels=labels,
                 )
             except Exception as exc:
                 network = self._inspect_network_or_none(name)
@@ -1288,28 +1372,86 @@ class RentalDockerSdkClient:
                         f"Docker network {name} was created but cannot be inspected"
                     )
         _require_icc_off(name, network)
+        if labels.get(POD_NETWORK_LABEL) and (network.get("Labels") or {}).get(POD_NETWORK_LABEL) != "pod":
+            # not made by a guarded create: the guard's inventory of pod bridges would not keep its rules
+            raise RentalDockerOperationError(
+                f"Docker network {name} exists on the executor without the {POD_NETWORK_LABEL}=pod label; "
+                "refusing to run the rental on it. Remove the network once it is empty."
+            )
+        return network.get("Id") or name
 
-    def _move_stopped_container_to_network_sync(self, container_name: str, network: str) -> bool:
-        """Move a stopped container that predates `network` from docker0 onto it; True when it moved.
+    def _guarded_pod_network_sync(self, name: str, network_id: str | None) -> dict:
+        """The pod's own bridge as its egress drop was applied to it, inspected only: never created after the drop.
+
+        Gone, or a same-name bridge with another ID (removed and made again since), refuses the start (DAH-6737)."""
+        network = self._inspect_network_or_none(name)
+        if network is None or (network_id and network.get("Id") != network_id):
+            raise RentalPodBridgeGone(f"Docker network {name} is gone since its egress drop was applied")
+        return network
+
+    def _move_stopped_container_to_network_sync(
+        self, container_name: str, network: str, network_id: str | None = None
+    ) -> bool:
+        """Move a stopped container that predates `network` onto it; True when it moved.
 
         A container keeps the network it was created with across `docker start`, so a pod created
-        before rentals ran on `network` would stay on the shared default bridge for its whole life.
-        Published ports are host config and survive the move. A running container is left alone (a
-        move would cut its live connections), and so is one on host, none or another container's
-        namespace: only the default bridge is the old setup this replaces.
+        before rentals ran on `network` would stay on a shared bridge (docker0, or the one
+        `lium-rentals` every rental used before DAH-6737) for its whole life. Published ports are host
+        config and survive the move. A running container is left alone (a move would cut its live
+        connections), and so is one on host, none or another container's namespace: only the shared
+        bridges are the old setups this replaces.
+
+        A pod's own bridge is never created here, after its egress drop (DAH-6737): it is inspected, must still be the
+        one the drop was applied to (`network_id`), and the container is bound to that ID. A stopped pod whose own
+        bridge is gone (a mode naming another bridge) is refused the same way, never started on whatever answers.
         """
         info = self._api_client.inspect_container(container_name)
         state = info.get("State") or {}
         if state.get("Running") or state.get("Restarting"):
             return False
-        attached = set(((info.get("NetworkSettings") or {}).get("Networks") or {}).keys())
+        networks = (info.get("NetworkSettings") or {}).get("Networks") or {}
         mode = (info.get("HostConfig") or {}).get("NetworkMode") or "default"
-        if network in attached or mode not in ("default", "bridge"):
+        own = network != RENTAL_NETWORK_NAME
+        if own:
+            target = self._guarded_pod_network_sync(network, network_id)
+            _require_icc_off(network, target)
+            network_id = target.get("Id") or network_id
+        if mode not in ("default", "bridge", RENTAL_NETWORK_NAME):
+            if own and mode not in (network, network_id, "host", "none") and not mode.startswith("container:"):
+                raise RentalPodBridgeGone(f"{container_name} is bound to network {mode}, not its guarded {network}")
             return False
-        self._ensure_rental_network_sync(network)
-        for name in sorted(attached):
-            self._api_client.disconnect_container_from_network(container_name, name)
-        self._api_client.connect_container_to_network(container_name, network)
+        # a moved pod keeps NetworkMode lium-rentals, which `docker start` resolves: the template is recreated (with
+        # the pod's own bridge) when it was pruned while the pod was stopped, moved before or not
+        self._ensure_rental_network_sync(RENTAL_NETWORK_NAME)
+        if own:
+            if network_id in {value.get("NetworkID") for value in networks.values()}:
+                return False
+        elif network in networks:
+            return False
+        target_ref = network
+        try:
+            for name in sorted(networks):
+                try:
+                    self._api_client.disconnect_container_from_network(container_name, name)
+                except Exception:
+                    # an old network removed while the pod was stopped holds nothing to leave
+                    if self._inspect_network_or_none(name) is not None:
+                        raise
+            if own:
+                # docker-py sends EndpointConfig {}: dockerd then keeps the attachment by network name and resolves the
+                # name again at start, a same-name bridge made since included. NetworkID pins it to the guarded one (F-36)
+                api = self._api_client
+                response = api._post_json(
+                    api._url("/networks/{0}/connect", network_id),
+                    data={"Container": container_name, "EndpointConfig": {"NetworkID": network_id}},
+                )
+                api._raise_for_status(response)
+            else:
+                self._api_client.connect_container_to_network(container_name, target_ref)
+        except Exception as exc:
+            raise RentalPodNetworkMoveFailed(
+                _wrap_error_message(f"Docker SDK move of {container_name} onto network {network} failed", exc)
+            ) from exc
         return True
 
     def _inspect_network_or_none(self, name: str) -> dict | None:
@@ -1989,7 +2131,7 @@ def _build_host_config_kwargs(spec: ContainerRunSpec) -> dict:
         ),
         "shm_size": spec.shm_size,
         "log_config": {"type": "json-file", "config": spec.log_opts} if spec.log_opts else None,
-        "network_mode": spec.network,
+        "network_mode": spec.network_id or spec.network,
     }
     return {key: value for key, value in kwargs.items() if value is not None}
 

@@ -95,6 +95,8 @@ class FailedContainerErrorCodes(enum.Enum):
     ContainerVanished = "ContainerVanished"
     # DAH-3338: the miner knows the executor but could not reach it; distinct from InvalidExecutorId
     ExecutorUnreachable = "ExecutorUnreachable"
+    # DAH-6737: the validator's own step left no container of the pod running: not billed, not a host fault
+    PodDownNotHostFault = "PodDownNotHostFault"
 
 
 class FailedContainerErrorTypes(enum.Enum):

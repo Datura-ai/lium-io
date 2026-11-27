@@ -360,6 +360,8 @@ async def test_a_create_failure_echoes_the_create_command_id(client):
 @pytest.mark.parametrize(
     ("code", "kept"),
     [(FailedContainerErrorCodes.ExecutorUnreachable, True), (FailedContainerErrorCodes.InvalidExecutorId, True),
+     # DAH-6737 F-31: a pod our own step left down is not billed either; a lost reply would leave it billed
+     (FailedContainerErrorCodes.PodDownNotHostFault, True),
      (FailedContainerErrorCodes.UnknownError, False)],
 )
 @pytest.mark.parametrize("reconnect_during_cleanup", [False, True])

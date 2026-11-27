@@ -21,6 +21,8 @@ VERSION_FILES = {
     "lium_protocol/pyproject.toml": r'^version = "([^"]+)"$',
     "lium_protocol/uv.lock": r'^name = "lium-protocol"\nversion = "([^"]+)"$',
     README: r"`PROTOCOL_VERSION` \(`([^`]+)`\)",
+    # the validator image build sees only neurons/validators, so this copy carries the version into it
+    "neurons/validators/validator_protocol": r"^(\d+\.\d+\.\d+)$",
 }
 SNAPSHOT_DIR = "lium_protocol/lium_protocol/snapshots"
 SNAPSHOT_PATTERN = r'^  "protocol_version": "([^"]+)",$'
