@@ -166,6 +166,7 @@ class VerifierParams:
 # only this failure by the probe's output (stderr and stdout): the other empty-uuid results (a sealed blob that failed
 # authentication, a stdout that could not be parsed) are not the probe's answer.
 UUID_MISMATCH_ERROR_PREFIX = "UUID mismatch"
+ALL_CARDS_FAILED_ERROR_PREFIX = "All-cards GPU work-proof failed"
 
 # Whose clock `ValidationResult.elapsed_seconds` is: the validator's around the SSH run, or the
 # executor's own word for the step when the answer came through the local transport.
@@ -201,6 +202,8 @@ class ValidationResult:
     card_metrics: dict[int, dict] | None = None
     # The all-cards work-proof failed with no card answering at all (see AllCardsProbe.no_card_answered).
     all_cards_no_answer: bool = False
+    # The all-cards work-proof failed and at least one card gave a wrong answer (DAH-6332).
+    all_cards_wrong_answer: bool = False
 
     def __bool__(self) -> bool:
         """Allow using ValidationResult in boolean context for backward compatibility."""
@@ -860,8 +863,9 @@ class ValidationService:
             ):
                 return ValidationResult(
                     success=False,
-                    error_message=f"All-cards GPU work-proof failed: {all_cards.failure_reason}",
+                    error_message=f"{ALL_CARDS_FAILED_ERROR_PREFIX}: {all_cards.failure_reason}",
                     all_cards_no_answer=all_cards.no_card_answered,
+                    all_cards_wrong_answer=any(c.get("reason") == "wrong_answer" for c in all_cards.per_card),
                 )
 
         # Per-call verifier object: its key MUST survive the SSH round-trip so we can
