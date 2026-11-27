@@ -10,6 +10,12 @@ RUN apt-get update \
 
 WORKDIR /app
 
+# DAH-7307: every prod build of this file passes PROTOCOL_RELEASE_GATE=1 (docker_build.sh for latest, the deployment's
+# prod stack), so a validator on a newer protocol than the prod backend fails to build; staging and dev pass nothing
+ARG PROTOCOL_RELEASE_GATE=0
+COPY protocol_release_gate.py validator_protocol backend_protocol_in_prod ./
+RUN if [ "$PROTOCOL_RELEASE_GATE" = "1" ]; then python3 protocol_release_gate.py; fi
+
 # pdm[locked]: pdm's own dependency pins; plain pdm took hishel 2.0.0, which crashes `pdm install` (DAH-5825)
 RUN pip install "pdm[locked]==2.29.3" "unearth<0.19"
 ENV PDM_CHECK_UPDATE=false

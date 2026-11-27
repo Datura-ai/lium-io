@@ -4,8 +4,9 @@ The backend rejects message types, codes and fields it does not know, so a valid
 protocol than the backend in prod sends replies the backend drops. backend_protocol_in_prod holds the
 PROTOCOL_VERSION that lium-platform's prod backend vendors; raise it only after that backend is live in prod.
 validator_protocol holds the PROTOCOL_VERSION this validator speaks (a test keeps it equal to lium_protocol's).
-docker_build.sh runs this check before the prod (latest) image build, the only prod release path; staging, dev and
-other builds of the Dockerfile run ahead of the prod backend and are not held.
+The Dockerfile runs this check when built with PROTOCOL_RELEASE_GATE=1, which every prod build passes: docker_build.sh
+for the public latest image and the deployment's prod stack for the image Lium's prod runs. Staging, dev and other
+builds pass nothing, run ahead of the prod backend and are not held.
 """
 
 import sys
