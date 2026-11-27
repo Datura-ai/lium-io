@@ -488,13 +488,13 @@ class ContainerCleanup:
 
                 removal_age = self._removal_age_minutes_for_unlisted_container(stripped_name, rented_data)
                 if age_minutes and age_minutes > removal_age:
-                    if legacy and not await self._legacy_ended(lium_workload_ended, stripped_name):
+                    if legacy and not await self._backend_confirms_workload_ended(lium_workload_ended, stripped_name):
                         continue
                     if not legacy and age_minutes <= self.stale_threshold_minutes:
                         # a filler younger than the fixed grace may be a run whose create callback comes late:
                         # only the backend's record that it ended lets it go, and that one lookup also confirms
                         # the removal, so it reserves no second one; past the grace the fixed rule applies
-                        if not await self._legacy_ended(lium_workload_ended, stripped_name):
+                        if not await self._backend_confirms_workload_ended(lium_workload_ended, stripped_name):
                             continue
                     elif (
                         not legacy
@@ -574,7 +574,8 @@ class ContainerCleanup:
         read_at = rented_data.read_at if rented_data is not None else None
         if not name.startswith(FILLER_CONTAINER_PREFIX) or read_at is None:
             return self.stale_threshold_minutes
-        return (time.time() - read_at) / 60 + FILLER_LIST_READ_MARGIN_MINUTES
+        # an old list read never waits longer than the fixed grace
+        return min(self.stale_threshold_minutes, (time.time() - read_at) / 60 + FILLER_LIST_READ_MARGIN_MINUTES)
 
     async def remove_never_started_check_containers(self, ssh_client, executor_uuid: str) -> int:
         # best-effort like the volume prune above: never raises
@@ -1011,7 +1012,7 @@ class ContainerCleanup:
             return 0
 
     @staticmethod
-    async def _legacy_ended(
+    async def _backend_confirms_workload_ended(
         lium_workload_ended: Callable[[str], Awaitable[bool]] | None, container_name: str
     ) -> bool:
         """True only when the backend's record says the pod_/filler_<uuid> workload ended (no callback: never)."""

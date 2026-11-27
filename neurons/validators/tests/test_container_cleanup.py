@@ -1708,6 +1708,20 @@ async def test_an_unlisted_filler_older_than_the_rented_list_goes_at_once_and_a_
     assert before_read not in [call.args[0] for call in reserve.call_args_list]
 
 
+def test_an_old_rented_list_read_never_waits_longer_than_the_fixed_grace():
+    """DAH-7071: the filler_ age from a list read long ago is capped at the fixed grace."""
+    import time
+
+    rented_data = _real_rented_data(EXECUTOR_UUID, [LIVE_POD])
+    rented_data.read_at = time.time() - 10 * FILLER_CONTAINER_GRACE_MINUTES * 60
+    cleanup = ContainerCleanup()
+
+    assert (
+        cleanup._removal_age_minutes_for_unlisted_container("filler_00000000-0000-4000-8000-0000000000c1", rented_data)
+        == FILLER_CONTAINER_GRACE_MINUTES
+    )
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "age_minutes, ended, removed",
