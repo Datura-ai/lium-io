@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from bittensor_wallet import Keypair
+from datura.requests.validator_requests import fresh_upload_nonce, ssh_pubkey_signing_blob
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from middlewares.miner import MinerMiddleware
@@ -61,12 +62,14 @@ def _trust(monkeypatch, **hotkeys: Keypair) -> None:
 
 
 def _upload_payload(miner_kp, validator_kp) -> dict:
-    # miners/services/executor_service.py:send_pubkey_to_executor, no nonce
+    # miners/services/executor_service.py:send_pubkey_to_executor; every upload carries a dated nonce
+    nonce = fresh_upload_nonce()
     return {
         "public_key": _SSH_KEY,
         "data_to_sign": _SSH_KEY,
         "signature": "0x" + miner_kp.sign(_SSH_KEY).hex(),
-        "validator_signature": "0x" + validator_kp.sign(_SSH_KEY).hex(),
+        "validator_signature": "0x" + validator_kp.sign(ssh_pubkey_signing_blob(_SSH_KEY, nonce)).hex(),
+        "nonce": nonce,
     }
 
 
