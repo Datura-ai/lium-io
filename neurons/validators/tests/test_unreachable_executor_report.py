@@ -247,7 +247,8 @@ def test_a_node_address_that_answers_404_is_named_as_no_executor_there_not_a_ref
     assert result.score == 0
     assert event.event == "Miner reached this node's address, but no executor answered there"
     assert "refused" not in event.event
-    assert "docker ps" in event.remediation and "ss -ltnp" in event.remediation
+    assert "docker ps" in event.remediation and "EXTERNAL_PORT" in event.remediation
+    assert "ss -ltnp" not in event.remediation
     assert event.what_we_saw["node_answer"] == "HTTP 404: Not Found"
 
 

@@ -293,10 +293,10 @@ def build_executor_unreachable_by_miner_event(
             event_text="Miner reached this node's address, but no executor answered there",
             impact="Score 0 for this cycle; the node is hidden from the market until a cycle installs the key.",
             remediation=(
-                "Something other than the executor answers on the node's executor port (HTTP 404 to "
-                "/upload_ssh_key), so the request never reached the executor and its log shows nothing. Check "
-                "that the executor container is running (`docker ps`) and that it is what listens on the executor "
-                "port (`ss -ltnp`), and that the miner's address and port for this node point at it."
+                "The request never reached the executor (HTTP 404 to /upload_ssh_key), so its log shows nothing: "
+                "the address and port the miner has for this node point at something else. Compare the node's "
+                "registered IP and port with the port the executor container publishes (`EXTERNAL_PORT` in `.env`; "
+                "`docker ps` shows it), and check that any router port forward leads to this machine."
             ),
             what_we_saw={"executor_uuid": executor_uuid, "miner_hotkey": miner_hotkey, "node_answer": refusal},
         )
