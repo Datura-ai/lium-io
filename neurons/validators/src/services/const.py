@@ -1,4 +1,8 @@
+import math
 import re
+from collections.abc import Callable
+from dataclasses import dataclass
+from enum import StrEnum
 
 MIN_JOB_TAKEN_TIME = 20
 
@@ -350,7 +354,9 @@ DPHN_CACHE_VOLUME_PREFIX = "dphn_cache_"
 # DAH-2805: only the download-temporary sweep looks at the ENGY cache — reclaiming a whole ENGY
 # volume is a separate decision nobody has made, so the DPHN-only paths keep using their own prefix.
 ENGY_CACHE_VOLUME_PREFIX = "engy_cache_"
-FILLER_CACHE_VOLUME_PREFIXES = (DPHN_CACHE_VOLUME_PREFIX, ENGY_CACHE_VOLUME_PREFIX)
+# DAH-6406: a provider's own Custom Docker job keeps one cache volume across launches (job_cache_<N>gb_<job>).
+# Its rules beside the Lium caches are in CACHE_KINDS.
+JOB_CACHE_VOLUME_PREFIX = "job_cache_"
 # DAH-2475: what one node's DPHN cache costs on disk, and how much room the node must keep free after
 # downloading it. The floor mirrors the backend's EXECUTORS_FILTER_MIN_GB — below it the node drops out
 # of the rental listing, where neither renters nor fillers can reach it — and the margin is headroom
@@ -376,6 +382,144 @@ ENGY_CACHE_MIN_FREE_BESIDE_GB = 2000
 # partial download, e.g. one a rental interrupted. It is kept and remounted, so the next run resumes it file
 # by file, but what is still missing is charged like a download.
 ENGY_CACHE_COMPLETE_SHARE = 0.98
+
+
+class CacheCharge(StrEnum):
+    """How a launch charges an existing cache of a kind against free disk.
+
+    Applied by DockerService._cache_missing_gb.
+    """
+
+    # its own size is unknown: the whole set when it is empty (the reclaim's wipe leaves it so), else nothing
+    WHOLE_WHEN_EMPTY = "whole_when_empty"
+    # a partial download: what it still lacks of its size, nothing once ENGY_CACHE_COMPLETE_SHARE of it is held
+    REST_OF_DOWNLOAD = "rest_of_download"
+    # its whole size was taken from the disk when it was created: an existing one costs nothing
+    PREALLOCATED = "preallocated"
+
+
+@dataclass(frozen=True)
+class CacheKind:
+    """One kind of filler cache volume. Every per-kind rule (size, charge, eviction, sweep) is a field here, and
+    every path reads it through cache_kind(), so a fix to a rule applies to each kind that has it."""
+
+    prefix: str
+    # the names of this kind: a volume that only starts with the prefix but does not match is not ours
+    name: re.Pattern[str]
+    # the size in GB: fixed, or group 1 of size_in_name (a name without it is never afforded)
+    fixed_size_gb: float | None
+    size_in_name: re.Pattern[str] | None
+    charge: CacheCharge
+    # du failed: charged its whole size (it may be empty), else nothing (mounting what exists costs nothing)
+    unmeasured_charged_whole: bool
+    # a loop-backed volume of exactly its size (vloopback, preallocated): the run cannot write more, and the disk
+    # it takes never changes after its creation. Else a plain volume that grows with its files.
+    loop_backed: bool
+    # the rental listing counts its disk as free, so a rental evicts it first, until the listing floor fits too
+    listed_as_free: bool
+    # the disk-tight reclaim takes it beside a live filler once no container mounts it (its run is gone)
+    reclaimed_beside_filler_when_unmounted: bool
+    # its abandoned download temporaries (*.incomplete) are swept; a provider's run may write one for hours
+    download_temporaries_swept: bool
+    # a launch of any of these kinds sweeps this kind's volumes it does not ask for (left by an older version
+    # or another workload)
+    swept_by_launches_of: frozenset[str]
+
+
+# The loopback plugin backs a volume with one file and ext4 caps a file at 16 TiB.
+LOOP_VOLUME_MAX_GB = 16 * 1024 - 1
+# the backend's whole job cache name (build_job_cache_volume), its size (the provider's limit) in group 1
+JOB_CACHE_VOLUME_NAME = re.compile(rf"^{JOB_CACHE_VOLUME_PREFIX}(\d+)gb_[0-9a-f]{{12}}$")
+
+CACHE_KINDS: tuple[CacheKind, ...] = (
+    CacheKind(
+        prefix=DPHN_CACHE_VOLUME_PREFIX,
+        name=re.compile(rf"^{DPHN_CACHE_VOLUME_PREFIX}"),
+        fixed_size_gb=DPHN_CACHE_SIZE_GB,
+        size_in_name=None,
+        charge=CacheCharge.WHOLE_WHEN_EMPTY,
+        unmeasured_charged_whole=True,
+        loop_backed=False,
+        listed_as_free=False,
+        reclaimed_beside_filler_when_unmounted=False,
+        download_temporaries_swept=True,
+        # a node moved to Engy no longer runs Dolphin; never the other way round (tens of GB against terabytes)
+        swept_by_launches_of=frozenset({DPHN_CACHE_VOLUME_PREFIX, ENGY_CACHE_VOLUME_PREFIX}),
+    ),
+    CacheKind(
+        prefix=ENGY_CACHE_VOLUME_PREFIX,
+        name=re.compile(rf"^{ENGY_CACHE_VOLUME_PREFIX}"),
+        fixed_size_gb=None,
+        # DAH-5014: engy_cache_hf_<N>gb_...; the wire CacheVolume has no size field
+        size_in_name=re.compile(rf"^{ENGY_CACHE_VOLUME_PREFIX}hf_(\d+)gb_"),
+        charge=CacheCharge.REST_OF_DOWNLOAD,
+        unmeasured_charged_whole=False,
+        loop_backed=False,
+        listed_as_free=True,
+        reclaimed_beside_filler_when_unmounted=False,
+        download_temporaries_swept=True,
+        swept_by_launches_of=frozenset({ENGY_CACHE_VOLUME_PREFIX}),
+    ),
+    CacheKind(
+        prefix=JOB_CACHE_VOLUME_PREFIX,
+        # the whole name: a provider's own volume with the prefix stays theirs
+        name=JOB_CACHE_VOLUME_NAME,
+        fixed_size_gb=None,
+        size_in_name=JOB_CACHE_VOLUME_NAME,
+        charge=CacheCharge.PREALLOCATED,
+        unmeasured_charged_whole=False,
+        loop_backed=True,
+        listed_as_free=True,
+        reclaimed_beside_filler_when_unmounted=True,
+        download_temporaries_swept=False,
+        # Lium's own filler runs only where no provider job does, so a job cache there is leftover
+        swept_by_launches_of=frozenset({DPHN_CACHE_VOLUME_PREFIX, ENGY_CACHE_VOLUME_PREFIX, JOB_CACHE_VOLUME_PREFIX}),
+    ),
+)
+FILLER_CACHE_VOLUME_PREFIXES = tuple(kind.prefix for kind in CACHE_KINDS)
+
+
+def cache_kind(name: str) -> CacheKind | None:
+    """The kind of this cache volume, or None when it is no cache volume of ours."""
+    for kind in CACHE_KINDS:
+        if name.startswith(kind.prefix):
+            return kind if kind.name.match(name) else None
+    return None
+
+
+def cache_prefixes(rule: Callable[[CacheKind], bool]) -> tuple[str, ...]:
+    """The prefixes of the kinds for which `rule` holds, e.g. `cache_prefixes(lambda kind: kind.listed_as_free)`."""
+    return tuple(kind.prefix for kind in CACHE_KINDS if rule(kind))
+
+
+def is_cache_volume_name(name: str, prefixes: tuple[str, ...]) -> bool:
+    """A cache volume of one of these kinds."""
+    kind = cache_kind(name)
+    return kind is not None and kind.prefix in prefixes
+
+
+def is_loop_backed_cache(name: str) -> bool:
+    """A cache volume of a kind created as a loop-backed volume of its size (CacheKind.loop_backed)."""
+    kind = cache_kind(name)
+    return kind is not None and kind.loop_backed
+
+
+def cache_size_gb(name: str) -> float:
+    """A cache volume's size in GB; inf (never afforded) when its kind carries the size in the name and this name
+    has none, or when no loop-backed volume can have that size."""
+    kind = cache_kind(name)
+    if kind is None:
+        return math.inf
+    if kind.fixed_size_gb is not None:
+        return kind.fixed_size_gb
+    match = kind.size_in_name.match(name) if kind.size_in_name else None
+    if match is None:
+        return math.inf
+    size_gb = int(match.group(1))
+    # 0 would make a plain volume with no limit (create_local_volume)
+    if kind.loop_backed and not 1 <= size_gb <= LOOP_VOLUME_MAX_GB:
+        return math.inf
+    return size_gb
 FILLER_CONTAINER_GRACE_MINUTES = 15
 # DAH-2757: how long after a rental closes a BROKEN pod's container still counts as ours. The
 # container lives until the sweep above collects it, so the bound follows that grace with one cycle

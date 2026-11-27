@@ -54,6 +54,9 @@ class FakeSshClient:
                 if name not in self._refuses and name in self._volumes:
                     self._volumes.remove(name)
             stdout = ""
+        elif "dangling=true" in command:
+            # a refused volume is one a container references
+            stdout = "\n".join(name for name in self._volumes if name not in self._refuses)
         elif "volume ls" in command:
             stdout = "\n".join(self._volumes)
         elif "docker ps" in command:
@@ -296,6 +299,20 @@ async def test_the_cache_stays_above_the_floor_or_while_a_filler_runs(cleanup, c
     assert _removed(ssh_client) == []
 
 
+@pytest.mark.asyncio
+async def test_an_unmounted_job_cache_is_reclaimed_while_a_filler_runs(cleanup):
+    # docker refuses a mounted volume, so only the unmounted job cache goes; the filler's caches stay
+    ssh_client = FakeSshClient(
+        ["pod_abc", "filler_x"],
+        ["engy_cache_hf_kimi-k3", "job_cache_50gb_0123456789ab", "job_cache_80gb_ba9876543210"],
+        free_gb=10,
+        refuses={"job_cache_80gb_ba9876543210"},
+    )
+
+    assert await cleanup.reclaim_dphn_cache_when_disk_is_tight(ssh_client, "exec-1") == 1
+    assert _removed(ssh_client) == ["job_cache_50gb_0123456789ab"]
+
+
 class CreatedSweepSshClient(FakeSshClient):
     """A sweep `docker run` killed between create and start: `lium_cache_sweep` sits in Created, never
     auto-removed, and dockerd refuses `volume rm` on the cache volume it mounts until it is gone."""
@@ -333,6 +350,14 @@ async def test_the_download_sweep_removes_its_helper_container_after_the_run_too
     assert "docker rm -f lium_cache_sweep" in before and "docker rm -f lium_cache_sweep" in after
 
 
+@pytest.mark.asyncio
+async def test_the_download_sweep_leaves_a_provider_job_cache_alone(cleanup):
+    ssh_client = FakeSshClient(containers=[], volumes=["job_cache_50gb_0123456789ab"], free_gb=40)
+
+    assert await cleanup.sweep_abandoned_download_temporaries(ssh_client, "exec-1") == 0
+    assert not [c for c in ssh_client.commands if "docker run" in c]
+
+
 CHECK_ID = "a1" * 32
 
 
@@ -367,3 +392,14 @@ async def test_the_stale_cleanup_removes_never_started_check_containers(cleanup)
 
     assert await cleanup.remove_never_started_check_containers(ssh_client, "exec-1") == 1
     assert any(c.startswith(f"/usr/bin/docker rm -f {CHECK_ID} ") for c in ssh_client.commands)
+
+
+@pytest.mark.asyncio
+async def test_a_removal_docker_refuses_is_not_counted_as_removed(cleanup):
+    # the re-list after `volume rm ... || true` must see pod volumes, which are no cache kind (review r4704472500)
+    volume = f"volume_{POD}"
+    ssh_client = VolumeHostSsh(
+        dangling=[volume], created={volume: "2026-09-10T08:00:00Z"}, volumes=[volume], refuses={volume}
+    )
+    assert await cleanup.remove_orphan_rental_volumes(ssh_client, _snapshot([LIVE]), "exec-1", AsyncMock(return_value=True)) == 0
+    assert _removed(ssh_client) == [volume]

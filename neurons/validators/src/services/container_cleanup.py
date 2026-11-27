@@ -18,6 +18,8 @@ from services.const import (
     DPHN_CACHE_LISTING_FLOOR_GB,
     CACHE_SWEEP_CONTAINER_NAME,
     PARKED_SUFFIXES,
+    cache_prefixes,
+    is_cache_volume_name,
     unparked_name,
     FILLER_CACHE_VOLUME_PREFIXES,
     FILLER_CONTAINER_GRACE_MINUTES,
@@ -148,7 +150,7 @@ async def evict_cache_volumes_oldest_first(
     volume_names: list[str],
     run_removal: Callable[[str], Awaitable[object]],
     has_room: Callable[[], Awaitable[bool]],
-    evict_first_prefix: str | None = None,
+    evict_first_prefixes: tuple[str, ...] | None = None,
     volume_remove: Callable[[str], str] = DockerCommand.volume_remove,
     keep_image: str | None = None,
 ) -> None:
@@ -175,11 +177,11 @@ async def evict_cache_volumes_oldest_first(
     await run_removal(idle_filler_images_removal_command(keep_image))
     if await has_room():
         return
-    # DAH-5260: a rental passes the Engy prefix, the cache its listing offered as free disk
+    # DAH-5260: a rental passes the prefixes of the caches its listing offered as free disk (CacheKind.listed_as_free)
     ordered: list[str] = sorted(
         volume_names,
         key=lambda name: (
-            not (evict_first_prefix and name.startswith(evict_first_prefix)),
+            not (evict_first_prefixes and name.startswith(evict_first_prefixes)),
             created_at.get(name, "~"),
             name,
         ),
@@ -617,6 +619,17 @@ class ContainerCleanup:
             )
             return 0
 
+    async def _caches_reclaimable_beside_a_filler(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        cache_volumes: list[str],
+    ) -> list[str]:
+        """The caches among ``cache_volumes`` whose kind is reclaimed beside a live filler once no container
+        mounts them (CacheKind.reclaimed_beside_filler_when_unmounted): their run is gone, but they still hold disk."""
+        unmounted: set[str] = set(await self._get_dangling_volumes(ssh_client) or [])
+        kinds = cache_prefixes(lambda kind: kind.reclaimed_beside_filler_when_unmounted)
+        return [name for name in cache_volumes if is_cache_volume_name(name, kinds) and name in unmounted]
+
     async def reclaim_dphn_cache_when_disk_is_tight(
         self,
         ssh_client: asyncssh.SSHClientConnection,
@@ -632,7 +645,8 @@ class ContainerCleanup:
         nothing, so the cache is the first thing to sacrifice.
 
         Gated on NO live filler container: a cache a sibling still mounts is in use (docker refuses to
-        remove it anyway), and a node still filling bundles is not the node this is meant to rescue.
+        remove it anyway), and a node still filling bundles is not the node this is meant to rescue. A kind
+        reclaimed beside a filler once unmounted is the exception (DAH-6406, CACHE_KINDS).
         A live customer pod does not hold it back (DAH-6187): the rent keeps the cache when the
         pod's volume fits beside it, but the pod's container writes take real disk, so once they
         push the node under the floor the cache gives way to the renter.
@@ -652,7 +666,9 @@ class ContainerCleanup:
             # RUNNING only: _get_all_rental_containers uses `docker ps -a`, so one long-exited
             # filler_* would make "no live filler" false forever and the reclaim would never fire.
             if await self._has_running_filler(ssh_client):
-                return 0
+                cache_volumes = await self._caches_reclaimable_beside_a_filler(ssh_client, cache_volumes)
+                if not cache_volumes:
+                    return 0
 
             free_gb = await self._get_free_disk_gb(ssh_client)
             if free_gb is None or free_gb >= DPHN_CACHE_RECLAIM_FREE_FLOOR_GB:
@@ -773,7 +789,9 @@ class ContainerCleanup:
 
             await ssh_client.run(DockerCommand.volume_remove(*orphans))
             # `volume_remove` ends in `|| true`: re-list to report only what is really gone
-            surviving: set[str] = set(await self._get_cache_volumes(ssh_client, ("volume_",)))
+            # a pod volume is no cache kind, so list it by name; a list that fails counts nothing as removed
+            listed: list[str] | None = await self._list_volume_names(ssh_client)
+            surviving: set[str] = set(orphans) if listed is None else {n for n in listed if n.startswith("volume_")}
             removed: list[str] = [name for name in orphans if name not in surviving]
             if removed:
                 logger.info(
@@ -832,17 +850,18 @@ class ContainerCleanup:
             # "leave the cache alone".
             return None
 
+    async def _list_volume_names(self, ssh_client: asyncssh.SSHClientConnection) -> list[str] | None:
+        # every volume on the host; None when docker cannot list them
+        result = await ssh_client.run(LIST_VOLUME_NAMES)
+        if getattr(result, "exit_status", 0) != 0:
+            return None
+        return [name for name in (line.strip() for line in (result.stdout or "").splitlines()) if name]
+
     async def _get_cache_volumes(
         self, ssh_client: asyncssh.SSHClientConnection, name_prefixes: tuple[str, ...]
     ) -> list[str]:
-        result = await ssh_client.run(LIST_VOLUME_NAMES)
-        if getattr(result, "exit_status", 0) != 0:
-            return []
-        return sorted(
-            name
-            for name in (line.strip() for line in (result.stdout or "").splitlines())
-            if name.startswith(name_prefixes)
-        )
+        names: list[str] = await self._list_volume_names(ssh_client) or []
+        return sorted(name for name in names if is_cache_volume_name(name, name_prefixes))
 
     async def sweep_abandoned_download_temporaries(
         self,
@@ -865,7 +884,9 @@ class ContainerCleanup:
         """
         extra = {"executor_uuid": executor_uuid}
         try:
-            cache_volumes: list[str] = await self._get_cache_volumes(ssh_client, FILLER_CACHE_VOLUME_PREFIXES)
+            cache_volumes: list[str] = await self._get_cache_volumes(
+                ssh_client, cache_prefixes(lambda kind: kind.download_temporaries_swept)
+            )
             if not cache_volumes:
                 return 0
             if self.dry_run:
