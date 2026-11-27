@@ -84,7 +84,7 @@ fi
 log_success "All required environment variables are set"
 log_kv "TAG:" "${TAG}"
 
-# IMAGE_REPO_SUFFIX=-dev (executor_cd_dev from a branch other than main) pushes to
+# IMAGE_REPO_SUFFIX=-dev (every executor_cd_dev dispatch) pushes to
 # daturaai/compute-subnet-executor-dev; unset, the release repository.
 IMAGE_NAME="daturaai/compute-subnet-executor${IMAGE_REPO_SUFFIX:-}:${TAG}"
 

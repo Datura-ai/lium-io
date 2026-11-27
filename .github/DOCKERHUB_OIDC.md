@@ -49,15 +49,16 @@ subject-claim rule, resources and a scope:
 | `lium-io-publish` | `repo:Datura-ai/lium-io:environment:dockerhub-push` | `daturaai/compute-subnet-executor`, `…-executor-runner`, `…-miner`, `…-miner-runner`, `…-validator`, `…-validator-runner`, `daturaai/lium-watchtower` (the `lium mine` preflight image is the `preflight` tag of `…-validator`) | image push |
 | `lium-io-dev` | `repo:Datura-ai/lium-io:environment:dockerhub-push-dev` | `daturaai/compute-subnet-executor-dev`, `daturaai/compute-subnet-executor-runner-dev` (only these two) | image push |
 
-`lium-io-dev` is the branch path: `executor_cd_dev` dispatched from any branch but `main` runs in
+`lium-io-dev` is the branch path: `executor_cd_dev`, dispatched from any branch (`main` too), runs in
 `dockerhub-push-dev`, which has no branch policy, and pushes `daturaai/compute-subnet-executor-dev:dev`
 and `…-executor-runner-dev:dev` (the runner pins the `-dev` executor by digest). A ruleset covers
 repositories, not tags, so the dev subject must never be added to `lium-io-publish`: a branch
 could then edit its workflow and push `:latest`. Create the two `-dev` repositories (Docker Hub →
 `daturaai` → Create repository) before the ruleset. A dev stack tests a branch image by pointing
 `EXECUTOR_IMAGE_REF` at `daturaai/compute-subnet-executor-dev:dev` (and its updater's
-`WATCHTOWER_IMAGE` at `daturaai/compute-subnet-executor-runner-dev`). A dispatch from `main` still
-pushes the `dev` tag of the release repositories, which the dev and staging stacks pull.
+`WATCHTOWER_IMAGE` at `daturaai/compute-subnet-executor-runner-dev`). The `dev` tag of the release
+repositories, which the dev and staging stacks pull, comes only from the deployment repository's staging
+executor publish, which bakes the staging liumd (DAH-6670); `executor_cd_dev` no longer writes it.
 `miner_cd_dev` and `validator_cd_dev` stay `main`-only (no branch run since April).
 
 Why the environment and not the tag: GitHub's default subject for a job that names an environment is
@@ -74,8 +75,8 @@ Copy the connection id into the repository variable:
 gh variable set DOCKERHUB_OIDC_CONNECTIONID -R Datura-ai/lium-io --body "<connection id>"
 ```
 
-Check: dispatch `executor_cd_dev.yml` from `main`, then from a feature branch; both login steps
-end with `Login Succeeded`. Until `lium-io-dev` exists, the branch run fails at the login step and
+Check: dispatch `executor_cd_dev.yml` from a feature branch; its login steps end with
+`Login Succeeded`. Until `lium-io-dev` exists, the branch run fails at the login step and
 pushes nothing.
 Failures are listed on the connection's Edit page (Failures table).
 

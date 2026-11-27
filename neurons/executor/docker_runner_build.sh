@@ -105,7 +105,7 @@ log_success "All required environment variables are set"
 log_kv "TAG:" "${TAG}"
 log_kv "EXECUTOR_IMAGE_SHA256:" "${EXECUTOR_IMAGE_SHA256}"
 
-# IMAGE_REPO_SUFFIX=-dev (executor_cd_dev from a branch other than main) names the -dev repositories
+# IMAGE_REPO_SUFFIX=-dev (every executor_cd_dev dispatch) names the -dev repositories
 # for both images; unset, the names are the release repositories.
 IMAGE_NAME="daturaai/compute-subnet-executor-runner${IMAGE_REPO_SUFFIX:-}:${TAG}"
 

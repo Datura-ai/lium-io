@@ -71,3 +71,15 @@ def test_every_staging_image_build_names_the_same_signed_owner_message(workflow)
     assert values["STAGING_TRUST_API_URL"] == STAGING_API   # the backend that serves this owner's messages
     assert Keypair(ss58_address=values["STAGING_TRUST_OWNER_SS58"]).verify(
         values["STAGING_TRUST_MESSAGE"], bytes.fromhex(values["STAGING_TRUST_SIGNATURE"][2:]))
+
+
+def test_the_executor_dev_build_never_writes_the_release_dev_tag():
+    # DAH-6670: the release repositories' dev tag (dev and staging stacks) comes only from the deployment repository's staging
+    # publish, which bakes the staging liumd; a second writer here baked the release liumd. Every dispatch, main too,
+    # must take the -dev environment and repositories.
+    import re
+
+    text = (WORKFLOWS / "executor_cd_dev.yml").read_text()
+    assert re.findall(r"^\s+environment: (.+)$", text, re.M) == ["dockerhub-push-dev"]
+    assert re.findall(r"^\s+IMAGE_REPO_SUFFIX: (.+)$", text, re.M) == ['"-dev"']
+    assert "github.ref" not in text
