@@ -27,7 +27,6 @@ from dataclasses import asdict, dataclass, field, fields
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
-from services.const import DEFAULT_JOB_OWNER_LIUM
 from services.redis_service import POST_RENTAL_GPU_RECHECK_PREFIX
 
 from core.config import settings
@@ -45,7 +44,7 @@ from .gpu_model_truth import (
     judged_cards,
     reported_gpu_model,
 )
-from .sshd_bootstrap import remove_lium_fillers
+from .sshd_bootstrap import remove_own_lium_fillers
 
 if TYPE_CHECKING:
     from services.matrix_validation_service import AllCardsProbe
@@ -154,7 +153,7 @@ class PostRentalGpuRecheckCheck:
 
         if get_filler_only_container(ctx):
             # both probes would compete with the filler for VRAM
-            what["removed_fillers"] = await self._remove_fillers(ctx)
+            what["removed_fillers"] = await remove_own_lium_fillers(ctx)
             if not what["removed_fillers"]:
                 # the filler still holds VRAM: a probe OOM here would fail a healthy card
                 await self._refresh_marker(ctx, key, what)
@@ -207,16 +206,6 @@ class PostRentalGpuRecheckCheck:
                 "load_test": msg.reason,
             },
         )
-
-    @staticmethod
-    async def _remove_fillers(ctx: Context) -> list[str]:
-        rented_data = ctx.state.rented_data
-        if (
-            settings.DRY_RUN
-            or rented_data.get_default_job_owner(ctx.executor.uuid) != DEFAULT_JOB_OWNER_LIUM
-        ):
-            return []
-        return await remove_lium_fillers(ctx, rented_data.get_filler_containers(ctx.executor.uuid))
 
     @staticmethod
     async def _read_marker(ctx: Context, key: str) -> RecheckMarker | None:

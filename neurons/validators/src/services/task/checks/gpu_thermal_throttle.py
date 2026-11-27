@@ -42,6 +42,12 @@ busy judgeable reading without a thermal slowdown bit; a load that ended before 
 nothing, and a cycle with less time left than the whole sequence skips it. No reading leaves the hold, and the TTL
 stays the fallback. A dry run writes nothing; a Redis that cannot be read is no hold.
 
+A Lium filler does not always load the held card (25 Nov, 8c7d58d6: a filler ran 3 h beside an idle held card), so
+while it runs no reading can clear the card. When the held cards read idle under Lium's own filler, the check stops
+that filler once per hold (``gpu_thermal_hold_filler_stopped:<hotkey>:<executor uuid>`` keeps the hold's start) and
+runs the load in the same cycle; the backend places a filler again after 30 minutes or more. Another owner's filler
+is not ours to stop.
+
 The event names the cause from the driver's own reason bits, never "heat" for a slowdown the driver does not call
 thermal: HW_SLOWDOWN (0x8) is also raised by a power brake from the power supply (0x80 then says so) or a power
 spike, so 0x8 alone is "a hardware slowdown" whose fix may be power delivery, not fans. The block decision is the
@@ -77,6 +83,7 @@ from .gpu_fault_probe import PROBE_SECONDS, PROBE_TIMEOUT_SECONDS, probe_source
 from .machine_spec_scrape import MachineSpecScrapeCheck, scrape_gpu_details
 from .rental_owner import rental_of_this_node
 from .rented_gpu_drop import GPU_DROP_REDIS_ERRORS
+from .sshd_bootstrap import remove_own_lium_fillers
 from .task_time import task_seconds_left
 
 logger = logging.getLogger(__name__)
@@ -133,6 +140,7 @@ CAUSES: dict[str, tuple[str, str]] = {
 }
 THERMAL_HOLD_KEY_PREFIX = "gpu_thermal_hold"
 THERMAL_HOLD_SECONDS = 7 * 24 * 3600
+THERMAL_HOLD_FILLER_STOPPED_KEY_PREFIX = "gpu_thermal_hold_filler_stopped"
 # DAH-6469: the validator's own load on a held node's cards: dense FMA work (the probe's --heat-seconds) after the
 # fault rounds. Under real filler load the first collapsed scrape came 3 min after the start at the fastest, so the
 # cards are read after that long under it; a card whose cooling still fails heats into its slowdown inside it.
@@ -298,13 +306,15 @@ class GpuThermalThrottleCheck:
         collapsed = [finding for finding in throttled if finding["collapsed"]]
         held, since = await self._update_hold(ctx, collapsed)
         load_probe: dict[str, Any] | None = None
+        # the load needs its whole sequence; a cycle without it leaves the hold to the next one (or the TTL)
+        probe_wanted = held and not collapsed and not rented and task_seconds_left(ctx) >= _load_probe_seconds(ctx)
+        stopped_fillers: list[str] = []
+        if probe_wanted and get_filler_only_container(ctx):
+            stopped_fillers = await self._stop_filler_beside_idle_held_cards(ctx, held, since)
         if (
-            held
-            and not collapsed
-            and not rented
-            and not get_filler_only_container(ctx)
-            # the load needs its whole sequence; a cycle without it leaves the hold to the next one (or the TTL)
-            and task_seconds_left(ctx) >= _load_probe_seconds(ctx)
+            probe_wanted
+            and (stopped_fillers or not get_filler_only_container(ctx))
+            and task_seconds_left(ctx) >= _load_probe_seconds(ctx)  # again after a stop
         ):
             readings = await self._load_probe(ctx)
             probe_findings = [finding for finding in map(judge_gpu, readings) if finding is not None]
@@ -313,6 +323,8 @@ class GpuThermalThrottleCheck:
             if readings:
                 held, since = await self._update_hold(ctx, collapsed, readings)
             load_probe = {"seconds": LOAD_PROBE_SECONDS, "readings": len(readings), "still_held": held}
+            if stopped_fillers:
+                load_probe["stopped_fillers"] = stopped_fillers
         if (collapsed or held) and not rented:
             what: dict[str, Any] = {
                 # an availability entry, as GpuLossHoldCheck's: the backend hides the node this cycle
@@ -359,6 +371,29 @@ class GpuThermalThrottleCheck:
             what={"gpu_count": len(ctx.state.gpu_details or [])},
         )
         return CheckResult(passed=True, event=event)
+
+    @staticmethod
+    async def _stop_filler_beside_idle_held_cards(ctx: Context, held: list[str], since: str | None) -> list[str]:
+        """Stop Lium's filler when every held card reads idle under it, once per hold; [] when it was not stopped."""
+        if settings.DRY_RUN or not since:
+            return []
+        busy = {
+            detail.get("uuid")
+            for detail in ctx.state.gpu_details or []
+            if isinstance(detail, dict) and (_to_number(detail.get("gpu_utilization")) or 0) >= MIN_UTILIZATION_PCT
+        }
+        if busy & set(held):
+            return []  # the filler loads a held card: the cycle's own reading judges it
+        key = f"{THERMAL_HOLD_FILLER_STOPPED_KEY_PREFIX}:{ctx.miner_hotkey}:{ctx.executor.uuid}"
+        try:
+            stopped_since = await ctx.services.redis.get(key)
+            if (stopped_since.decode() if isinstance(stopped_since, bytes) else stopped_since) == since:
+                return []
+            # written before the stop: a stop that fails is not retried in this hold either, never a stop every cycle
+            await ctx.services.redis.set(key, since, ex=THERMAL_HOLD_SECONDS)
+        except GPU_DROP_REDIS_ERRORS:
+            return []
+        return await remove_own_lium_fillers(ctx)
 
     async def _load_probe(self, ctx: Context) -> list[dict[str, Any]]:
         """The cards' rows from an encrypted scrape taken under the validator's load; [] when there is no such reading.

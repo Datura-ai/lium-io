@@ -33,7 +33,7 @@ from .gpu_model_truth import (
 from .matmul_speed_log import log_matmul_speed
 from .rental_probe import has_standing_failure
 from .rental_owner import uuid_listed_under_another_miner, rental_of_this_node
-from .sshd_bootstrap import remove_lium_fillers
+from .sshd_bootstrap import remove_lium_fillers, remove_own_lium_fillers
 
 if TYPE_CHECKING:
     from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
@@ -600,10 +600,7 @@ async def _stop_filler_for_full_check(ctx: Context) -> list[str]:
     then keeps the once-a-day pace unless the full check stores a real verdict, so a node is never
     stopped every cycle. Another owner's filler is not ours to stop: its node keeps being sampled.
     Called only while the mark is set. Returns the stopped filler names, or [] when the filler path runs as before."""
-    rented_data = ctx.state.rented_data
-    if settings.DRY_RUN or rented_data.get_default_job_owner(ctx.executor.uuid) != DEFAULT_JOB_OWNER_LIUM:
-        return []
-    removed = await remove_lium_fillers(ctx, rented_data.get_filler_containers(ctx.executor.uuid))
+    removed = await remove_own_lium_fillers(ctx)
     if not removed:
         return []  # the filler still holds the cards: the mark stays and the next cycle tries again
     with contextlib.suppress(Exception):

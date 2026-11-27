@@ -230,6 +230,20 @@ class SshdBootstrapCheck:
         return None
 
 
+async def remove_own_lium_fillers(ctx: Context) -> list[str]:
+    """Remove the node's fillers when Lium's default job runs them, so a check gets idle cards; the backend places a
+    filler again later. [] under a dry run (it shares the live node) and for another owner's filler, not ours to stop.
+    Never raises."""
+    rented_data = ctx.state.rented_data
+    if (
+        settings.DRY_RUN
+        or rented_data is None
+        or rented_data.get_default_job_owner(ctx.executor.uuid) != DEFAULT_JOB_OWNER_LIUM
+    ):
+        return []
+    return await remove_lium_fillers(ctx, rented_data.get_filler_containers(ctx.executor.uuid))
+
+
 async def remove_lium_fillers(ctx: Context, fillers: list[str]) -> list[str]:
     """`docker rm -fv` each filler, mark it ours, then report it missing so the backend closes its run.
 

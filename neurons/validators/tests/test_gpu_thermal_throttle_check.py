@@ -760,6 +760,103 @@ async def test_no_load_without_a_hold_or_under_a_rental(context_factory):
     assert runner.calls == []
 
 
+# --------------------------------------------------------------------------------------------------
+# 25 Nov, 8c7d58d6: a Lium filler that leaves the held card idle is stopped once per hold for the load
+# --------------------------------------------------------------------------------------------------
+@pytest.fixture
+def filler(monkeypatch):
+    """A filler-only node; `stops` records each stop, `removes` is what the stop removes (Lium's own filler)."""
+    state = SimpleNamespace(stops=0, removes=["filler_a"])
+
+    async def remove_own_lium_fillers(ctx):
+        state.stops += 1
+        return list(state.removes)
+
+    monkeypatch.setattr(gpu_thermal_throttle, "get_filler_only_container", lambda ctx: "filler_a")
+    monkeypatch.setattr(gpu_thermal_throttle, "remove_own_lium_fillers", remove_own_lium_fillers)
+    return state
+
+
+@pytest.mark.asyncio
+async def test_a_filler_beside_an_idle_held_card_is_stopped_once_and_the_load_clears_the_card(context_factory, filler):
+    redis = FakeRedis()
+    await run(context_factory, COLLAPSED_ROW, redis=redis)
+    runner = LoadRunner(h100())
+
+    result = await run(context_factory, IDLE_ROW, redis=redis, runner=runner)
+
+    assert filler.stops == 1 and runner.scraped_under_load == [True]
+    assert result.passed is True
+    assert await redis.get(_hold_key(context_factory)) is None
+
+
+@pytest.mark.asyncio
+async def test_the_filler_is_stopped_once_per_hold_not_every_cycle(context_factory, filler):
+    redis = FakeRedis()
+    await run(context_factory, COLLAPSED_ROW, redis=redis)
+    runners = [LoadRunner(h100(graphics_speed=1350, clocks_event_reasons=SW_THERMAL)) for _ in range(3)]
+
+    results = [await run(context_factory, IDLE_ROW, redis=redis, runner=runner) for runner in runners]
+
+    assert filler.stops == 1
+    assert results[0].event.what_we_saw["load_probe"]["stopped_fillers"] == ["filler_a"]
+    # the filler is back on later cycles (still listed): no load beside it
+    assert [runner.scraped_under_load for runner in runners] == [[True], [], []]
+    assert all(r.event.what_we_saw["held_gpu_uuids"] == ["GPU-aaaa"] for r in results)
+
+
+@pytest.mark.asyncio
+async def test_a_new_hold_gets_its_own_stop(context_factory, filler):
+    redis = FakeRedis()
+    await run(context_factory, COLLAPSED_ROW, redis=redis)
+    await run(context_factory, IDLE_ROW, redis=redis, runner=LoadRunner(h100()))  # stop 1 clears the hold
+    await run(context_factory, COLLAPSED_ROW, redis=redis)  # a new hold
+
+    await run(context_factory, IDLE_ROW, redis=redis, runner=LoadRunner(h100()))
+
+    assert filler.stops == 2
+
+
+@pytest.mark.asyncio
+async def test_a_filler_that_loads_the_held_card_is_not_stopped(context_factory, filler):
+    redis = FakeRedis()
+    await run(context_factory, COLLAPSED_ROW, redis=redis)
+    runner = LoadRunner(h100())
+
+    # busy under the filler with the thermal bit: the cycle's own reading judges the card
+    result = await run(
+        context_factory, h100(graphics_speed=1350, clocks_event_reasons=SW_THERMAL), redis=redis, runner=runner
+    )
+
+    assert (filler.stops, runner.calls) == (0, [])
+    assert result.event.what_we_saw["held_gpu_uuids"] == ["GPU-aaaa"]
+
+
+@pytest.mark.asyncio
+async def test_another_owners_filler_is_left_running_and_no_load_runs(context_factory, filler):
+    filler.removes = []  # remove_own_lium_fillers stops only Lium's own filler
+    redis = FakeRedis()
+    await run(context_factory, COLLAPSED_ROW, redis=redis)
+    runner = LoadRunner(h100())
+
+    result = await run(context_factory, IDLE_ROW, redis=redis, runner=runner)
+
+    assert runner.calls == []
+    assert result.event.what_we_saw["held_gpu_uuids"] == ["GPU-aaaa"]
+
+
+@pytest.mark.asyncio
+async def test_a_dry_run_stops_no_filler(context_factory, filler, monkeypatch):
+    redis = FakeRedis()
+    await run(context_factory, COLLAPSED_ROW, redis=redis)
+    monkeypatch.setattr(gpu_thermal_throttle.settings, "DRY_RUN", True)
+    runner = LoadRunner(h100())
+
+    await run(context_factory, IDLE_ROW, redis=redis, runner=runner)
+
+    assert (filler.stops, runner.calls) == (0, [])
+
+
 @pytest.mark.asyncio
 async def test_the_load_outlasts_the_warmup_and_the_slowest_scrape_and_fits_the_task(context_factory):
     import re
