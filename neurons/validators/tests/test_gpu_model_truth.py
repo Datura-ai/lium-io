@@ -401,6 +401,36 @@ async def test_a_failed_all_cards_proof_keeps_failing_the_node_once_the_filler_i
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("card_refused, passed", [(True, False), (False, True)], ids=["card_no_answer", "card_timeout"])
+async def test_a_card_that_does_not_answer_on_the_sample_turn_fails_the_node_and_is_stored(
+    context_factory, monkeypatch, card_refused, passed
+):
+    # review of lio#2511: Lium's filler was stopped for the sample turn, so the cards are idle; a card that did not
+    # answer is the node's own failure, stored so the node keeps failing once the filler is back. A card that only
+    # timed out (a slow model) proves nothing either way.
+    monkeypatch.setattr(capability.settings, "MATMUL_ALLCARDS_CHECK_ENABLED", True)
+    monkeypatch.setattr(capability.settings, "MATMUL_ALLCARDS_ENFORCEMENT_ENABLED", True)
+    redis = FakeRedis()
+    await _run(context_factory, *REAL_H100[:1], "9.0", 132, redis=redis)  # a stored passing verdict
+    monkeypatch.setattr(capability, "_filler_matmul_sample_due", lambda ctx, cycle: True)
+    failed = ValidationResult(
+        success=False,
+        error_message="All-cards GPU work-proof failed: 1/2 card(s) failed device work-proof",
+        all_cards_card_refused=card_refused,
+    )
+    ctx, _ = _filler_ctx(context_factory, redis, None, success=False, failure=failed)
+    result = await CapabilityCheck().run(_lium_filler(ctx))
+    assert result.event.what_we_saw["stopped_fillers_for_full_check"] == ["filler_active"]
+    assert result.passed is passed
+    assert _stored_kinds(redis) == ([] if passed else [(0, "full_check_failed")])
+
+    # the next cycle is off the sample turn and the filler runs again
+    monkeypatch.setattr(capability, "_filler_matmul_sample_due", lambda ctx, cycle: False)
+    ctx, _ = _filler_ctx(context_factory, redis, REAL_H100[1])
+    assert (await CapabilityCheck().run(_lium_filler(ctx))).passed is passed
+
+
+@pytest.mark.asyncio
 async def test_a_redis_outage_never_stops_the_filler_for_the_all_cards_proof(context_factory, monkeypatch):
     monkeypatch.setattr(capability.settings, "MATMUL_ALLCARDS_CHECK_ENABLED", True)
     monkeypatch.setattr(capability.settings, "MATMUL_ALLCARDS_ENFORCEMENT_ENABLED", True)

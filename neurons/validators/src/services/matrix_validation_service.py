@@ -202,6 +202,9 @@ class ValidationResult:
     card_metrics: dict[int, dict] | None = None
     # The all-cards work-proof failed with no card answering at all (see AllCardsProbe.no_card_answered).
     all_cards_no_answer: bool = False
+    # The all-cards work-proof found a claimed card the node could not run it on (AllCardsProbe.card_refused),
+    # whether or not that run was enforced.
+    all_cards_card_refused: bool = False
     # The all-cards work-proof failed and at least one card gave a wrong answer (DAH-6332).
     all_cards_wrong_answer: bool = False
 
@@ -233,6 +236,21 @@ class AllCardsProbe:
         return bool(self.per_card) and all(
             not c.get("ok") and c.get("reason") != "wrong_answer" for c in self.per_card
         )
+
+    @property
+    def card_refused(self) -> bool:
+        """A claimed card the node itself could not run the challenge on (CUDA cannot select it, it gave no or a
+        wrong answer), as a card it lists but does not have does. Not a timeout (a slow model) or our side."""
+        return any(
+            not c.get("ok") and c.get("reason") not in _NOT_THE_NODES_REFUSAL
+            and not str(c.get("reason", "")).startswith("ssh_error")
+            for c in self.per_card
+        )
+
+
+# per-card outcomes that say nothing against the card being there: slowness, the transport, our own error, and a
+# card whose memory another workload holds (it ran far enough to allocate)
+_NOT_THE_NODES_REFUSAL = frozenset({"timeout", "timeout_after_retry", "validator_error", "vram_busy"})
 
 
 def _not_probed(reason: str) -> AllCardsProbe:
@@ -865,6 +883,7 @@ class ValidationService:
                     success=False,
                     error_message=f"{ALL_CARDS_FAILED_ERROR_PREFIX}: {all_cards.failure_reason}",
                     all_cards_no_answer=all_cards.no_card_answered,
+                    all_cards_card_refused=all_cards.card_refused,
                     all_cards_wrong_answer=any(c.get("reason") == "wrong_answer" for c in all_cards.per_card),
                 )
 

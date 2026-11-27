@@ -250,7 +250,11 @@ class CapabilityCheck:
             failure_details = {"error": failure_reason}
         if stop.fillers:
             failure_details["stopped_fillers_for_full_check"] = list(stop.fillers)
-            if _probe_gave_wrong_answer(result):
+            # on the sample-turn stop (no due card) the node had a passing verdict and its cards are idle, so a card
+            # that could not run the all-cards proof is the node's own failure (review of lio#2511); the DAH-6332
+            # stop keeps its rule that only a wrong answer is a verdict
+            idle_card_refused = stop.due_card is None and _card_refused(result)
+            if _probe_gave_wrong_answer(result) or idle_card_refused:
                 # stored like any mismatch: until a full check passes, the node fails and Lium's filler is removed
                 failed = full_check_failed(specs, 0)
                 await judge_gpu_model(ctx, [failed], {0})
@@ -311,6 +315,12 @@ def _probe_gave_no_answer(result: ValidationResult | None) -> bool:
     if not (result.error_message or "").startswith(UUID_MISMATCH_ERROR_PREFIX):
         return False
     return (result.returned_uuid or "").strip().lower() in _NO_UUID
+
+
+def _card_refused(result: ValidationResult | None) -> bool:
+    """True when the all-cards proof found a claimed card that could not run it (no answer, a failed run, an empty
+    output). A timeout, the transport or an error on the validator's side is not."""
+    return result is not None and not result.validator_error and bool(getattr(result, "all_cards_card_refused", False))
 
 
 def _probe_gave_wrong_answer(result: ValidationResult | None) -> bool:
