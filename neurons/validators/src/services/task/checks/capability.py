@@ -13,7 +13,7 @@ from core.config import settings
 from core.utils import _m, get_extra_info
 from services.const import DEFAULT_JOB_OWNER_LIUM, SECONDS_PER_BLOCK
 from services.gpu_spec_table import normalize_gpu_model
-from services.matrix_validation_service import UUID_MISMATCH_ERROR_PREFIX
+from services.matrix_validation_service import ALL_CARDS_FAILED_ERROR_PREFIX, UUID_MISMATCH_ERROR_PREFIX
 
 from ..availability import ReachSource, ReachTarget
 from ..messages import CapabilityMessages as Msg, MessageTemplate, render_message
@@ -240,11 +240,14 @@ class CapabilityCheck:
             failure_details = {"error": failure_reason}
         if stopped_filler:
             failure_details["stopped_fillers_for_full_check"] = stopped_filler
+            if not _probe_gave_wrong_answer(result):
+                # DAH-6332: only a wrong answer proves a mismatch; the day entry stored at the stop retries the node
+                event = render_message(Msg.FULL_CHECK_INCONCLUSIVE, ctx=ctx, check_id=self.check_id, what=failure_details)
+                return CheckResult(passed=True, event=event)
 
         if _probe_gave_no_answer(result):
             lium_workload = await lium_workload_live_now(ctx)
-            # after the stop the backend still lists the stopped filler: that one is no waiver, a filler placed since is
-            if lium_workload is not None and not set(lium_workload.container_names) <= set(stopped_filler):
+            if lium_workload is not None:
                 event = render_message(
                     Msg.RENTED_SKIPPED,
                     ctx=ctx,
@@ -292,6 +295,16 @@ def _probe_gave_no_answer(result: ValidationResult | None) -> bool:
     if not (result.error_message or "").startswith(UUID_MISMATCH_ERROR_PREFIX):
         return False
     return (result.returned_uuid or "").strip().lower() in _NO_UUID
+
+
+def _probe_gave_wrong_answer(result: ValidationResult | None) -> bool:
+    """True when a card answered and the answer was wrong. No answer, a timeout, no free memory or an
+    error on the validator's side (SSH, our cipher, our exception) is not."""
+    if result is None or result.validator_error or result.timed_out:
+        return False
+    if (result.error_message or "").startswith(ALL_CARDS_FAILED_ERROR_PREFIX):
+        return result.all_cards_wrong_answer
+    return not _probe_gave_no_answer(result)
 
 
 @dataclass(frozen=True)

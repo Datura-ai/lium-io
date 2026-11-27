@@ -222,6 +222,7 @@ async def test_a_claimed_card_cuda_cannot_see_fails_even_though_its_run_exits_ze
     assert result.success is False
     assert result.error_message.startswith("All-cards GPU work-proof failed")
     assert result.all_cards_no_answer is False
+    assert result.all_cards_wrong_answer is False  # DAH-6332: no card answered wrong
 
 
 @pytest.mark.asyncio
@@ -238,6 +239,11 @@ async def test_a_wrong_answer_on_one_card_is_never_a_no_answer(svc, monkeypatch)
     assert probe.passed is False
     assert probe.per_card[5]["reason"] == "wrong_answer"
     assert probe.no_card_answered is False
+
+    result = await svc.validate_gpu_model_and_process_job(
+        ssh_client=SimpleNamespace(run=run), executor_info=_executor(), default_extra={}, machine_spec=_spec(8)
+    )
+    assert result.all_cards_wrong_answer is True  # DAH-6332
 
 
 @pytest.mark.parametrize(
@@ -382,6 +388,7 @@ async def test_one_card_that_times_out_again_while_the_others_answer_fails_with_
     assert result.success is False
     assert result.error_message.startswith("All-cards GPU work-proof failed")
     assert result.all_cards_no_answer is False
+    assert result.all_cards_wrong_answer is False  # DAH-6332: no card answered wrong
 
 
 @pytest.mark.asyncio
