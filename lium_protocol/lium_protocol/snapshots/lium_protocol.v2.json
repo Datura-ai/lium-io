@@ -495,18 +495,6 @@
     },
     "CancelStorageOperationRequest": {
       "properties": {
-        "auth_token": {
-          "anyOf": [
-            {
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "title": "Auth Token"
-        },
         "command_id": {
           "default": "",
           "title": "Command Id",
@@ -555,22 +543,6 @@
         "pod_id": {
           "title": "Pod Id",
           "type": "string"
-        },
-        "resource": {
-          "anyOf": [
-            {
-              "enum": [
-                "backup",
-                "restore"
-              ],
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "title": "Resource"
         },
         "workload_kind": {
           "$ref": "#/$defs/WorkloadKind",
@@ -6693,7 +6665,7 @@
       "$ref": "#/$defs/RentedExecutorsResponse"
     }
   },
-  "protocol_version": "2.21.0",
+  "protocol_version": "2.17.0",
   "socket_replies": {
     "RentedMachineResponse": {
       "$ref": "#/$defs/RentedMachineResponse"
