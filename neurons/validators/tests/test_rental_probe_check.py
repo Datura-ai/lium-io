@@ -64,13 +64,6 @@ from tests.helpers import (
 pytestmark = pytest.mark.real_rental_probe_proof
 
 
-@pytest.fixture(autouse=True)
-def _fresh_proof_memo():
-    module._PROVEN_SEEN.clear()
-    yield
-    module._PROVEN_SEEN.clear()
-
-
 EXECUTOR = default_executor()
 MINER = "miner-hotkey"
 IMAGE = DefaultDockerImage(docker_image="daturaai/pytorch", docker_image_tag="2.7.0-cuda12.8")
@@ -652,6 +645,39 @@ async def test_a_standing_failure_holds_through_a_cycle_without_a_verdict(make_c
     assert result.updates["clear_verified_job_info"] is True
     assert result.updates["clear_verified_job_evidence"]["failed_step"] == STEP_SSHD_LISTEN
     assert redis.standing_failure() == STEP_SSHD_LISTEN
+
+
+class _FailureWriteRefused(FakeRedis):
+    async def set(self, key: str, value: str, ex: int | None = None):
+        if key.startswith("rental_probe_failed:"):
+            raise ConnectionError("redis refused the write")
+        await super().set(key, value, ex)
+
+
+@pytest.mark.asyncio
+async def test_a_failure_that_cannot_be_recorded_still_holds_a_proven_node_until_a_pass():
+    """Regression (stand case g): the failure write raised, so only the earlier pass was on record, and the next cycle
+    without a verdict relisted the node on that pass alone."""
+    redis = _FailureWriteRefused()
+    redis.store[f"rental_probe_proven:{EXECUTOR.uuid}"] = "1"
+    ctx, _, _ = make_probe_context(redis=redis)
+    with probe_settings(deadline=1), renter_path(sshd_listens=False):
+        result = await RentalProbeCheck().run(ctx)
+    assert result.passed is False and redis.standing_failure() is None
+
+    ctx, _, _ = make_probe_context(redis=redis, image_present=False)
+    with probe_settings(deadline=1), renter_path(sshd_listens=False):
+        result = await RentalProbeCheck().run(ctx)
+    assert result.passed is False
+    assert result.event.what_we_saw["failed_step"] == STEP_SSHD_LISTEN
+    assert result.event.what_we_saw["standing_failure"] is True
+
+    # a pass ends the hold
+    ctx, _, _ = make_probe_context(redis=redis)
+    with renter_path():
+        result = await RentalProbeCheck().run(ctx)
+    assert result.passed is True
+    assert not module._UNRECORDED_FAILURE
 
 
 @pytest.mark.asyncio

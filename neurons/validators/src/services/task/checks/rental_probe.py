@@ -1009,13 +1009,14 @@ async def _standing_failure(ctx: Context) -> _Failure | None:
 
     None when there is none or Redis could not be read (logged; this cycle then decides as if none
     stood, which is what today's code does)."""
+    unrecorded = _UNRECORDED_FAILURE.get(ctx.executor.uuid)
     try:
         raw = await ctx.services.redis.get(f"{_REDIS_FAILED_PREFIX}:{ctx.executor.uuid}")
     except Exception:
         _read_failed(ctx, "its standing failure in Redis")
-        return None
+        return unrecorded
     if raw is None:
-        return None
+        return unrecorded
     try:
         # keys written on 27 Oct got a day's lifetime; drop it so only a passing probe clears them
         await ctx.services.redis.persist(f"{_REDIS_FAILED_PREFIX}:{ctx.executor.uuid}")
@@ -1060,6 +1061,12 @@ async def with_the_unproven_hold(
     return [*errors, failed_check_event(False, [event]).model_dump(mode="json")]
 
 
+# Failures this process could not write to Redis (executor uuid -> failure): they stand like a recorded one until a
+# probe passes, so a cycle without a verdict cannot relist the node on its earlier pass alone.
+# shortcut: in-process only, so a validator restart before Redis takes a write forgets it.
+_UNRECORDED_FAILURE: dict[str, _Failure] = {}
+
+
 async def _stamp_failure(ctx: Context, failure: _Failure) -> None:
     # the failure stands until _clear_failure (see _REDIS_FAILED_PREFIX)
     try:
@@ -1068,16 +1075,20 @@ async def _stamp_failure(ctx: Context, failure: _Failure) -> None:
             f"{failure.step}:{failure.create_step or ''}",
         )
     except Exception:
+        _UNRECORDED_FAILURE[ctx.executor.uuid] = failure
         logger.warning(
             _m(
-                "Rental probe failed but the failure could not be recorded; a cycle without a verdict may relist the node",
+                "Rental probe failed but the failure could not be recorded; this process holds the node until a pass",
                 extra=get_extra_info(ctx.default_extra),
             ),
             exc_info=True,
         )
+        return
+    _UNRECORDED_FAILURE.pop(ctx.executor.uuid, None)
 
 
 async def _clear_failure(ctx: Context) -> None:
+    _UNRECORDED_FAILURE.pop(ctx.executor.uuid, None)
     try:
         await ctx.services.redis.delete(f"{_REDIS_FAILED_PREFIX}:{ctx.executor.uuid}")
     except Exception:
