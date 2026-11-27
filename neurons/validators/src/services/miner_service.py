@@ -37,6 +37,7 @@ from payload_models.payloads import (
     RestoreContainerRequest,
     ContainerBaseRequest,
     ContainerCreateRequest,
+    ContainerDeleteOnNodeLeftRequest,
     ContainerDeleteRequest,
     ContainerStartRequest,
     ContainerStopRequest,
@@ -278,6 +279,10 @@ def _bypasses_renting_in_progress(payload: ContainerBaseRequest) -> bool:
     if not isinstance(payload, ContainerDeleteRequest):
         return False
     if payload.workload_kind == WorkloadKind.FILLER:
+        return True
+    if isinstance(payload, ContainerDeleteOnNodeLeftRequest):
+        # DAH-6531: it checks the pod's creates itself; the source create's pending flag outlives its run while its
+        # receipt is processed, and declining here would drop the delete
         return True
     # DAH-2728: the pending-pod flag this guard reads is set by the very create this delete is
     # about to cancel, so declining here would leave that create to finish and orphan its
@@ -2641,7 +2646,9 @@ class MinerService:
                             log_extra=default_extra,
                         )
 
-                    if executor:
+                    # the node-left delete's endpoint may be the replacement's by now: the entry keyed by it is
+                    # not the left node's (DAH-6531)
+                    if executor and not isinstance(payload, ContainerDeleteOnNodeLeftRequest):
                         logger.info(
                             _m(
                                 "Remove rented machine from redis",

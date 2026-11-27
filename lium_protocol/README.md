@@ -3,7 +3,7 @@
 The validator↔backend wire, once. Pydantic v2 models for:
 
 - `lium_protocol.validator_to_backend` — every message the validator sends the backend over its WebSocket (`ValidatorMessageType`, 30 types: cycle results and scores, the per-cycle pod-states report, and the answers to container requests).
-- `lium_protocol.backend_to_validator` — every message the backend sends down that socket (`BackendMessageType`, 19 types: container lifecycle, ssh keys, backups, Jupyter, the estimate request, the staging-only forced cycle, the one-node recheck), plus the three typeless replies it sends there (`SOCKET_REPLIES`: `Response`, `RentedMachineResponse`, `RevenuePerGpuTypeResponse` — no `message_type`, told apart by the request the validator is waiting for).
+- `lium_protocol.backend_to_validator` — every message the backend sends down that socket (`BackendMessageType`, 20 types: container lifecycle (with the identity-checked delete on a node a moved pod left), ssh keys, backups, Jupyter, the estimate request, the staging-only forced cycle, the one-node recheck), plus the three typeless replies it sends there (`SOCKET_REPLIES`: `Response`, `RentedMachineResponse`, `RevenuePerGpuTypeResponse` — no `message_type`, told apart by the request the validator is waiting for).
 - `lium_protocol.http` — the bodies of the backend HTTP API the validator reads between cycles (`HTTP_MODELS`, 10 bodies).
 
 No application code: nothing here imports the validator or the backend. `PROTOCOL_VERSION` (`2.17.0`) is semver over the wire.

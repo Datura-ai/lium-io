@@ -239,6 +239,7 @@ class ContainerRequestType(enum.Enum):
     InstallJupyterServer = "InstallJupyterServer"
     ResetPodGpuRequest = "ResetPodGpuRequest"
     LockPodGpuClocksRequest = "LockPodGpuClocksRequest"
+    ContainerDeleteOnNodeLeftRequest = "ContainerDeleteOnNodeLeftRequest"
 
 
 class ForcedValidationCycleRequest(BaseModel):
@@ -517,6 +518,15 @@ class ContainerDeleteRequest(ContainerBaseRequest):
     external_volume: str | None = None
 
 
+class ContainerDeleteOnNodeLeftRequest(ContainerDeleteRequest):
+    """lium_protocol ContainerDeleteOnNodeLeftRequest: the delete for the node a moved pod left
+    (DockerService._delete_on_node_left). Only the pod's container labelled create_command_id is removed."""
+
+    message_type: ContainerRequestType = ContainerRequestType.ContainerDeleteOnNodeLeftRequest
+    # the create command id of the placement on the node left: only a container that create made is removed
+    create_command_id: str
+
+
 class GetPodLogsRequestFromServer(ContainerBaseRequest):
     message_type: ContainerRequestType = ContainerRequestType.GetPodLogsRequestFromServer
     container_name: str
@@ -783,6 +793,8 @@ class ContainerStopped(ContainerBaseResponse):
 
 class ContainerDeleted(ContainerBaseResponse):
     message_type: ContainerResponseType = ContainerResponseType.ContainerDeleted
+    # a ContainerDeleteOnNodeLeftRequest's command_id, echoed; empty for any other delete
+    command_id: str = ""
 
 
 class SshPubKeyAdded(ContainerBaseResponse):
@@ -824,6 +836,8 @@ class FailedContainerErrorCodes(enum.Enum):
     # DAH-2703: the container we created was gone from the host before creation finished — a
     # host-side reaper, not a container that failed on its own.
     ContainerVanished = "ContainerVanished"
+    # a delete for the node a moved pod left found another placement's container or another boot; nothing deleted
+    NotTheNodeLeft = "NotTheNodeLeft"
 
 
 class FailedContainerErrorTypes(enum.Enum):

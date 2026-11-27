@@ -95,6 +95,9 @@ class FailedContainerErrorCodes(enum.Enum):
     ContainerVanished = "ContainerVanished"
     # DAH-3338: the miner knows the executor but could not reach it; distinct from InvalidExecutorId
     ExecutorUnreachable = "ExecutorUnreachable"
+    # a ContainerDeleteOnNodeLeftRequest found a container under the pod's name that the left placement did not
+    # make, or reached another boot; nothing was deleted
+    NotTheNodeLeft = "NotTheNodeLeft"
 
 
 class FailedContainerErrorTypes(enum.Enum):
@@ -476,6 +479,9 @@ class ContainerStopped(PodContainerResponse):
 @VALIDATOR_MESSAGES.register
 class ContainerDeleted(PodContainerResponse):
     message_type: ValidatorMessageType = ValidatorMessageType.ContainerDeleted
+    # a ContainerDeleteOnNodeLeftRequest's command_id, echoed so the backend can tell which delete this answers;
+    # empty for any other delete and from older validators
+    command_id: str = ""
 
 
 @VALIDATOR_MESSAGES.register
@@ -498,7 +504,8 @@ class SshPubKeyRemoved(PodContainerResponse):
 class FailedContainerRequest(PodContainerResponse):
     message_type: ValidatorMessageType = ValidatorMessageType.FailedRequest
     # the failed request's command_id, echoed for an AddSshPublicKeyRequest, (since lium-io#2028) a
-    # ContainerCreateRequest and (DAH-7216) a ContainerDeleteRequest; empty otherwise and from older validators
+    # ContainerCreateRequest and (DAH-7216) a ContainerDeleteRequest, incl. a ContainerDeleteOnNodeLeftRequest; empty
+    # otherwise and from older validators
     command_id: str = ""
     error_type: FailedContainerErrorTypes = FailedContainerErrorTypes.ContainerCreationFailed
     error_code: FailedContainerErrorCodes | None = None

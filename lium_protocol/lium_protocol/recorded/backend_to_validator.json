@@ -181,6 +181,20 @@
       }
     },
     {
+      "expect": "ContainerDeleteOnNodeLeftRequest",
+      "message": {
+        "message_type": "ContainerDeleteOnNodeLeftRequest",
+        "miner_hotkey": "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty",
+        "executor_id": "6f1d2c3b-4a5e-4f60-9b7c-8d9e0f1a2b3c",
+        "pod_id": "0b1c2d3e-4f50-4617-8293-a4b5c6d7e8f9",
+        "workload_kind": "CUSTOMER_RENTAL",
+        "container_name": "container_0b1c2d3e",
+        "local_volume": "volume_0b1c2d3e",
+        "external_volume": null,
+        "create_command_id": "7c1e9a52-3b4d-4f8e-a6c0-2d9b8e7f1a35"
+      }
+    },
+    {
       "expect": "AddSshPublicKeyRequest",
       "message": {
         "message_type": "AddSshPublicKey",

@@ -224,7 +224,8 @@
         "GetEstimateRequest",
         "ResetPodGpuRequest",
         "LockPodGpuClocksRequest",
-        "RecheckExecutorRequest"
+        "RecheckExecutorRequest",
+        "ContainerDeleteOnNodeLeftRequest"
       ],
       "title": "BackendMessageType",
       "type": "string"
@@ -1283,6 +1284,101 @@
       "title": "ContainerCreated",
       "type": "object"
     },
+    "ContainerDeleteOnNodeLeftRequest": {
+      "description": "A ContainerDeleteRequest for the node a moved pod left. The validator removes, by the inspected ID, only the\npod's container labelled with this pod and `create_command_id`; anything else under the name is kept and answered\n`NotTheNodeLeft`. The delete is sent before the replacement create, which gets another create id, so the label\nalone tells the container the pod left from any later one.\nIts own type, not a field: a validator that does not know it refuses the message instead of deleting unchecked.",
+      "properties": {
+        "command_id": {
+          "default": "",
+          "title": "Command Id",
+          "type": "string"
+        },
+        "container_name": {
+          "title": "Container Name",
+          "type": "string"
+        },
+        "create_command_id": {
+          "title": "Create Command Id",
+          "type": "string"
+        },
+        "executor_id": {
+          "title": "Executor Id",
+          "type": "string"
+        },
+        "external_volume": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "External Volume"
+        },
+        "local_volume": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Local Volume"
+        },
+        "message_type": {
+          "$ref": "#/$defs/BackendMessageType",
+          "default": "ContainerDeleteOnNodeLeftRequest"
+        },
+        "miner_address": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Miner Address"
+        },
+        "miner_hotkey": {
+          "title": "Miner Hotkey",
+          "type": "string"
+        },
+        "miner_port": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Miner Port"
+        },
+        "pod_id": {
+          "title": "Pod Id",
+          "type": "string"
+        },
+        "workload_kind": {
+          "$ref": "#/$defs/WorkloadKind",
+          "default": "CUSTOMER_RENTAL"
+        }
+      },
+      "required": [
+        "miner_hotkey",
+        "executor_id",
+        "pod_id",
+        "container_name",
+        "create_command_id"
+      ],
+      "title": "ContainerDeleteOnNodeLeftRequest",
+      "type": "object"
+    },
     "ContainerDeleteRequest": {
       "properties": {
         "command_id": {
@@ -1374,6 +1470,11 @@
     },
     "ContainerDeleted": {
       "properties": {
+        "command_id": {
+          "default": "",
+          "title": "Command Id",
+          "type": "string"
+        },
         "executor_id": {
           "title": "Executor Id",
           "type": "string"
@@ -2910,7 +3011,8 @@
         "NoJupyterPortMapping",
         "AttestationError",
         "ContainerVanished",
-        "ExecutorUnreachable"
+        "ExecutorUnreachable",
+        "NotTheNodeLeft"
       ],
       "title": "FailedContainerErrorCodes",
       "type": "string"
@@ -6589,6 +6691,9 @@
     },
     "ContainerCreateRequest": {
       "$ref": "#/$defs/ContainerCreateRequest"
+    },
+    "ContainerDeleteOnNodeLeftRequest": {
+      "$ref": "#/$defs/ContainerDeleteOnNodeLeftRequest"
     },
     "ContainerDeleteRequest": {
       "$ref": "#/$defs/ContainerDeleteRequest"

@@ -52,6 +52,7 @@ from payload_models.payloads import (
     ContainerDeleted,
     ContainerStarted,
     ContainerStopped,
+    ContainerDeleteOnNodeLeftRequest,
     ContainerDeleteRequest,
     ContainerStartRequest,
     ContainerStopRequest,
@@ -90,6 +91,7 @@ from services.const import (
     unparked_name,
     KEPT_UNMOUNTED_PREFIX,
     LIUM_POD_ID_LABEL,
+    LIUM_CREATE_COMMAND_LABEL,
     LEGACY_LOOPBACK_PLUGIN_ALIAS,
     LOOPBACK_PLUGIN_ALIAS,
     FILLER_CACHE_VOLUME_PREFIXES,
@@ -1913,6 +1915,35 @@ class KeptContainersNotRemoved(RuntimeError):
 def _kept_container_prefix(container_name: str) -> str:
     # kept_unmounted_<pod id>_<time>: the trailing "_" keeps one pod's prefix from matching another's
     return f"{KEPT_UNMOUNTED_PREFIX}{container_name.removeprefix(POD_CONTAINER_PREFIX)}_"
+
+
+_NOT_THE_NODE_LEFT_EXIT = 97
+
+
+def _node_left_delete_command(payload: ContainerDeleteOnNodeLeftRequest) -> str:
+    """Exits 97 when the pod's container there is not labelled with this pod and `create_command_id` (a later
+    placement of the pod on this node has another create id); 0 once the left placement's container is gone, removed
+    by the inspected ID. Kept or parked edit containers are never touched. The pod's volume stays until the pod ends,
+    as before this delete."""
+    if not payload.create_command_id:
+        raise ValueError("the delete names no placement")
+    if payload.container_name != DockerService.get_container_name(payload):
+        raise ValueError("the delete names another pod's container")
+    name = shlex.quote(payload.container_name)
+    found = f'{{{{.Id}}}} {{{{index .Config.Labels "{LIUM_POD_ID_LABEL}"}}}} {{{{index .Config.Labels "{LIUM_CREATE_COMMAND_LABEL}"}}}}'
+    lines = [
+        # a failed inspect is absence only when a listing that succeeded shows no container under the name
+        f"found=$(/usr/bin/docker inspect --type container -f {shlex.quote(found)} {name} 2>/dev/null) "
+        f'|| {{ named=$(/usr/bin/docker ps -aq --no-trunc --filter name=^{name}$) && [ -z "$named" ] && exit 0; exit 1; }}',
+        f'[ "${{found#* }}" = {shlex.quote(f"{payload.pod_id} {payload.create_command_id}")} ] '
+        f"|| exit {_NOT_THE_NODE_LEFT_EXIT}",
+        'id="${found%% *}"',
+        '/usr/bin/docker rm -fv "$id" >/dev/null 2>&1',
+        # done only when a listing that succeeded no longer shows it
+        'left=$(/usr/bin/docker ps -aq --no-trunc) || exit 1',
+        'case "$left" in *"$id"*) exit 1;; esac',
+    ]
+    return "\n".join(lines)
 
 
 async def _remove_kept_containers(ssh_client: asyncssh.SSHClientConnection, container_name: str) -> list[str]:
@@ -4818,7 +4849,7 @@ class DockerService:
             log_opts={"max-size": settings.RENTAL_LOG_MAX_SIZE, "max-file": str(settings.RENTAL_LOG_MAX_FILE)},
             entrypoint=custom_options.entrypoint,
             network=RENTAL_NETWORK_NAME,
-            labels={LIUM_POD_ID_LABEL: payload.pod_id},
+            labels={LIUM_POD_ID_LABEL: payload.pod_id, LIUM_CREATE_COMMAND_LABEL: payload.command_id},
             before_create=lambda: _refuse_filler_during_customer_create(payload),
             # a customer pod created since the cleanup's listing is seen here, before the filler starts
             before_start=(
@@ -14873,7 +14904,12 @@ class DockerService:
             workload_kind=payload.workload_kind,
         )
 
-    def _failed_delete(self, payload: ContainerDeleteRequest, msg: str) -> FailedContainerRequest:
+    def _failed_delete(
+        self,
+        payload: ContainerDeleteRequest,
+        msg: str,
+        error_code: FailedContainerErrorCodes = FailedContainerErrorCodes.UnknownError,
+    ) -> FailedContainerRequest:
         return FailedContainerRequest(
             miner_hotkey=payload.miner_hotkey,
             executor_id=payload.executor_id,
@@ -14881,7 +14917,7 @@ class DockerService:
             workload_kind=payload.workload_kind,
             msg=msg,
             error_type=FailedContainerErrorTypes.ContainerDeletionFailed,
-            error_code=FailedContainerErrorCodes.UnknownError,
+            error_code=error_code,
         )
 
     @dataclass(frozen=True)
@@ -15314,6 +15350,9 @@ class DockerService:
         keypair: bittensor.Keypair,
         private_key: str,
     ):
+        if isinstance(payload, ContainerDeleteOnNodeLeftRequest):
+            # the pod lives on another node now: none of this validator's per-pod create or GPU state is this host's
+            return await self._delete_on_node_left(payload, executor_info, keypair, private_key)
         refused = await self._stop_create_before_delete(payload, executor_info)
         if refused is not None:
             return refused
@@ -15331,6 +15370,54 @@ class DockerService:
                 )
                 return self._deletion_in_progress(payload, msg="A GPU operation is still running; retry deletion")
             return await self._delete_container(payload, executor_info, keypair, private_key)
+
+    async def _delete_on_node_left(
+        self,
+        payload: ContainerDeleteOnNodeLeftRequest,
+        executor_info: ExecutorSSHInfo,
+        keypair: bittensor.Keypair,
+        private_key: str,
+    ):
+        """The registration may point at another host by now, so the label check and the removal run as one shell on
+        one connection. Refused while a create of the pod runs (any registration): it could make its container after
+        the removal."""
+        log = _BoundLog(_delete_container_log_extra(payload, executor_info))
+        if not payload.container_name:
+            payload.container_name = self.get_container_name(payload)
+        try:
+            command = _node_left_delete_command(payload)
+        except ValueError as exc:
+            log.error("Invalid delete for the node a moved pod left", error=str(exc))
+            return self._failed_delete(payload, msg=f"Invalid delete: {exc}")
+        if inflight_creates.is_running(payload.pod_id):
+            log.warning("A create of the moved pod is running; nothing deleted on the node it left")
+            return self._failed_delete(payload, msg="A create of the pod is running; nothing deleted")
+        pkey = asyncssh.import_private_key(self.ssh_service.decrypt_payload(keypair.ss58_address, private_key))
+        try:
+            known_hosts_policy = await self._prepare_known_hosts_policy(executor_info, payload.miner_hotkey, log.base_extra)
+            require_rental_docker_ssh_host_key(executor_info)
+            async with asyncssh.connect(**await _ssh_connect_kwargs(executor_info, pkey, known_hosts_policy)) as ssh_client:
+                result = await _run_with_host_timeout(ssh_client, command, _PARK_COMMAND_TIMEOUT_SECONDS)
+        except (AttestationError, RentalDockerConnectionError) as exc:
+            log.error("Delete for the node a moved pod left could not connect", error=str(exc))
+            return self._failed_delete(payload, msg=f"Could not connect: {exc}")
+        except Exception as exc:  # noqa: BLE001
+            log.error("Delete for the node a moved pod left failed", error=str(exc))
+            return self._failed_delete(payload, msg=f"Unknown Error delete_container: {exc}")
+        if result.exit_status == _NOT_THE_NODE_LEFT_EXIT:
+            log.warning("Delete for the node a moved pod left found another placement; nothing deleted")
+            return self._failed_delete(
+                payload, msg="The host reached is not the node the pod left", error_code=FailedContainerErrorCodes.NotTheNodeLeft
+            )
+        if result.exit_status != 0:
+            log.warning("Delete for the node a moved pod left did not finish", exit_status=result.exit_status)
+            return self._failed_delete(payload, msg=f"Removal on the node left exited {result.exit_status}")
+        if inflight_creates.is_running(payload.pod_id):
+            # registered during the removal: it may make its container after it
+            log.warning("A create of the moved pod started during the removal on the node it left")
+            return self._failed_delete(payload, msg="A create of the pod started during the removal; not confirmed deleted")
+        log.info("Deleted the container on the node a moved pod left")
+        return self._container_deleted(payload)
 
     async def _stop_create_before_delete(self, payload: ContainerDeleteRequest, executor_info: ExecutorSSHInfo):
         """The delete's steps before its teardown: the refusal to answer, or None."""
@@ -15501,11 +15588,14 @@ class DockerService:
                 # DAH-2211: always-on inline cleanup of custom-build artifacts
                 # for this pod. No-op if the pod was not a custom build.
                 # (self-guarding: logs and never raises)
-                await self._cleanup_custom_build_artifacts(
-                    ssh_client=ssh_client,
-                    pod_id=payload.pod_id,
-                    default_extra=default_extra,
-                )
+                # DAH-6531: named by the pod alone, so skipped while a create of the pod runs on any registration (a
+                # moved pod's create on a daemon both share); that create removes its own on failure
+                if not inflight_creates.is_running(payload.pod_id):
+                    await self._cleanup_custom_build_artifacts(
+                        ssh_client=ssh_client,
+                        pod_id=payload.pod_id,
+                        default_extra=default_extra,
+                    )
 
                 # DAH-2356: restore the pre-cap GPU power limits after a Lium PEARL filler is
                 # removed, so the next rental gets the machine at its original power.

@@ -45,6 +45,8 @@ class BackendMessageType(enum.Enum):
     LockPodGpuClocksRequest = "LockPodGpuClocksRequest"
     # 2.6.0: validate one node now (a provider's "Recheck now")
     RecheckExecutorRequest = "RecheckExecutorRequest"
+    # delete a moved pod's container on the node it left, by its create id (and its boot, when the backend knows it)
+    ContainerDeleteOnNodeLeftRequest = "ContainerDeleteOnNodeLeftRequest"
 
 
 BACKEND_MESSAGES: Registry[BackendMessage] = Registry(BackendMessageType)
@@ -203,6 +205,20 @@ class ContainerDeleteRequest(ContainerRequest):
     container_name: str
     local_volume: str | None = None
     external_volume: str | None = None
+
+
+@BACKEND_MESSAGES.register
+class ContainerDeleteOnNodeLeftRequest(ContainerDeleteRequest):
+    """A ContainerDeleteRequest for the node a moved pod left. The validator removes, by the inspected ID, only the
+    pod's container labelled with this pod and `create_command_id`; anything else under the name is kept and answered
+    `NotTheNodeLeft`. The delete is sent before the replacement create, which gets another create id, so the label
+    alone tells the container the pod left from any later one.
+    Its own type, not a field: a validator that does not know it refuses the message instead of deleting unchecked."""
+
+    message_type: BackendMessageType = BackendMessageType.ContainerDeleteOnNodeLeftRequest
+    # the `command_id` of the ContainerCreateRequest that placed the pod on the node it left (the pod's create command
+    # id there): the validator removes only a container that create made, never a later placement's on the same boot
+    create_command_id: str
 
 
 @BACKEND_MESSAGES.register

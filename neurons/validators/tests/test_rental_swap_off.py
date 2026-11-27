@@ -32,7 +32,7 @@ def test_host_config_never_sends_memory_swap_without_memory():
     assert "mem_limit" not in kwargs and "memswap_limit" not in kwargs
 
 
-def _run_spec(docker_service, memory_gb, cpu_count=None):
+def _run_spec(docker_service, memory_gb, cpu_count=None, command_id=""):
     from payload_models.payloads import ContainerCreateRequest, CustomOptions
     from services.rental_docker_sdk import GpuDockerConfig
 
@@ -43,6 +43,7 @@ def _run_spec(docker_service, memory_gb, cpu_count=None):
         docker_image="img:tag",
         gpu_uuids=["g0"],
         memory_gb=memory_gb,
+        command_id=command_id,
     )
     return docker_service._build_rental_container_run_spec(
         payload=payload,
@@ -69,11 +70,12 @@ def test_run_spec_swap_off_follows_the_memory_limit(svc, memory_gb, expected):  
     assert (run_spec.memory_gb or None, run_spec.memory_swap_gb, run_spec.oom_score_adj) == expected
 
 
-def test_run_spec_labels_the_container_with_its_pod_id(svc):  # noqa: F811
-    """DAH-5117: the stale cleanup reaps only containers carrying this label."""
-    from services.const import LIUM_POD_ID_LABEL
+def test_run_spec_labels_the_container_with_its_pod_id_and_create(svc):  # noqa: F811
+    """DAH-5117: the stale cleanup reaps only containers carrying the pod label. DAH-6531: the node-left delete removes
+    only the container its create command id made."""
+    from services.const import LIUM_CREATE_COMMAND_LABEL, LIUM_POD_ID_LABEL
 
-    assert _run_spec(svc, 30).labels == {LIUM_POD_ID_LABEL: "pod"}
+    assert _run_spec(svc, 30, command_id="cmd-1").labels == {LIUM_POD_ID_LABEL: "pod", LIUM_CREATE_COMMAND_LABEL: "cmd-1"}
 
 
 @pytest.mark.parametrize("value", ["0", "-1", "1001"])
