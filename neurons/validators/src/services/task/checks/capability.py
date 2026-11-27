@@ -142,6 +142,8 @@ class CapabilityCheck:
             seen, mismatches = await stored_gpu_model_verdict(ctx)
             if not seen:
                 stop = await _stop_filler_when_full_check_due(ctx)
+            elif not mismatches and _filler_matmul_sample_due(ctx, _filler_cycle_index(ctx)):
+                stop = await _stop_filler_for_count_proof(ctx)
             if not stop.fillers:
                 return await self._filler_sample(ctx, specs, filler_container, seen, mismatches)
 
@@ -248,7 +250,11 @@ class CapabilityCheck:
             failure_details = {"error": failure_reason}
         if stop.fillers:
             failure_details["stopped_fillers_for_full_check"] = list(stop.fillers)
-            if _probe_gave_wrong_answer(result):
+            # on the sample-turn stop (no due card) the node had a passing verdict and its cards are idle, so a card
+            # that could not run the all-cards proof is the node's own failure (review of lio#2511); the DAH-6332
+            # stop keeps its rule that only a wrong answer is a verdict
+            idle_card_refused = stop.due_card is None and _card_refused(result)
+            if _probe_gave_wrong_answer(result) or idle_card_refused:
                 # stored like any mismatch: until a full check passes, the node fails and Lium's filler is removed
                 failed = full_check_failed(specs, 0)
                 await judge_gpu_model(ctx, [failed], {0})
@@ -309,6 +315,12 @@ def _probe_gave_no_answer(result: ValidationResult | None) -> bool:
     if not (result.error_message or "").startswith(UUID_MISMATCH_ERROR_PREFIX):
         return False
     return (result.returned_uuid or "").strip().lower() in _NO_UUID
+
+
+def _card_refused(result: ValidationResult | None) -> bool:
+    """True when the all-cards proof found a claimed card that could not run it (no answer, a failed run, an empty
+    output). A timeout, the transport or an error on the validator's side is not."""
+    return result is not None and not result.validator_error and bool(getattr(result, "all_cards_card_refused", False))
 
 
 def _probe_gave_wrong_answer(result: ValidationResult | None) -> bool:
@@ -641,6 +653,20 @@ class _FullCheckStop:
 
     fillers: tuple[str, ...] = ()
     due_card: int | None = None
+
+
+async def _stop_filler_for_count_proof(ctx: Context) -> _FullCheckStop:
+    """On the node's sample turn Lium's filler stops and the full check runs on the idle cards instead of the
+    one-card sample; the default job places a filler again afterwards. Only with all-cards enforcement on. Another
+    owner's filler is not ours to stop: that node keeps its sample. Empty when the filler path runs as before."""
+    if settings.DRY_RUN or not allcards_enforced() or not _lium_filler(ctx):
+        return _FullCheckStop()
+    # a failed Redis read comes back as a stored pass; with Redis down the stop could not be marked as ours either
+    _, _, _, read_ok = await _read_gpu_model_verdict(ctx)
+    if not read_ok:
+        return _FullCheckStop()
+    rented_data = ctx.state.rented_data
+    return _FullCheckStop(tuple(await remove_lium_fillers(ctx, rented_data.get_filler_containers(ctx.executor.uuid))))
 
 
 async def _stop_filler_when_full_check_due(ctx: Context) -> _FullCheckStop:
