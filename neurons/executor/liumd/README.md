@@ -16,7 +16,7 @@ It also keeps an NVIDIA GB10 card whose driver reports its memory as Not Support
 local-volume walk its own time budget after the layer reads. Each pod whose disk size is unknown
 carries the reason, and liumd's own network probe never joins a renter's bridge network.
 The embedded verifyx prover is the DAH-7126 build (a stalled package download still measures upload),
-the same change `libverifyx.so` already carries; matmul and inspector are unchanged.
+the same change `libverifyx.so` already carries; the other embedded provers are unchanged.
 
 `provenance-amd64.json`/`provenance-arm64.json` are the same run's metadata, kept beside the
 binaries for traceability. `manifest.json` is the validator refresh manifest: it names the
