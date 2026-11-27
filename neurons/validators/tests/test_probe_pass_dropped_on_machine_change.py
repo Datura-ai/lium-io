@@ -81,6 +81,8 @@ async def test_a_re_anchored_gpu_set_drops_the_probe_pass(prev_uuids, current_uu
         (["", "timeout_after_retry"], False),
         (["", "ssh_error: reset"], False),
         (["", "validator_error"], False),
+        # another workload holds the card's memory (review on lium-io#2515): the card is there
+        (["", "vram_busy"], False),
     ],
 )
 def test_a_card_the_node_cannot_run_the_proof_on_is_a_refusal(reasons, refused):

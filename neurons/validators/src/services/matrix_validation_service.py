@@ -245,8 +245,9 @@ class AllCardsProbe:
         )
 
 
-# per-card outcomes that say nothing about whether the card is there: slowness, the transport, our own error
-_NOT_THE_NODES_REFUSAL = frozenset({"timeout", "timeout_after_retry", "validator_error"})
+# per-card outcomes that say nothing against the card being there: slowness, the transport, our own error, and a
+# card whose memory another workload holds (it ran far enough to allocate)
+_NOT_THE_NODES_REFUSAL = frozenset({"timeout", "timeout_after_retry", "validator_error", "vram_busy"})
 
 
 def _not_probed(reason: str) -> AllCardsProbe:
@@ -565,8 +566,11 @@ class ValidationService:
 
         exit_status = getattr(result, "exit_status", 0)
         stdout = getattr(result, "stdout", "") or ""
+        # out of memory: the card is there and another workload holds its memory (the capability check reads it the
+        # same way, VERIFY_FAILED_VRAM_UNAVAILABLE); a card CUDA cannot see says "no CUDA-capable device" instead
+        vram_busy = "out of memory" in f"{getattr(result, 'stderr', '') or ''}\n{stdout}".lower()
         if exit_status != 0:
-            return {"card_index": index, "ok": False, "reason": f"exit_status={exit_status}"}
+            return {"card_index": index, "ok": False, "reason": "vram_busy" if vram_busy else f"exit_status={exit_status}"}
         if not stdout.strip():
             return {"card_index": index, "ok": False, "reason": "empty_output"}
         # The card passes only with the right answer to its own challenge (evaluate_matmul_output
@@ -586,7 +590,7 @@ class ValidationService:
             return {
                 "card_index": index,
                 "ok": False,
-                "reason": "no_answer" if no_answer else "wrong_answer",
+                "reason": ("vram_busy" if vram_busy else "no_answer") if no_answer else "wrong_answer",
                 "error": (judged.error_message or "")[:200],
                 "stderr_tail": (judged.stderr or "")[-200:],
             }
