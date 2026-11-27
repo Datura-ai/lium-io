@@ -291,3 +291,21 @@ def test_normalization_maps_the_liumd_contract_without_mutating_the_snapshot():
     assert normalized["os"] == "Ubuntu 24.04 LTS"
     assert "vloopback_check" not in normalized
     assert raw == snapshot
+
+
+def test_normalization_maps_every_infiniband_port_key_liumd_emits():
+    """The backend pairs InfiniBand nodes by sm_guid (DAH-6480); an unmapped key would reach it as ib_sm_guid."""
+    port = {
+        key: ""
+        for key in (
+            "ib_device", "ib_port", "ib_node_guid", "ib_link_layer", "ib_state", "ib_phys_state", "ib_rate",
+            "ib_lid", "ib_sm_lid", "ib_sm_guid", "ib_sys_image_guid", "ib_pkey", "ib_gids", "ib_driver",
+        )
+    }
+    port["ib_sm_guid"] = "0x0002c90300a1b2c3"
+
+    normalized = normalize_liumd_specs({"data_infiniband_ports": [port]})
+
+    (mapped,) = normalized["infiniband_ports"]
+    assert mapped["sm_guid"] == "0x0002c90300a1b2c3"
+    assert not [key for key in mapped if key.startswith("ib_")]
