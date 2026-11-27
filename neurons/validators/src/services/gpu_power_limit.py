@@ -962,6 +962,29 @@ async def _restore_records(
     clear_failed = False
     host_failed = False
 
+    # a reboot put the host back at its own boot limit: a record from an earlier boot no longer says what the host
+    # allows, and setting it would leave the next renter on that limit (lio#2238 review), so it is cleared unapplied
+    cleared_stale = 0
+    host_boot_id = await _read_host_boot_id(ssh) if any(record.boot_id for record in records) else None
+    if host_boot_id:
+        current: list[GpuPowerRestoreRecord] = []
+        for record in records:
+            if record.boot_id in (None, host_boot_id):
+                current.append(record)
+                continue
+            try:
+                await redis.delete(_restore_key(record.gpu_uuid))
+                cleared_stale += 1
+            except Exception as exc:
+                clear_failed = True
+                _log(
+                    logging.ERROR,
+                    f"gpu power restore: could not clear {record.gpu_uuid}'s record from an earlier boot: {exc}",
+                    {"gpu_uuid": record.gpu_uuid},
+                    log_extra,
+                )
+        records = current
+
     async def restore_one(record: GpuPowerRestoreRecord, setter: _Setter) -> bool:
         nonlocal clear_failed, host_failed
         state = state_by_uuid.get(record.gpu_uuid)
@@ -995,7 +1018,7 @@ async def _restore_records(
         raise GpuPowerRestoreStateError("GPU power restore records could not be cleared")
     if require_recorded_gpus_restored and host_failed:
         raise RuntimeError("GPU power restoration incomplete")
-    return restored
+    return restored + cleared_stale
 
 
 def _warn_unread_records_for_rental(read_result: GpuPowerRestoreReadResult, log_extra: dict[str, object] | None) -> None:

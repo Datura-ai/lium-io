@@ -227,6 +227,34 @@ async def test_a_customer_create_restores_and_leaves_record_less_gpus_to_the_flo
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("whole_node", [False, True])
+async def test_a_customer_create_clears_a_record_from_an_earlier_boot_without_setting_it(whole_node):
+    # lio#2238 review (taiberium 27 Nov): the host rebooted since GPU-a's record, so its 300 W is not the host's now
+    stale = GpuPowerRestoreRecord(
+        gpu_uuid="GPU-a", watts=300, pod_id=POD_ID, executor_id="executor-1", capped_at=time.time(), boot_id="boot-old"
+    ).model_dump_json()
+    redis = FakeRedis({_restore_key("GPU-a"): stale})
+    commands: list[str] = []
+
+    async def run(command, **kwargs):
+        commands.append(command)
+        if command == POWER_STATE_CMD:
+            return FakeRun(stdout="GPU-a, 400, 400, 100, 400\n")
+        if "boot_id" in command:
+            return FakeRun(stdout="boot-new\n")
+        return FakeRun(stdout="300, Enabled\n")
+
+    ssh = AsyncMock(run=AsyncMock(side_effect=run))
+    if whole_node:
+        restored = await restore_all_host_gpu_power_limits(ssh, redis, require_recorded_gpus_restored=True)
+    else:
+        restored = await restore_tracked_gpu_power_limits(ssh, redis, ["GPU-a"], require_recorded_gpus_restored=True)
+    assert restored == 1
+    assert not redis.store
+    assert not any(" -pl " in command for command in commands)
+
+
+@pytest.mark.asyncio
 async def test_a_whole_node_customer_create_with_an_unreadable_host_fails_as_the_nodes():
     redis = FakeRedis({_restore_key("GPU-a"): _record("GPU-a", 400)})
     ssh = AsyncMock(run=AsyncMock(side_effect=TimeoutError()))
