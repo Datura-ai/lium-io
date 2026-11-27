@@ -201,6 +201,9 @@ class ValidationResult:
     card_metrics: dict[int, dict] | None = None
     # The all-cards work-proof failed with no card answering at all (see AllCardsProbe.no_card_answered).
     all_cards_no_answer: bool = False
+    # When the all-cards run failed the result (enforced): the claimed cards that failed it on the node's side (no
+    # answer, a wrong one, a failed start), not by a timeout or our error; empty for a slow run alone. None otherwise.
+    all_cards_failed_cards: tuple[int, ...] | None = None
 
     def __bool__(self) -> bool:
         """Allow using ValidationResult in boolean context for backward compatibility."""
@@ -862,6 +865,13 @@ class ValidationService:
                     success=False,
                     error_message=f"All-cards GPU work-proof failed: {all_cards.failure_reason}",
                     all_cards_no_answer=all_cards.no_card_answered,
+                    all_cards_failed_cards=tuple(
+                        c["card_index"]
+                        for c in all_cards.per_card
+                        if not c.get("ok")
+                        and c.get("reason") not in ("timeout", "timeout_after_retry", "validator_error")
+                        and not str(c.get("reason", "")).startswith("ssh_error")
+                    ),
                 )
 
         # Per-call verifier object: its key MUST survive the SSH round-trip so we can

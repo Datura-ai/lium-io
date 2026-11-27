@@ -241,6 +241,18 @@ class CapabilityCheck:
             failure_details = {"error": failure_reason}
         if stopped_filler:
             failure_details["stopped_fillers_for_full_check"] = stopped_filler
+            # Stored like a filler sample's failure (review): left unstored, the verdict from before the stop stood
+            # and the next filler turn passed the node. Now each filler turn re-runs a failed card and the node
+            # fails until that run passes. Slowness, a full card and our own errors stay unstored, as for a sample.
+            if (
+                result is not None
+                and allcards_enforced()
+                and _sample_error_kind(result) in ("no_answer", "wrong_answer")
+            ):
+                # card 0 is the single-card run's; an all-cards run names its own failed cards (none for slowness)
+                cards = {0} if result.all_cards_failed_cards is None else set(result.all_cards_failed_cards)
+                if cards:
+                    await judge_gpu_model(ctx, [work_proof_failed(specs, card) for card in sorted(cards)], cards)
 
         # after the stop the backend still lists the filler, so a no-answer is the card's own, not a waiver
         if _probe_gave_no_answer(result) and not stopped_filler:

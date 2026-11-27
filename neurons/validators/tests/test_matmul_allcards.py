@@ -222,6 +222,8 @@ async def test_a_claimed_card_cuda_cannot_see_fails_even_though_its_run_exits_ze
     assert result.success is False
     assert result.error_message.startswith("All-cards GPU work-proof failed")
     assert result.all_cards_no_answer is False
+    # the cards the node could not run it on, for the stored verdict
+    assert result.all_cards_failed_cards == tuple(range(1, 8))
 
 
 @pytest.mark.asyncio
@@ -382,6 +384,8 @@ async def test_one_card_that_times_out_again_while_the_others_answer_fails_with_
     assert result.success is False
     assert result.error_message.startswith("All-cards GPU work-proof failed")
     assert result.all_cards_no_answer is False
+    # a slow card fails the run but names no card for the stored verdict
+    assert result.all_cards_failed_cards == ()
 
 
 @pytest.mark.asyncio

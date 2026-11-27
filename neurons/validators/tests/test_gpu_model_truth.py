@@ -319,6 +319,34 @@ async def test_a_judged_filler_node_gets_the_all_cards_proof_on_its_sample_turn(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("card_back", [False, True], ids=["card_still_fails", "card_answers_again"])
+async def test_a_failed_all_cards_proof_keeps_failing_the_node_once_the_filler_is_back(
+    context_factory, monkeypatch, card_back
+):
+    # review: the failed proof left the earlier passing verdict standing, so the next filler turn passed the node
+    monkeypatch.setattr(capability.settings, "MATMUL_ALLCARDS_CHECK_ENABLED", True)
+    monkeypatch.setattr(capability.settings, "MATMUL_ALLCARDS_ENFORCEMENT_ENABLED", True)
+    redis = FakeRedis()
+    await _run(context_factory, *REAL_H100[:1], "9.0", 132, redis=redis)  # a stored passing verdict
+    monkeypatch.setattr(capability, "_filler_matmul_sample_due", lambda ctx, cycle: True)
+    ctx, _ = _filler_ctx(context_factory, redis, None, success=False, failure=WRONG_ANSWER)
+    assert (await CapabilityCheck().run(_lium_filler(ctx))).passed is False
+
+    # the next cycle is off the sample turn and the filler runs again
+    monkeypatch.setattr(capability, "_filler_matmul_sample_due", lambda ctx, cycle: False)
+    ctx, service = _filler_ctx(
+        context_factory,
+        redis,
+        REAL_H100[1] if card_back else None,
+        success=card_back,
+        failure=WRONG_ANSWER,
+    )
+    result = await CapabilityCheck().run(_lium_filler(ctx))
+    assert service.budgets == [capability.settings.FILLER_MATMUL_SAMPLE_VRAM_MB]  # the failed card is run again
+    assert result.passed is card_back
+
+
+@pytest.mark.asyncio
 async def test_a_redis_outage_never_stops_the_filler_for_the_all_cards_proof(context_factory, monkeypatch):
     monkeypatch.setattr(capability.settings, "MATMUL_ALLCARDS_CHECK_ENABLED", True)
     monkeypatch.setattr(capability.settings, "MATMUL_ALLCARDS_ENFORCEMENT_ENABLED", True)
