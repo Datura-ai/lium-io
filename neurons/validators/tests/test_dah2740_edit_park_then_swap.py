@@ -225,10 +225,13 @@ async def test_a_successful_edit_runs_the_same_host_commands(svc, monkeypatch):
         " --format=csv,noheader,nounits",
         # DAH-4663: the clock-lock safety net resets the pod's GPUs, inside the failed-create cleanup, before docker run
         # with application and memory clocks, every GPU in parallel, each reset under its own SIGKILL timeout
-        "sh -c '( timeout -s KILL 15 nvidia-smi -i GPU-test -rgc >/dev/null 2>&1; echo GPU-test $? >> /tmp/lium-gpu-clock-reset-t; "
-        "timeout -s KILL 15 nvidia-smi -i GPU-test -rac >/dev/null 2>&1; echo GPU-test -rac $? >> /tmp/lium-gpu-clock-reset-t; "
-        "timeout -s KILL 15 nvidia-smi -i GPU-test -rmc >/dev/null 2>&1; echo GPU-test -rmc $? >> /tmp/lium-gpu-clock-reset-t ) & "
-        "wait; cat /tmp/lium-gpu-clock-reset-t && rm -f /tmp/lium-gpu-clock-reset-t'",
+        "sh -c '( timeout -s KILL 15 nvidia-smi -i GPU-test -rgc >/dev/null 2>&1; "
+        "echo GPU-test $? | tee -a /tmp/lium-gpu-clock-reset-t 2>/dev/null; "
+        "timeout -s KILL 15 nvidia-smi -i GPU-test -rac >/dev/null 2>&1; "
+        "echo GPU-test -rac $? | tee -a /tmp/lium-gpu-clock-reset-t 2>/dev/null; "
+        "timeout -s KILL 15 nvidia-smi -i GPU-test -rmc >/dev/null 2>&1; "
+        "echo GPU-test -rmc $? | tee -a /tmp/lium-gpu-clock-reset-t 2>/dev/null ) & "
+        "wait; rm -f /tmp/lium-gpu-clock-reset-t'",
         host_key,
         # the validator's own collector starter (services.executor_payload), not the executor's reported paths
         DockerService._build_inspector_collector_command(_executor_info(payload), "start"),
