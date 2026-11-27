@@ -3,6 +3,7 @@ import functools
 import json
 import logging
 import os
+import signal
 import time
 from contextlib import suppress
 from contextvars import ContextVar
@@ -137,6 +138,14 @@ CONNECTOR_LEAD_LOCK_KEY = "lock:connector-lead"
 # reconnect (12-14 s at 15 s, 29 Oct); 6 s keeps that under the backend's 10 s rent wait (lium-platform DAH-5174).
 CONNECTOR_LEAD_LOCK_TTL_SECONDS = 6
 CONNECTOR_READY_FILE = "/tmp/connector-ready"  # the deployment's readinessProbe
+# the lead lock is renewed this often; it also bounds the release at SIGTERM: a release slower than that is a Redis
+# fault, and the lock then just expires in its TTL
+LEAD_RENEWAL_INTERVAL_SECONDS = CONNECTOR_LEAD_LOCK_TTL_SECONDS / 3
+# after a rollout's SIGTERM, in-flight creates, deletes and GPU resets and their replies finish up to this: above a
+# delete's 30 s container stop grace plus the volume wipe (~33 s), and inside the deployment's 60 s termination grace
+SIGTERM_DRAIN_SECONDS = 50
+# the SIGTERM handler's task, held so it is not collected before it exits
+_sigterm_exits: set[asyncio.Task] = set()
 
 
 def mark_connector_unready() -> None:
@@ -204,6 +213,13 @@ class ComputeClient:
         self.compute_app_uri = compute_app_uri
         self.compute_app_rest_api_uri = compute_app_uri.replace("wss", "https").replace("ws", "http")
         self.miner_drivers = asyncio.Queue()
+        # the drivers not yet done, which a rollout's SIGTERM lets finish
+        self.in_flight_drivers: set[asyncio.Task] = set()
+        # a reply popped from the queue whose send has not ended
+        self.is_reply_being_sent = False
+        # set by take_connector_lead; a SIGTERM before it has no lead to release
+        self._lead_lock: aioredis.lock.Lock | None = None
+        self._lead_task: asyncio.Task | None = None
         self.miner_driver_awaiter_task = asyncio.create_task(self.miner_driver_awaiter())
         # self.heartbeat_task = asyncio.create_task(self.heartbeat())
         self.miner_service = miner_service
@@ -697,6 +713,7 @@ class ComputeClient:
 
                 if log_to_send:
                     try:
+                        self.is_reply_being_sent = True
                         await self.send_model(log_to_send)
                         if getattr(log_to_send, "failure_step", None) == CREATE_CUT_OFF_BY_RESTART_STEP:
                             # kept until now so a second restart before the send reports it again;
@@ -731,6 +748,8 @@ class ComputeClient:
                                 }),
                             )
                         )
+                    finally:
+                        self.is_reply_being_sent = False
             else:
                 self.message_queue.appended.clear()
                 await self.message_queue.appended.wait()
@@ -977,6 +996,7 @@ class ComputeClient:
                 else:
                     driver = self._accept_then_drive(job_request, accepted_ns, driver)
             task = asyncio.create_task(driver)
+            self.track_in_flight_driver(task)
             await self.miner_drivers.put(task)
             return
 
@@ -1415,13 +1435,72 @@ class ComputeClient:
                 mark_connector_unready()
                 logger.warning(_m("Could not take the connector lead", extra={**extra, "error": str(exc)}))
                 await asyncio.sleep(1)
+        self._lead_lock = lock
         logger.info(_m("Leading the backend connection", extra=extra))
         self._lead_task = asyncio.create_task(self._keep_connector_lead(lock))
+
+    def track_in_flight_driver(self, task: asyncio.Task) -> None:
+        self.in_flight_drivers.add(task)
+        task.add_done_callback(self.in_flight_drivers.discard)
+
+    def exit_on_sigterm(self, loop: asyncio.AbstractEventLoop) -> None:
+        """A rollout's SIGTERM lets the in-flight work finish while this pod still leads, then hands the lead to the
+        new pod and exits 0, instead of being SIGKILLed at the end of the grace holding the lock."""
+
+        def on_sigterm() -> None:
+            task = loop.create_task(self._release_lead_and_exit())
+            _sigterm_exits.add(task)
+            task.add_done_callback(_sigterm_exits.discard)
+
+        loop.add_signal_handler(signal.SIGTERM, on_sigterm)
+
+    async def _release_lead_and_exit(self) -> None:
+        extra = get_extra_info(self.logging_extra)
+        logger.info(_m("SIGTERM: finishing in-flight work, then releasing the connector lead", extra=extra))
+        mark_connector_unready()
+        # the lead is kept through the drain: the new pod's restart sweep, which resumes every recorded create, starts
+        # only once this pod no longer drives one
+        await self._finish_in_flight_work(asyncio.get_running_loop().time() + SIGTERM_DRAIN_SECONDS)
+        if self._lead_task is not None:
+            self._lead_task.cancel()
+        if self._lead_lock is not None:
+            try:
+                await asyncio.wait_for(self._lead_lock.release(), LEAD_RENEWAL_INTERVAL_SECONDS)
+            except Exception as exc:
+                logger.warning(
+                    _m("Could not release the connector lead; it expires", extra={**extra, "error": str(exc)})
+                )
+        os._exit(0)
+
+    async def _finish_in_flight_work(self, deadline: float) -> None:
+        """The drivers, their steps after the reply and the replies still queued, until the deadline; what is left
+        then is cut as the SIGKILL would cut it, and the new leader's restart sweep resends a cut create (DAH-5437)."""
+        loop = asyncio.get_running_loop()
+        # one loop over all three: commands keep arriving on the socket during the drain, and a driver or after-reply
+        # step started by any of them, or a reply it queues, is waited for too
+        while loop.time() < deadline:
+            work = self.in_flight_drivers | create_steps_after_reply.pending()
+            if work:
+                await asyncio.wait(work, timeout=deadline - loop.time(), return_when=asyncio.FIRST_COMPLETED)
+            elif self.message_queue or self.is_reply_being_sent:
+                await asyncio.sleep(min(0.1, deadline - loop.time()))
+            else:
+                return
+        logger.warning(
+            _m(
+                "SIGTERM: exiting with work still in flight",
+                extra={
+                    **get_extra_info(self.logging_extra),
+                    "drivers": len(self.in_flight_drivers),
+                    "unsent": len(self.message_queue),
+                },
+            )
+        )
 
     async def _keep_connector_lead(self, lock: aioredis.lock.Lock) -> None:
         extra = get_extra_info(self.logging_extra)
         while True:
-            await asyncio.sleep(CONNECTOR_LEAD_LOCK_TTL_SECONDS / 3)
+            await asyncio.sleep(LEAD_RENEWAL_INTERVAL_SECONDS)
             try:
                 await lock.reacquire()
             except redis.exceptions.LockNotOwnedError:

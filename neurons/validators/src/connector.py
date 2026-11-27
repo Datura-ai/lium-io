@@ -19,6 +19,7 @@ async def run_forever():
     compute_app_client = ComputeClient(
         keypair, f"{settings.COMPUTE_APP_URI}/validator/{keypair.ss58_address}", ioc["MinerService"]
     )
+    compute_app_client.exit_on_sigterm(asyncio.get_running_loop())
     async with compute_app_client:
         await compute_app_client.run_forever()
 

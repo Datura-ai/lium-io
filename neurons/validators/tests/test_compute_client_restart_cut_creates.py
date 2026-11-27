@@ -69,6 +69,7 @@ def _client(redis_service: RedisService) -> ComputeClient:
     client.deleted_pod_ids = set()
     client.unrecorded_create_acceptances = {}
     client.miner_drivers = asyncio.Queue()
+    client.in_flight_drivers = set()
     client.resumed_creates_report = None
     client.report_awaiting = {}
     client.create_accepted_while_report_pending = False

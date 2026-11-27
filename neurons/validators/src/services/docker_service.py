@@ -2753,7 +2753,11 @@ class _CreateStepsAfterReplyRegistry:
     async def wait_until_all_done(self) -> bool:
         """The same for every pod's steps, bounded as a delete's wait: the connector's shutdown, so it does
         not cut a key removal."""
-        return await self._wait_or_cancel(set().union(*self._tasks.values()), _INSPECTOR_LIFECYCLE_TIMEOUT_SECONDS)
+        return await self._wait_or_cancel(self.pending(), _INSPECTOR_LIFECYCLE_TIMEOUT_SECONDS)
+
+    def pending(self) -> set[asyncio.Task]:
+        """Every pod's steps not yet done."""
+        return set().union(*self._tasks.values())
 
     @staticmethod
     async def _wait_or_cancel(tasks: set[asyncio.Task], timeout: float) -> bool:
