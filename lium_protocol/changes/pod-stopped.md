@@ -1,0 +1,2 @@
+minor
+`PodGpuResetResult.pod_stopped` (optional): whether the pod's container was down during the reset (its `docker stop` was sent, or an earlier reset had left it stopped); `false` when it was seen running and never touched (it runs as before, so `container_restarted` false does not mean it is stopped); `null` when not known (refused before its state was read, a lost session, or an older validator). A reset whose GPUs were all reset and whose container did not start again still goes with no `error_code` (`ok` false, each GPU `reset`, `container_restarted` false).

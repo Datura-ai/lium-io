@@ -920,6 +920,7 @@ class PodGpuResetResult(ContainerBaseResponse):
     container_restarted: bool = False
     gpus: list[GpuResetOutcome] = []
     detail: str | None = None
+    pod_stopped: bool | None = None
 
 
 class GpuClockOutcome(BaseModel):

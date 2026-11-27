@@ -30,7 +30,7 @@ from services.docker_service import (
     executor_key,
     inflight_creates,
 )
-from services.gpu_reset import RECENT_RENTER_GPU_RESET_SECONDS
+from services.gpu_reset import RECENT_RENTER_GPU_RESET_SECONDS, STOPPED_UNITS_READ_COMMAND
 from services.host_memory_guard import host_memory_guard_script
 from services.hung_gpu_reset import HUNG_GPU_QUERY_COMMAND, HungGpuResult
 from services.redis_service import GPU_RESET_PENDING_KIND
@@ -184,13 +184,16 @@ async def test_a_successful_edit_runs_the_same_host_commands(svc, monkeypatch):
     assert isinstance(result, ContainerCreated)
     host_key = next(cmd for cmd in ssh.commands if "pod_ssh_host_key" in cmd)
     mount_read = next(cmd for cmd in ssh.commands if "/proc/$p/mountinfo" in cmd and "docker diff" not in cmd)
-    # DAH-5301: the one hung-GPU query while the old container is parked (a healthy GPU adds nothing). It
-    # races the early power-floor read, so only its place against the sequential steps is pinned.
-    assert ssh.commands.count(HUNG_GPU_QUERY_COMMAND) == 1
+    # DAH-5301: the one hung-GPU query while the old container is parked (a healthy GPU adds nothing), first
+    # reading which host services an earlier GPU reset left stopped (DAH-6741). Both race the early power-floor
+    # read (a create_task), so only their place against the sequential steps is pinned.
+    assert ssh.commands.count(HUNG_GPU_QUERY_COMMAND) == ssh.commands.count(STOPPED_UNITS_READ_COMMAND) == 1
     hung_query = ssh.commands.index(HUNG_GPU_QUERY_COMMAND)
-    assert ssh.commands.index('/usr/bin/docker volume ls --format "{{.Name}}"') < hung_query
+    stopped_read = ssh.commands.index(STOPPED_UNITS_READ_COMMAND)
+    assert ssh.commands.index('/usr/bin/docker volume ls --format "{{.Name}}"') < stopped_read < hung_query
     assert hung_query < len(ssh.commands) - 1 - ssh.commands[::-1].index(_POWER_READ)  # before the last power read
-    assert [cmd for cmd in ssh.commands if cmd != HUNG_GPU_QUERY_COMMAND] == [
+    hung_check = (HUNG_GPU_QUERY_COMMAND, STOPPED_UNITS_READ_COMMAND)
+    assert [cmd for cmd in ssh.commands if cmd not in hung_check] == [
         # with the host reads, before anything else on the session and before any container starts
         host_memory_guard_script(),
         # the pre-run host probe (DAH-3257); no image-label section, the volume is not encrypted; before the park, so

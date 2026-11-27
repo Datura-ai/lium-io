@@ -605,6 +605,10 @@ class PodGpuResetResult(PodContainerResponse):
     container_restarted: bool = False
     gpus: list[GpuResetOutcome] = []
     detail: str | None = None
+    # the pod's container was down during this reset (its `docker stop` was sent, or it was found stopped by an
+    # earlier reset). False: it was seen running and never touched, so it runs as before (container_restarted is
+    # then false too). None: not known (refused before its state was read, a lost session, an older validator)
+    pod_stopped: bool | None = None
 
 
 class GpuClockOutcome(pydantic.BaseModel):

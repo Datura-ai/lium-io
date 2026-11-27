@@ -1692,6 +1692,7 @@ class MinerService:
                 if error_code == FailedContainerErrorCodes.RentingInProgress
                 else GpuResetErrorCode.ExecutorUnreachable,
                 detail=headline,
+                pod_stopped=None,  # its state was never read: an earlier reset may have left it stopped
             )
         elif isinstance(payload, LockPodGpuClocksRequest):
             # nothing on the host changed: the request never reached the executor

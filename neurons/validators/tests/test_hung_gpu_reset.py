@@ -61,7 +61,7 @@ async def test_a_healthy_reboot_runs_only_the_one_query():
     # a GPU outside the pod being broken is not the pod's business
     host = HungHost(query=_query({U[2]: f"{U[2]}, [Unknown Error], [Unknown Error]"}))
     result = await _reset(host)
-    assert host.commands == [HUNG_GPU_QUERY_COMMAND]
+    assert host.commands == [gpu_reset.STOPPED_UNITS_READ_COMMAND, HUNG_GPU_QUERY_COMMAND]
     assert result.warning is None and result.hung_uuids == []
 
 
@@ -99,7 +99,7 @@ async def test_a_latched_gpu_gets_the_context_cycle_before_any_reset(cure_ok):
 async def test_a_busy_gpu_with_a_live_process_is_not_the_latch():
     host = HungHost(query=_query({U[0]: f"{U[0]}, 100, 0"}, apps="4242\n"))
     assert (await _reset(host)).warning is None
-    assert host.commands == [HUNG_GPU_QUERY_COMMAND]
+    assert host.commands == [gpu_reset.STOPPED_UNITS_READ_COMMAND, HUNG_GPU_QUERY_COMMAND]
 
 
 @pytest.mark.asyncio
@@ -166,7 +166,7 @@ async def test_a_runner_error_changes_nothing():
     # the SSH session failed (no exit status): nothing is known about the GPUs; the shell timeout (124) still means hung
     host = HungHost(query="", query_exit=-1)
     result = await _reset(host)
-    assert host.commands == [HUNG_GPU_QUERY_COMMAND]
+    assert host.commands == [gpu_reset.STOPPED_UNITS_READ_COMMAND, HUNG_GPU_QUERY_COMMAND]
     assert result.warning is None and result.hung_uuids == []
 
 
@@ -377,6 +377,64 @@ async def test_a_whole_host_pod_whose_exporter_does_not_come_back_is_not_a_reset
     host = _whole_host(container_state="false false")
     result = await reset_hung_pod_gpus(host, list(U), settle_seconds=0)
     assert result.warning == W.HungGpuNotResetUnsupported and "is not running again" in result.detail
+
+
+@pytest.mark.asyncio
+async def test_a_whole_host_pod_whose_late_stopped_service_does_not_come_back_is_not_a_reset():
+    # DAH-6741 review: a service the host unit stopped on its own (it opened a GPU after the scan) is restored too
+    host = _whole_host(late_units=("late-monitor.service",), start_fails=("late-monitor.service",))
+    result = await reset_hung_pod_gpus(host, list(U), settle_seconds=0)
+    assert result.warning == W.HungGpuNotResetUnsupported
+    assert "late-monitor.service is not active again" in result.detail
+
+
+@pytest.mark.asyncio
+async def test_a_service_left_stopped_is_restored_before_a_latch_cure_returns():
+    # DAH-6741 review: the latch cure returns before any host reset, so the restore must come first
+    late = "late-monitor.service"
+    host = HungHost(query=_query({U[0]: f"{U[0]}, 100, 0"}))
+    host.active[late], host.stopped_file = False, [late]
+    result = await _reset(host)
+    assert result.warning is None and _resets(host) == []
+    assert host.active[late] and host.stopped_file == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("query_exit", [0, -1])
+async def test_a_service_left_stopped_is_restored_when_no_gpu_is_hung_or_the_query_fails(query_exit):
+    # DAH-6741 review: those checks return early; the listed service must not wait for the next hung GPU
+    late = "late-monitor.service"
+    host = HungHost(query="" if query_exit else _query(), query_exit=query_exit)
+    host.active[late], host.stopped_file = False, [late]
+    result = await _reset(host)
+    assert result.warning is None and _resets(host) == []
+    assert host.active[late] and host.stopped_file == []
+
+
+@pytest.mark.asyncio
+async def test_an_unreadable_list_of_stopped_services_is_logged_and_the_check_goes_on(caplog):
+    # DAH-6741 review: a failed read (an SSH timeout) is not "nothing stopped"; it is said, and the check still runs
+    class UnreadableList(HungHost):
+        async def run(self, cmd, **kwargs):
+            if cmd == gpu_reset.STOPPED_UNITS_READ_COMMAND:
+                self.commands.append(cmd)
+                return make_command_result(False, "", "timed out", exit_code=124)
+            return await super().run(cmd, **kwargs)
+
+    host = UnreadableList(query=_query())
+    result = await _reset(host)
+    assert result.warning is None and HUNG_GPU_QUERY_COMMAND in host.commands
+    assert "could not read which host services a GPU reset left stopped" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_a_service_left_stopped_that_stays_down_refuses_the_hung_reset():
+    late = "late-monitor.service"
+    host = HungHost(query=_query({U[0]: None}), start_fails=(late,))
+    host.active[late], host.stopped_file = False, [late]
+    result = await _reset(host)
+    assert result.warning == W.HungGpuNotResetUnsupported and f"{late} is not active" in result.detail
+    assert _resets(host) == [] and host.stopped_file == [late]
 
 
 @pytest.mark.asyncio

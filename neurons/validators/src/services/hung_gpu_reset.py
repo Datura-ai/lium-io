@@ -13,6 +13,7 @@ fallback. A latch clear is never reported as a reset (HungGpuNotResetUnsupported
 from __future__ import annotations
 
 import contextlib
+import logging
 import re
 from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager
@@ -21,12 +22,12 @@ from typing import TYPE_CHECKING
 
 from payload_models.payloads import ContainerWarningCode, GpuResetErrorCode
 from services.gpu_reset import (
-    _FABRIC_START_FAILED_EXIT,
     _FABRIC_STOP_FAILED_EXIT,
     _RESET_TIMEOUT_SECONDS,
     FABRIC_SERVICES,
     HOST_GPUS_COMMAND,
     NVSWITCH_COMMAND,
+    STOPPED_UNITS_READ_COMMAND,
     TOPOLOGY_COMMAND,
     GpuResetRefused,
     HostGpu,
@@ -73,6 +74,8 @@ _NOT_RESET_WARNING = {
     GpuResetErrorCode.GpuInUseOutsidePod: ContainerWarningCode.HungGpuNotResetInUse,
 }
 
+logger = logging.getLogger(__name__)
+
 
 @dataclass
 class HungGpuResult:
@@ -113,6 +116,7 @@ async def reset_hung_pod_gpus(
     `resetting` is entered once a GPU is found hung and held until the reset is over (the caller's
     gpu_reset pending-pod mark, so the rented checks skip the node meanwhile). A list it yields gets the
     result before it exits."""
+    await _restore_left_stopped(runner)
     query = await _run(runner, HUNG_GPU_QUERY_COMMAND, timeout=_QUERY_SSH_TIMEOUT_SECONDS)
     if query.exit_code == -1 and not (query.stdout or "").strip():
         # the SSH command itself failed: nothing is known about the GPUs (a hung nvidia-smi is the shell's 124)
@@ -129,12 +133,30 @@ async def reset_hung_pod_gpus(
     return result
 
 
+async def _restore_left_stopped(runner: SSHCommandRunner) -> None:
+    """Starts the services an earlier reset left stopped, on every check: the returns below (no GPU hung, a failed
+    query) must not leave them down until a GPU hangs again. A healthy host pays one read of the unit's list."""
+    try:
+        listed = await _run(runner, STOPPED_UNITS_READ_COMMAND)
+        if listed.exit_code not in (0, 127):  # 127: no nsenter, so no unit can have run on this host
+            logger.error("could not read which host services a GPU reset left stopped: %s", _tail(listed.stderr))
+        elif (listed.stdout or "").strip() and not await _reset_unit_pending(runner):
+            await _restore_fabric_services(runner, [])  # logs what stays down; _reset refuses on it
+    except Exception as exc:
+        logger.error("could not restore the host services an earlier GPU reset stopped: %s", exc)
+
+
 async def _reset(
     runner: SSHCommandRunner, hung: list[str], latched: set[str], pod_gpu_uuids: list[str], settle_seconds: float
 ) -> HungGpuResult:
     if await _reset_unit_pending(runner):
         # as in reset_pod_gpus: an earlier reset that outlived its SSH timeout still holds the GPUs and the fabric
         detail = "the GPU reset is still running on the host"
+        return HungGpuResult(hung, ContainerWarningCode.HungGpuNotResetUnsupported, detail)
+    # as in reset_pod_gpus: services an earlier unit left stopped are started before any early return
+    left_down = await _restore_fabric_services(runner, [])
+    if left_down:
+        detail = f"a host GPU service an earlier reset stopped is down, nothing was stopped: {left_down}"
         return HungGpuResult(hung, ContainerWarningCode.HungGpuNotResetUnsupported, detail)
     if set(hung) <= latched:
         # latch only: the seconds-long context cycle first, not a reset (a healthy GPU stopped a moment
@@ -176,11 +198,11 @@ async def _reset(
                 )
         if fabric_manager_problem:
             return HungGpuResult(hung, ContainerWarningCode.HungGpuNotResetUnsupported, fabric_manager_problem)
-        if reset.exit_code in (_FABRIC_STOP_FAILED_EXIT, _FABRIC_START_FAILED_EXIT):
+        if reset.exit_code == _FABRIC_STOP_FAILED_EXIT:
             return HungGpuResult(
                 hung,
                 ContainerWarningCode.HungGpuNotResetUnsupported,
-                _tail(reset.stderr) or "a host GPU holder did not stop or start",
+                _tail(reset.stderr) or "a host GPU holder did not stop",
             )
     if reset.exit_code == 0:
         return HungGpuResult(hung, ContainerWarningCode.HungGpuReset, f"reset {plan.targets}")
