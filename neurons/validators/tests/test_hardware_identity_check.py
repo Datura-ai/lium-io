@@ -338,3 +338,33 @@ async def test_a_dmi_change_stays_a_finding_when_the_session_drops_while_the_new
     assert not reconnect.called
     assert Msg.SPOOFED.reason in [e.reason_code for e in events]
     assert after.hardware_identity_passed is False
+
+
+@pytest.mark.asyncio
+async def test_a_return_to_an_earlier_identity_holds_the_node_through_the_checks_after_it(context_factory, redis):
+    """Node 7be61cf6 (26-27 Nov 2026): a second machine answered for one check, then the first came back; every
+    check after the return passed again and re-listed it. A return to an identity already seen holds the node."""
+    assert await _seen(context_factory, redis, A, B1)
+    assert await _seen(context_factory, redis, B, B1) is False
+    assert await _seen(context_factory, redis, A, B1) is False
+
+    ctx = _ctx(context_factory, stdout=_stdout(values=A, boot=B1), redis=redis)
+    result = await _run(ctx)
+    assert result.passed is False
+    assert result.event.what_we_saw["findings"] == ["machines_alternate_behind_node"]
+    assert result.event.what_we_saw["alternation_hold"]["since"] > 0
+
+
+@pytest.mark.asyncio
+async def test_one_change_to_a_new_identity_is_flagged_once_and_holds_nothing(context_factory, redis):
+    assert await _seen(context_factory, redis, A, B1)
+    assert await _seen(context_factory, redis, B, B1) is False
+    assert await _seen(context_factory, redis, B, B1)
+
+
+@pytest.mark.asyncio
+async def test_a_record_without_identity_history_is_seeded_with_its_identity(context_factory, redis):
+    await redis.set(f"{HW_ID_KEY_PREFIX}:{default_executor().uuid}", json.dumps({"gpus": ["GPU-a"], "dmi": A}))
+    assert await _seen(context_factory, redis, B, B1) is False
+    assert await _seen(context_factory, redis, A, B1) is False
+    assert await _seen(context_factory, redis, A, B1) is False
