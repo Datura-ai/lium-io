@@ -986,6 +986,25 @@ async def has_standing_failure(ctx: Context) -> bool:
     return await _standing_failure(ctx) is not None
 
 
+async def require_probe_pass(ctx: Context, why: str) -> None:
+    """The machine may no longer be the one the last probe proved: drop that pass.
+
+    The node then stands as never passed (`_never_passed`): it scores nothing until a probe passes on the
+    machine it is now, which confirms every listed card as a CUDA device of its model. The probe runs on the
+    next idle cycle, this one too when the probe check is still ahead. A rented node is left alone as before.
+    """
+    try:
+        await ctx.services.redis.delete(f"{_REDIS_LAST_OK_PREFIX}:{ctx.executor.uuid}")
+    except Exception:
+        logger.warning(
+            _m(f"Rental probe pass could not be dropped ({why}); the node keeps its last pass",
+               extra=get_extra_info(ctx.default_extra)),
+            exc_info=True,
+        )
+        return
+    logger.info(_m(f"Rental probe pass dropped: {why}", extra=get_extra_info(ctx.default_extra)))
+
+
 async def _stamp_failure(ctx: Context, failure: _Failure) -> None:
     # the failure stands until _clear_failure (see _REDIS_FAILED_PREFIX)
     try:

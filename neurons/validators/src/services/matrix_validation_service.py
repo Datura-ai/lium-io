@@ -201,6 +201,9 @@ class ValidationResult:
     card_metrics: dict[int, dict] | None = None
     # The all-cards work-proof failed with no card answering at all (see AllCardsProbe.no_card_answered).
     all_cards_no_answer: bool = False
+    # The all-cards work-proof found a claimed card the node could not run it on (AllCardsProbe.card_refused),
+    # whether or not that run was enforced.
+    all_cards_card_refused: bool = False
 
     def __bool__(self) -> bool:
         """Allow using ValidationResult in boolean context for backward compatibility."""
@@ -230,6 +233,20 @@ class AllCardsProbe:
         return bool(self.per_card) and all(
             not c.get("ok") and c.get("reason") != "wrong_answer" for c in self.per_card
         )
+
+    @property
+    def card_refused(self) -> bool:
+        """A claimed card the node itself could not run the challenge on (CUDA cannot select it, it gave no or a
+        wrong answer), as a card it lists but does not have does. Not a timeout (a slow model) or our side."""
+        return any(
+            not c.get("ok") and c.get("reason") not in _NOT_THE_NODES_REFUSAL
+            and not str(c.get("reason", "")).startswith("ssh_error")
+            for c in self.per_card
+        )
+
+
+# per-card outcomes that say nothing about whether the card is there: slowness, the transport, our own error
+_NOT_THE_NODES_REFUSAL = frozenset({"timeout", "timeout_after_retry", "validator_error"})
 
 
 def _not_probed(reason: str) -> AllCardsProbe:
@@ -963,6 +980,7 @@ class ValidationService:
             judged.elapsed_seconds = run_seconds
             judged.elapsed_source = ELAPSED_SOURCE_VALIDATOR
             if all_cards is not None:
+                judged.all_cards_card_refused = all_cards.card_refused
                 judged.card_metrics = {
                     outcome["card_index"]: outcome["metrics"]
                     for outcome in all_cards.per_card

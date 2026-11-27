@@ -8,6 +8,7 @@ from services.redis_service import GPU_ANCHOR_KEY
 from ..messages import GpuFingerprintMessages as Msg, render_message
 from ..pipeline import CheckResult, Context
 from .banned_provider import has_live_rental
+from .rental_probe import require_probe_pass
 
 logger = logging.getLogger(__name__)
 
@@ -123,6 +124,8 @@ class GpuFingerprintCheck:
                 return CheckResult(passed=True, event=event)
             # not a fault (owner decision, 29 Oct): anchor the new set and verify it now, rented or idle
             logger.info("GPU set of executor %s changed in full; re-anchored: %s", ctx.executor.uuid, current_uuids)
+            # other cards: the last probe proved the old ones, so the node is listed again on a probe of these
+            await require_probe_pass(ctx, "full GPU set changed")
             event = render_message(
                 Msg.UUID_OK,
                 ctx=ctx,

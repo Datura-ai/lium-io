@@ -5,6 +5,7 @@ from services.redis_service import GPU_ANCHOR_KEY
 from ..messages import SpecChangeMessages as Msg, render_message
 from ..pipeline import CheckResult, Context
 from .gpu_fingerprint import as_listed, full_set_changed, listed_model, split_uuids
+from .rental_probe import require_probe_pass
 
 
 class SpecChangeCheck:
@@ -29,6 +30,8 @@ class SpecChangeCheck:
             other_machine = listed_model(prev_spec) != listed_model(current_spec) and full_set_changed(
                 split_uuids((ctx.verified or {}).get(GPU_ANCHOR_KEY) or ""), split_uuids(ctx.state.gpu_uuids or "")
             )
+            # the reset relists the node on its next pass; it relists on a probe of the cards it lists now
+            await require_probe_pass(ctx, f"listed GPUs changed from {prev_spec} to {current_spec}")
             event = render_message(
                 Msg.SPEC_MODEL_CHANGED if other_machine else Msg.SPEC_CHANGED,
                 ctx=ctx,
