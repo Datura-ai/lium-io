@@ -62,6 +62,7 @@ async def test_cancel_signals_the_helper_by_name_never_a_stored_pid(
 ) -> None:
     # Runs the real cancel shell with a fake docker. A stale PID file names a live unrelated process.
     monkeypatch.setattr(storage_operations, "REMOTE_OPERATION_DIRECTORY", tmp_path)
+    monkeypatch.setattr(storage_operations, "CANCEL_MARKER_DIRECTORY", tmp_path / "reserve")
     monkeypatch.setattr(storage_operations, "_report_cancelled", AsyncMock(return_value=True))
     fake_docker, docker_log = _fake_docker(tmp_path, "false")  # stopped once signalled
     unrelated = subprocess.Popen(["sleep", "60"])
@@ -110,6 +111,7 @@ async def test_state_is_read_from_the_wrapper_helper(
     expected: str,
 ) -> None:
     monkeypatch.setattr(storage_operations, "REMOTE_OPERATION_DIRECTORY", tmp_path)
+    monkeypatch.setattr(storage_operations, "CANCEL_MARKER_DIRECTORY", tmp_path / "reserve")
     fake_docker, _ = _fake_docker(tmp_path, helper_state)
     if status_file is not None:
         (tmp_path / f"{OPERATION_ID}.status").write_text(status_file + "\n")
@@ -127,6 +129,7 @@ async def test_redispatch_keeps_a_running_helper_and_relaunches_a_finished_one(
     # Real state shell with a fake docker. A running helper owns the run; a finished one is removed and run again,
     # and a killed one is first reported, since it could not report for itself.
     monkeypatch.setattr(storage_operations, "REMOTE_OPERATION_DIRECTORY", tmp_path)
+    monkeypatch.setattr(storage_operations, "CANCEL_MARKER_DIRECTORY", tmp_path / "reserve")
     monkeypatch.setattr(
         storage_operations, "supports_storage_operation", AsyncMock(return_value=True)
     )
@@ -169,6 +172,7 @@ async def test_an_older_executor_s_running_helper_is_owned_only_by_a_live_runner
     fake_docker.write_text(f'#!/bin/sh\ncase "$*" in *"name=^{HELPER}$"*) echo abc123;; esac\n')
     fake_docker.chmod(0o755)
     monkeypatch.setattr(storage_operations, "REMOTE_OPERATION_DIRECTORY", tmp_path)
+    monkeypatch.setattr(storage_operations, "CANCEL_MARKER_DIRECTORY", tmp_path / "reserve")
     runner = _legacy_runner(tmp_path) if runner_alive else None
     try:
         files = storage_operations.StorageOperationFiles.for_operation(OPERATION_ID)
@@ -221,6 +225,7 @@ async def test_a_cancel_reports_through_the_reporter_this_validator_launched_wit
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     monkeypatch.setattr(storage_operations, "REMOTE_OPERATION_DIRECTORY", tmp_path)
+    monkeypatch.setattr(storage_operations, "CANCEL_MARKER_DIRECTORY", tmp_path / "reserve")
     report = AsyncMock(return_value=True)
     monkeypatch.setattr(storage_operations, "_report_cancelled", report)
     _planted_node_spec()
@@ -239,6 +244,7 @@ async def test_a_cancel_with_no_held_reporter_sends_nothing_even_with_a_node_spe
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     monkeypatch.setattr(storage_operations, "REMOTE_OPERATION_DIRECTORY", tmp_path)
+    monkeypatch.setattr(storage_operations, "CANCEL_MARKER_DIRECTORY", tmp_path / "reserve")
     report = AsyncMock(return_value=True)
     monkeypatch.setattr(storage_operations, "_report_operation_status", report)
     _planted_node_spec()
@@ -282,6 +288,8 @@ def node(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """A stand-in executor: the operation directory, the staging parent and the validator's runner payload (a script
     the test writes per case), with every remote command run by a local shell."""
     monkeypatch.setattr(storage_operations, "REMOTE_OPERATION_DIRECTORY", storage_operations.PurePosixPath(str(tmp_path)))
+    # the executor's reserve_data volume, outside the operation directory an executor restart wipes
+    monkeypatch.setattr(storage_operations, "CANCEL_MARKER_DIRECTORY", storage_operations.PurePosixPath(str(tmp_path / "reserve")))
     monkeypatch.setattr(storage_operations, "supports_storage_operation", AsyncMock(return_value=True))
     monkeypatch.setattr(storage_operations, "report_launch_failure", AsyncMock())
     payloads = tmp_path / "payloads"
@@ -634,6 +642,33 @@ def test_a_cancelled_operation_never_runs(node: Path, monkeypatch: pytest.Monkey
     assert Path(str(files.cancel)).exists()  # the marker stays for any later dispatch of the operation
 
 
+def test_a_cancel_survives_an_executor_restart_before_a_late_dispatch(node: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """An executor restart wipes the container's own files, the operation directory with them. A cancel that
+    finished before it still keeps a dispatch reaching the node afterwards from running the operation."""
+    import asyncio as aio
+
+    monkeypatch.setattr(storage_operations, "_report_cancelled", AsyncMock(return_value=True))
+    ran = node / "ran"
+    _runner(node, f"open({str(ran)!r}, 'w').close()\n")
+    files = storage_operations.StorageOperationFiles.for_operation(OPERATION_ID)
+
+    async def cancel_restart_then_dispatch() -> None:
+        await storage_operations.cancel_storage_operation(_node_client(), await _held(), OPERATION_ID)
+        for path in node.glob(f"{OPERATION_ID}.*"):  # the restart wipes the operation directory
+            path.unlink()
+        await storage_operations.start_storage_operation(
+            _node_client(), sys.executable, OPERATION_ID, {"engine": "restic"}, retain_terminal_artifacts=False
+        )
+
+    aio.run(cancel_restart_then_dispatch())
+    for staged in (node / "service").iterdir():
+        _wait_for(staged, gone=True)  # a launched wrapper removes its staged runner as it ends
+
+    assert not ran.exists()
+    assert not Path(str(files.spec)).exists()
+    assert Path(str(files.cancel)).exists()
+
+
 @pytest.mark.parametrize("cancel_lands", ["before_launch", "before_the_wrapper_starts", "while_it_runs"])
 def test_a_bootstrap_wait_on_a_cancelled_operation_ends_cancelled_not_failed(
     node: Path, monkeypatch: pytest.MonkeyPatch, cancel_lands: str
@@ -663,6 +698,7 @@ def test_a_bootstrap_wait_on_a_cancelled_operation_ends_cancelled_not_failed(
             _node_client(run), sys.executable, OPERATION_ID, {"engine": "restic"}, retain_terminal_artifacts=True
         )
         if cancel_lands == "while_it_runs":
+            Path(str(files.cancel)).parent.mkdir(exist_ok=True)  # the cancel creates the marker directory
             Path(str(files.cancel)).touch()  # the marker a cancel leaves while the runner works
         await storage_operations.wait_for_storage_operation(
             _node_client(), launched, poll_interval_seconds=0.05, launch_grace_polls=4

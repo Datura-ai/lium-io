@@ -22,6 +22,9 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 REMOTE_OPERATION_DIRECTORY = PurePosixPath("/root/app/storage-operations")
+# cancel markers live on the executor's reserve_data volume: the container's own filesystem does not survive an
+# executor restart, and a marker lost there lets a dispatch that arrives later run the cancelled operation
+CANCEL_MARKER_DIRECTORY = PurePosixPath("/var/lium-reserve/storage-cancels")
 # the executor image's own runner: its presence marks an image that supports storage operations. It is never run; the
 # validator runs its own copy (executor_payload.STORAGE)
 REMOTE_RUNNER_PATH = "/root/app/src/storage_runner.py"
@@ -214,7 +217,7 @@ class StorageOperationFiles:
             log=REMOTE_OPERATION_DIRECTORY / f"{stem}.log",
             pid=REMOTE_OPERATION_DIRECTORY / f"{stem}.pid",
             status=REMOTE_OPERATION_DIRECTORY / f"{stem}.status",
-            cancel=REMOTE_OPERATION_DIRECTORY / f"{stem}.cancel",
+            cancel=CANCEL_MARKER_DIRECTORY / f"{stem}.cancel",
             helper=helper_container_name(operation_id),
         )
 
@@ -578,7 +581,7 @@ async def cancel_storage_operation(
         # the marker stays for good (an empty file per cancelled operation; ids are never reused): nothing bounds how
         # late a dispatch still in flight reaches the node, so no age makes removing it safe
         # a cancel ahead of the launch may find no directory yet; without its marker the cancel has failed
-        f"m=0; {{ install -d -m 0700 {shlex.quote(str(REMOTE_OPERATION_DIRECTORY))} "
+        f"m=0; {{ install -d -m 0700 {shlex.quote(str(CANCEL_MARKER_DIRECTORY))} "
         f"&& touch {shlex.quote(str(files.cancel))}; }} || m=1; "
         f"/usr/bin/docker kill --signal TERM {helper} >/dev/null 2>&1 || true; "
         f'attempt=0; while test "$(/usr/bin/docker inspect -f {{{{.State.Running}}}} {helper} 2>/dev/null)" = true '
