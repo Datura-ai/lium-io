@@ -21,7 +21,11 @@
                 "created_at": "2026-09-08T20:33:00Z",
                 "gpu_count": 2,
                 "ssh_port": 40001,
-                "status": "RUNNING"
+                "status": "RUNNING",
+                "gpu_uuids": [
+                  "GPU-11111111-2222-3333-4444-555555555555",
+                  "GPU-66666666-7777-8888-9999-000000000000"
+                ]
               }
             ]
           }
@@ -46,6 +50,11 @@
         "filler_ports_by_executor": {
           "7a6b5c4d-3e2f-4a1b-9c8d-7e6f5a4b3c2d": [
             41000
+          ]
+        },
+        "filler_gpu_uuids_by_executor": {
+          "7a6b5c4d-3e2f-4a1b-9c8d-7e6f5a4b3c2d": [
+            "GPU-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
           ]
         },
         "gpu_splitting_config": {

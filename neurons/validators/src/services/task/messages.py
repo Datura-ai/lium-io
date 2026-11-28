@@ -2316,6 +2316,20 @@ class CapabilityMessages:
         ),
         remediation="No action needed.",
     )
+    ALLCARDS_DEFERRED = MessageTemplate(
+        event="GPU capability verification not scored: the connection to the node was lost during the all-cards work proof",
+        reason="GPU_VERIFY_DEFERRED_CONNECTION_LOST",
+        severity="warning",
+        category="runtime",
+        impact="Not scored this cycle; every card proves itself in the next idle cycle.",
+        remediation="Keep the node reachable over SSH.",
+    )
+    # impact of a deferral (RENTED_SKIPPED / ALLCARDS_DEFERRED) on a node with no live all-cards pass: the rental
+    # probe then does not pass the cycle (CYCLE_WITHOUT_ALLCARDS), so the score is not left unchanged
+    ALLCARDS_DEFERRED_WITHOUT_PASS_IMPACT = (
+        "Score set to 0 this cycle: the node has no valid all-cards pass, so it is not offered until every card "
+        "proves itself in the next idle cycle."
+    )
     # DAH-6332: the full check run with Lium's filler stopped gave no verdict
     FULL_CHECK_INCONCLUSIVE = MessageTemplate(
         event="GPU capability check after the filler stop gave no verdict",
@@ -2883,7 +2897,7 @@ class RentalProbeMessages:
         impact="Proceed",
     )
     CYCLE_WITHOUT_ALLCARDS = MessageTemplate(
-        event="Cycle not passed: the all-cards GPU work proof did not run this cycle",
+        event="Cycle not passed: the all-cards GPU work proof did not prove every card this cycle",
         reason="RENTAL_PROBE_CYCLE_WITHOUT_ALLCARDS",
         severity="warning",
         category="runtime",

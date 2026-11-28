@@ -5342,6 +5342,17 @@
           "title": "Filler Create Kill Executor Ids",
           "type": "array"
         },
+        "filler_gpu_uuids_by_executor": {
+          "additionalProperties": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "default": {},
+          "title": "Filler Gpu Uuids By Executor",
+          "type": "object"
+        },
         "filler_ports_by_executor": {
           "additionalProperties": {
             "items": {
@@ -5634,6 +5645,21 @@
           ],
           "default": null,
           "title": "Gpu Count"
+        },
+        "gpu_uuids": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Gpu Uuids"
         },
         "pod_id": {
           "title": "Pod Id",

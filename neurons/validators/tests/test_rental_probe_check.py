@@ -725,7 +725,7 @@ async def test_a_probe_that_clears_a_standing_failure_in_a_cycle_without_the_all
     relist the node before every card proved itself."""
     redis = FakeRedis(failed_step=STEP_GPU_COUNT)
     ctx, docker, _ = make_probe_context(redis=redis)
-    ctx = ctx.model_copy(update={"state": replace(ctx.state, allcards_skipped_for_standing_probe_failure=True)})
+    ctx = ctx.model_copy(update={"state": replace(ctx.state, allcards_not_proven=True)})
     with probe_settings(), renter_path():
         result = await RentalProbeCheck().run(ctx)
     assert result.passed is False and result.event.reason_code == Msg.CYCLE_WITHOUT_ALLCARDS.reason

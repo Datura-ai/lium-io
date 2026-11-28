@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 from neurons.validators.src.protocol.vc_protocol.compute_requests import RentedExecutorsResponse
+from neurons.validators.src.services.matrix_validation_service import AllCardsProbe
 from neurons.validators.src.services.task.checks import (
     GpuFaultProbeCheck,
     GpuModelValidCheck,
@@ -40,14 +41,16 @@ class FakeValidation:
         return self.all_cards
 
 
-def _all_cards(*reasons, over_wall_clock=False):
+def _all_cards(*reasons, over_wall_clock=False, connection_closed=False):
     per_card = [{"card_index": i, "ok": not r, "reason": r} for i, r in enumerate(reasons)]
     passed = not any(reasons) and not over_wall_clock
-    return SimpleNamespace(
+    return AllCardsProbe(
         passed=passed,
         failure_reason="" if passed else "1/2 card(s) failed device work-proof",
+        elapsed_seconds=1.0,
         over_wall_clock=over_wall_clock,
         per_card=per_card,
+        connection_closed=connection_closed,
     )
 
 
@@ -212,14 +215,21 @@ async def test_no_all_cards_matmul_is_inconclusive_on_a_multi_card_node(
 @pytest.mark.parametrize(
     "all_cards",
     [
-        _all_cards("timeout", "timeout"),
-        _all_cards("ssh_error: channel closed", ""),
-        _all_cards("ssh_error: channel closed", "timeout"),
+        # the connection to the whole node was lost: every card's run raised an SSH error
+        _all_cards("ssh_error: connection lost", "ssh_error: connection lost"),
+        # the connection closed after card 0 answered (arhangel66 review 6054371012)
+        _all_cards("", "ssh_error: connection lost", connection_closed=True),
+        # the connection was aborted while card 1 ran: asyncssh ends that run with no exit status (review 6055346146)
+        _all_cards("", "exit_status=None", connection_closed=True),
         _all_cards("", "", over_wall_clock=True),
         # review (17 Nov): a multi-card claim the probe could not run (no card details or size, our own cipher
-        # failed) ran no card, so it says nothing about them: inconclusive as before, whatever the flags
-        SimpleNamespace(
-            passed=False, failure_reason="not probed: no card details", over_wall_clock=False, per_card=[]
+        # failed) ran no card, so it says nothing about them: inconclusive as before
+        AllCardsProbe(
+            passed=False,
+            failure_reason="not probed: no card details",
+            elapsed_seconds=0.0,
+            over_wall_clock=False,
+            per_card=[],
         ),
     ],
 )
@@ -235,14 +245,88 @@ async def test_an_all_cards_matmul_lost_to_ssh_or_time_is_inconclusive(context_f
 
 @pytest.mark.asyncio
 async def test_a_card_that_times_out_again_on_the_retry_fails_the_recheck(context_factory):
-    # lio#2305: the probe retries a run with a timeout once; a card that times out again is a verdict here, whatever
-    # the MATMUL_ALLCARDS flags say (the recheck always runs the probe)
+    # lio#2305: the probe retries a run with a timeout once; a card that times out again is a verdict here
     all_cards = _all_cards("", "timeout_after_retry")
     ctx = _idle_ctx(context_factory, FakeRunner(probe_stdout("ok")), FakeValidation(all_cards))
 
     result = await PostRentalGpuRecheckCheck().run(ctx)
 
     assert result.passed is False and result.event.reason_code == Msg.FAILED.reason
+    assert KEY in ctx.services.redis.store
+
+
+@pytest.mark.parametrize(
+    "all_cards",
+    [
+        # a run that ended without an exit status on a live connection: the channel answered, so it is the card's verdict
+        _all_cards("exit_status=None", "exit_status=None"),
+        # one card's channel failed while the other answered: not a lost connection to the node
+        _all_cards("ssh_error: channel closed", ""),
+        _all_cards("ssh_error: channel closed", "timeout_after_retry"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_run_without_a_status_or_one_lost_channel_fails_the_recheck(context_factory, all_cards):
+    ctx = _idle_ctx(context_factory, FakeRunner(probe_stdout("ok")), FakeValidation(all_cards))
+
+    result = await PostRentalGpuRecheckCheck().run(ctx)
+
+    assert result.passed is False and result.event.reason_code == Msg.FAILED.reason
+    assert KEY in ctx.services.redis.store
+
+
+@pytest.mark.parametrize(("assigned", "inconclusive"), [([0], True), ([1], False)], ids=["on-that-card", "on-another"])
+@pytest.mark.asyncio
+async def test_a_card_our_own_workload_holds_now_gives_no_verdict(context_factory, assigned, inconclusive):
+    # review of lio#2440: the backend assigned a Lium workload to GPU 0 during the run and GPU 0 timed out. As in
+    # CapabilityCheck, that card is not the node's to give this cycle; a workload on another card says nothing about it
+    specs = {"gpu": {"count": 2, "details": [{"uuid": "GPU-0"}, {"uuid": "GPU-1"}]}}
+    ctx = _idle_ctx(
+        context_factory, FakeRunner(probe_stdout("ok")), FakeValidation(_all_cards("timeout", "")), specs=specs
+    )
+    ctx.services.backend.get_rented_executors_now.return_value = RentedExecutorsResponse(
+        executors={},
+        all_filler_containers_by_executor={ctx.executor.uuid: ["filler_e741"]},
+        filler_gpu_uuids_by_executor={ctx.executor.uuid: [f"GPU-{i}" for i in assigned]},
+    )
+
+    result = await PostRentalGpuRecheckCheck().run(ctx)
+
+    expected = Msg.INCONCLUSIVE.reason if inconclusive else Msg.FAILED.reason
+    assert (result.passed, result.event.reason_code) == (inconclusive, expected)
+    assert KEY in ctx.services.redis.store
+
+
+@pytest.mark.parametrize("cut", ["exit_status=None", "ssh_error: channel closed"])
+@pytest.mark.asyncio
+async def test_a_channel_cut_on_a_live_connection_fails_even_on_a_card_our_workload_holds(context_factory, cut):
+    # review 6061077726: the same run as CapabilityCheck's, judged the same way
+    specs = {"gpu": {"count": 2, "details": [{"uuid": "GPU-0"}, {"uuid": "GPU-1"}]}}
+    ctx = _idle_ctx(context_factory, FakeRunner(probe_stdout("ok")), FakeValidation(_all_cards(cut, "")), specs=specs)
+    ctx.services.backend.get_rented_executors_now.return_value = RentedExecutorsResponse(
+        executors={},
+        all_filler_containers_by_executor={ctx.executor.uuid: ["filler_e741"]},
+        filler_gpu_uuids_by_executor={ctx.executor.uuid: ["GPU-0"]},
+    )
+
+    result = await PostRentalGpuRecheckCheck().run(ctx)
+
+    assert (result.passed, result.event.reason_code) == (False, Msg.FAILED.reason)
+
+
+@pytest.mark.asyncio
+async def test_a_node_rented_at_the_cycle_snapshot_is_not_probed_this_cycle(context_factory):
+    """The A6000 case (DAH-6978): the rental ended mid-cycle and its workload still loaded the cards. The cards prove
+    themselves in the first idle cycle; this one is inconclusive and the marker stays."""
+    validation = FakeValidation(_all_cards("timeout_after_retry", "timeout_after_retry"))
+    ctx = _idle_ctx(context_factory, FakeRunner(probe_stdout("ok")), validation)
+    ctx = ctx.model_copy(update={"state": build_state(specs={"gpu": {"count": 2}}, rented_data=_live_rental())})
+
+    result = await PostRentalGpuRecheckCheck().run(ctx)
+
+    assert validation.calls == 0
+    assert result.passed and result.event.reason_code == Msg.INCONCLUSIVE.reason
+    assert result.event.what_we_saw["skipped"] == "rented_at_snapshot"
     assert KEY in ctx.services.redis.store
 
 
@@ -306,6 +390,65 @@ async def test_a_filler_is_removed_and_the_cards_probed_on_the_first_cycle(
     assert validation.calls == 1
     assert result.passed and result.event.reason_code == Msg.PASSED.reason
     assert KEY not in ctx.services.redis.store
+
+
+def _filler_ctx(context_factory, validation, fillers, rm_exit_statuses):
+    """Our fillers on GPU-0 at the snapshot; the recheck removes them (each `docker rm` exits as given)."""
+    ssh = AsyncMock()
+    ssh.run.side_effect = [
+        step
+        for status in rm_exit_statuses
+        for step in (
+            SimpleNamespace(exit_status=0, stdout="abc123\n", stderr=""),
+            SimpleNamespace(exit_status=status, stdout="", stderr=""),
+        )
+    ]
+    services = build_services(validation=validation)
+    services.redis.store[KEY] = json.dumps(MARKER)
+    uuid = default_executor().uuid
+    listed = RentedExecutorsResponse(
+        all_filler_containers_by_executor={uuid: fillers},
+        filler_gpu_uuids_by_executor={uuid: ["GPU-0"]},
+        default_job_owner_by_executor={uuid: "lium"},
+        executors={},
+    )
+    services.backend.get_rented_executors_now.return_value = listed  # not caught up with the removal yet
+    return context_factory(
+        services=services,
+        config=build_context_config(),
+        state=build_state(
+            specs={"gpu": {"count": 2, "details": [{"uuid": "GPU-0"}, {"uuid": "GPU-1"}]}}, rented_data=listed
+        ),
+        runner=FakeRunner(probe_stdout("ok")),
+        ssh=ssh,
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_card_whose_filler_the_recheck_removed_is_judged_though_the_backend_still_lists_it(context_factory):
+    # review of lio#2440: the fresh read still lists the filler the recheck just removed; its card is free now, so a
+    # timeout there is the card's verdict (the stuck-card case), not our workload
+    validation = FakeValidation(_all_cards("timeout", ""))
+    ctx = _filler_ctx(context_factory, validation, ["filler_run-1"], [0])
+
+    result = await PostRentalGpuRecheckCheck().run(ctx)
+
+    assert validation.calls == 1
+    assert result.passed is False and result.event.reason_code == Msg.FAILED.reason
+    assert KEY in ctx.services.redis.store
+
+
+@pytest.mark.asyncio
+async def test_a_filler_left_running_after_a_partial_removal_is_inconclusive(context_factory):
+    # one of two fillers could not be removed: it may still hold a card, so the cards are not probed this cycle
+    validation = FakeValidation(_all_cards("timeout", ""))
+    ctx = _filler_ctx(context_factory, validation, ["filler_run-1", "filler_run-2"], [0, 1])
+
+    result = await PostRentalGpuRecheckCheck().run(ctx)
+
+    assert validation.calls == 0
+    assert result.passed and result.event.reason_code == Msg.INCONCLUSIVE.reason
+    assert KEY in ctx.services.redis.store
 
 
 @pytest.mark.asyncio

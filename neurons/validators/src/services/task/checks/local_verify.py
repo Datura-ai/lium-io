@@ -16,8 +16,8 @@ that arrived later than the SSH
 path's own cap for that step (`ROUND_TRIP_CAP_MS_BY_STEP`, measured on the validator's clock) — leaves
 that step to the SSH path, so the new transport can only save time, never change a verdict on its
 own. The matmul is not asked for
-at all while `MATMUL_ALLCARDS_CHECK_ENABLED` is on (the all-cards work-proof runs inside the SSH
-matmul path and a consumed local pass must not skip it). Nothing is sent outside the first pass
+at all (the all-cards work-proof runs inside the SSH matmul path and a consumed local pass must
+not skip it). Nothing is sent outside the first pass
 (`ctx.config.first_pass` off): a full-size VerifyX can outlast the call's timeout and then run
 again over SSH, past `JOB_TIME_OUT`; the check is skipped and both steps stay on SSH. The call's
 timeout is at most half the time the job has left, so a slow `/verify` still leaves the SSH
@@ -90,15 +90,11 @@ def _matmul_ssh_reason() -> str | None:
     """Why the matmul is not asked for in the one call, or None when it is.
 
     `allcards_ssh` (DAH-2671 item 3): the all-cards work-proof (`probe_all_claimed_cards`, one
-    pinned run per card) lives inside the SSH matmul path only. While that check is on, the matmul
-    stays on SSH so a consumed local pass can never skip the probe or its enforcement; phase 2
-    carries `devices` in the intent and judges the per-card output here.
+    pinned run per card) lives inside the SSH matmul path only, so the matmul stays on SSH and a
+    consumed local pass can never skip the probe; phase 2 carries `devices` in the intent and
+    judges the per-card output here.
     """
-    if settings.MATMUL_ALLCARDS_CHECK_ENABLED:
-        return "allcards_ssh"
-    # shortcut: the matmul runs over SSH with the validator's own script (services.executor_payload); ask for it
-    # here again once the intent carries that script
-    return "validator_payload"
+    return "allcards_ssh"
 
 
 class _NothingToSend(Exception):

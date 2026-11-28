@@ -29,6 +29,8 @@ class RentedPod(pydantic.BaseModel):
     ssh_port: int | None = None
     # DAH-2870: the pod's status (`RUNNING`, `REBOOT_PENDING`, ...); None = an older backend
     status: str | None = None
+    # DAH-6978: the GPU UUIDs the backend assigned to the pod; None = an older backend
+    gpu_uuids: list[str] | None = None
 
 
 class RentedExecutor(pydantic.BaseModel):
@@ -91,6 +93,8 @@ class RentedExecutorsResponse(pydantic.BaseModel):
     all_filler_containers_by_executor: dict[str, list[str]] = {}
     # executor_id → external ports its active fillers hold (DAH-2527)
     filler_ports_by_executor: dict[str, list[int]] = {}
+    # DAH-6978: executor_id → the GPU UUIDs its active fillers hold (a whole-node filler lists every card)
+    filler_gpu_uuids_by_executor: dict[str, list[str]] = {}
     gpu_splitting_config: dict[str, int] = {}  # executor_id → min_gpu_count_for_rental
     network_ema: dict[str, NetworkEMA] = {}
     spot_executor_ids: list[str] = []

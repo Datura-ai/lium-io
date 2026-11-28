@@ -73,15 +73,29 @@ REAL_MATMUL_SSH_REASON = local_verify._matmul_ssh_reason
 
 # --- fakes -------------------------------------------------------------------------------------
 
+from neurons.validators.src.services.task.checks import local_verify as _lv_module  # noqa: E402
+from services.task.checks import local_verify as _lv_module_short  # noqa: E402
+
+_REAL_MATMUL_SSH_REASON = _lv_module._matmul_ssh_reason
+
+
+def set_matmul_ssh_reason(monkeypatch, fn) -> None:
+    # the module loads under two names (neurons.validators.src.services... and services...)
+    for module in (_lv_module, _lv_module_short):
+        monkeypatch.setattr(module, "_matmul_ssh_reason", fn)
+
 
 @pytest.fixture(autouse=True)
-def allcards_off(monkeypatch):
-    """The one call carries the matmul only while the all-cards check (on by default) is off. The tests below exercise
-    the one-call path as if it were asked for; `test_the_first_pass_matmul_runs_the_validators_script` the real choice."""
-    monkeypatch.setattr(settings, "MATMUL_ALLCARDS_CHECK_ENABLED", False)
-    monkeypatch.setattr(
-        local_verify, "_matmul_ssh_reason", lambda: "allcards_ssh" if settings.MATMUL_ALLCARDS_CHECK_ENABLED else None
-    )
+def matmul_in_the_one_call(monkeypatch):
+    """Phase 2's path, where the one call carries the matmul; today it stays on SSH for the all-cards proof
+    (`allcards_ssh`, the tests that ask for `matmul_on_ssh`)."""
+    set_matmul_ssh_reason(monkeypatch, lambda: None)
+
+
+@pytest.fixture
+def matmul_on_ssh(monkeypatch):
+    set_matmul_ssh_reason(monkeypatch, _REAL_MATMUL_SSH_REASON)
+
 
 
 @pytest.fixture
@@ -1048,11 +1062,10 @@ async def test_the_verify_timeout_is_capped_at_half_the_time_the_job_has_left(
 
 @pytest.mark.asyncio
 async def test_all_cards_check_keeps_the_matmul_on_ssh(
-    keypair, monkeypatch, short_local_verify_timeouts, verifyx_service
+    keypair, monkeypatch, short_local_verify_timeouts, verifyx_service, matmul_on_ssh
 ):
     """DAH-2671 item 3: `probe_all_claimed_cards` runs inside the SSH matmul path only. With the
-    check on no step is left for the local call: it is skipped, and both checks run over SSH."""
-    monkeypatch.setattr(settings, "MATMUL_ALLCARDS_CHECK_ENABLED", True)
+    check always on no step is left for the local call: it is skipped, and both checks run over SSH."""
     validation = matmul_service(monkeypatch)
     ssh_matmul = AsyncMock(return_value=mvs.ValidationResult(success=True, metrics={"from": "ssh"}))
     validation.validate_gpu_model_and_process_job = ssh_matmul

@@ -5,7 +5,7 @@ A rented node's cycle halts at TenantEnforcementCheck before any GPU work, and a
 rental can keep passing the single-card matmul once the renter leaves. GpuMemoryHealthCheck, the one NVML
 read that runs on rented nodes (DAH-3110), records a per-executor marker when it flags a card under a live
 rental; on the node's next unrented cycle this check runs the all-cards matmul and the kernel-fault probe
-on every card, whatever the MATMUL_ALLCARDS_* / GPU_FAULT_PROBE_* flags say. A failure fails the node and keeps the marker; a pass
+on every card, whatever the GPU_FAULT_PROBE_* flags say. A failure fails the node and keeps the marker; a pass
 clears it. The marker has no expiry (DAH-6355): only a pass ends it.
 
 A card that falls off the bus (GpuModelValidCheck's GPU_DETAILS_MISMATCH) also sets the marker.
@@ -37,7 +37,12 @@ from ..availability import ReachSource, ReachTarget
 from ..messages import GpuFaultProbeMessages, render_message
 from ..messages import PostRentalGpuRecheckMessages as Msg
 from ..pipeline import CheckResult, Context
-from .capability import get_filler_only_container, judge_gpu_model
+from .capability import (
+    get_filler_only_container,
+    judge_gpu_model,
+    record_all_cards_pass,
+    unanswered_cards_on_lium_workload,
+)
 from .gpu_fault_probe import GpuFaultProbeCheck
 from .gpu_model_truth import (
     expected_cc_and_sm,
@@ -45,6 +50,7 @@ from .gpu_model_truth import (
     judged_cards,
     reported_gpu_model,
 )
+from .rental_owner import rental_of_this_node
 from .sshd_bootstrap import remove_lium_fillers
 
 if TYPE_CHECKING:
@@ -121,20 +127,29 @@ async def record_gpu_drop(ctx: Context, missing_uuids: list[str]) -> None:
     )
 
 
-def _all_cards_no_verdict(probe: AllCardsProbe) -> bool:
-    # SSH errors, a first-run timeout and the wall clock say nothing about the cards, as the fault probe treats them,
-    # except a timeout on a run where another card finished: the channel worked, so that card is stuck
-    # (an 8x node's GPU 0 timed out every recheck 10-16 Nov and re-listed each time);
-    # a card that timed out again on the probe's retry (`timeout_after_retry`) is a verdict and fails the recheck
+async def _all_cards_no_verdict(ctx: Context, probe: AllCardsProbe, *, fillers_removed: bool) -> bool:
+    # Only a lost connection to the whole node (`AllCardsProbe.connection_lost`) and unanswered cards the backend has a
+    # Lium workload on now say nothing about the cards, as CapabilityCheck judges them. A run over the wall clock with
+    # every card answering differs on purpose: CapabilityCheck fails it, while this check, which has no shadow mode,
+    # leaves it to CapabilityCheck until the wall clock is set per model (DAH-6978 follow-up). Otherwise a timeout, a timeout again on the probe's retry (`timeout_after_retry`) or
+    # a run that ended without an exit status on a live connection is a verdict and fails the recheck (an 8x node's
+    # GPU 0 timed out every recheck 10-16 Nov and re-listed each time).
     if not probe.per_card:
         # not probed (no card details or size, our own cipher failed): no card was run, inconclusive as before
         return True
-    reasons = [c.get("reason") or "" for c in probe.per_card if not c.get("ok")]
-    if not reasons:
+    if all(c.get("ok") for c in probe.per_card):
         return probe.over_wall_clock
-    if any(c.get("ok") for c in probe.per_card) and "timeout" in reasons:
-        return False
-    return all(r == "timeout" or r.startswith("ssh_error") for r in reasons)
+    if probe.connection_lost:
+        return True
+    # fillers_removed: the backend can still list the fillers this recheck removed, whose cards are free now
+    return (
+        not probe.wrong_answer
+        and (
+            await unanswered_cards_on_lium_workload(
+                ctx, ctx.state.specs or {}, probe, fillers_removed=fillers_removed
+            )
+        )[0]
+    )
 
 
 class PostRentalGpuRecheckCheck:
@@ -152,11 +167,20 @@ class PostRentalGpuRecheckCheck:
             )
         what: dict[str, Any] = {"executor_uuid": ctx.executor.uuid, "marker": asdict(marker)}
 
+        rental = rental_of_this_node(ctx)
+        if rental is not None and rental.pods:
+            # the cycle snapshot lists a rental: its workload may still load the cards though it ended mid-cycle,
+            # so the cards prove themselves in the first idle cycle (as CapabilityCheck does)
+            what["skipped"] = "rented_at_snapshot"
+            await self._refresh_marker(ctx, key, what)
+            self._log(ctx, "POST_RENTAL_GPU_RECHECK_INCONCLUSIVE", what, logging.INFO)
+            return self._not_run(ctx, marker, Msg.INCONCLUSIVE, what)
+
         if get_filler_only_container(ctx):
             # both probes would compete with the filler for VRAM
             what["removed_fillers"] = await self._remove_fillers(ctx)
-            if not what["removed_fillers"]:
-                # the filler still holds VRAM: a probe OOM here would fail a healthy card
+            if set(what["removed_fillers"]) != set(ctx.state.rented_data.get_filler_containers(ctx.executor.uuid)):
+                # a filler still holds VRAM: a probe OOM here would fail a healthy card
                 await self._refresh_marker(ctx, key, what)
                 self._log(ctx, "POST_RENTAL_GPU_RECHECK_INCONCLUSIVE", what, logging.INFO)
                 return self._not_run(ctx, marker, Msg.INCONCLUSIVE, what)
@@ -269,8 +293,10 @@ class PostRentalGpuRecheckCheck:
         )
         gpu_count = ((ctx.state.specs or {}).get("gpu") or {}).get("count") or 0
         inconclusive = all_cards_probe is None and gpu_count > 1
+        if all_cards_probe is not None and all_cards_probe.passed:
+            await record_all_cards_pass(ctx)
         if all_cards_probe is not None and not all_cards_probe.passed:
-            if _all_cards_no_verdict(all_cards_probe):
+            if await _all_cards_no_verdict(ctx, all_cards_probe, fillers_removed=bool(what.get("removed_fillers"))):
                 inconclusive = True
             else:
                 failures.append(f"all-cards matmul: {all_cards_probe.failure_reason}")

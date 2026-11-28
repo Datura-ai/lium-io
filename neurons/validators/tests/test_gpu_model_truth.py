@@ -6,7 +6,11 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from neurons.validators.src.services.matrix_validation_service import UUID_MISMATCH_ERROR_PREFIX, ValidationResult
+from neurons.validators.src.services.matrix_validation_service import (
+    UUID_MISMATCH_ERROR_PREFIX,
+    AllCardsProbe,
+    ValidationResult,
+)
 from neurons.validators.src.services.task.availability import availability_errors
 from neurons.validators.src.services.task.checks import capability
 from neurons.validators.src.services.task.checks.capability import CapabilityCheck
@@ -318,7 +322,16 @@ async def test_an_all_cards_failure_after_the_stop_fails_only_on_a_wrong_answer(
     failed = ValidationResult(
         success=False,
         error_message="All-cards GPU work-proof failed: 1/2 card(s) failed device work-proof",
-        all_cards_wrong_answer=wrong_card,
+        all_cards=AllCardsProbe(
+            passed=False,
+            failure_reason="1/2 card(s) failed device work-proof",
+            elapsed_seconds=1.0,
+            over_wall_clock=False,
+            per_card=[
+                {"card_index": 0, "ok": True},
+                {"card_index": 1, "ok": False, "reason": "wrong_answer" if wrong_card else "timeout"},
+            ],
+        ),
     )
     redis = FakeRedis()
     ctx, _ = _filler_ctx(context_factory, redis, None, success=False, failure=failed)
@@ -789,7 +802,6 @@ def test_a_bare_nvidia_h100_with_the_sxm_sm_count_passes_as_the_pcie_card():
 async def test_a_carried_work_proof_failure_clears_on_a_right_answer_with_no_numbers(context_factory, monkeypatch):
     """Review (17 Nov): a filler-sample work-proof failure on card 1, the filler then removed. The normal path's pinned
     remeasure of card 1 gets a right answer without numbers: that clears the failure, as the filler sample does."""
-    monkeypatch.setattr(capability.settings, "MATMUL_ALLCARDS_CHECK_ENABLED", True)
     monkeypatch.setattr(capability.settings, "MATMUL_ALLCARDS_ENFORCEMENT_ENABLED", True)
     redis = FakeRedis()
     failed = capability.work_proof_failed(_two_card_specs(), 1)
@@ -916,8 +928,8 @@ RIGHT_ANSWER = ValidationResult(success=True, metrics=REAL_H100[1])
 async def test_a_wrong_uuid_after_the_stop_fails_the_node_and_removes_the_filler_until_a_full_check_passes(
     context_factory, sample_never_due, monkeypatch, all_cards, card, retry
 ):
-    # review: a proven wrong answer is stored like any mismatch, under all-cards on and off
-    monkeypatch.setattr(capability.settings, "MATMUL_ALLCARDS_CHECK_ENABLED", all_cards)
+    # review: a proven wrong answer is stored like any mismatch, under all-cards enforcement on and off (DAH-6978: the
+    # all-cards check itself is always on)
     monkeypatch.setattr(capability.settings, "MATMUL_ALLCARDS_ENFORCEMENT_ENABLED", all_cards)
     redis = FakeRedis()
 

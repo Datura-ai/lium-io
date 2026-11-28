@@ -57,6 +57,9 @@ class RentedPod(BaseModel):
     # pod with an ssh_port whatever its status, and counts only RUNNING (or None = backend predates
     # the field) pods towards the our-own-outage share.
     status: str | None = None
+    # The GPU UUIDs the backend assigned to this pod. None = backend predates the field: no card of
+    # the pod is known to be held by it.
+    gpu_uuids: list[str] | None = None
 
     @field_validator("container_name", mode="before")
     @classmethod
@@ -180,6 +183,9 @@ class RentedExecutorsResponse(BaseModel):
     # these ports never show up in executors[].pods and port verification used to probe them and
     # collide. Empty for a backend that predates the field — the collision simply stays.
     filler_ports_by_executor: dict[str, list[int]] = {}
+    # executor_id -> the GPU UUIDs its active fillers hold (a whole-node filler lists every card). Empty for a
+    # backend that predates the field: then no card is known to be held by a filler.
+    filler_gpu_uuids_by_executor: dict[str, list[str]] = {}
     banned_guids: list[str] = []
     banned_hotkeys: list[str] = []
     banned_coldkeys: list[str] = []
@@ -349,6 +355,9 @@ class RentedExecutorsResponse(BaseModel):
         # (skip-checks, logging). Container protection and GPU-usage tolerance use get_filler_containers.
         containers = self.get_filler_containers(executor_uuid)
         return containers[0] if containers else None
+
+    def get_filler_gpu_uuids(self, executor_uuid: str) -> list[str]:
+        return self.filler_gpu_uuids_by_executor.get(str(executor_uuid), [])
 
     def get_filler_ports(self, executor_uuid: str) -> list[int]:
         return self.filler_ports_by_executor.get(str(executor_uuid), [])

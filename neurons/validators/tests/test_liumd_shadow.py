@@ -44,7 +44,13 @@ from services.task.service import TaskService
 
 from core.config import settings
 from tests.helpers import build_context_config, build_services, build_state, make_context
-from tests.test_local_verify import _FakeVerifyXValidator, matmul_service, matmul_stdout
+from tests.test_local_verify import (
+    _REAL_MATMUL_SSH_REASON,
+    _FakeVerifyXValidator,
+    matmul_service,
+    matmul_stdout,
+    set_matmul_ssh_reason,
+)
 from tests.test_verifyx_cold_sample_retry import _idle_now
 
 SPECS = {"gpu": {"count": 1, "details": [{"uuid": "GPU-1", "name": "H100", "capacity": 81559}]}}
@@ -87,9 +93,9 @@ def reserved_executor(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def allcards_off(monkeypatch):
-    """The one call carries the matmul only while the all-cards check (on by default) is off."""
-    monkeypatch.setattr(settings, "MATMUL_ALLCARDS_CHECK_ENABLED", False)
+def matmul_in_the_one_call(monkeypatch):
+    """Phase 2's path, where the one call carries the matmul (test_local_verify.matmul_in_the_one_call)."""
+    set_matmul_ssh_reason(monkeypatch, lambda: None)
 
 
 @pytest.fixture
@@ -1109,7 +1115,7 @@ async def test_an_outdated_verifyx_library_disagrees(
 async def test_all_cards_mode_does_not_compare_the_matmul(
     keypair, monkeypatch, verifyx_service, gpu_steps
 ):
-    monkeypatch.setattr(settings, "MATMUL_ALLCARDS_CHECK_ENABLED", True)
+    set_matmul_ssh_reason(monkeypatch, _REAL_MATMUL_SSH_REASON)
     fake = FakeLiumd()
 
     record = await _shadow(_ctx(keypair, monkeypatch, verifyx_service), fake)

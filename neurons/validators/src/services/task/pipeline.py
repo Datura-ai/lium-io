@@ -233,9 +233,9 @@ class ContextState:
     port_check_deferred: bool = False
     # VerifyXCheck skipped its run for a standing rental-probe failure; RentalProbeCheck then never passes the cycle
     verifyx_skipped_for_standing_probe_failure: bool = False
-    # CapabilityCheck skipped the enforced all-cards work proof for a standing rental-probe failure; RentalProbeCheck
-    # then never passes the cycle either
-    allcards_skipped_for_standing_probe_failure: bool = False
+    # CapabilityCheck has no all-cards work proof of every card this cycle (skipped, or deferred without a valid last
+    # pass); RentalProbeCheck then never passes the cycle, so the node is not offered until its cards prove themselves
+    allcards_not_proven: bool = False
     # DAH-5981: the error of this cycle's port probe when the SSH connection dropped mid-probe; None otherwise.
     # PortCountCheck then reports the lost connection, not a port shortfall it never measured.
     port_probe_connection_lost: str | None = None
