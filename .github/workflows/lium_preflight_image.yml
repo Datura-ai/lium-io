@@ -28,20 +28,35 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     environment: dockerhub-push
-    timeout-minutes: 30
+    # arm64 builds under QEMU on this x86 runner
+    timeout-minutes: 60
     permissions:
       contents: read
       id-token: write
+    env:
+      IMAGE: daturaai/compute-subnet-validator:preflight
+      # one OCI index for x86 and ARM (GB10 / DGX Spark, Grace) hosts, as watchtower_image.yml
+      PLATFORMS: "linux/amd64,linux/arm64"
 
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      # same pinned actions and images as watchtower_image.yml (they run with id-token: write)
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+        with:
+          image: docker.io/tonistiigi/binfmt:qemu-v10.2.3@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+        with:
+          driver-opts: image=moby/buildkit:v0.33.1@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea
 
       # Build before the login: the base image is a public docker.io image, and once the OIDC
       # token is the docker.io credential every pull uses it.
       - name: Build the image
         run: |
           cd neurons/validators
-          docker build -f Dockerfile.preflight -t daturaai/compute-subnet-validator:preflight .
+          # no provenance: it shows as an `unknown` platform and fails the check below (as watchtower/docker_build.sh)
+          docker buildx build --platform "$PLATFORMS" --provenance=false -f Dockerfile.preflight \
+            --output type=oci,dest=/tmp/preflight.oci.tar .
 
       - name: Log in to Docker Hub (OIDC, no stored token)
         uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0 (>= 4.5.0 for Docker Hub OIDC)
@@ -52,4 +67,14 @@ jobs:
           username: daturaai
 
       - name: Push the image
-        run: docker push daturaai/compute-subnet-validator:preflight
+        run: skopeo copy --all oci-archive:/tmp/preflight.oci.tar "docker://docker.io/$IMAGE"
+
+      - name: Check the tag lists both platforms
+        run: |
+          # os/architecture pairs: an architecture alone would accept a non-Linux manifest
+          platforms=$(docker manifest inspect "$IMAGE" | jq -r '[.manifests[]?.platform | "\(.os)/\(.architecture)"] | sort | join(",")')
+          if [ "$platforms" != "linux/amd64,linux/arm64" ]; then
+            echo "::error::$IMAGE lists platforms '$platforms', not linux/amd64,linux/arm64"
+            exit 1
+          fi
+          echo "published $IMAGE ($platforms)"
