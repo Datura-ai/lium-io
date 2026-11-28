@@ -1199,6 +1199,39 @@ class HostPidMaxMessages:
     )
 
 
+class RentalNetworkMessages:
+    # the create refuses every rental on a lium-rentals network that is not an isolated bridge
+    UNUSABLE = MessageTemplate(
+        event="The lium-rentals Docker network is not usable for a rental",
+        reason="RENTAL_NETWORK_UNUSABLE",
+        severity="error",
+        category=AVAILABILITY_CATEGORY,
+        impact="Verification failed; node hidden and not rentable until the lium-rentals network is recreated "
+        "(a running rental is kept)",
+        remediation=(
+            "Every rental on this node is refused: the lium-rentals network must be a bridge with inter-container "
+            "traffic off. While no pod container exists, running or stopped, run `docker network rm lium-rentals`; "
+            "the validator recreates it at the next rental, or create it yourself with `docker network create -d "
+            "bridge -o com.docker.network.bridge.enable_icc=false lium-rentals` (add "
+            "`-o com.docker.network.driver.mtu=<MTU>` if the uplink MTU is below 1500)."
+        ),
+    )
+    NOT_READ = MessageTemplate(
+        event="The lium-rentals Docker network not read this cycle",
+        reason="RENTAL_NETWORK_NOT_READ",
+        severity="info",
+        category="policy",
+        impact="Proceed; the read got no answer, which says nothing about the network",
+    )
+    OK = MessageTemplate(
+        event="The lium-rentals Docker network is usable for a rental",
+        reason="RENTAL_NETWORK_OK",
+        severity="info",
+        category="policy",
+        impact="Proceed",
+    )
+
+
 class DuplicateExecutorMessages:
     DUPLICATE = MessageTemplate(
         event="Duplicate executor registration",

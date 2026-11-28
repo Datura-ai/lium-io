@@ -311,6 +311,7 @@ def make_probe_context(
     rented_now=None,
     first_pass: bool = False,
     port_check_deferred: bool = False,
+    rental_network_usable: bool = True,
 ):
     docker = docker or FakeDocker()
     redis = redis or FakeRedis()
@@ -342,6 +343,7 @@ def make_probe_context(
         verified_port_pairs=list(port_pairs),
         rented_data=rented if rented is not None else rented_data(),
         port_check_deferred=port_check_deferred,
+        rental_network_usable=rental_network_usable,
     )
     ctx = make_context(
         services=services,
@@ -1857,17 +1859,24 @@ async def test_a_filler_node_is_probed_beside_its_filler():
 
 
 @pytest.mark.asyncio
-async def test_a_cycle_whose_port_check_was_deferred_for_disk_pressure_rents_nothing():
-    """Regression (DAH-5244 review): the port check kept its memory instead of a container on a Docker root
-    whose sync stalls, and the probe then started one on the same root: its create waited in that sync and
-    failed the filler node at container_start."""
+@pytest.mark.parametrize(
+    ("state", "reason"),
+    [
+        # DAH-5244 review: the port check kept its memory instead of a container on a Docker root whose sync
+        # stalls; a probe create on the same root waited in that sync and failed the filler node at container_start
+        ({"port_check_deferred": True}, "port check deferred for disk pressure"),
+        # RentalNetworkCheck hid the node and the cycle runs on to scoring: the probe's create would be refused
+        ({"rental_network_usable": False}, "lium-rentals network not usable for a rental"),
+    ],
+)
+async def test_a_cycle_the_probe_create_cannot_use_rents_nothing(state, reason):
     fillers = rented_data(fillers=1)
-    ctx, docker, redis = make_probe_context(rented=fillers, rented_now=fillers, port_check_deferred=True)
+    ctx, docker, redis = make_probe_context(rented=fillers, rented_now=fillers, **state)
     with probe_settings(), renter_path():
         result = await RentalProbeCheck().run(ctx)
 
     assert result.passed and result.event.reason_code == Msg.SKIPPED.reason
-    assert result.event.what_we_saw["reason"] == "port check deferred for disk pressure"
+    assert result.event.what_we_saw["reason"] == reason
     assert docker.create_calls == [] and not redis.stamped()
 
 

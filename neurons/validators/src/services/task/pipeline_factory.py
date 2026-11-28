@@ -96,6 +96,7 @@ from .checks import (
     SysboxLayerResetCheck,
     HostPidMaxCheck,
     PidHostRequiredCheck,
+    RentalNetworkCheck,
     SysboxRequiredCheck,
     TdxHostCheck,
     RentedMidCycleCheck,
@@ -431,6 +432,8 @@ class PipelineFactory:
                 # Fatal, so it runs after the stale container cleanup and every non-fatal check above: a halt here
                 # must not leave an ended rental's container running on the host or skip one of them
                 HostPidMaxCheck(),
+                # the create refuses every rental on a lium-rentals network that is not an isolated bridge; same place
+                RentalNetworkCheck(),
                 PortConnectivityCheck(),
                 PortCountCheck(),
                 # Before the rented short-circuit; it leaves a rented node alone itself (no pull beside a
@@ -603,6 +606,7 @@ class PipelineFactory:
                 _CUSTOM_BUILD_ORPHAN_SWEEP_SINGLETON,
                 # DAH-7041: same place as in build_checks(), after the stale container cleanup
                 HostPidMaxCheck(),
+                RentalNetworkCheck(),
                 ExecutorImageCheck(),
                 InspectorRentedCheck(),
                 RentedPodResourcesCheck(),
@@ -698,6 +702,8 @@ class PipelineFactory:
                 TdxHostCheck(),
                 # DAH-7041: one read-only cat; the dry run has no stale container cleanup to run first
                 HostPidMaxCheck(),
+                # one read-only docker network inspect
+                RentalNetworkCheck(),
                 GpuCountCheck(),
                 GpuModelValidCheck(),
                 GpuVramPrecheck(),

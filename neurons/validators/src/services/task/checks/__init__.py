@@ -63,6 +63,7 @@ from .docker_cpu import DockerCpuCheck
 from .needrestart_guard import NeedrestartGuardCheck
 from .sysbox_layer_reset import SysboxLayerResetCheck
 from .host_pid_max import HostPidMaxCheck
+from .rental_network import RentalNetworkCheck
 from .pid_host_required import PidHostRequiredCheck
 from .sysbox_required import SysboxRequiredCheck
 from .tdx_host import TdxHostCheck
@@ -136,6 +137,7 @@ __all__ = [
     "NeedrestartGuardCheck",
     "SysboxLayerResetCheck",
     "HostPidMaxCheck",
+    "RentalNetworkCheck",
     "PidHostRequiredCheck",
     "SysboxRequiredCheck",
     "SpecChangeCheck",
