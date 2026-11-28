@@ -1994,10 +1994,16 @@ def _build_host_config_kwargs(spec: ContainerRunSpec) -> dict:
     return {key: value for key, value in kwargs.items() if value is not None}
 
 
-def _require_icc_off(name: str, network: dict) -> None:
+def rental_network_isolated(network: dict) -> bool:
+    """A Docker network inspect the rental create runs pods on; RentalNetworkCheck lists a node by the same rule."""
     options = network.get("Options") or {}
-    if network.get("Driver") == "bridge" and options.get(RENTAL_NETWORK_ICC_OPTION) == "false":
+    return network.get("Driver") == "bridge" and options.get(RENTAL_NETWORK_ICC_OPTION) == "false"
+
+
+def _require_icc_off(name: str, network: dict) -> None:
+    if rental_network_isolated(network):
         return
+    options = network.get("Options") or {}
     raise RentalDockerOperationError(
         f"Docker network {name} exists on the executor but is not a bridge with "
         f"{RENTAL_NETWORK_ICC_OPTION}=false (driver={network.get('Driver')!r}, options={options!r}); "

@@ -79,6 +79,8 @@ class AvailabilityErrorCode(StrEnum):
     NODE_ACCOUNT_UNVERIFIED = "NODE_ACCOUNT_UNVERIFIED"
     # DAH-7041: the host answered a kernel.pid_max the create refuses every rental on (HostPidMaxCheck).
     HOST_PID_MAX_UNUSABLE = "HOST_PID_MAX_UNUSABLE"
+    # the host's lium-rentals network is one the create refuses every rental on (RentalNetworkCheck).
+    RENTAL_NETWORK_UNUSABLE = "RENTAL_NETWORK_UNUSABLE"
 
 
 # Faults the node itself proved: never a sign of our own outage, and never silenced with one.
@@ -95,6 +97,7 @@ NODE_GPU_FAULT_CODES = frozenset(
         AvailabilityErrorCode.NODE_ACCOUNT_MISMATCH,
         # the host's own answer to the read, never a read that got none
         AvailabilityErrorCode.HOST_PID_MAX_UNUSABLE,
+        AvailabilityErrorCode.RENTAL_NETWORK_UNUSABLE,
         # only raised for REASONS_THAT_HIDE_AT_ONCE, all read off the node's own report or probe
         AvailabilityErrorCode.VERIFICATION_FAILED,
     }
