@@ -139,19 +139,25 @@ def staged_directory(purpose: str, stdout: object) -> str:
 def run_job(staged: str, files: tuple[str, ...], args: list[str], log: str | None = None) -> str:
     """Start the job staged in `staged` (stage_job) with the trusted interpreter and -E -s, so its imports resolve to the
     staged files only, never to code on the node or in its environment. The directory goes when the run ends, also when
-    it is killed. `log`: run detached (nohup) with its output there."""
-    command = f'{shlex.quote(EXECUTOR_PYTHON)} -E -s "$D"/{shlex.quote(files[0])} {shlex.join(args)}'
+    it is killed. `log`: run detached with its output there.
+
+    The job's credentials (one JSON line) arrive on this command's stdin and reach the job through a pipe from the
+    launching shell's memory: S is never exported and printf is a builtin, so they are in no file, argv or environ."""
+    command = f'printf \'%s\\n\' "$S" | {shlex.quote(EXECUTOR_PYTHON)} -E -s "$D"/{shlex.quote(files[0])} {shlex.join(args)}'
     worker = "trap 'rm -rf \"$D\"' EXIT; trap 'exit 1' HUP INT TERM; " + command
+    read = 'IFS= read -r S || { rm -rf "$D"; exit 1; }; '
     if log is None:
-        return f"D={shlex.quote(staged)}; {worker}"
-    log_q = shlex.quote(log)
-    # the log is opened before detaching: a detached job that could not open it would never start the shell that
-    # removes the directory (and the credentials in it), while this command still succeeded
-    return (
-        f"D={shlex.quote(staged)}; if ( : > {log_q} ) 2>/dev/null; then exec 8>>{log_q}; "
-        'else rm -rf "$D"; exit 1; fi; '
-        f'D="$D" nohup /bin/sh -c {shlex.quote(worker)} >&8 2>&8 < /dev/null 8>&- &'
-    )
+        launcher = read + worker
+    else:
+        log_q = shlex.quote(log)
+        # the log is opened before detaching: a detached job that could not open it would never start the shell that
+        # removes the directory, while this command still succeeded
+        launcher = (
+            f"{read}if ( : > {log_q} ) 2>/dev/null; then exec 8>>{log_q}; "
+            'else rm -rf "$D"; exit 1; fi; '
+            f"( trap '' HUP; {worker} ) >&8 2>&8 < /dev/null 8>&- &"
+        )
+    return f"D={shlex.quote(staged)} /bin/sh -c {shlex.quote(launcher)}"
 
 
 def label(files: tuple[str, ...], args: str) -> str:

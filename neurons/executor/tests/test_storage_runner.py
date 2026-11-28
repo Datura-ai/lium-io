@@ -2114,10 +2114,8 @@ def test_executor_only_launches_the_helper_detached_with_the_runner_as_its_entry
 ) -> None:
     # DAH-5893: the executor resolves the workspace and starts the helper; restic, retries and reporting run in the
     # helper, so an executor restart leaves the operation running.
-    spec = tmp_path / "op.json"
-    spec.write_text(json.dumps({**_operation_payload(), "detach": True}))
-    spec.chmod(0o600)
-    monkeypatch.setattr("sys.argv", ["storage_runner.py", "--spec", str(spec)])
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps({**_operation_payload(), "detach": True})))
+    monkeypatch.setattr("sys.argv", ["storage_runner.py", "--spec", "-"])
     workspace = (
         DockerUserNamespaceWorkspace(IMAGE, "rental-pod", CONTAINER_ID, 4242, PurePosixPath("/root"), True)
         if encrypted
@@ -2467,27 +2465,26 @@ def test_legacy_restore_downloads_from_the_root_directory(tmp_path: Path, encryp
     assert record.read_text().strip() == "/"
 
 
-def test_load_operation_leaves_only_the_reporter_in_the_spec_file(tmp_path: Path) -> None:
+def test_load_operation_reads_the_spec_from_stdin_and_refuses_a_spec_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # the spec carries the repository credentials: it never sits in a file on the node, even briefly
+    payload = {"action": "restore", "repository": {"password": "p"}}
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(payload)))
+    assert storage_runner._load_operation("-") == payload
+
     spec = tmp_path / "spec.json"
-    reporter = {"api_url": "https://api.example", "auth_token": "t", "resource": "restore"}
-    spec.write_text(json.dumps({"action": "restore", "repository": {"password": "p"}, "reporter": reporter}))
-    spec.chmod(0o600)
-
-    payload = storage_runner._load_operation(str(spec))
-
-    assert payload["repository"] == {"password": "p"}
-    assert json.loads(spec.read_text()) == {"reporter": reporter}
-    assert spec.stat().st_mode & 0o777 == 0o600
+    spec.write_text(json.dumps(payload))
+    with pytest.raises(OperationSpecError, match="stdin"):
+        storage_runner._load_operation(str(spec))
 
 
 def test_without_detach_the_executor_returns_only_when_the_helper_ends(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capfd: pytest.CaptureFixture[str]
 ) -> None:
     """An older validator (no spec "detach") reads the runner's exit as the end, so the runner follows the helper."""
-    spec = tmp_path / "op.json"
-    spec.write_text(json.dumps(_operation_payload()))
-    spec.chmod(0o600)
-    monkeypatch.setattr("sys.argv", ["storage_runner.py", "--spec", str(spec)])
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(_operation_payload())))
+    monkeypatch.setattr("sys.argv", ["storage_runner.py", "--spec", "-"])
     workspace = DockerVolumeWorkspace(IMAGE, "customer-volume", PurePosixPath("/workspace/checkpoints"), True)
     monkeypatch.setattr(storage_runner.WorkspaceResolver, "resolve", lambda self, operation: workspace)
     calls: list[str] = []

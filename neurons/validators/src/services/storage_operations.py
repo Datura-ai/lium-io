@@ -350,17 +350,15 @@ async def start_storage_operation(
             )
         stage_dir = _staged_directory(staged.stdout)
 
-        async with ssh_client.start_sftp_client() as sftp:
-            async with sftp.open(str(files.spec), "w") as remote_spec:
-                await remote_spec.write(
-                    json.dumps({**spec, "detach": True}, separators=(",", ":"), sort_keys=True)
-                )
-            await sftp.chmod(str(files.spec), 0o600)
-
+        # The spec (repository keys, restic password, reporter token) never touches the executor's disk: it reaches
+        # the launching shell on stdin and the runner through a pipe from that shell's memory. printf is a builtin
+        # and S is never exported, so it is in no argv or environ either. files.spec stays as an empty marker of the
+        # launch, which the restart checks above read.
+        spec_line = json.dumps({**spec, "detach": True}, separators=(",", ":"), sort_keys=True)
         # -E -s: the runner imports only the staged files and the standard library
         runner = (
-            f'{shlex.quote(python_path)} -E -s "$D"/{executor_payload.STORAGE[0]} '
-            f"--spec {shlex.quote(str(files.spec))} --cancel-file {shlex.quote(str(files.cancel))}"
+            f'printf \'%s\\n\' "$S" | {shlex.quote(python_path)} -E -s "$D"/{executor_payload.STORAGE[0]} '
+            f"--spec - --cancel-file {shlex.quote(str(files.cancel))}"
         )
         terminal_cleanup = (
             ""
@@ -383,11 +381,18 @@ async def start_storage_operation(
             f"rm -f {shlex.quote(str(files.spec))} {shlex.quote(str(files.pid))} "
             f"{shlex.quote(str(files.cancel))}{terminal_cleanup}"
         )
-        launch_command = (
-            f"D={shlex.quote(stage_dir)} nohup /bin/sh -c {shlex.quote(wrapper)} "
-            f"> {shlex.quote(str(files.log))} 2>&1 < /dev/null &"
+        # the launching shell reads the spec line, marks the launch, then leaves the wrapper running without it;
+        # a failed marker write aborts the launch so the restart checks never see a runner with no marker
+        launcher = (
+            "IFS= read -r S || exit 1; "
+            f"( umask 077; : > {shlex.quote(str(files.spec))} ) || exit 1; "
+            f"( trap '' HUP; {wrapper} ) > {shlex.quote(str(files.log))} 2>&1 < /dev/null &"
         )
-        await ssh_client.run(launch_command, check=True)
+        await ssh_client.run(
+            f"D={shlex.quote(stage_dir)} /bin/sh -c {shlex.quote(launcher)}",
+            check=True,
+            input=spec_line + "\n",
+        )
         return files
     except Exception as error:
         if stage_dir is not None:
@@ -413,19 +418,25 @@ async def run_job_with_secrets(
     files: tuple[str, ...],
     auth_token: str,
     volume_info,
-    argv: Callable[[str], list[str]],
+    args: list[str],
     log: str | None = None,
     **run_kwargs,
 ) -> None:
-    """Stage a legacy tar job, then hand it its credentials file (upload_secrets_file) and start it: the credentials reach
-    the node only once the job that reads and deletes them is in place. A failed start removes both."""
+    """Stage a legacy tar job, then start it with its credentials on stdin (run_job): they never touch the node's disk.
+    A failed start removes the staged directory."""
     staged = await ssh_client.run(executor_payload.stage_job(purpose, files), check=True)
     stage_dir = executor_payload.staged_directory(purpose, staged.stdout)
+    secrets = json.dumps(
+        {
+            "auth_token": auth_token,
+            "aws_access_key_id": volume_info.iam_user_access_key,
+            "aws_secret_access_key": volume_info.iam_user_secret_key,
+        }
+    )
     try:
-        # inside the job's own private directory: whatever fails (the upload's close, the start, the job), removing that
-        # directory removes the credentials, and the job's shell removes it when it ends
-        secrets_file = await upload_secrets_file(ssh_client, auth_token, volume_info, stage_dir)
-        await ssh_client.run(executor_payload.run_job(stage_dir, files, argv(secrets_file), log=log), check=True, **run_kwargs)
+        await ssh_client.run(
+            executor_payload.run_job(stage_dir, files, args, log=log), check=True, input=secrets + "\n", **run_kwargs
+        )
     except BaseException:
         # a cancellation too: the directory goes now, while the session is still open
         await ssh_client.run(f"rm -rf -- {shlex.quote(stage_dir)}", check=False)
@@ -550,9 +561,7 @@ async def cancel_storage_operation(
     # the node's files are the provider's to write: the report goes where this validator's own record says
     spec = await _held_reporter_spec(redis, operation_id)
     helper = shlex.quote(files.helper)
-    legacy_runner = shlex.quote(
-        f"[-]-spec {files.spec}"
-    )  # "[-]" keeps pgrep from matching this shell
+    legacy_runner = shlex.quote(_runner_pattern(files))
     # Targets are named, never a stored PID (the executor shares the host's PID namespace, so a stale PID
     # could be an unrelated process). SIGTERM to the helper: its storage_runner.py stops restic and reports CANCELLED.
     command = (
@@ -601,12 +610,18 @@ async def _remote_file_exists(
     return result.exit_status == 0
 
 
+def _runner_pattern(files: StorageOperationFiles) -> str:
+    """pgrep -f pattern for this operation's runner: its --cancel-file argument, in whatever directory the release
+    that launched it kept cancel markers (the file name names the operation), so a runner a previous validator
+    release started is still found during a rolling release. "[-]" keeps pgrep from matching its own shell."""
+    return f"[-]-cancel-file [^ ]*/{files.cancel.name.replace('.', '[.]')}( |$)"
+
+
 async def _runner_alive(
     ssh_client: asyncssh.SSHClientConnection,
     files: StorageOperationFiles,
 ) -> bool:
-    # "[-]-spec" keeps pgrep from matching this command's own shell
-    runner_pattern = f"[-]-spec {files.spec}"
+    runner_pattern = _runner_pattern(files)
     # an executor before the wrapper helper (a running wrapper helper already reads as RUNNING)
     result = await ssh_client.run(
         f"pgrep -f -- {shlex.quote(runner_pattern)} >/dev/null",
@@ -783,25 +798,3 @@ async def _report_operation_status(
     return False
 
 
-async def upload_secrets_file(
-    ssh_client: asyncssh.SSHClientConnection, auth_token: str, volume_info, directory: str
-) -> str:
-    """Hand the legacy tar backup/restore scripts their credentials as a fresh 0600 file in `directory`, the job's own
-    0700 staging directory (stage_job), so the file goes with it.
-
-    Keeps the values out of the remote command line. The file is created exclusively with mode 0600; the script deletes
-    it on read.
-    """
-    path = f"{directory}/secrets.json"
-    async with ssh_client.start_sftp_client() as sftp:
-        async with sftp.open(path, "x", asyncssh.SFTPAttrs(permissions=0o600)) as remote_file:
-            await remote_file.write(
-                json.dumps(
-                    {
-                        "auth_token": auth_token,
-                        "aws_access_key_id": volume_info.iam_user_access_key,
-                        "aws_secret_access_key": volume_info.iam_user_secret_key,
-                    }
-                )
-            )
-    return path

@@ -3,7 +3,7 @@ import subprocess
 import tempfile
 import re
 
-from workspace_mount import VolumeAccess, detect_volume_access, load_secrets_file
+from workspace_mount import VolumeAccess, detect_volume_access, load_secrets
 
 # Setup logger
 logging.basicConfig(level=logging.INFO)
@@ -134,7 +134,7 @@ def docker_base_command(args, volumes=None, volume_args=None, entrypoint=None, i
         command.extend(["--entrypoint", entrypoint])
     command.extend(
         [
-            # values come from this process's env (load_secrets_file), never the command line
+            # values come from this process's env (load_secrets), never the command line
             "-e", "AWS_ACCESS_KEY_ID",
             "-e", "AWS_SECRET_ACCESS_KEY",
             "-e", "AWS_DEFAULT_REGION=us-east-1",
@@ -339,9 +339,6 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Restore storage script")
     parser.add_argument("--api-url", type=str, help="API URL")
-    parser.add_argument(
-        "--secrets-file", type=str, required=True, help="0600 JSON file with the auth token and S3 keys; deleted on read"
-    )
     parser.add_argument("--backup-volume-name", type=str, help="Backup volume name")
     parser.add_argument("--target-volume", type=str, help="Target volume for restore")
     parser.add_argument("--backup-source-path", type=str, help="Backup source path in S3")
@@ -350,6 +347,6 @@ if __name__ == "__main__":
     parser.add_argument("--restore-log-id", type=str, help="Restore log ID")
 
     args = parser.parse_args()
-    args.auth_token = load_secrets_file(args.secrets_file)
+    args.auth_token = load_secrets()
     restore_storage(args)
     logger.info("Restore storage script completed")
