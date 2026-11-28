@@ -8,13 +8,13 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from protocol.vc_protocol.compute_requests import RentedExecutor, RentedExecutorsResponse, RentedPod
 from services.executor_rollout import ExecutorRolloutTracker
-from services.redis_service import PENDING_PODS_PREFIX, RedisService, create_started_at_key
+from services.redis_service import PENDING_PODS_PREFIX, RENTAL_CHANGE_STATE_KEY, RedisService, create_started_at_key
 from services.task.checks import rented_mid_cycle as rented_mid_cycle_module
 from services.task.checks.rented_mid_cycle import RentedMidCycleCheck
 from services.task.messages import TenantEnforcementMessages as Msg
 from services.task.pipeline_factory import PipelineFactory
 
-from tests.helpers import FakeRedis, build_services, build_state, make_context
+from tests.helpers import FakeRedis, build_context_config, build_services, build_state, make_context
 from test_executor_rollout_grace import _failed, _scored, _validator_process
 
 NODE = "miner-hotkey:executor-123"
@@ -210,3 +210,42 @@ def test_a_hold_for_a_create_mid_cycle_keeps_no_miner_active():
     _, withheld = withhold_renter_gpu_reset_verdicts({"5Miner": [held]})
 
     assert len(withheld) == 1 and session_kept_hotkeys(withheld) == set()
+
+
+def batch_ctx(batch: str, redis: FakeRedis):
+    services = build_services(redis=redis_service(redis))
+    mark(redis, "pod-new")
+    return make_context(
+        services=services,
+        state=build_state(rented_data=UNRENTED),
+        ssh=NoSSH(),
+        config=build_context_config(job_batch_id=batch),
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_passing_node_rented_in_consecutive_cycles_still_gets_a_verdict():
+    """DAH-7343 (details on the ticket)."""
+    redis = FakeRedis()
+    first = await RentedMidCycleCheck().run(batch_ctx("2026-11-28 11:00:00", redis))
+    again = await RentedMidCycleCheck().run(batch_ctx("2026-11-28 11:00:00", redis))  # the express lane asks again
+    second = await RentedMidCycleCheck().run(batch_ctx("2026-11-28 11:15:00", redis))
+    third = await RentedMidCycleCheck().run(batch_ctx("2026-11-28 11:30:00", redis))
+
+    assert [first.passed, again.passed, second.passed] == [False, False, False]
+    assert second.event.reason_code == Msg.RENTED_SINCE_CYCLE_START.reason
+    assert third.passed
+    assert json.loads(redis.hashes[RENTAL_CHANGE_STATE_KEY][NODE])["batches"] == [
+        "2026-11-28 11:00:00",
+        "2026-11-28 11:15:00",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_the_pause_and_the_rental_change_rule_share_one_per_node_state():
+    redis = FakeRedis()
+    redis.hashes[RENTAL_CHANGE_STATE_KEY] = {NODE: json.dumps({"batches": ["b1", "b2"], "at": time.time()})}
+    assert (await RentedMidCycleCheck().run(batch_ctx("b3", redis))).passed
+
+    redis.hashes[RENTAL_CHANGE_STATE_KEY].pop(NODE)  # what withhold_rental_change_verdicts does on a real pass
+    assert not (await RentedMidCycleCheck().run(batch_ctx("b4", redis))).passed

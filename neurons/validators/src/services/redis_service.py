@@ -37,6 +37,11 @@ CREATE_STARTED_AT_PREFIX = "create_started_at"
 CREATE_STARTED_AT_TTL_SECONDS = 900
 # set on the pending-pod entry of a renter's create (not a filler's, a probe's or a GPU operation's)
 PENDING_RENTER_CREATE = "renter"
+# one hash for the fleet: "<miner hotkey>:<executor uuid>" -> {"batches": [withheld job_batch_ids], "at": epoch}
+RENTAL_CHANGE_STATE_KEY = "rental_change_withheld"
+# cycles withheld for a rental change since the node last passed (DAH-6564's rule and the mid-cycle create halt): a
+# withheld cycle does not reset the backend's 45 min inactive sweep, so a node gets a verdict before it fires
+MAX_RENTAL_CHANGE_WITHHELD_CYCLES = 2
 GPU_RESET_PENDING_KIND = "gpu_reset"
 # DAH-4663: a renter's own GPU clock lock in progress (a second lock, reset or create is declined meanwhile)
 GPU_CLOCKS_PENDING_KIND = "gpu_clocks"
