@@ -22,6 +22,9 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 REMOTE_OPERATION_DIRECTORY = PurePosixPath("/root/app/storage-operations")
+# cancel markers live on the executor's reserve_data volume: the container's own filesystem does not survive an
+# executor restart, and a marker lost there lets a dispatch that arrives later run the cancelled operation
+CANCEL_MARKER_DIRECTORY = PurePosixPath("/var/lium-reserve/storage-cancels")
 # the executor image's own runner: its presence marks an image that supports storage operations. It is never run; the
 # validator runs its own copy (executor_payload.STORAGE)
 REMOTE_RUNNER_PATH = "/root/app/src/storage_runner.py"
@@ -191,6 +194,11 @@ class StorageOperationLaunchError(RuntimeError):
     pass
 
 
+class StorageOperationCancelled(RuntimeError):
+    """The operation's cancel marker is on the node: it ended, or never started, because it was cancelled. Not a
+    launch error, so a waiting caller never reports FAILED over the CANCELLED the cancel already reported."""
+
+
 @dataclass(frozen=True)
 class StorageOperationFiles:
     spec: PurePosixPath
@@ -200,6 +208,14 @@ class StorageOperationFiles:
     cancel: PurePosixPath
     # the operation's helper container: it, not the files above, outlives an executor restart
     helper: str = ""
+    # where a validator release before CANCEL_MARKER_DIRECTORY writes its marker: during a rolling release its
+    # in-flight cancel must still stop this release's launch
+    legacy_cancel: PurePosixPath | None = None
+
+    def cancel_marker_test(self) -> str:
+        """Shell test that succeeds when either release's cancel marker is on the node."""
+        markers = (self.cancel, self.legacy_cancel) if self.legacy_cancel else (self.cancel,)
+        return " || ".join(f"test -e {shlex.quote(str(marker))}" for marker in markers)
 
     @classmethod
     def for_operation(cls, operation_id: UUID) -> StorageOperationFiles:
@@ -209,8 +225,9 @@ class StorageOperationFiles:
             log=REMOTE_OPERATION_DIRECTORY / f"{stem}.log",
             pid=REMOTE_OPERATION_DIRECTORY / f"{stem}.pid",
             status=REMOTE_OPERATION_DIRECTORY / f"{stem}.status",
-            cancel=REMOTE_OPERATION_DIRECTORY / f"{stem}.cancel",
+            cancel=CANCEL_MARKER_DIRECTORY / f"{stem}.cancel",
             helper=helper_container_name(operation_id),
+            legacy_cancel=REMOTE_OPERATION_DIRECTORY / f"{stem}.cancel",
         )
 
 
@@ -301,6 +318,9 @@ async def start_storage_operation(
             f"install -d -m 0700 {shlex.quote(str(REMOTE_OPERATION_DIRECTORY))}",
             check=True,
         )
+        if await _cancel_marker_present(ssh_client, files):
+            # cancelled before this dispatch reached the node: a cancelled operation never runs
+            return files
         existing_state = await _operation_state(ssh_client, files)
         if existing_state == "STARTING" and await _remote_file_exists(ssh_client, files.spec):
             # A repeated backend dispatch can arrive while the first wrapper is between
@@ -373,15 +393,16 @@ async def start_storage_operation(
         # Bootstrap callers consume the terminal files; detached online jobs
         # remove them themselves after the runner has finished reporting.
         wrapper = (
-            f"rm -f {shlex.quote(str(files.status))} {shlex.quote(str(files.cancel))}; "
+            # a cancel that landed after the checks above leaves its marker: the runner never starts
+            f"rm -f {shlex.quote(str(files.status))}; "
+            f"! {{ {files.cancel_marker_test()}; }} || {{ rm -rf -- \"$D\"; rm -f {shlex.quote(str(files.spec))}; exit 0; }}; "
             f"{runner} & child=$!; "
             f"printf '%s\\n' \"$child\" > {shlex.quote(str(files.pid))}; "
             "trap 'kill -TERM \"$child\" 2>/dev/null || true' TERM INT; "
             'wait "$child"; result=$?; '
             f"printf '%s\\n' \"$result\" > {shlex.quote(str(files.status))}; "
             'rm -rf -- "$D"; '
-            f"rm -f {shlex.quote(str(files.spec))} {shlex.quote(str(files.pid))} "
-            f"{shlex.quote(str(files.cancel))}{terminal_cleanup}"
+            f"rm -f {shlex.quote(str(files.spec))} {shlex.quote(str(files.pid))}{terminal_cleanup}"
         )
         launch_command = (
             f"D={shlex.quote(stage_dir)} nohup /bin/sh -c {shlex.quote(wrapper)} "
@@ -453,6 +474,7 @@ async def wait_for_storage_operation(
                     "storage operation returned an invalid status"
                 ) from error
             if exit_code != 0:
+                await _raise_if_cancelled(ssh_client, files)
                 detail = await _tail_operation_log(ssh_client, files.log, files.helper)
                 await _remove_operation_artifacts(ssh_client, files)
                 raise StorageOperationLaunchError(
@@ -463,6 +485,7 @@ async def wait_for_storage_operation(
         if state == "RUNNING":
             runner_seen = True
         elif state in {"EXITED", "INVALID"} or runner_seen:
+            await _raise_if_cancelled(ssh_client, files)
             detail = await _tail_operation_log(ssh_client, files.log, files.helper)
             await _remove_operation_artifacts(ssh_client, files)
             raise StorageOperationLaunchError(
@@ -471,12 +494,25 @@ async def wait_for_storage_operation(
         else:
             starting_polls += 1
             if starting_polls >= launch_grace_polls:
+                # a launch that found the cancel marker returned without starting anything
+                await _raise_if_cancelled(ssh_client, files)
                 detail = await _tail_operation_log(ssh_client, files.log, files.helper)
                 await _remove_operation_artifacts(ssh_client, files)
                 raise StorageOperationLaunchError(
                     f"storage operation runner did not start: {detail}"
                 )
         await asyncio.sleep(poll_interval_seconds)
+
+
+async def _raise_if_cancelled(ssh_client: asyncssh.SSHClientConnection, files: StorageOperationFiles) -> None:
+    if await _cancel_marker_present(ssh_client, files):
+        await _remove_operation_artifacts(ssh_client, files)
+        raise StorageOperationCancelled("storage operation was cancelled")
+
+
+async def _cancel_marker_present(ssh_client: asyncssh.SSHClientConnection, files: StorageOperationFiles) -> bool:
+    result = await ssh_client.run(files.cancel_marker_test(), check=False)
+    return result.exit_status == 0
 
 
 async def _operation_state(
@@ -556,7 +592,11 @@ async def cancel_storage_operation(
     # Targets are named, never a stored PID (the executor shares the host's PID namespace, so a stale PID
     # could be an unrelated process). SIGTERM to the helper: its storage_runner.py stops restic and reports CANCELLED.
     command = (
-        f"touch {shlex.quote(str(files.cancel))}; "
+        # the marker stays for good (an empty file per cancelled operation; ids are never reused): nothing bounds how
+        # late a dispatch still in flight reaches the node, so no age makes removing it safe
+        # a cancel ahead of the launch may find no directory yet; without its marker the cancel has failed
+        f"m=0; {{ install -d -m 0700 {shlex.quote(str(CANCEL_MARKER_DIRECTORY))} "
+        f"&& touch {shlex.quote(str(files.cancel))}; }} || m=1; "
         f"/usr/bin/docker kill --signal TERM {helper} >/dev/null 2>&1 || true; "
         f'attempt=0; while test "$(/usr/bin/docker inspect -f {{{{.State.Running}}}} {helper} 2>/dev/null)" = true '
         '&& test "$attempt" -lt 120; do sleep 0.25; attempt=$((attempt + 1)); done; '
@@ -570,7 +610,7 @@ async def cancel_storage_operation(
         f"/usr/bin/docker rm -f -- {helper} >/dev/null 2>&1 || true; "
         f'attempt=0; while pgrep -f -- {legacy_runner} >/dev/null && test "$attempt" -lt 40; do '
         "sleep 0.25; attempt=$((attempt + 1)); done; "
-        f"! pgrep -f -- {legacy_runner} >/dev/null"
+        f'! pgrep -f -- {legacy_runner} >/dev/null && test "$m" = 0'
     )
     result = await ssh_client.run(command, check=False)
     if result.exit_status != 0:
@@ -671,7 +711,8 @@ def _remove_operation_artifacts_command(files: StorageOperationFiles) -> str:
         "rm -f "
         + " ".join(
             shlex.quote(str(path))
-            for path in (files.status, files.log, files.pid, files.spec, files.cancel)
+            # never the cancel marker: it is what keeps a later dispatch of a cancelled operation from running it
+            for path in (files.status, files.log, files.pid, files.spec)
         )
         + (
             f"; /usr/bin/docker rm -f -- {shlex.quote(files.helper)} >/dev/null 2>&1 || true"
