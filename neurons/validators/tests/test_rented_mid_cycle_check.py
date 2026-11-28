@@ -225,8 +225,8 @@ def batch_ctx(batch: str, redis: FakeRedis):
 
 @pytest.mark.asyncio
 async def test_renters_creates_in_every_cycle_withhold_at_most_two_cycles_then_the_tests_run():
-    """classydg 441a4bf4, 28 Nov 11:11-11:56Z: a renter's create halted four cycles in a row, no report reached the
-    backend and its 45 min sweep marked the passing node offline at 12:00Z."""
+    """DAH-7343: a renter's create halted four cycles in a row, no report reached the backend and its 45 min sweep
+    marked the passing node offline."""
     redis = FakeRedis()
     first = await RentedMidCycleCheck().run(batch_ctx("2026-11-28 11:00:00", redis))
     again = await RentedMidCycleCheck().run(batch_ctx("2026-11-28 11:00:00", redis))  # the express lane asks again
