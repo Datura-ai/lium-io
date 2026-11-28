@@ -555,9 +555,7 @@ async def cancel_storage_operation(
     # the node's files are the provider's to write: the report goes where this validator's own record says
     spec = await _held_reporter_spec(redis, operation_id)
     helper = shlex.quote(files.helper)
-    legacy_runner = shlex.quote(
-        f"[-]-cancel-file {files.cancel}"
-    )  # "[-]" keeps pgrep from matching this shell
+    legacy_runner = shlex.quote(_runner_pattern(files))
     # Targets are named, never a stored PID (the executor shares the host's PID namespace, so a stale PID
     # could be an unrelated process). SIGTERM to the helper: its storage_runner.py stops restic and reports CANCELLED.
     command = (
@@ -606,13 +604,18 @@ async def _remote_file_exists(
     return result.exit_status == 0
 
 
+def _runner_pattern(files: StorageOperationFiles) -> str:
+    """pgrep -f pattern for this operation's runner: its --cancel-file argument, in whatever directory the release
+    that launched it kept cancel markers (the file name names the operation), so a runner a previous validator
+    release started is still found during a rolling release. "[-]" keeps pgrep from matching its own shell."""
+    return f"[-]-cancel-file [^ ]*/{files.cancel.name.replace('.', '[.]')}( |$)"
+
+
 async def _runner_alive(
     ssh_client: asyncssh.SSHClientConnection,
     files: StorageOperationFiles,
 ) -> bool:
-    # "[-]-cancel-file" keeps pgrep from matching this command's own shell; the cancel path names this operation
-    # for runners launched with a spec file (older validators) and with the spec on stdin alike
-    runner_pattern = f"[-]-cancel-file {files.cancel}"
+    runner_pattern = _runner_pattern(files)
     # an executor before the wrapper helper (a running wrapper helper already reads as RUNNING)
     result = await ssh_client.run(
         f"pgrep -f -- {shlex.quote(runner_pattern)} >/dev/null",

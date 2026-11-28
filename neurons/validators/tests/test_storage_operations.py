@@ -1,4 +1,5 @@
 import json
+import shlex
 import subprocess
 import sys
 import textwrap
@@ -162,15 +163,17 @@ async def test_redispatch_keeps_a_running_helper_and_relaunches_a_finished_one(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("runner_alive", [True, False])
+@pytest.mark.parametrize("runner_directory", ["", "previous-release"])
 async def test_an_older_executor_s_running_helper_is_owned_only_by_a_live_runner(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, runner_alive: bool
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, runner_alive: bool, runner_directory: str
 ) -> None:
     # Runs the real ownership shell: docker lists the running helper; pgrep looks for the runner's command line.
     fake_docker = tmp_path / "docker"
     fake_docker.write_text(f'#!/bin/sh\ncase "$*" in *"name=^{HELPER}$"*) echo abc123;; esac\n')
     fake_docker.chmod(0o755)
     monkeypatch.setattr(storage_operations, "REMOTE_OPERATION_DIRECTORY", tmp_path)
-    runner = _legacy_runner(tmp_path) if runner_alive else None
+    # a runner a previous release launched keeps its cancel marker in that release's directory
+    runner = _legacy_runner(tmp_path / runner_directory) if runner_alive else None
     try:
         files = storage_operations.StorageOperationFiles.for_operation(OPERATION_ID)
         owned = await storage_operations._runner_alive(_local_ssh(fake_docker), files)
@@ -274,7 +277,7 @@ async def test_a_repeated_dispatch_never_starts_a_second_runner(monkeypatch: pyt
     )
     assert files == storage_operations.StorageOperationFiles.for_operation(OPERATION_ID)
     probe = next(c for c in commands if c.startswith("pgrep -f"))
-    assert f"[-]-cancel-file {files.cancel}" in probe
+    assert shlex.quote(storage_operations._runner_pattern(files)) in probe
     # never a second wrapper, the helper stays
     assert not any("docker rm -f" in c or "IFS= read -r S" in c for c in commands)
 
