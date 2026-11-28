@@ -184,7 +184,7 @@ class CapabilityCheck:
                 )
             except Exception as exc:
                 failure_reason = str(exc)
-        allcards = await judge_all_cards(ctx, specs, result, allcards_skip)
+        allcards = await judge_all_cards(ctx, specs, result, allcards_skip, fillers_removed=bool(stop.fillers))
         if allcards is not None and not allcards_enforced():
             # shadow: the verdict is logged, never acted on
             logger.info(_m("All-cards verdict (shadow)", extra=get_extra_info({**ctx.default_extra, **allcards.as_dict()})))
@@ -348,7 +348,12 @@ async def _allcards_skip_reason(ctx: Context) -> str | None:
 
 
 async def judge_all_cards(
-    ctx: Context, specs: dict, result: ValidationResult | None, skip_reason: str | None
+    ctx: Context,
+    specs: dict,
+    result: ValidationResult | None,
+    skip_reason: str | None,
+    *,
+    fillers_removed: bool = False,
 ) -> AllCardsVerdict | None:
     """The all-cards verdict of this cycle, or None on a single-card node or a run that failed before the proof.
 
@@ -377,7 +382,11 @@ async def judge_all_cards(
     if probe.connection_lost:
         reason = "connection_lost"
     else:
-        on_workload, snapshot = await unanswered_cards_on_lium_workload(ctx, specs, probe)
+        # fillers_removed: this cycle stopped Lium's fillers for the full check, so a filler the backend still lists
+        # holds no card (as in the post-rental recheck)
+        on_workload, snapshot = await unanswered_cards_on_lium_workload(
+            ctx, specs, probe, fillers_removed=fillers_removed
+        )
         if not on_workload:
             return await _all_cards_failed(ctx, probe.failure_reason)
         reason = "lium_workload"

@@ -15,6 +15,7 @@ from types import SimpleNamespace
 import asyncssh
 import pytest
 from protocol.vc_protocol.compute_requests import RentedExecutor, RentedExecutorsResponse, RentedPod
+from services.matrix_validation_service import AllCardsProbe, ValidationResult
 from services.task.checks import capability
 from services.task.checks.capability import CapabilityCheck
 from services.task.messages import CapabilityMessages as Msg
@@ -443,6 +444,31 @@ async def test_a_skipped_cycle_still_fails_a_failed_single_card_run(context_fact
 
     assert result.passed is False
     assert result.event.reason_code == Msg.VERIFY_FAILED.reason
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fillers_removed, outcome", [(False, "deferred"), (True, "failed")])
+async def test_a_filler_this_cycle_stopped_holds_no_card_though_the_backend_still_lists_it(
+    context_factory, fillers_removed, outcome
+):
+    """arhangel66 review 6095315017: after the full-check stop the backend can still return the stopped filler's cards;
+    they are free, so card 0's missing answer fails here as it does in the post-rental recheck."""
+    services = build_services(redis=_proven(FakeRedis()))
+    services.backend.get_rented_executors_now.return_value = _filler_on([0])
+    ctx = context_factory(services=services, state=build_state(specs=_spec(8)))
+    probe = AllCardsProbe(
+        passed=False,
+        failure_reason="1/8 card(s) failed device work-proof",
+        elapsed_seconds=1.0,
+        over_wall_clock=False,
+        per_card=[{"card_index": 0, "ok": False, "reason": "timeout"}]
+        + [{"card_index": i, "ok": True} for i in range(1, 8)],
+    )
+    result = ValidationResult(success=False, error_message="All-cards GPU work-proof failed", all_cards=probe)
+
+    verdict = await capability.judge_all_cards(ctx, _spec(8), result, None, fillers_removed=fillers_removed)
+
+    assert verdict.outcome == outcome
 
 
 def test_enforcement_is_off_by_default():
