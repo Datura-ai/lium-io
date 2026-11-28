@@ -224,9 +224,8 @@ def batch_ctx(batch: str, redis: FakeRedis):
 
 
 @pytest.mark.asyncio
-async def test_renters_creates_in_every_cycle_withhold_at_most_two_cycles_then_the_tests_run():
-    """DAH-7343: a renter's create halted four cycles in a row, no report reached the backend and its 45 min sweep
-    marked the passing node offline."""
+async def test_a_passing_node_rented_in_consecutive_cycles_still_gets_a_verdict():
+    """DAH-7343 (details on the ticket)."""
     redis = FakeRedis()
     first = await RentedMidCycleCheck().run(batch_ctx("2026-11-28 11:00:00", redis))
     again = await RentedMidCycleCheck().run(batch_ctx("2026-11-28 11:00:00", redis))  # the express lane asks again
@@ -243,7 +242,7 @@ async def test_renters_creates_in_every_cycle_withhold_at_most_two_cycles_then_t
 
 
 @pytest.mark.asyncio
-async def test_cycles_the_rental_change_rule_withheld_count_toward_the_halt_and_a_pass_clears_them():
+async def test_the_pause_and_the_rental_change_rule_share_one_per_node_state():
     redis = FakeRedis()
     redis.hashes[RENTAL_CHANGE_STATE_KEY] = {NODE: json.dumps({"batches": ["b1", "b2"], "at": time.time()})}
     assert (await RentedMidCycleCheck().run(batch_ctx("b3", redis))).passed
