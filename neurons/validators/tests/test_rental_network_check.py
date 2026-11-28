@@ -30,14 +30,17 @@ ACCEPTED = [
 ]
 
 
-def _ctx(ssh, rented: bool = False):
+NOT_FOUND = "Error response from daemon: network lium-rentals not found"
+
+
+def _ctx(ssh, rented: bool = False, services=None):
     state = build_state(rented_data=_rented_data() if rented else None)
-    return make_context(ssh=ssh, runner=SSHCommandRunner(ssh), state=state)
+    return make_context(ssh=ssh, runner=SSHCommandRunner(ssh), state=state, services=services)
 
 
-def _ssh(exit_status: int, stdout: str):
+def _ssh(exit_status: int, stdout: str, stderr: str = ""):
     ssh = AsyncMock()
-    ssh.run = AsyncMock(return_value=Mock(exit_status=exit_status, stdout=stdout, stderr=""))
+    ssh.run = AsyncMock(return_value=Mock(exit_status=exit_status, stdout=stdout, stderr=stderr))
     return ssh
 
 
@@ -100,20 +103,52 @@ async def test_an_isolated_bridge_passes(network):
 
 
 @pytest.mark.asyncio
-async def test_a_host_without_the_network_passes_the_create_makes_it():
-    result = await RentalNetworkCheck().run(_ctx(_ssh(1, "[]\n")))
+@pytest.mark.parametrize("stderr", [NOT_FOUND, "Error: No such network: lium-rentals"])
+async def test_a_host_without_the_network_passes_the_create_makes_it(stderr):
+    result = await RentalNetworkCheck().run(_ctx(_ssh(1, "[]\n", stderr)))
 
     assert result.passed is True
     assert result.event.reason_code == "RENTAL_NETWORK_OK"
 
 
+UNREAD = [
+    (1, "", ""),
+    (127, "sh: docker: not found\n", ""),
+    (0, "garbage", ""),
+    # a daemon failure prints [] and exits 1 too; only the not-found answer proves absence
+    (1, "[]\n", "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?"),
+]
+
+
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("exit_status", "stdout"), [(1, ""), (127, "sh: docker: not found\n"), (0, "garbage")])
-async def test_an_answer_that_says_nothing_passes(exit_status, stdout):
-    result = await RentalNetworkCheck().run(_ctx(_ssh(exit_status, stdout)))
+@pytest.mark.parametrize(("exit_status", "stdout", "stderr"), UNREAD)
+async def test_an_answer_that_says_nothing_passes(exit_status, stdout, stderr):
+    result = await RentalNetworkCheck().run(_ctx(_ssh(exit_status, stdout, stderr)))
 
     assert result.passed is True
     assert result.event.reason_code == "RENTAL_NETWORK_NOT_READ"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("exit_status", "stdout", "stderr"), UNREAD)
+async def test_a_refused_network_stays_hidden_until_a_read_clears_it(exit_status, stdout, stderr):
+    """Review (lio#2529 at 02a1530): an unreadable cycle published no error and listed a refused node again."""
+    services = build_services()
+    timeout = AsyncMock()
+    timeout.run = AsyncMock(side_effect=asyncio.TimeoutError)
+    steps = [
+        (_inspect(REFUSED[0]), False),
+        (_ssh(exit_status, stdout, stderr), False),
+        (timeout, False),
+        (_inspect(ACCEPTED[0]), True),
+        (_ssh(exit_status, stdout, stderr), True),
+        (_inspect(REFUSED[0]), False),
+        (_ssh(1, "[]\n", NOT_FOUND), True),
+    ]
+
+    seen = [(await RentalNetworkCheck().run(_ctx(ssh, services=services))).passed for ssh, _ in steps]
+
+    assert seen == [listed for _, listed in steps]
 
 
 @pytest.mark.asyncio
