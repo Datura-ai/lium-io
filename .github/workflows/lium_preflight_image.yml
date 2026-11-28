@@ -71,9 +71,10 @@ jobs:
 
       - name: Check the tag lists both platforms
         run: |
-          platforms=$(docker manifest inspect "$IMAGE" | jq -r '[.manifests[]?.platform.architecture] | sort | join(",")')
-          if [ "$platforms" != "amd64,arm64" ]; then
-            echo "::error::$IMAGE lists platforms '$platforms', not amd64,arm64"
+          # os/architecture pairs: an architecture alone would accept a non-Linux manifest
+          platforms=$(docker manifest inspect "$IMAGE" | jq -r '[.manifests[]?.platform | "\(.os)/\(.architecture)"] | sort | join(",")')
+          if [ "$platforms" != "linux/amd64,linux/arm64" ]; then
+            echo "::error::$IMAGE lists platforms '$platforms', not linux/amd64,linux/arm64"
             exit 1
           fi
           echo "published $IMAGE ($platforms)"
