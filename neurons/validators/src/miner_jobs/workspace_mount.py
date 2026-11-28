@@ -1,8 +1,8 @@
-import contextlib
 import json
 import os
 import posixpath
 import subprocess
+import sys
 from dataclasses import dataclass
 
 
@@ -10,18 +10,13 @@ WORKSPACE_PATH = "/workspace"
 LIUM_CIPHER_MOUNT = "/lium-cipher"
 
 
-def load_secrets_file(path: str) -> str:
-    """Read the validator's 0600 credentials file and delete it at once (shared by backup/restore).
+def load_secrets() -> str:
+    """Read the validator's credentials, one JSON line on stdin (shared by backup/restore; never a file on the node).
 
     The S3 keys go to this process's environment so `docker run -e NAME` inherits them without
     a value on any command line; the API auth token is returned.
     """
-    try:
-        with open(path) as secrets_file:
-            secrets = json.load(secrets_file)
-    finally:
-        with contextlib.suppress(FileNotFoundError):
-            os.unlink(path)
+    secrets = json.loads(sys.stdin.readline())
     os.environ["AWS_ACCESS_KEY_ID"] = secrets["aws_access_key_id"]
     os.environ["AWS_SECRET_ACCESS_KEY"] = secrets["aws_secret_access_key"]
     return secrets["auth_token"]

@@ -13012,14 +13012,14 @@ class DockerService:
         local_volume: str,
         local_volume_path: str,
     ) -> None:
-        # the validator's restore job, staged first; its credentials file only then (run_job_with_secrets)
+        # the validator's restore job, staged first; its credentials on stdin (run_job_with_secrets)
         await run_job_with_secrets(
             ssh_client,
             "restore",
             executor_payload.RESTORE_JOB,
             restore.auth_token,
             restore.backup_volume_info,
-            lambda secrets_file: [
+            [
                 "--api-url",
                 settings.COMPUTE_REST_API_URL_EXTERNAL,
                 "--target-volume",
@@ -13028,8 +13028,6 @@ class DockerService:
                 restore.restore_path or local_volume_path,
                 "--backup-source-path",
                 restore.legacy_object_key or "",
-                "--secrets-file",
-                secrets_file,
                 "--restore-log-id",
                 restore.restore_log_id,
                 "--backup-volume-name",

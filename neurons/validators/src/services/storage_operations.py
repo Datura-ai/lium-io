@@ -418,19 +418,25 @@ async def run_job_with_secrets(
     files: tuple[str, ...],
     auth_token: str,
     volume_info,
-    argv: Callable[[str], list[str]],
+    args: list[str],
     log: str | None = None,
     **run_kwargs,
 ) -> None:
-    """Stage a legacy tar job, then hand it its credentials file (upload_secrets_file) and start it: the credentials reach
-    the node only once the job that reads and deletes them is in place. A failed start removes both."""
+    """Stage a legacy tar job, then start it with its credentials on stdin (run_job): they never touch the node's disk.
+    A failed start removes the staged directory."""
     staged = await ssh_client.run(executor_payload.stage_job(purpose, files), check=True)
     stage_dir = executor_payload.staged_directory(purpose, staged.stdout)
+    secrets = json.dumps(
+        {
+            "auth_token": auth_token,
+            "aws_access_key_id": volume_info.iam_user_access_key,
+            "aws_secret_access_key": volume_info.iam_user_secret_key,
+        }
+    )
     try:
-        # inside the job's own private directory: whatever fails (the upload's close, the start, the job), removing that
-        # directory removes the credentials, and the job's shell removes it when it ends
-        secrets_file = await upload_secrets_file(ssh_client, auth_token, volume_info, stage_dir)
-        await ssh_client.run(executor_payload.run_job(stage_dir, files, argv(secrets_file), log=log), check=True, **run_kwargs)
+        await ssh_client.run(
+            executor_payload.run_job(stage_dir, files, args, log=log), check=True, input=secrets + "\n", **run_kwargs
+        )
     except BaseException:
         # a cancellation too: the directory goes now, while the session is still open
         await ssh_client.run(f"rm -rf -- {shlex.quote(stage_dir)}", check=False)
@@ -792,25 +798,3 @@ async def _report_operation_status(
     return False
 
 
-async def upload_secrets_file(
-    ssh_client: asyncssh.SSHClientConnection, auth_token: str, volume_info, directory: str
-) -> str:
-    """Hand the legacy tar backup/restore scripts their credentials as a fresh 0600 file in `directory`, the job's own
-    0700 staging directory (stage_job), so the file goes with it.
-
-    Keeps the values out of the remote command line. The file is created exclusively with mode 0600; the script deletes
-    it on read.
-    """
-    path = f"{directory}/secrets.json"
-    async with ssh_client.start_sftp_client() as sftp:
-        async with sftp.open(path, "x", asyncssh.SFTPAttrs(permissions=0o600)) as remote_file:
-            await remote_file.write(
-                json.dumps(
-                    {
-                        "auth_token": auth_token,
-                        "aws_access_key_id": volume_info.iam_user_access_key,
-                        "aws_secret_access_key": volume_info.iam_user_secret_key,
-                    }
-                )
-            )
-    return path

@@ -1835,11 +1835,10 @@ class MinerService:
             logger.info(_m("Starting the backup job on the executor", extra=get_extra_info({"backup_log_id": payload.backup_log_id})))
             await run_job_with_secrets(
                 ssh_client, "backup", executor_payload.BACKUP_JOB, payload.auth_token, payload.backup_volume_info,
-                lambda secrets_file: [
+                [
                     "--api-url", settings.COMPUTE_REST_API_URL_EXTERNAL,
                     "--source-volume", payload.source_volume,
                     "--backup-path", payload.backup_path,
-                    "--secrets-file", secrets_file,
                     "--backup-log-id", payload.backup_log_id,
                     "--backup-volume-name", payload.backup_volume_info.name,
                     "--source-volume-path", payload.source_volume_path,
@@ -1885,12 +1884,11 @@ class MinerService:
             logger.info(_m("Starting the restore job on the executor", extra=get_extra_info({"restore_log_id": payload.restore_log_id})))
             await run_job_with_secrets(
                 ssh_client, "restore", executor_payload.RESTORE_JOB, payload.auth_token, payload.backup_volume_info,
-                lambda secrets_file: [
+                [
                     "--api-url", settings.COMPUTE_REST_API_URL_EXTERNAL,
                     "--target-volume", payload.target_volume,
                     "--restore-path", payload.restore_path,
                     "--backup-source-path", payload.backup_source_path,
-                    "--secrets-file", secrets_file,
                     "--restore-log-id", payload.restore_log_id,
                     "--backup-volume-name", payload.backup_volume_info.name,
                     "--target-volume-path", payload.target_volume_path,

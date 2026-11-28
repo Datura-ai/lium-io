@@ -1,5 +1,6 @@
 """A validator miner job runs from its own fresh private directory, never importing node-local code."""
 
+import asyncio
 import os
 import subprocess
 import sys
@@ -11,6 +12,8 @@ import pytest
 
 from services import executor_payload, storage_operations
 
+SECRET = '{"auth_token":"tok"}'
+
 
 @pytest.fixture
 def jobs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
@@ -19,6 +22,7 @@ def jobs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     (src / "job.py").write_text(
         "import sys, helper\nprint('helper from', helper.__file__)\nprint('args', sys.argv[1:])\n"
         "print('safe', sys.flags.ignore_environment, sys.flags.no_user_site)\n"
+        "print('stdin', sys.stdin.readline().strip())\n"
     )
     (src / "helper.py").write_text("")
     service = tmp_path / "service"
@@ -31,16 +35,16 @@ def jobs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return service
 
 
-def _sh(command: str, service: Path) -> subprocess.CompletedProcess:
+def _sh(command: str, service: Path, input: str | None = None) -> subprocess.CompletedProcess:
     env = {**os.environ, "PYTHONPATH": str(service)}
-    return subprocess.run(["sh", "-c", command], cwd=service, env=env, capture_output=True, text=True)
+    return subprocess.run(["sh", "-c", command], cwd=service, env=env, capture_output=True, text=True, input=input)
 
 
 def _stage_and_run(purpose: str, args: list[str], service: Path, log: str | None = None) -> subprocess.CompletedProcess:
     files = ("job.py", "helper.py")
     staged = _sh(executor_payload.stage_job(purpose, files), service)
     assert staged.returncode == 0, staged.stderr
-    return _sh(executor_payload.run_job(executor_payload.staged_directory(purpose, staged.stdout), files, args, log=log), service)
+    return _sh(executor_payload.run_job(executor_payload.staged_directory(purpose, staged.stdout), files, args, log=log), service, SECRET + "\n")
 
 
 def test_a_foreground_job_imports_only_its_staged_helper_and_leaves_nothing(jobs: Path) -> None:
@@ -48,7 +52,7 @@ def test_a_foreground_job_imports_only_its_staged_helper_and_leaves_nothing(jobs
     assert done.returncode == 0, done.stderr
     lines = done.stdout.splitlines()
     assert lines[0].startswith("helper from " + executor_payload.service_dir_glob("backup", str(jobs)))
-    assert lines[1:] == ["args ['--x', 'a b']", "safe 1 1"]
+    assert lines[1:] == ["args ['--x', 'a b']", "safe 1 1", f"stdin {SECRET}"]
     assert sorted(p.name for p in jobs.iterdir()) == ["helper.py"]   # the staged directory is gone
 
 
@@ -61,6 +65,7 @@ def test_a_detached_job_logs_and_its_worker_removes_the_directory(jobs: Path, tm
         time.sleep(0.1)
     text = log.read_text()
     assert "helper from " + executor_payload.service_dir_glob("restore", str(jobs)) in text and "safe 1 1" in text
+    assert f"stdin {SECRET}" in text   # the credentials reached the detached job through the pipe, not a file
     assert sorted(p.name for p in jobs.iterdir()) == ["helper.py"]
 
 
@@ -71,104 +76,63 @@ def test_a_failed_staging_leaves_no_partial_directory(jobs: Path) -> None:
     assert sorted(p.name for p in jobs.iterdir()) == ["helper.py"]
 
 
-@pytest.mark.parametrize("fails", ["staging", "start"])
-def test_the_credentials_file_never_outlives_a_job_that_did_not_start(
-    jobs: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fails: str
-) -> None:
-    # the job reads and deletes its credentials file: the file is uploaded only once the job is staged, and a failed
-    # start removes it with the staged directory
-    import asyncio
+def _volume() -> SimpleNamespace:
+    return SimpleNamespace(iam_user_access_key="ak-value", iam_user_secret_key="sk-value")
 
-    uploaded: list[str] = []
 
-    async def upload(ssh_client, auth_token, volume_info, directory):
-        # into the job's own staged directory (the real upload_secrets_file's place)
-        path = Path(directory) / "secrets.json"
-        path.write_text("{}")
-        uploaded.append(str(path))
-        return str(path)
+def _no_secret_on_disk(root: Path) -> bool:
+    return not any(b"sk-value" in p.read_bytes() for p in root.rglob("*") if p.is_file())
 
-    monkeypatch.setattr(storage_operations, "upload_secrets_file", upload)
-    async def run(command: str, check: bool = False, **_) -> SimpleNamespace:
-        if fails == "start" and "nohup" in command:
-            raise RuntimeError("the start failed")
+
+def _runner(jobs: Path, starts: list[str], fails: str = ""):
+    async def run(command: str, check: bool = False, input: str | None = None, **_) -> SimpleNamespace:
+        if input is not None:
+            starts.append(command)
+            if fails == "cancel":
+                raise asyncio.CancelledError
+            if fails == "start":
+                raise RuntimeError("the start failed")
         if fails == "staging" and "mktemp" in command:
             command = command.replace("base64 -d >", "false >", 1)   # the node fails a write after mktemp
-        done = _sh(command, jobs)
+        done = _sh(command, jobs, input)
         if check and done.returncode:
             raise RuntimeError(f"exit {done.returncode}")
         return SimpleNamespace(exit_status=done.returncode, stdout=done.stdout, stderr=done.stderr)
 
-    with pytest.raises(RuntimeError):
-        asyncio.run(storage_operations.run_job_with_secrets(
-            SimpleNamespace(run=run), "backup", ("job.py", "helper.py"), "token", None,
-            lambda secrets_file: ["--secrets-file", secrets_file], log=str(tmp_path / "job.log"),
-        ))
-    assert len(uploaded) == (0 if fails == "staging" else 1)
-    assert not any(Path(path).exists() for path in uploaded)
-    assert sorted(p.name for p in jobs.iterdir()) == ["helper.py"]
+    return run
 
 
-def test_the_credentials_file_never_outlives_a_detached_job_whose_log_cannot_be_opened(
-    jobs: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # the log is opened before detaching: a job that could not open it would never start the shell removing the directory
-    import asyncio
-
-    uploaded: list[str] = []
-
-    async def upload(ssh_client, auth_token, volume_info, directory):
-        path = Path(directory) / "secrets.json"
-        path.write_text("{}")
-        uploaded.append(str(path))
-        return str(path)
-
-    monkeypatch.setattr(storage_operations, "upload_secrets_file", upload)
-
-    async def run(command: str, check: bool = False, **_) -> SimpleNamespace:
-        done = _sh(command, jobs)
-        if check and done.returncode:
-            raise RuntimeError(f"exit {done.returncode}")
-        return SimpleNamespace(exit_status=done.returncode, stdout=done.stdout, stderr=done.stderr)
-
+def test_a_detached_job_gets_its_credentials_on_stdin_and_none_touch_the_disk(jobs: Path, tmp_path: Path) -> None:
+    starts: list[str] = []
     log = tmp_path / "job.log"
-    log.mkdir()
-    with pytest.raises(RuntimeError):
-        asyncio.run(storage_operations.run_job_with_secrets(
-            SimpleNamespace(run=run), "backup", ("job.py", "helper.py"), "token", None,
-            lambda secrets_file: ["--secrets-file", secrets_file], log=str(log),
-        ))
-    assert len(uploaded) == 1 and not Path(uploaded[0]).exists()
+    asyncio.run(storage_operations.run_job_with_secrets(
+        SimpleNamespace(run=_runner(jobs, starts)), "backup", ("job.py", "helper.py"), "token", _volume(), ["--z"],
+        log=str(log),
+    ))
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline and (
+        len(list(jobs.iterdir())) > 1 or "stdin" not in (log.read_text() if log.exists() else "")
+    ):
+        time.sleep(0.1)
+    assert '"aws_secret_access_key": "sk-value"' in log.read_text()   # the job printed what it read on stdin
+    assert len(starts) == 1 and "sk-value" not in starts[0]
     assert sorted(p.name for p in jobs.iterdir()) == ["helper.py"]
+    assert _no_secret_on_disk(jobs)
 
 
-def test_a_job_cancelled_after_its_credentials_were_written_leaves_none_behind(
-    jobs: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("fails", ["staging", "start", "log", "cancel"])
+def test_a_job_that_did_not_start_leaves_no_directory_and_no_credentials(
+    jobs: Path, tmp_path: Path, fails: str
 ) -> None:
-    import asyncio
-
-    uploaded: list[str] = []
-    started: list[str] = []
-
-    async def upload(ssh_client, auth_token, volume_info, directory):
-        # written whole, then cancelled while the upload closes, before the job starts
-        path = Path(directory) / "secrets.json"
-        path.write_text("{}")
-        uploaded.append(str(path))
-        raise asyncio.CancelledError
-
-    monkeypatch.setattr(storage_operations, "upload_secrets_file", upload)
-
-    async def run(command: str, check: bool = False, **_) -> SimpleNamespace:
-        if "nohup" in command:
-            started.append(command)
-        done = _sh(command, jobs)
-        return SimpleNamespace(exit_status=done.returncode, stdout=done.stdout, stderr=done.stderr)
-
-    with pytest.raises(asyncio.CancelledError):
+    starts: list[str] = []
+    log = tmp_path / "job.log"
+    if fails == "log":
+        log.mkdir()   # the log is opened before detaching; a job that cannot open it must not leave its directory
+    with pytest.raises((RuntimeError, asyncio.CancelledError)):
         asyncio.run(storage_operations.run_job_with_secrets(
-            SimpleNamespace(run=run), "backup", ("job.py", "helper.py"), "token", None,
-            lambda secrets_file: ["--secrets-file", secrets_file], log=str(tmp_path / "job.log"),
+            SimpleNamespace(run=_runner(jobs, starts, fails)), "backup", ("job.py", "helper.py"), "token", _volume(),
+            ["--z"], log=str(log),
         ))
-    assert len(uploaded) == 1 and not Path(uploaded[0]).exists() and started == []
+    assert len(starts) == (0 if fails == "staging" else 1)
     assert sorted(p.name for p in jobs.iterdir()) == ["helper.py"]
+    assert _no_secret_on_disk(jobs)

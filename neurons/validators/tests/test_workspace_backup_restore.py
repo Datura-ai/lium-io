@@ -1,4 +1,5 @@
 import json
+import io
 import os
 import sys
 from pathlib import Path
@@ -162,37 +163,6 @@ def test_detect_volume_access_raises_when_gocryptfs_conf_present(monkeypatch):
         detect_volume_access("source-volume", "/root")
 
 
-class _FakeRemoteFile:
-    def __init__(self, files, path):
-        self.files, self.path = files, path
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, exc_type, exc, tb):
-        return None
-
-    async def write(self, data):
-        self.files[self.path] = data
-
-
-class _FakeSftpContext:
-    def __init__(self):
-        self.put = AsyncMock()
-        self.files: dict[str, str] = {}
-        self.opens: list[tuple] = []
-
-    def open(self, path, mode, attrs=None):
-        self.opens.append((path, mode, attrs))
-        return _FakeRemoteFile(self.files, path)
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, exc_type, exc, tb):
-        return None
-
-
 class _FakeSshContext:
     def __init__(self, ssh_client):
         self.ssh_client = ssh_client
@@ -230,14 +200,15 @@ def _docker_service_with_pinned_hosts() -> Mock:
     return docker_service
 
 
-def _assert_secrets_only_in_the_0600_file(ssh_client, sftp_context) -> None:
+def _assert_secrets_only_on_stdin(ssh_client) -> None:
+    # no credentials file on the node: no SFTP at all, and the values only in the start command's stdin
     commands = " ".join(str(call.args[0]) for call in ssh_client.run.await_args_list)
     for value in (ACCESS_KEY, SECRET_KEY, AUTH_TOKEN):
         assert value not in commands
-    ((path, mode, attrs),) = sftp_context.opens
-    assert mode == "x" and attrs.permissions == 0o600
-    assert f"--secrets-file {path}" in commands
-    assert json.loads(sftp_context.files[path]) == {
+    ssh_client.start_sftp_client.assert_not_called()
+    (start,) = [call for call in ssh_client.run.await_args_list if "input" in call.kwargs]
+    assert "secrets" not in start.args[0]
+    assert json.loads(start.kwargs["input"]) == {
         "auth_token": AUTH_TOKEN,
         "aws_access_key_id": ACCESS_KEY,
         "aws_secret_access_key": SECRET_KEY,
@@ -312,8 +283,7 @@ async def test_legacy_bootstrap_restore_keeps_secrets_off_the_command_line():
     ssh_client = AsyncMock()
     # the staging command prints the job's fresh directory
     ssh_client.run.return_value = SimpleNamespace(stdout=executor_payload.service_dir_glob("restore") + "AbCd1234")
-    sftp_context = _FakeSftpContext()
-    ssh_client.start_sftp_client = Mock(return_value=sftp_context)
+    ssh_client.start_sftp_client = Mock()
     payload = _restore_payload()
     restore = SimpleNamespace(
         restore_path="/root/test",
@@ -331,7 +301,7 @@ async def test_legacy_bootstrap_restore_keeps_secrets_off_the_command_line():
         local_volume_path="/root",
     )
 
-    _assert_secrets_only_in_the_0600_file(ssh_client, sftp_context)
+    _assert_secrets_only_on_stdin(ssh_client)
 
 
 def test_scripts_pass_s3_keys_to_docker_by_name_only():
@@ -342,17 +312,14 @@ def test_scripts_pass_s3_keys_to_docker_by_name_only():
         assert not any(item.startswith(("AWS_SECRET_ACCESS_KEY=", "AWS_ACCESS_KEY_ID=")) for item in command)
 
 
-def test_load_secrets_file_exports_keys_and_deletes_the_file(tmp_path, monkeypatch):
+def test_load_secrets_reads_one_stdin_line_and_exports_the_keys(monkeypatch):
     monkeypatch.delenv("AWS_ACCESS_KEY_ID", raising=False)
     monkeypatch.delenv("AWS_SECRET_ACCESS_KEY", raising=False)
-    path = tmp_path / "secrets.json"
-    path.write_text(
-        json.dumps({"auth_token": AUTH_TOKEN, "aws_access_key_id": ACCESS_KEY, "aws_secret_access_key": SECRET_KEY})
-    )
+    line = json.dumps({"auth_token": AUTH_TOKEN, "aws_access_key_id": ACCESS_KEY, "aws_secret_access_key": SECRET_KEY})
+    monkeypatch.setattr(sys, "stdin", io.StringIO(line + "\n"))
 
-    assert workspace_mount_module.load_secrets_file(str(path)) == AUTH_TOKEN
+    assert workspace_mount_module.load_secrets() == AUTH_TOKEN
 
-    assert not path.exists()
     assert os.environ["AWS_ACCESS_KEY_ID"] == ACCESS_KEY
     assert os.environ["AWS_SECRET_ACCESS_KEY"] == SECRET_KEY
 
