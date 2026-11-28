@@ -508,3 +508,27 @@ async def test_a_node_written_deadline_marker_never_turns_a_failing_check_into_a
 
     assert result.passed is False
     assert result.event.reason_code not in NO_TASK_TIME_REASONS
+
+
+def test_the_python_watchdog_never_imports_a_look_alike_module_from_its_working_dir(tmp_path, monkeypatch):
+    """A `-c` program has its working dir first on sys.path: the watchdog runs isolated (-I), so a `subprocess.py`
+    placed in the run's dir is never imported in place of the standard library's."""
+    import re
+    import subprocess
+    import sys
+    from types import SimpleNamespace
+
+    from neurons.validators.src.services.verifyx_validation_service import VerifyXValidationService
+
+    _trusted_payload(monkeypatch, tmp_path)
+    service = VerifyXValidationService.__new__(VerifyXValidationService)
+    executor = SimpleNamespace(python_path="/reported/python", root_dir="/reported/root")
+    command = service._verifyx_command(executor, SimpleNamespace(seed=1, cipher_text="x"), "lib", ".verifyx-t", True, 30)
+    flags, program = re.search(r" (-\S+(?: -\S+)*) -c ('(?:[^']|'\\'')*') 30 ", command).groups()
+    (tmp_path / "subprocess.py").write_text("open('imported', 'w').write('x')\nraise SystemExit(99)\n")
+    watchdog = subprocess.run(
+        ["sh", "-c", f"{sys.executable} {flags} -c {program} 30 {sys.executable} -c 'print(1)'"],
+        cwd=tmp_path, capture_output=True, text=True, timeout=30,
+    )
+    assert (watchdog.returncode, watchdog.stdout.strip()) == (0, "1"), watchdog.stderr
+    assert not (tmp_path / "imported").exists()

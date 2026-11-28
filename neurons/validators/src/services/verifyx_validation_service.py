@@ -706,11 +706,12 @@ class VerifyXValidationService:
             # DAH-5933 review F-29/F-32: the bounded first sample runs under the executor's own Python watchdog, the
             # backstop that stops it after the validator's own cut if that cut's kill never landed. Its marker,
             # written right before its kill, is a diagnostic in the stderr tail only: nothing decides on it.
-            # the watchdog runs under the validator's interpreter, never the executor's reported python_path (DAH-6681)
+            # the watchdog runs under the validator's interpreter, never the executor's reported python_path (DAH-6681).
+            # -I: a `-c` program puts its working dir first on sys.path, so a look-alike stdlib module there would run
             start = (
                 f"mkdir {d} && cd {d} || exit 1; "
                 f"{install}; "
-                f"{shlex.quote(executor_payload.EXECUTOR_PYTHON)} -E -s -c {shlex.quote(_PYTHON_WATCHDOG)} "
+                f"{shlex.quote(executor_payload.EXECUTOR_PYTHON)} -I -c {shlex.quote(_PYTHON_WATCHDOG)} "
                 f"{int(seconds)} {command} & "
             )
         else:
