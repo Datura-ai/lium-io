@@ -741,6 +741,9 @@ async def _skip_reason(ctx: Context, standing: _Failure | None = None) -> tuple[
         # whose sync stalls; the probe's create would wait in that same sync and fail the filler node at
         # container_start. Bounded by the port check's own deferral streak, which ends in a real check.
         return "port check deferred for disk pressure", {}
+    if not ctx.state.rental_network_usable:
+        # RentalNetworkCheck already hid the node: the create would refuse this lium-rentals network
+        return "lium-rentals network not usable for a rental", {}
     seconds_left = task_seconds_left(ctx)
     if seconds_left < (_MIN_TASK_SECONDS_LEFT_STANDING if standing else _MIN_TASK_SECONDS_LEFT):
         return "too little cycle time left", {"task_seconds_left": int(seconds_left)}

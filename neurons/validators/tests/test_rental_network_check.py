@@ -8,12 +8,14 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 from services.rental_docker_sdk import RentalDockerOperationError, _require_icc_off
-from services.task.availability import AvailabilityErrorCode
+from services.task.availability import AvailabilityErrorCode, run_availability_errors
 from services.task.checks.rental_network import RentalNetworkCheck
+from services.task.checks.score import ScoreCheck
+from services.task.pipeline import LoggerSink, Pipeline
 from services.task.pipeline_factory import PipelineFactory
 from services.task.runner import SSHCommandRunner
 
-from tests.helpers import build_state, make_context
+from tests.helpers import build_services, build_state, make_context
 from tests.test_sysbox_required_check import _rented_data
 
 ICC = "com.docker.network.bridge.enable_icc"
@@ -49,9 +51,10 @@ async def test_an_unrented_node_with_a_refused_network_is_hidden(network):
     result = await RentalNetworkCheck().run(_ctx(_inspect(network)))
 
     assert result.passed is False
-    assert result.fatal is True
+    assert result.fatal is None and RentalNetworkCheck.fatal is False
     assert result.event.reason_code == AvailabilityErrorCode.RENTAL_NETWORK_UNUSABLE
     assert result.event.is_availability_error
+    assert result.updates["state"].rental_network_usable is False
 
 
 @pytest.mark.asyncio
@@ -59,7 +62,32 @@ async def test_a_rented_node_is_hidden_and_its_rental_runs_on():
     result = await RentalNetworkCheck().run(_ctx(_inspect(REFUSED[0]), rented=True))
 
     assert result.passed is False
-    assert result.fatal is False
+    assert result.fatal is None and RentalNetworkCheck.fatal is False
+
+
+class _Log:
+    def info(self, *a, **k): ...
+    warning = error = debug = info
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("rented", [False, True])
+async def test_a_refused_network_hides_the_node_and_keeps_its_score(rented):
+    """Review (lio#2529 at 02a1530): a fatal stop before ScoreCheck left an idle node at score 0 as well as hidden."""
+
+    async def run(network):
+        ssh = _inspect(network)
+        state = build_state(rented_data=_rented_data() if rented else None)
+        services = build_services(score_calculator=lambda ctx, is_rented: (0.7, 0.4, ""))
+        ctx = make_context(ssh=ssh, runner=SSHCommandRunner(ssh), state=state, services=services, rented=rented)
+        ok, events, end = await Pipeline([RentalNetworkCheck(), ScoreCheck()], sink=LoggerSink(_Log())).run(ctx)
+        return ok, run_availability_errors(ok, events), (end.score, end.job_score)
+
+    accepted, refused = await run(ACCEPTED[0]), await run(REFUSED[0])
+
+    assert accepted[2] == refused[2] == (0.7, 0.4)
+    assert accepted[1] == []
+    assert [e["reason_code"] for e in refused[1]] == [AvailabilityErrorCode.RENTAL_NETWORK_UNUSABLE]
 
 
 @pytest.mark.asyncio

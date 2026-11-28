@@ -7,13 +7,15 @@ next clean cycle. This inspects the same network and judges it with the create's
 
 A host without the network passes: the create makes it with the right options. Only an answer the host gave decides:
 a read that timed out or failed for another reason passes, and the create's own inspect still refuses that rental.
-Like HostPidMaxCheck, a failure is an availability error: the node is hidden and new rentals on it are refused, while
-a rental already on it runs on (not fatal there, score unchanged).
+A failure is an availability error, never fatal: the node is hidden and new rentals on it are refused, while the
+cycle runs on to ScoreCheck, so the node keeps its score and a rental already on it runs on. The rental probe reads
+`rental_network_usable` and skips its create, which the create would refuse on this network.
 """
 
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 
 from services.rental_docker_sdk import RENTAL_NETWORK_NAME, rental_network_isolated
 
@@ -21,7 +23,6 @@ from ..availability import ReachSource, ReachTarget
 from ..messages import RentalNetworkMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
-from .banned_provider import has_live_rental
 
 READ_TIMEOUT_SECONDS = 15
 INSPECT_COMMAND = f"/usr/bin/docker network inspect {RENTAL_NETWORK_NAME}"
@@ -44,7 +45,7 @@ def inspected_network(exit_code: int, stdout: str) -> tuple[dict | None, bool]:
 class RentalNetworkCheck:
     check_id = "executor.validate.rental_network"
     replays_after_session_drop = True
-    fatal = True
+    fatal = False
 
     async def run(self, ctx: Context) -> CheckResult:
         what: dict = {"executor_uuid": ctx.executor.uuid}
@@ -69,4 +70,4 @@ class RentalNetworkCheck:
             }
         )
         event = render_message(Msg.UNUSABLE, ctx=ctx, check_id=self.check_id, what=what)
-        return CheckResult(passed=False, event=event, fatal=not has_live_rental(ctx))
+        return CheckResult(passed=False, event=event, updates={"state": replace(ctx.state, rental_network_usable=False)})

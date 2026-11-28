@@ -231,6 +231,8 @@ class ContextState:
     # DAH-5244: this cycle's verified ports and sysbox were republished from the last completed check's memory,
     # not measured; a consumer that keeps "last good ports" must not store them as fresh.
     port_check_deferred: bool = False
+    # False once RentalNetworkCheck reads a lium-rentals network the create refuses; the rental probe then skips its create
+    rental_network_usable: bool = True
     # VerifyXCheck skipped its run for a standing rental-probe failure; RentalProbeCheck then never passes the cycle
     verifyx_skipped_for_standing_probe_failure: bool = False
     # CapabilityCheck skipped the enforced all-cards work proof for a standing rental-probe failure; RentalProbeCheck

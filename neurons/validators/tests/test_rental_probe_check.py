@@ -311,6 +311,7 @@ def make_probe_context(
     rented_now=None,
     first_pass: bool = False,
     port_check_deferred: bool = False,
+    rental_network_usable: bool = True,
 ):
     docker = docker or FakeDocker()
     redis = redis or FakeRedis()
@@ -342,6 +343,7 @@ def make_probe_context(
         verified_port_pairs=list(port_pairs),
         rented_data=rented if rented is not None else rented_data(),
         port_check_deferred=port_check_deferred,
+        rental_network_usable=rental_network_usable,
     )
     ctx = make_context(
         services=services,
@@ -1868,6 +1870,19 @@ async def test_a_cycle_whose_port_check_was_deferred_for_disk_pressure_rents_not
 
     assert result.passed and result.event.reason_code == Msg.SKIPPED.reason
     assert result.event.what_we_saw["reason"] == "port check deferred for disk pressure"
+    assert docker.create_calls == [] and not redis.stamped()
+
+
+@pytest.mark.asyncio
+async def test_a_node_whose_lium_rentals_network_the_create_refuses_rents_nothing():
+    """RentalNetworkCheck hid the node and the cycle runs on to scoring: the probe's create would be refused."""
+    fillers = rented_data(fillers=1)
+    ctx, docker, redis = make_probe_context(rented=fillers, rented_now=fillers, rental_network_usable=False)
+    with probe_settings(), renter_path():
+        result = await RentalProbeCheck().run(ctx)
+
+    assert result.passed and result.event.reason_code == Msg.SKIPPED.reason
+    assert result.event.what_we_saw["reason"] == "lium-rentals network not usable for a rental"
     assert docker.create_calls == [] and not redis.stamped()
 
 
