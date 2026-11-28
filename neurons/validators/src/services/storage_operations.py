@@ -208,6 +208,14 @@ class StorageOperationFiles:
     cancel: PurePosixPath
     # the operation's helper container: it, not the files above, outlives an executor restart
     helper: str = ""
+    # where a validator release before CANCEL_MARKER_DIRECTORY writes its marker: during a rolling release its
+    # in-flight cancel must still stop this release's launch
+    legacy_cancel: PurePosixPath | None = None
+
+    def cancel_marker_test(self) -> str:
+        """Shell test that succeeds when either release's cancel marker is on the node."""
+        markers = (self.cancel, self.legacy_cancel) if self.legacy_cancel else (self.cancel,)
+        return " || ".join(f"test -e {shlex.quote(str(marker))}" for marker in markers)
 
     @classmethod
     def for_operation(cls, operation_id: UUID) -> StorageOperationFiles:
@@ -219,6 +227,7 @@ class StorageOperationFiles:
             status=REMOTE_OPERATION_DIRECTORY / f"{stem}.status",
             cancel=CANCEL_MARKER_DIRECTORY / f"{stem}.cancel",
             helper=helper_container_name(operation_id),
+            legacy_cancel=REMOTE_OPERATION_DIRECTORY / f"{stem}.cancel",
         )
 
 
@@ -309,7 +318,7 @@ async def start_storage_operation(
             f"install -d -m 0700 {shlex.quote(str(REMOTE_OPERATION_DIRECTORY))}",
             check=True,
         )
-        if await _remote_file_exists(ssh_client, files.cancel):
+        if await _cancel_marker_present(ssh_client, files):
             # cancelled before this dispatch reached the node: a cancelled operation never runs
             return files
         existing_state = await _operation_state(ssh_client, files)
@@ -386,7 +395,7 @@ async def start_storage_operation(
         wrapper = (
             # a cancel that landed after the checks above leaves its marker: the runner never starts
             f"rm -f {shlex.quote(str(files.status))}; "
-            f"test ! -e {shlex.quote(str(files.cancel))} || {{ rm -rf -- \"$D\"; rm -f {shlex.quote(str(files.spec))}; exit 0; }}; "
+            f"! {{ {files.cancel_marker_test()}; }} || {{ rm -rf -- \"$D\"; rm -f {shlex.quote(str(files.spec))}; exit 0; }}; "
             f"{runner} & child=$!; "
             f"printf '%s\\n' \"$child\" > {shlex.quote(str(files.pid))}; "
             "trap 'kill -TERM \"$child\" 2>/dev/null || true' TERM INT; "
@@ -496,9 +505,14 @@ async def wait_for_storage_operation(
 
 
 async def _raise_if_cancelled(ssh_client: asyncssh.SSHClientConnection, files: StorageOperationFiles) -> None:
-    if await _remote_file_exists(ssh_client, files.cancel):
+    if await _cancel_marker_present(ssh_client, files):
         await _remove_operation_artifacts(ssh_client, files)
         raise StorageOperationCancelled("storage operation was cancelled")
+
+
+async def _cancel_marker_present(ssh_client: asyncssh.SSHClientConnection, files: StorageOperationFiles) -> bool:
+    result = await ssh_client.run(files.cancel_marker_test(), check=False)
+    return result.exit_status == 0
 
 
 async def _operation_state(

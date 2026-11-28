@@ -642,6 +642,38 @@ def test_a_cancelled_operation_never_runs(node: Path, monkeypatch: pytest.Monkey
     assert Path(str(files.cancel)).exists()  # the marker stays for any later dispatch of the operation
 
 
+@pytest.mark.parametrize("marker_lands", ["before_launch", "before_the_wrapper_starts"])
+def test_an_earlier_releases_in_flight_cancel_stops_the_launch(
+    node: Path, monkeypatch: pytest.MonkeyPatch, marker_lands: str
+) -> None:
+    """During a rolling validator release the earlier release cancels by its marker in the operation directory and
+    is still stopping the operation when this release's dispatch reaches the node: the runner never starts."""
+    import asyncio as aio
+
+    ran = node / "ran"
+    _runner(node, f"open({str(ran)!r}, 'w').close()\n")
+    files = storage_operations.StorageOperationFiles.for_operation(OPERATION_ID)
+    legacy = node / f"{OPERATION_ID}.cancel"  # the earlier release's marker, in the operation directory
+
+    async def run(command: str, check: bool = False, input: str | None = None) -> SimpleNamespace:
+        if "nohup" in command and marker_lands == "before_the_wrapper_starts":
+            legacy.touch()
+        return await _run_locally(command, check, input)
+
+    if marker_lands == "before_launch":
+        legacy.touch()
+    aio.run(
+        storage_operations.start_storage_operation(
+            _node_client(run), sys.executable, OPERATION_ID, {"engine": "restic"}, retain_terminal_artifacts=False
+        )
+    )
+    for staged in (node / "service").iterdir():
+        _wait_for(staged, gone=True)
+
+    assert not ran.exists()
+    assert not Path(str(files.spec)).exists()
+
+
 def test_a_cancel_survives_an_executor_restart_before_a_late_dispatch(node: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """An executor restart wipes the container's own files, the operation directory with them. A cancel that
     finished before it still keeps a dispatch reaching the node afterwards from running the operation."""
