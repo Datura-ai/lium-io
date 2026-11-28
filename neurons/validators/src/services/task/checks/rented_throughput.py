@@ -101,7 +101,8 @@ _UNSAVED: dict[str, _State] = {}
 # init's (/proc/1/net/dev), read only when /proc/1 is the host's; else no rx/tx and a slow network side is inconclusive.
 # The devices under the docker root (the probe's writable layer) are host_disk.DOCKER_ROOT_DEVICES. Then bytes
 # received and sent on the physical NICs and sectors
-# moved (and requests completed) per whole disk (/proc/diskstats is not namespaced), twice BUSY_WINDOW_SECONDS apart
+# moved (and requests completed) per docker-root device in $dv, a loop or dm device included (/proc/diskstats is
+# not namespaced; a list of whole-disk names left a loop-image docker root unmeasured), twice BUSY_WINDOW_SECONDS apart
 # before the probe, then again after the disk container and after the fetch container (throughput_command).
 _COUNTER_SNAPSHOTS = (
     # Only physical NICs (a sysfs `device` link) are counted: disjoint, so a bond, bridge, VLAN or OVS port can neither
@@ -143,7 +144,7 @@ _COUNTER_SNAPSHOTS = (
     'np=split(ph, q, " "); for (i=1; i<=np; i++) phy[q[i]]=1} '
     "NR>2 && (np ? ($1 in phy) : keep($1) && !(($1 in mst) && keep(mst[$1]))){r+=$2; t+=$10; k++} "
     'END{if (k) printf "rx=%.0f tx=%.0f", r, t}\') '
-    "io=$(awk '$3~/^(sd[a-z]+|nvme[0-9]+n[0-9]+|vd[a-z]+|xvd[a-z]+|md[0-9]+)$/{printf \"%s:%.0f:%.0f,\", $3, $6+$10, $4+$8}' "
+    "io=$(awk -v ds=\" $(echo $dv) \" 'index(ds, \" \"$3\" \"){printf \"%s:%.0f:%.0f,\", $3, $6+$10, $4+$8}' "
     '/proc/diskstats) pod=$(pods)"; }; '
     f"snap; sleep {BUSY_WINDOW_SECONDS}; snap; "
 )

@@ -816,6 +816,25 @@ def test_pod_counters_come_from_the_pods_netns_and_cgroup(tmp_path):
     assert out.splitlines()[-1] == "1/4242:1000:60:300:7:1:,2/4343:1000:60::::,", out
 
 
+# F-1998: a docker root on a loop image resolves to the loop device alone (sysfs links no backing disk); the busy
+# snapshot read only sd/nvme/vd/xvd/md names, so it had no counters there and the disk was never measured
+@pytest.mark.parametrize("dv", ["loop4", "dm-0 nvme0n1"])
+def test_busy_snapshot_reads_the_resolved_docker_root_devices(tmp_path, dv):
+    first, second = tmp_path / "ds", tmp_path / "ds2"
+    line = " 7 4 loop4 10 0 {} 0 10 0 {} 0 0 {} 0\n 252 0 dm-0 1 0 {} 0 1 0 {} 0 0 {} 0\n 259 0 nvme0n1 1 0 7 0 1 0 7 0 0 5 0\n"
+    first.write_text(line.format(500, 500, 100, 500, 500, 100))
+    second.write_text(line.format(500, 500 + 2_000_000, 900, 500, 500 + 2_000_000, 900))
+    script = (
+        module._COUNTER_SNAPSHOTS.replace("/proc/diskstats", str(first))
+        .replace("[ /proc/1/root/ -ef / ] ||", "")
+        .replace(f"sleep {module.BUSY_WINDOW_SECONDS}; ", f"cp {second} {first}; ")
+    )
+    out = subprocess.run(["sh", "-c", f'dv="{dv}"; {script}'], capture_output=True, text=True, timeout=30).stdout
+    devices = "".join(f"lium_tp_device name={d}\n" for d in dv.split())
+    # 2,000,000 sectors in the snapshots' own window: an idle nvme0n1 next to it never stands in for the busy device
+    assert parse_busy(devices + out)[1] is not None and parse_busy(devices + out)[1] > 0, out
+
+
 # own(): a process is the container's when it descends from the init; a host process attached to the cgroup is not,
 # even in the init's PID namespace (pid 1 shares this test's namespace). This shell plays the container init.
 def test_provenance_tells_the_containers_processes_from_a_host_helper(tmp_path):
