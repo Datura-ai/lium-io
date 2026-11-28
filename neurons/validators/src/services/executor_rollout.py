@@ -33,6 +33,8 @@ from protocol.vc_protocol.compute_requests import RentedExecutor, RentedExecutor
 from services.executor_image_policy import normalize_sha256_digest
 from services.redis_service import (
     LAST_SCORED_RESULT_TTL_SECONDS,
+    MAX_RENTAL_CHANGE_WITHHELD_CYCLES,
+    RENTAL_CHANGE_STATE_KEY,
     RedisService,
     RedisWrites,
     last_scored_result_key,
@@ -612,10 +614,6 @@ RENTAL_CHANGE_REASONS = frozenset(
         ExecutorImageMessages.OUTDATED.reason,
     }
 )
-# one hash for the fleet: "<miner hotkey>:<executor uuid>" -> {"batches": [withheld job_batch_ids], "at": epoch}
-RENTAL_CHANGE_STATE_KEY = "rental_change_withheld"
-# cycles withheld by this rule since the node last passed; the backend's 45 min inactive sweep is not reset by it
-MAX_RENTAL_CHANGE_WITHHELD_CYCLES = 2
 RENTAL_CHANGE_STATE_MAX_AGE_SECONDS = 7 * 24 * 3600
 
 
